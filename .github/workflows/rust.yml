@@ -2,6 +2,7 @@ name: Rust
 
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
   workflow_dispatch:
@@ -11,41 +12,138 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      codecov: ${{ steps.codecov.outputs.enabled }}
+      rust: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && 'true' || steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        if: github.event_name != 'workflow_dispatch' && github.event_name != 'merge_group'
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'src/**'
+              - 'assets/**'
+              - 'tests/**'
+              - 'examples/**'
+              - 'benches/**'
+              - 'build.rs'
+              - 'Cargo.*'
+              - '.cargo/**'
+              - 'rust-toolchain*'
+              - '.github/**'
+              - 'prek.toml'
+              - 'deny.toml'
+              - 'codecov.yml'
+      - name: Codecov availability
+        id: codecov
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          if [[ -n "$CODECOV_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CODECOV_TOKEN absent : couverture indicative, envoi désactivé."
+          fi
+
+  prek:
+    name: Quality gate (prek)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust toolchain
+        run: rustup default stable
+      # Les hooks système utilisent les mêmes outils que le poste local.
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
+        with:
+          tool: cargo-deny,cargo-machete,cargo-audit
+      - uses: j178/prek-action@44924fe9ef4a6f88253c4b6b1bf11c689d3ce53d # v3.1.0
+        with:
+          # Hygiène et dépendances sur Ubuntu ; Rust/Metal dans le job macOS.
+          # Gitleaks analyse les commits dans son propre job.
+          extra-args: >-
+            --all-files
+            --stage pre-push
+            --skip gitleaks
+            --skip cargo-sweep
+            --skip cargo-fmt
+            --skip cargo-clippy
+            --skip cargo-doc
+            --skip no-commit-to-branch
+      # Les hooks correcteurs ne doivent jamais masquer une modification.
+      - name: Fail if any hook rewrote a file
+        run: |
+          if ! git diff --exit-code; then
+            echo "::error::A prek hook modified files. Run 'prek run --all-files' locally and commit the result."
+            exit 1
+          fi
+
+  release-build-check:
+    name: Release build (Apple Silicon)
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-plz-')
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      # Même commande que release.yml : échouer avant le merge et le tag.
+      - name: Build and check release CLI
+        run: |
+          test "$(uname -m)" = arm64
+          cargo build --locked --release --target "$TARGET" --bin saragossa --features metal,devtools
+          "target/$TARGET/release/saragossa" --help
+
   rust:
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     name: fmt, clippy, build, tests
     runs-on: macos-15
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust toolchain
         run: |
           rustup default stable
           rustup component add rustfmt clippy
           rustc --version
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: stable-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --features metal,devtools -- -D warnings
-      - name: Build
-        run: cargo build --features metal,devtools
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Documentation
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features --document-private-items
       - name: Tests
-        run: cargo test --features metal,devtools
+        run: cargo test --locked --all-features
 
   cpu:
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     name: CPU (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -54,10 +152,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust toolchain
         run: rustup default stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: stable-cpu-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -75,53 +173,111 @@ jobs:
         run: cargo test --locked --bin saragossa --no-default-features --features devtools "serve::"
 
   msrv:
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     name: MSRV 1.85
     runs-on: macos-15
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust 1.85 toolchain
         run: |
           rustup toolchain install 1.85 --profile minimal
           rustc +1.85 --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: msrv-1.85-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build with MSRV
-        run: cargo +1.85 build
+        run: cargo +1.85 build --locked
 
-  audit:
-    name: cargo audit
+  gitleaks:
+    name: Gitleaks
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - name: Rust toolchain
-        run: rustup default stable
-      - name: Cache cargo-audit
-        uses: actions/cache@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: ~/.cargo/bin/cargo-audit
-          key: ${{ runner.os }}-cargo-audit
-      - name: Install cargo-audit
-        run: command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
-      - name: Vulnerabilities
-        run: cargo audit
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          VERSION=8.24.3  # pinned — update manually
+          curl -sSfL --retry 3 --retry-delay 10 --retry-all-errors \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
+            | sudo tar xz -C /usr/local/bin gitleaks
+      - name: Run gitleaks
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          # Les SHA passent par l'environnement, jamais par interpolation shell.
+          # Sans base valide (lancement manuel), analyser tout l'historique.
+          args=(detect --source . --config .gitleaks.toml --redact)
+          if [[ "$EVENT_NAME" != "workflow_dispatch" && -n "$BASE_SHA" && \
+                "$BASE_SHA" != "0000000000000000000000000000000000000000" ]] && \
+                git cat-file -e "${BASE_SHA}^{commit}"; then
+            args+=(--log-opts "${BASE_SHA}..HEAD")
+          fi
+          gitleaks "${args[@]}"
 
-  dependency-policy:
-    name: cargo deny, machete
+  validate-yaml:
+    name: Validate CI YAML
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
-      - name: Rust toolchain
-        run: rustup default stable
-      - name: Install policy tools
-        uses: taiki-e/install-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
         with:
-          tool: cargo-deny,cargo-machete
-      - name: Dependency policy
-        run: cargo deny check
-      - name: Unused dependencies
-        run: cargo machete
+          args: -color
+
+  coverage:
+    name: Coverage
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-15
+    # Sans secret (y compris les PR de forks), la mesure reste indicative.
+    continue-on-error: ${{ needs.changes.outputs.codecov != 'true' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust coverage toolchain
+        run: |
+          rustup default stable
+          rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: coverage-cpu-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
+        with:
+          tool: cargo-llvm-cov
+      - name: CPU test coverage
+        run: cargo llvm-cov --locked --no-default-features --features devtools --lib --bins --lcov --output-path lcov.info
+      - name: Upload coverage
+        if: needs.changes.outputs.codecov == 'true'
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: lcov.info
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  required:
+    name: Required checks
+    if: always()
+    needs: [changes, prek, rust, cpu, msrv, gitleaks, validate-yaml, coverage, release-build-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check required jobs
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          # Seul ce statut agrégé doit être requis par le ruleset.
+          # Les jobs ignorés ou annulés restent non fatals, comme dans grob.
+          for result in $RESULTS; do
+            if [[ "$result" == "failure" ]]; then
+              echo "::error::Un contrôle obligatoire a échoué."
+              exit 1
+            fi
+          done
+          echo "Contrôles réussis ; jobs ignorés ou annulés non fatals."

@@ -27,12 +27,12 @@ jobs:
       - uses: step-security/harden-runner@v2
         with:
           egress-policy: audit
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: nightly-${{ matrix.toolchain }}-macos
           save-if: true
@@ -42,3 +42,66 @@ jobs:
         run: cargo test --lib --bins --all-features
       - name: Documentation tests
         run: cargo test --doc --all-features
+
+  # Open (or reuse) a tracking issue when the BETA matrix fails. Nightly
+  # failures stay silent (they are allowed to break). Avoids spamming: the
+  # step searches for an open "nightly-toolchain" labeled issue and
+  # comments on it instead of creating duplicates.
+  alert:
+    name: Alert on beta regression
+    needs: [check]
+    if: always() && needs.check.result == 'failure' && github.event_name == 'schedule'
+    permissions:
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Open or update tracking issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const label = 'nightly-toolchain';
+            const title = `Régression Rust beta (${new Date().toISOString().slice(0,10)})`;
+            const body = [
+              `Le contrôle planifié ${context.runId} a détecté une régression sur la toolchain \`beta\`.`,
+              ``,
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              ``,
+              `Les échecs nightly sont tolérés ; corriger la régression beta avant la prochaine release.`,
+            ].join('\n');
+            // Le premier incident doit fonctionner sans label précréé.
+            try {
+              await github.rest.issues.getLabel({ ...context.repo, name: label });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.issues.createLabel({
+                ...context.repo,
+                name: label,
+                color: 'd73a4a',
+                description: 'Régressions de la toolchain Rust beta',
+              });
+            }
+            const { data: entries } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: label,
+              per_page: 100,
+            });
+            const issues = entries.filter(issue => !issue.pull_request);
+            if (issues.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues[0].number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: [label],
+              });
+            }

@@ -6,16 +6,24 @@ repository = "https://github.com/azerozero/saragossa"
 keywords = ["llm", "inference", "metal", "apple-silicon", "transformer"]
 categories = ["science", "concurrency", "command-line-utilities"]
 license = "Apache-2.0"
-publish = true
+publish = false
 edition = "2021"
 rust-version = "1.85"
 build = "build.rs"
 # `tools/` regroupe des utilitaires Python annexes (quantification, mesure de
 # qualité) : utiles dans le dépôt, inutiles à qui compile le crate. Les exclure
-# garde le paquet crates.io strictement Rust.
+# garde le paquet source strictement Rust.
 # `tests/fixtures/` : corpus de prompts des oracles (textes tiers sous leurs
 # propres licences), réservé aux tests du dépôt.
 exclude = ["tools/", "tests/fixtures/"]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[profile.release]
+strip = true
 
 [lib]
 name = "saragossa"

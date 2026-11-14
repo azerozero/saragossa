@@ -2,6 +2,7 @@ name: GPU synthétique
 
 on:
   workflow_dispatch:
+  merge_group:
   schedule:
     - cron: "17 3 * * *"
   pull_request:
@@ -29,6 +30,8 @@ env:
 jobs:
   gpu-synthetic:
     name: Tests GPU à poids synthétiques
+    # La PR de release ne change que version, changelog et lock après la CI de main.
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-')
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -151,8 +154,8 @@ jobs:
             RETI_RUST_SINGLE_COPY_WEIGHTS="$single_copy" cargo test --lib --features metal -- --exact "${tests[@]}" --test-threads=1
           done
       - name: Vérifier et mesurer les deux tests GPU lourds
-        # Environ 7 min à eux deux : hors des PR, ils tournent la nuit.
-        if: github.event_name != 'pull_request'
+        # Environ 7 min à eux deux : hors des PR et de la queue, la nuit ou à la demande.
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail

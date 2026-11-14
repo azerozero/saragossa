@@ -887,7 +887,7 @@ capture, hors journal). Reste opt-in : gain sous le seuil de 2 % hors DFlash cod
 hybride (Qwen3.8-27B) dans un command buffer par pas ; normes, projections, tail
 dense et lm_head batchés sur N lignes, RoPE/KV/attention et conv/SSM par flux
 (namespaces de scratch par slot). Harnais `SARAGOSSA_RUST_LIGHTBATCH_ACCEPTANCE=1`
-+ `SARAGOSSA_RUST_LIGHTBATCH_STREAMS=N`, 4k, 200 tokens :
+\+ `SARAGOSSA_RUST_LIGHTBATCH_STREAMS=N`, 4k, 200 tokens :
 
 | N | ms/pas | agrégé tok/s | gain vs solo |
 |---|---|---|---|
