@@ -16,6 +16,7 @@ include!("tests/qmv_align64.rs");
 include!("tests/moe_duo.rs");
 include!("tests/linear_attention.rs");
 include!("tests/attention.rs");
+include!("tests/attention_generic.rs");
 include!("tests/mtp_seed.rs");
 include!("tests/verify_tree.rs");
 include!("tests/moe_verify_rows.rs");
