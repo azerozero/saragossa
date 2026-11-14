@@ -30,13 +30,14 @@ const STEEL_SINK_ATTN_D128_KV_BF16: &str =
 #[cfg(all(target_os = "macos", feature = "metal"))]
 const STEEL_ATTENTION_NAX_KERNELS: &str = include_str!("../../assets/steel_attention_nax.metal");
 const GATED_DELTA_NAX_KERNELS: &str = include_str!("../../assets/gated_delta_nax.metal");
+const GATED_DELTA_NAX_HK16_HV32: &str = "gated_delta_fused_nax_f32_dk128_dv128_hk16_hv32_c16";
 const GATED_DELTA_NAX_HK16_HV48: &str = "gated_delta_fused_nax_f32_dk128_dv128_hk16_hv48_c16";
 const MAX_MOE_TOP_K: usize = 16;
 pub(crate) const MAX_SAMPLER_TOP_K: usize = 32;
 const FAST_QMV_GROUP_SIZE: usize = 64;
 const QMM_NA_GS128_GROUP_SIZE: usize = 128;
 const FAST_QMV_BITS: usize = 4;
-/// Lignes par tuile (un seul expert) des kernels MoE groupés tuilés de flint.
+/// Lignes par tuile (un seul expert) des kernels MoE groupés tuilés.
 const MOE_COOP_TILED_BM: usize = 32;
 /// Lignes par tuile des kernels MoE groupés 16 × 32.
 const MOE_COOP_TILE_M: usize = 16;
@@ -425,6 +426,8 @@ pub struct MetalExecutor {
     na_gemm_bf16: Option<ComputePipelineState>,
     /// Variante encodeur Whisper plus proche du tiling MLX Steel NAX (BN=128).
     na_gemm_bf16_bn128: Option<ComputePipelineState>,
+    /// Gated delta NAX de MLX (MoE : 16/32 têtes, dk = dv = 128).
+    pub(super) gated_delta_nax_hk16_hv32: Option<ComputePipelineState>,
     /// Gated delta NAX de MLX (27B : 16/48 têtes, dk = dv = 128).
     pub(super) gated_delta_nax_hk16_hv48: Option<ComputePipelineState>,
     na_gemm_coop_qb: Option<ComputePipelineState>,
@@ -1054,3 +1057,6 @@ enum MetalBufferElement {
 
 #[cfg(test)]
 pub(crate) mod weight_file_tests;
+
+#[cfg(test)]
+pub(crate) use linear_attention_encode::{linear_nax_hv32_calls, with_linear_nax_disabled};

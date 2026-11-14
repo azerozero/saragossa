@@ -25,4 +25,7 @@ include!("tests/verify_tree.rs");
 include!("tests/moe_verify_rows.rs");
 include!("tests/rows_exact.rs");
 include!("tests/flash_next.rs");
+
+include!("tests/moe_prefill_variants.rs");
+include!("tests/gated_delta_variants.rs");
 include!("tests/kernel_safety.rs");

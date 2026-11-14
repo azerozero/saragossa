@@ -159,12 +159,12 @@ pub(crate) fn flint_moe_coop_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_MOE_COOP", true))
 }
 
-/// Kernels groupés TUILÉS pour le MoE routé coop de flint
+/// Kernels groupés TUILÉS pour le MoE coop routé et partagé
 /// (`gemm_nax_coop_qb_grouped_*_u4_bm*`) : tuiles d'un expert de
 /// `MOE_COOP_TILED_BM` lignes × 64 colonnes au lieu de 16 × 32, poids
 /// déquantifié une fois par tuile en mémoire threadgroup. Même arithmétique
-/// que les kernels 16 × 32 (oracle bit à bit dans les tests). Qwen3-30B
-/// (softmax) garde les kernels 16 × 32 : pas de modèle local pour mesurer.
+/// que les kernels 16 × 32 (oracle bit à bit dans les tests). Le choix du
+/// routeur (softmax ou sigmoïde) ne change pas cette arithmétique.
 ///
 /// NOTE: Mesuré le 31 oct. 2026 sur flint-int4 (prefill seul, morceaux de
 /// 4096) : MoE routé 4,49 → 3,17 s à 32k et 9,89 → 6,99 s à 64k, prefill
@@ -185,6 +185,11 @@ pub(crate) fn flint_moe_coop_tiled_enabled() -> bool {
 thread_local! {
     static FLINT_MOE_COOP_TILED_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn flint_moe_coop_tiled_override() -> Option<bool> {
+    FLINT_MOE_COOP_TILED_TEST_OVERRIDE.with(Cell::get)
 }
 
 /// Force les kernels coop tuilés de flint sur ce thread le temps de `run`.

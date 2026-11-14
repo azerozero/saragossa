@@ -1209,3 +1209,6 @@ mod tests;
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 mod direct_file_tests;
+
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+mod prefill_variants_tests;
