@@ -9,8 +9,9 @@ fabriquer des poids, pas à les exécuter.
 | `mixed_quant.py` | Alloue deux largeurs de bits par couche selon la sensibilité, écrit un modèle MLX |
 | `kl_eval.py` | Mesure KL(bf16 ‖ quantifié) et l'accord top-1, en teacher forcing |
 | `test_allocation.py` | Tests de la logique d'allocation, sans dépendance à MLX |
-| `convert_ls.py` | Re-quantifie en u4 gs64 par moindres carrés depuis les poids BF16, sans changer le format (+1,7 % de perplexité contre +2,9 % en min-max sur le 27B, sans données de calibration) |
+| `convert_ls.py` | Re-quantifie en affine gs64 (4 ou 8 bits, selon le template) par moindres carrés depuis les poids BF16, sans changer le format (+1,7 % de perplexité contre +2,9 % en min-max sur le 27B, sans données de calibration) |
 | `opt_quant.py` | Ajustement d'échelle et de biais par groupe utilisé par `convert_ls.py` |
+| `chat_kl.py` | KL en régime chat contre les poids officiels bf16 (référence transformers, candidat mlx-lm) |
 
 ## Méthode
 
@@ -105,6 +106,52 @@ un accord top-1 > 0,95 vaut quasi-sans-perte.
 Le jeu de prompts est figé dans `kl_eval.py` pour que deux exécutions restent
 comparables. Le remplacer via `--prompts` change les valeurs absolues, pas
 seulement leur bruit : ne comparez que des mesures issues du même jeu.
+
+## Gemma 4 26B-A4B : attention en 8 bits
+
+Le checkpoint `mlx-community/gemma-4-26b-a4b-it-4bit` (attention, experts et
+embeddings en 4 bits ; MLP dense et routeur en 8) perd nettement face aux poids
+Google bf16. Mesure en régime chat avec `chat_kl.py` : 8 réponses greedy de
+192 tokens au plus générées par transformers bf16, top-64 par position, KL sur
+la partition top-64 + reste (1 505 positions). Le texte brut ne convient pas :
+sur un extrait de Sherlock Holmes précédé du BOS, les poids officiels dans
+transformers 5.22.2 ont une perplexité d'environ 10⁵, sur CPU comme sur MPS,
+alors qu'ils répondent correctement en chat.
+
+Chaque ligne « + … » modifie un seul groupe de modules par rapport au
+checkpoint mlx-community ; les lignes ne se cumulent pas.
+
+| variante (mlx-lm) | KL | même top-1 | taille |
+|---|---|---|---|
+| poids Google bf16 (plancher mlx/transformers) | 0,0037 | 99,1 % | bf16 |
+| mlx-community 4 bits | 0,134 | 92,0 % | 13,5 Gio |
+| + embeddings 8 bits | 0,129 | 92,6 % | 13,8 Gio |
+| + k/v 8 bits | 0,083 | 93,4 % | 13,6 Gio |
+| + attention 8 bits | 0,046 | 95,1 % | 14,0 Gio |
+| + attention non quantifiée | 0,046 | 95,2 % | 15,0 Gio |
+| + experts 8 bits | 0,107 | 92,2 % | 24,1 Gio |
+| attention et embeddings 8 bits (q4a8) | 0,041 | 95,4 % | 14,3 Gio |
+| q4a8 + `convert_ls.py` | **0,034** | **96,0 %** | 14,3 Gio |
+
+Dans le moteur Rust, q4a8 + moindres carrés donne KL 0,031 et 96,2 % de top-1,
+contre 0,132 et 91,7 % sur le checkpoint mlx-community. Les moindres carrés
+seuls sur le checkpoint mlx-community ne changent rien (KL 0,137, dans le bruit) : l'erreur
+dominante vient de la largeur de l'attention, pas de l'arrondi. Coût en
+decode, A/B ABBA sur 5 blocs (prompt de 1 024 tokens, 256 générés, M5 Max) :
+18,35 contre 18,95 tok/s, soit −3,2 %.
+
+```bash
+python3 mixed_quant.py --input gemma-4-26B-A4B-it --output gemma4-q4a8-minmax \
+    --low-bits 4 --high-bits 8 --high-fraction 0 \
+    --force-high 'self_attn|embed_tokens|\.mlp\.|router'
+python3 convert_ls.py --src gemma-4-26B-A4B-it --template gemma4-q4a8-minmax \
+    --dst gemma4-q4a8-ls
+python3 chat_kl.py ref --model gemma-4-26B-A4B-it --out chatref.json  # transformers
+python3 chat_kl.py eval --model gemma4-q4a8-ls --ref chatref.json
+```
+
+`convert_ls.py` suit la largeur de chaque tenseur du template (4 ou 8 bits) et
+découpe les experts fusionnés `gate_up_proj` des poids Google comme mlx-lm.
 
 ## Référence KL du moteur Rust
 
