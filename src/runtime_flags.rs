@@ -1573,8 +1573,9 @@ pub(super) fn prefill_resident_gemma4_enabled() -> bool {
 }
 
 /// Longueur maximale du prefill résident Gemma 4, enveloppe chat comprise.
-/// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS` vaut 4096 par défaut,
-/// borne de qualification mesurée. Zéro, valeur invalide ou absente gardent
+/// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS` vaut 3000 par défaut.
+/// Ce plafond d'admission ne qualifie pas tous les prompts plus courts : voir
+/// `docs/perf/gemma4-prefill.md`. Zéro, valeur invalide ou absente gardent
 /// cette borne ; une valeur positive la remplace explicitement.
 /// Au-delà, le résident est inéligible AVANT embedding/allocation : `Ok(None)`
 /// laisse l'appelant choisir le per-op. Les erreurs après admission remontent.
@@ -1595,7 +1596,7 @@ fn parse_gemma4_prefill_max_tokens(value: Option<&str>) -> usize {
     value
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&max| max > 0)
-        .unwrap_or(4096)
+        .unwrap_or(3000)
 }
 
 /// Active le tail MLP dense du prefill résident (27B hybride `qwen3_5`).
@@ -2380,7 +2381,7 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn gemma4_prefill_max_tokens_defaults_and_override() {
         for value in [None, Some(""), Some("0"), Some("-1"), Some("invalid")] {
-            assert_eq!(super::parse_gemma4_prefill_max_tokens(value), 4096);
+            assert_eq!(super::parse_gemma4_prefill_max_tokens(value), 3000);
         }
         assert_eq!(super::parse_gemma4_prefill_max_tokens(Some(" 4109 ")), 4109);
         assert_eq!(super::parse_gemma4_prefill_max_tokens(Some("256")), 256);

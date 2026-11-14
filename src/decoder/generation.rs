@@ -5898,6 +5898,75 @@ impl CausalDecoder {
         self.prefill_cache_state_metal_resident(prompt)
     }
 
+    /// Ablation de diagnostic : seules les couches globales d512 passent en
+    /// per-op. Le contrôle garde toutes les couches résidentes, une par soumission.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn prefill_gemma4_global_ablation_for_test(
+        &self,
+        prompt: &[usize],
+        global_per_op: bool,
+    ) -> Result<(CausalDecoderCache, Tensor)> {
+        let metal = self
+            .resident_metal()
+            .ok_or_else(|| InferError::Config("ablation Gemma 4: Metal requis".into()))?;
+        let spec = self
+            .resident_prefill_spec(prompt.len(), self.final_norm.data().len())
+            .ok_or_else(|| InferError::Config("ablation Gemma 4: spec refusée".into()))?;
+        let mut hidden = self.embed_scaled(prompt)?;
+        let mut cache = self.empty_cache();
+        let mut per_op_layers = 0;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let prefill_layer = layer
+                .prefill_moe_layer(&self.config, spec)
+                .ok_or_else(|| InferError::Config("ablation Gemma 4: couche refusée".into()))?;
+            let layer_spec = prefill_layer.attention_spec;
+            if global_per_op && layer_spec.head_dim == 512 && layer_spec.window.is_none() {
+                hidden = layer.forward_prefill(
+                    &self.config,
+                    &hidden,
+                    &mut cache.layers[index],
+                    0,
+                    self.forward_runtime(),
+                )?;
+                per_op_layers += 1;
+            } else {
+                let (output, states) =
+                    metal.qwen_moe_prefill_resident(&hidden, &[prefill_layer], layer_spec)?;
+                assert_eq!(states.len(), 1);
+                for state in states {
+                    let crate::metal_backend::PrefillResidentLayerCache::Full {
+                        key,
+                        value,
+                        kv_dim,
+                        base,
+                        ..
+                    } = state
+                    else {
+                        return Err(InferError::Config(
+                            "ablation Gemma 4: cache full attendu".into(),
+                        ));
+                    };
+                    let layout = AttentionLayout {
+                        num_attention_heads: layer_spec.q_heads,
+                        num_key_value_heads: layer_spec.kv_heads,
+                        head_dim: layer_spec.head_dim,
+                        rope_dims: layer_spec.rope_dims,
+                        attn_scalar: layer_spec.attn_scalar,
+                        sliding_window: layer_spec.window,
+                    };
+                    cache.layers[index].append_prefill(key, value, kv_dim, base, &layout)?;
+                }
+                hidden = output;
+            }
+        }
+        eprintln!("Gemma4 ablation global_per_op={global_per_op} per_op_layers={per_op_layers}");
+        assert_eq!(per_op_layers > 0, global_per_op);
+        cache.position = prompt.len();
+        let final_hidden = Tensor::row(hidden.last_row()?.to_vec())?;
+        let state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
+        Ok((cache, state))
+    }
+
     fn can_prefill_batched(&self) -> bool {
         let linear_enabled = prefill_linear_batched_enabled();
         self.layers

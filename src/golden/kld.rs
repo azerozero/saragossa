@@ -186,9 +186,18 @@ pub(crate) fn compare_gemma4_long_prefill(
     model: &crate::CausalDecoder,
     prompt: &[usize],
 ) -> TestResult {
+    assert!((4096..=4128).contains(&prompt.len()), "prompt long attendu");
+    compare_gemma4_prefill_at_length(model, prompt)
+}
+
+/// Même oracle et mêmes seuils, à une longueur totale contrôlée par le test.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn compare_gemma4_prefill_at_length(
+    model: &crate::CausalDecoder,
+    prompt: &[usize],
+) -> TestResult {
     let meta: Meta = json("kld/gemma4_meta")?;
     assert_eq!(meta.model, "gemma4");
-    assert!((4096..=4128).contains(&prompt.len()), "prompt long attendu");
     assert!(
         prompt.len() <= crate::runtime_flags::prefill_resident_gemma4_max_tokens(),
         "relever explicitement SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS pour cet oracle"
@@ -235,12 +244,30 @@ pub(crate) fn compare_gemma4_long_prefill(
         prompt.len()
     );
     let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(true);
-    let (mut cache, state) = model
-        .prefill_cache_state_metal_resident_for_test(prompt)?
-        .ok_or("oracle long: prefill résident refusé")?;
+    // Diagnostic limité au prefill candidat : référence et decode inchangés.
+    let strict = crate::runtime_flags::env_var("SARAGOSSA_GEMMA4_ORACLE_GEMM_F32")
+        .is_some_and(|value| value == "1");
+    let global_ablation = crate::runtime_flags::env_var("SARAGOSSA_GEMMA4_ORACLE_GLOBAL_PER_OP");
+    let (mut cache, state) = crate::metal_backend::with_verify_strict_override(strict, || {
+        let _greedy = crate::metal_backend::install_verify_greedy_scope(strict);
+        assert_eq!(crate::metal_backend::verify_strict_active(), strict);
+        if let Some(mode) = &global_ablation {
+            assert!(mode == "1" || mode == "control");
+            model
+                .prefill_gemma4_global_ablation_for_test(prompt, mode == "1")
+                .map(Some)
+        } else {
+            model.prefill_cache_state_metal_resident_for_test(prompt)
+        }
+    })?
+    .ok_or("oracle long: prefill résident refusé")?;
     let trace = crate::MetalExecutor::take_long_d512_dispatches_for_test();
     eprintln!("kld/gemma4-long: trace causal_attention_prefill_long_d512_f32 {trace:?}");
-    assert!(!trace.is_empty(), "aucun dispatch du kernel long d512");
+    assert_eq!(
+        !trace.is_empty(),
+        prompt.len() > 2048 && global_ablation.as_deref() != Some("1"),
+        "dispatch long d512 incohérent avec la longueur"
+    );
     assert!(trace
         .iter()
         .all(|&(seq, dim)| seq == prompt.len() && dim == 512));

@@ -585,6 +585,11 @@ impl MetalExecutor {
         let bf16_store = chunked
             && kv_bf16_readable
             && bf16_min_rows.is_some_and(|min_rows| spec.seq >= min_rows);
+        if trace_prefill_enabled() {
+            eprintln!(
+                "prefill layout rows={rows} chunk_rows={chunk_rows} chunks={chunk_count} kv_bf16_store={bf16_store}"
+            );
+        }
         // Réserve d'un K/V écrit dans un buffer neuf (prefill à froid, préfixe
         // recopié) : la demande de l'appelant pour un K/V bf16, adoptable par
         // l'arène, plus un huitième du prompt dans la limite du contexte.

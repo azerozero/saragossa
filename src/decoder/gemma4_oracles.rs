@@ -181,9 +181,10 @@ fn prefill_comparison(tokens: usize) -> Result<(Vec<usize>, Vec<usize>)> {
 // Les deux oracles externes ci-dessous ne préremplissent que 88–96 tokens
 // (chunks de 216–224 moins 128 positions notées). Ils couvrent le kernel court,
 // ni mid (>256), ni long d512 (>2048). Les A/B 1k/4k restent des diagnostics
-// greedy sans seuil de qualité. L'oracle long séparé enregistre le per-op f32
-// à ~4100 tokens et compare le résident, avec trace du dispatch long d512 et
-// les mêmes seuils KL/p99/top-1 ; ce n'est pas une référence MLX longue.
+// greedy sans seuil de qualité. L'oracle long enregistre le per-op (attention
+// CPU f32, GEMM selon les flags) à ~4100 tokens et compare le résident, avec
+// trace du dispatch long d512 et les mêmes seuils KL/p99/top-1 ; ce n'est pas
+// une référence MLX longue.
 // L'identité stricte reste exigée pour le decode seul et le prompt français
 // court historique (32 tokens générés).
 #[test]
@@ -199,10 +200,60 @@ fn gemma4_prefill_reference_kld_resident() -> crate::golden::external::TestResul
 }
 
 #[test]
-#[ignore = "oracle long sur poids réels, borne explicite >4096, lancer sous verrou GPU"]
+#[ignore = "échec KL/top-1 connu à 4109, borne explicite et poids réels, lancer sous verrou GPU"]
 fn gemma4_prefill_long_per_op_kld_resident() -> crate::golden::external::TestResult {
     let (model, prompt) = model_and_prompt(4096)?;
     crate::golden::kld::compare_gemma4_long_prefill(&model, &prompt)
+}
+
+// Longueurs totales, enveloppe chat comprise : ne pas déplacer le seuil
+// mid/long de 2048 en ajoutant implicitement les 13 tokens de l'enveloppe.
+fn prefill_kld_at_length(total: usize) -> crate::golden::external::TestResult {
+    let (model, prompt) = model_and_prompt(total - 13)?;
+    assert_eq!(prompt.len(), total, "longueur chat de l'oracle");
+    crate::golden::kld::compare_gemma4_prefill_at_length(&model, &prompt)
+}
+
+#[test]
+#[ignore = "échec top-1 connu à 64 tokens, poids réels, lancer sous verrou GPU"]
+fn gemma4_prefill_per_op_kld_resident_64() -> crate::golden::external::TestResult {
+    prefill_kld_at_length(64)
+}
+
+#[test]
+#[ignore = "échec top-1 connu à 128 tokens, poids réels, lancer sous verrou GPU"]
+fn gemma4_prefill_per_op_kld_resident_128() -> crate::golden::external::TestResult {
+    prefill_kld_at_length(128)
+}
+
+#[test]
+#[ignore = "oracle 256 tokens sur poids réels, lancer sous verrou GPU"]
+fn gemma4_prefill_per_op_kld_resident_256() -> crate::golden::external::TestResult {
+    prefill_kld_at_length(256)
+}
+
+#[test]
+#[ignore = "oracle 512 tokens sur poids réels, lancer sous verrou GPU"]
+fn gemma4_prefill_per_op_kld_resident_512() -> crate::golden::external::TestResult {
+    prefill_kld_at_length(512)
+}
+
+#[test]
+#[ignore = "oracle 1024 tokens sur poids réels, lancer sous verrou GPU"]
+fn gemma4_prefill_per_op_kld_resident_1024() -> crate::golden::external::TestResult {
+    prefill_kld_at_length(1024)
+}
+
+#[test]
+#[ignore = "oracle 2048 tokens sur poids réels, lancer sous verrou GPU"]
+fn gemma4_prefill_per_op_kld_resident_2048() -> crate::golden::external::TestResult {
+    prefill_kld_at_length(2048)
+}
+
+#[test]
+#[ignore = "oracle 3000 tokens sur poids réels, borne explicite, lancer sous verrou GPU"]
+fn gemma4_prefill_per_op_kld_resident_3000() -> crate::golden::external::TestResult {
+    prefill_kld_at_length(3000)
 }
 
 #[test]
