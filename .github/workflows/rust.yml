@@ -27,6 +27,7 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
+      codecov: ${{ steps.codecov.outputs.enabled }}
       rust: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'merge_group') && 'true' || steps.filter.outputs.rust }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,6 +50,17 @@ jobs:
               - 'prek.toml'
               - 'deny.toml'
               - 'codecov.yml'
+      - name: Codecov availability
+        id: codecov
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          if [[ -n "$CODECOV_TOKEN" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CODECOV_TOKEN absent : couverture indicative, envoi désactivé."
+          fi
 
   prek:
     name: Quality gate (prek)
@@ -203,10 +215,41 @@ jobs:
       - name: Validate workflows
         run: actionlint -color
 
+  coverage:
+    name: Coverage
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-15
+    # Sans secret (y compris les PR de forks), la mesure reste indicative.
+    continue-on-error: ${{ needs.changes.outputs.codecov != 'true' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust coverage toolchain
+        run: |
+          rustup default stable
+          rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: coverage-cpu-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
+        with:
+          tool: cargo-llvm-cov
+      - name: CPU test coverage
+        run: cargo llvm-cov --locked --no-default-features --features devtools --lib --bins --lcov --output-path lcov.info
+      - name: Upload coverage
+        if: needs.changes.outputs.codecov == 'true'
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: lcov.info
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
   required:
     name: Required checks
     if: always()
-    needs: [changes, prek, rust, cpu, msrv, gitleaks, validate-yaml]
+    needs: [changes, prek, rust, cpu, msrv, gitleaks, validate-yaml, coverage]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
