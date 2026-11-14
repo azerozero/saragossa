@@ -17,6 +17,14 @@ build = "build.rs"
 # propres licences), réservé aux tests du dépôt.
 exclude = ["tools/", "tests/fixtures/"]
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[profile.release]
+strip = true
+
 [lib]
 name = "saragossa"
 path = "src/lib.rs"

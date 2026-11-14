@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TARGET: aarch64-apple-darwin
+  ARCHIVE_NAME: saragossa-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+
+jobs:
+  build:
+    name: Build Apple Silicon archive
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Validate release version
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          if os.environ["GITHUB_REF_NAME"] != f"v{version}":
+              raise SystemExit(f"Tag does not match Cargo.toml version v{version}")
+          PY
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      # Scanner les sources avant le build pour exclure les artefacts de target/.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: sbom-saragossa.spdx.json
+          output-file: sbom-saragossa.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Build and check CLI
+        run: |
+          test "$(uname -m)" = arm64
+          cargo build --locked --release --target "$TARGET" --bin saragossa --features metal,devtools
+          "target/$TARGET/release/saragossa" --help
+
+      - name: Package binary and checksum
+        run: |
+          mkdir -p staging dist
+          cp "target/$TARGET/release/saragossa" README.md NOTICE staging/
+          cp LICENSE-APACHE staging/LICENSE
+          COPYFILE_DISABLE=1 tar -czf "dist/$ARCHIVE_NAME" -C staging saragossa README.md LICENSE NOTICE
+          mv sbom-saragossa.spdx.json dist/
+          cd dist
+          shasum -a 256 "$ARCHIVE_NAME" > "$ARCHIVE_NAME.sha256"
+
+      - name: Attest archive provenance
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: dist/*.tar.gz
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create release
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: artifacts
+
+      - name: Verify checksums
+        working-directory: artifacts
+        run: sha256sum --check ./*.sha256
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Validate tag and extract changelog
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"]
+          if os.environ["GITHUB_REF_NAME"] != f"v{version}":
+              raise SystemExit(f"Tag does not match Cargo.toml version v{version}")
+          changelog = Path("CHANGELOG.md").read_text()
+          section = re.search(
+              rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## |\Z)",
+              changelog,
+              re.MULTILINE | re.DOTALL,
+          )
+          if section is None or not section.group(1).strip():
+              raise SystemExit(f"Missing changelog section for {version}")
+          Path("RELEASE_NOTES.md").write_text(section.group(0).strip() + "\n\n")
+          PY
+
+      - name: Prepare checksums and release notes
+        run: |
+          {
+            echo "## SHA256 Checksums"
+            echo '```'
+            cat artifacts/*.sha256
+            echo '```'
+          } > CHECKSUMS.md
+          cat CHECKSUMS.md >> RELEASE_NOTES.md
+
+      # Ce workflow est le seul créateur de la release : release-plz pose le tag.
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          options=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes-file RELEASE_NOTES.md \
+            "${options[@]}" \
+            artifacts/*.tar.gz artifacts/*.sha256 artifacts/sbom-saragossa.spdx.json CHECKSUMS.md
