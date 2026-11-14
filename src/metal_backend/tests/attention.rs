@@ -618,6 +618,31 @@ fn causal_attention_prefill_mid_is_bit_identical_to_short_at_256() -> Result<()>
     Ok(())
 }
 
+/// Le long conserve les bits du mid et écrit aussi la moitié haute de d512.
+#[test]
+fn causal_attention_prefill_long_d512_matches_mid_and_cpu() -> Result<()> {
+    let executor = MetalExecutor::new()?;
+    for seq in [256, 257] {
+        let (q, k, v) = causal_attention_inputs(seq, 2, 1, 512)?;
+        let mid = causal_attention_prefill_with_pipeline(
+            &executor, &q, &k, &v, 2, 1, &executor.causal_attention_prefill_mid_f32, 256,
+        )?;
+        let long = causal_attention_prefill_with_pipeline(
+            &executor, &q, &k, &v, 2, 1, &executor.causal_attention_prefill_long_d512_f32, 256,
+        )?;
+        assert_bits_equal(mid.data(), long.data(), "prefill mid vs long");
+    }
+    // Frontière du sélecteur puis longueur de la régression mesurée.
+    for seq in [2048, 2049, 4109] {
+        let (q, k, v) = causal_attention_inputs(seq, 2, 1, 512)?;
+        let got = executor.causal_attention_prefill(&q, &k, &v, 2, 1)?;
+        let rows = [0, 255, 256, 2047, seq - 1];
+        let expected = cpu_causal_attention_selected_rows_gqa(&q, &k, &v, 2, 1, &rows)?;
+        assert_causal_rows_close(&got, &expected, 5.0e-4)?;
+    }
+    Ok(())
+}
+
 #[test]
 fn causal_attention_prefill_batch_long_is_scoped_to_27b_30b_35b() {
     let base = PrefillAttentionSpec {

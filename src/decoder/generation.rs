@@ -3690,8 +3690,9 @@ impl CausalDecoder {
 
     /// Capture le prefill Gemma 4 MoE dans un répertoire neuf (feature `devtools`).
     ///
-    /// Utilise le runtime attaché : CPU f32 ou Metal per-op par défaut, sans
-    /// cache de préfixe ni snapshot disque. Aucun poids ni token n'est téléchargé.
+    /// Utilise le runtime attaché : CPU f32, ou Metal per-op avec
+    /// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0`, sans cache de préfixe ni
+    /// snapshot disque. Aucun poids ni token n'est téléchargé.
     ///
     /// # Errors
     ///
@@ -5674,6 +5675,19 @@ impl CausalDecoder {
         if self.config.is_gemma4 && !prefill_resident_gemma4_enabled() {
             return Ok(None);
         }
+        if self.config.is_gemma4 {
+            let max_tokens = crate::runtime_flags::prefill_resident_gemma4_max_tokens();
+            if prompt.len() > max_tokens {
+                if trace_prefill_enabled() {
+                    eprintln!(
+                        "prefill résident Gemma 4 inéligible: tokens={} > \
+                         SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS={max_tokens}; per-op",
+                        prompt.len()
+                    );
+                }
+                return Ok(None);
+            }
+        }
         self.ensure_prompt_within_prefill_cap(prompt.len())?;
         let Some(spec) = self.resident_prefill_spec(prompt.len(), self.final_norm.data().len())
         else {
@@ -5744,9 +5758,9 @@ impl CausalDecoder {
                 cache.position = prompt.len();
                 Ok(Some((cache, final_hidden, captures)))
             }
-            // Erreur d'exécution flint : la propager plutôt que masquer un
-            // kernel cassé derrière un prefill CPU ~500× plus lent.
-            Err(error) if resident_only => Err(error),
+            // Une erreur résidente Gemma 4 ou flint ne doit pas masquer un
+            // kernel cassé derrière un prefill CPU beaucoup plus lent.
+            Err(error) if resident_only || self.config.is_gemma4 => Err(error),
             Err(error) => {
                 if trace_prefill_enabled() {
                     eprintln!("prefill résident fallback: {error}");

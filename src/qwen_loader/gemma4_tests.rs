@@ -353,6 +353,10 @@ fn gemma4_resident_prefill_tokens_match_per_op() {
         .into_iter()
         .map(|id| usize::try_from(id).expect("invariant: id tokenizer représentable"))
         .collect::<Vec<_>>();
+    // Décision du 2026-11-14 : les prefills longs sont qualifiés par KL,
+    // mais ce contrôle court garde son assertion d'identité stricte et son
+    // budget historique de 32 tokens générés. L'enveloppe chat compte aussi.
+    assert!(prompt_ids.len() < 64);
     let options = GenerationOptions {
         stop_token_ids: assets.stop_token_ids(),
         ..GenerationOptions::default()
@@ -385,7 +389,8 @@ fn gemma4_resident_prefill_tokens_match_per_op() {
         .zip(&resident)
         .position(|(left, right)| left != right);
     eprintln!(
-        "TOKENS per_op.len={} resident.len={} first_div={first_div:?}",
+        "TOKENS prompt={} per_op.len={} resident.len={} first_div={first_div:?}",
+        prompt_ids.len(),
         per_op.len(),
         resident.len()
     );
