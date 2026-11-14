@@ -5,8 +5,6 @@ pub(crate) mod pairwise;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::cell::Cell;
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
-use std::sync::atomic::AtomicU8;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -1475,18 +1473,22 @@ pub(crate) fn with_prefill_resident_override<R>(enabled: bool, run: impl FnOnce(
 }
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
-static PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+thread_local! {
+    static PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
 
 /// Restaure la bascule Gemma 4 précédente à la fin d'un test.
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 pub(crate) struct PrefillResidentGemma4TestOverride {
-    previous: u8,
+    previous: Option<bool>,
+    // Une garde locale ne doit pas être restaurée par un autre thread.
+    _thread: std::marker::PhantomData<*const ()>,
 }
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 impl Drop for PrefillResidentGemma4TestOverride {
     fn drop(&mut self) {
-        PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.store(self.previous, Ordering::Relaxed);
+        PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.with(|cell| cell.set(self.previous));
     }
 }
 
@@ -1495,23 +1497,24 @@ impl Drop for PrefillResidentGemma4TestOverride {
 pub(crate) fn override_prefill_resident_gemma4_for_test(
     enabled: bool,
 ) -> PrefillResidentGemma4TestOverride {
-    let value = if enabled { 2 } else { 1 };
-    let previous = PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.swap(value, Ordering::Relaxed);
-    PrefillResidentGemma4TestOverride { previous }
+    let previous = PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+    PrefillResidentGemma4TestOverride {
+        previous,
+        _thread: std::marker::PhantomData,
+    }
 }
 
 /// Active le prefill résident Gemma 4.
 ///
-/// Défaut OFF : `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=1` ouvre le gate après
-/// qualification des couches fenêtrées, du tail parallèle et de la continuité
-/// KV prefill vers decode.
+/// Défaut OFF : le KL chat passe, mais le prefill q4a8-ls diverge du per-op
+/// au token greedy 161 sur le corpus 1k et 62 à 4k (oracles sur 200 tokens).
+/// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=1` reste une qualification explicite ;
+/// voir docs/perf/gemma4-prefill.md.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn prefill_resident_gemma4_enabled() -> bool {
     #[cfg(test)]
-    match PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.load(Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
+    if let Some(forced) = PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.with(Cell::get) {
+        return forced;
     }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", false))
