@@ -9,11 +9,90 @@ fabriquer des poids, pas à les exécuter.
 | `mixed_quant.py` | Alloue deux largeurs de bits par couche selon la sensibilité, écrit un modèle MLX |
 | `kl_eval.py` | Mesure KL(bf16 ‖ quantifié) et l'accord top-1, en teacher forcing |
 | `test_allocation.py` | Tests de la logique d'allocation, sans dépendance à MLX |
-| `convert_ls.py` | Re-quantifie en affine gs64 (4 ou 8 bits, selon le template) par moindres carrés depuis les poids BF16, sans changer le format (+1,7 % de perplexité contre +2,9 % en min-max sur le 27B, sans données de calibration) |
+| `convert_ls.py` | Re-quantifie en affine gs64 (4/6/8 bits, selon le template) par moindres carrés, éventuellement pondérés par l'imatrix |
 | `opt_quant.py` | Ajustement d'échelle et de biais par groupe utilisé par `convert_ls.py` |
+| `imatrix.py` | Capture BF16 de E[x²] par canal d'entrée, corpus indépendant |
+| `sensitivity.py` | Allocation calibrée 4/6/8 bits sous budget réel, appelée par `mixed_quant.py` |
+| `test_quant.py` | Auto-tests stdlib et contrôle facultatif MLX CPU sur de petits tenseurs |
 | `chat_kl.py` | KL en régime chat contre les poids officiels bf16 (référence transformers, candidat mlx-lm) |
 
-## Méthode
+## Qwen3.8-27B : recette imatrix à 4,8 bpw
+
+Recette expérimentale, **aucun gain KL encore mesuré**. Objectif : battre
+Jundot/Qwen3.8-27B-oQ4e-mtp (KL chat 0,0164, même top-1 94,66 %, 4,84 bpw
+langage), contre mix46 ≈ 0,021 et u4ls ≈ 0,031 à 4,5 bpw. Le corpus doit
+être indépendant des huit `PROMPTS` de `chat_kl.py` : leur présence est refusée
+avant chargement, après découpage et après application du chat template,
+y compris après normalisation de casse, espaces et ponctuation. Ce contrôle
+ne détecte pas les paraphrases ni la contamination sémantique du corpus.
+
+Depuis la racine du dépôt, avec `mlx`, `mlx-lm`, `torch` et `transformers`
+compatibles avec `qwen3_5` dans l'environnement Python actif :
+
+```bash
+MODEL_ROOT="$HOME/workspace/ai_model"
+SRC="$MODEL_ROOT/Qwen3.8-27B-BF16"
+CALIB="/chemin/vers/corpus-independant.txt"  # à fournir, au moins 65 536 tokens
+IMATRIX="$MODEL_ROOT/qwen38-imatrix.safetensors"
+TEMPLATE="$MODEL_ROOT/Qwen3.8-27B-imatrix48-template"
+DST="$MODEL_ROOT/Qwen3.8-27B-imatrix48"
+REF="$MODEL_ROOT/qwen38-chatref.json"
+
+python3 -I -B tools/quant/test_quant.py
+python3 -I -B tools/quant/test_quant.py --mlx-cpu  # petits tenseurs, aucun poids externe
+python3 -I -B tools/quant/imatrix.py --model "$SRC" --calib "$CALIB" \
+    --out "$IMATRIX" --samples 128 --length 512 --chat
+python3 -I -B tools/quant/mixed_quant.py --input "$SRC" --output "$TEMPLATE" \
+    --imatrix "$IMATRIX" --target-bpw 4.8 --high-bits 6 --force-high 'embed|lm_head'
+python3 -I -B tools/quant/convert_ls.py --src "$SRC" --template "$TEMPLATE" \
+    --imatrix "$IMATRIX" --dst "$DST"
+python3 -I -B tools/quant/chat_kl.py ref --model "$SRC" --out "$REF"
+python3 -I -B tools/quant/chat_kl.py eval --model "$DST" --ref "$REF"
+python3 -I -B tools/quant/chat_kl.py eval \
+    --model "$MODEL_ROOT/Qwen3.8-27B-oQ4e-mtp-Jundot" --ref "$REF"
+```
+
+Les destinations doivent être nouvelles. Réutiliser le même `REF` pour tous
+les candidats (8 réponses greedy, 192 tokens maximum, KL top-64 + reste).
+Conserver le corpus, son SHA-256 enregistré dans l'imatrix, les versions des
+bibliothèques et `allocation.json`. Le template est un vrai checkpoint MLX
+min-max avec une entrée `config.json.quantization` par module ; prévoir
+l'espace du template et du candidat final.
+
+`--chat` enveloppe un extrait sur deux ; les extraits disjoints sont répartis
+dans le corpus, sans cache partagé. Les tokens du chat template s'ajoutent
+aux 512 tokens et comptent dans E[x²]. Le forward utilise les poids BF16,
+sauf les exceptions prévues par mlx-lm, notamment `A_log`.
+
+Le fit minimise Σ E[x_j²] (W_quant − W)², en gardant le meilleur groupe entre
+min-max et ajustement après arrondi BF16. Le chemin sans `weight` conserve
+les opérations historiques 4/8 bits. L'allocation mesure cette erreur totale
+après fit en **4/6/8 bits**, puis promeut au meilleur gain par bit supplémentaire.
+C'est un glouton, sans garantie d'optimum global. Le budget réel inclut les
+0,5 bpw d'échelles/biais gs64, les tenseurs langage non quantifiés et les
+épinglés ; vision et MTP retirés par mlx-lm ne comptent pas. Il est contrôlé
+avant sauvegarde et consigné dans `allocation.json`.
+
+Dans ce mode, `--high-fraction` est ignoré, `--low-bits` vaut 4 et
+`--high-bits` fixe le minimum de `--force-high` (6 par défaut, 8 possible).
+Les trios experts gate/up/down restent uniformes, même si un seul membre
+est épinglé ; `--moe` active le regex structurel historique. Un budget
+infaisable est refusé. Les embeddings utilisent une importance uniforme ;
+tout linéaire sans vecteur valide est refusé.
+
+Pour le Qwen dense 64 couches, les noms attendus sont
+`language_model.model.layers.N.linear_attn.in_proj_{qkv,z,a,b}` et `out_proj`,
+`self_attn.{q,k,v,o}_proj`, `mlp.{gate,up,down}_proj`, puis
+`language_model.lm_head` : normalement **497 vecteurs**. Ils sont découverts
+via `named_modules()` et interceptés par classe, sans renommage. Vérifier
+ces noms avec la version installée de [qwen3_5 dans mlx-lm](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_5.py) ;
+un module jamais appelé fait échouer la capture. Le proxy diagonal ignore
+les corrélations et l'amplification SSM ; en MoE, le vecteur est partagé entre
+experts, sans pondération par fréquence de routage. Le gain KL, la capture
+27B et la compatibilité numérique MLX restent à mesurer : les auto-tests
+stdlib seuls ne les prouvent pas.
+
+## Méthode historique sans calibration
 
 Pour chaque couche linéaire, on mesure l'erreur relative de la largeur basse :
 
@@ -150,7 +229,7 @@ python3 chat_kl.py ref --model gemma-4-26B-A4B-it --out chatref.json  # transfor
 python3 chat_kl.py eval --model gemma4-q4a8-ls --ref chatref.json
 ```
 
-`convert_ls.py` suit la largeur de chaque tenseur du template (4 ou 8 bits) et
+`convert_ls.py` suit la largeur de chaque tenseur du template (4, 6 ou 8 bits) et
 découpe les experts fusionnés `gate_up_proj` des poids Google comme mlx-lm.
 
 ## Référence KL du moteur Rust
@@ -196,7 +275,8 @@ ce format est propre au moteur, sans compatibilité binaire llama.cpp.
 ## Tests
 
 ```bash
-python3 test_allocation.py
+python3 -I -B test_allocation.py
+python3 -I -B test_quant.py
 ```
 
 Les tests couvrent le classement, le budget, les couches épinglées et
