@@ -199,12 +199,14 @@ impl MetalExecutor {
             )
         {
             AffineMatmulKernel::QmmNaFusedTiledU4Align64
-        } else if (fast_affine_qmv_enabled(out_dim) || prefer_fast_affine)
-            && batch > 0
-            && bits == FAST_QMV_BITS
-            && group_size == FAST_QMV_GROUP_SIZE
-            && in_dim % 512 == 0
-        {
+        } else if can_use_fast_affine_qmv_buffers(
+            batch,
+            in_dim,
+            out_dim,
+            group_size,
+            bits,
+            prefer_fast_affine,
+        ) {
             AffineMatmulKernel::FastQmvU4
         } else if can_use_fast_affine_qmv_u2_buffers(batch, in_dim, out_dim, group_size, bits) {
             AffineMatmulKernel::FastQmvU2
@@ -282,9 +284,7 @@ impl MetalExecutor {
             && can_use_qmm_na_fused_tiled_u4_align64(batch, in_dim, weight)
         {
             AffineMatmulKernel::QmmNaFusedTiledU4Align64
-        } else if can_use_fast_affine_qmv(batch, in_dim, weight)
-            || (prefer_fast_affine && can_use_fast_affine_qmv_shape(batch, in_dim, weight))
-        {
+        } else if can_use_fast_affine_qmv_preferred(batch, in_dim, weight, prefer_fast_affine) {
             AffineMatmulKernel::FastQmvU4
         } else if can_use_fast_affine_qmv_u2(batch, in_dim, weight) {
             AffineMatmulKernel::FastQmvU2
