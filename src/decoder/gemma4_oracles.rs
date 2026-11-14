@@ -29,8 +29,7 @@ fn gemma4_prefill_override_is_thread_local_and_restored() {
     );
 }
 
-#[test]
-fn gemma4_resident_prefill_propagates_execution_error() -> Result<()> {
+fn small_gemma4_model() -> Result<CausalDecoder> {
     let mut weights = test_weights();
     for norm in [
         "post_attention_layernorm",
@@ -47,7 +46,7 @@ fn gemma4_resident_prefill_propagates_execution_error() -> Result<()> {
     for projection in ["gate_proj", "up_proj", "down_proj"] {
         weights.insert(format!("layers.0.mlp.{projection}.weight"), identity2()?);
     }
-    let mut model = CausalDecoder::from_tensors(
+    CausalDecoder::from_tensors(
         weights,
         CausalDecoderConfig {
             is_gemma4: true,
@@ -59,7 +58,34 @@ fn gemma4_resident_prefill_propagates_execution_error() -> Result<()> {
             ..CausalDecoderConfig::default()
         },
     )?
-    .with_metal_runtime()?;
+    .with_metal_runtime()
+}
+
+#[test]
+fn gemma4_resident_prefill_token_limit_before_embedding() -> Result<()> {
+    let model = small_gemma4_model()?;
+    let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(true);
+    // À la borne, le résident atteint l'embedding (ids volontairement invalides).
+    // Au-delà, il refuse avant toute allocation dépendant du prompt.
+    let max_tokens = crate::runtime_flags::prefill_resident_gemma4_max_tokens();
+    let mut invalid_prompt = vec![usize::MAX; max_tokens];
+    assert!(model
+        .prefill_cache_state_metal_resident_for_test(&invalid_prompt)
+        .is_err());
+    invalid_prompt.push(usize::MAX);
+    assert!(model
+        .prefill_cache_state_metal_resident_for_test(&invalid_prompt)?
+        .is_none());
+    // Le dispatch ordinaire essaie bien le per-op après l'inéligibilité.
+    assert!(model
+        .prefill_cache_state_batched_for_test(&invalid_prompt)
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn gemma4_resident_prefill_propagates_execution_error() -> Result<()> {
+    let mut model = small_gemma4_model()?;
     let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(true);
     assert!(model
         .prefill_cache_state_metal_resident_for_test(&[0, 1])?
