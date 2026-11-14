@@ -358,7 +358,8 @@ impl MetalExecutor {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si Metal est indisponible ou si la compilation échoue.
+    /// Renvoie une erreur si un flag retiré est activé, si Metal est indisponible
+    /// ou si la compilation échoue.
     pub fn new() -> Result<Self> {
         Self::new_with_kernel_profile(crate::KernelProfile::for_legacy_executor())
     }
@@ -366,8 +367,10 @@ impl MetalExecutor {
     /// Construit un executor dont les choix de kernels restent propres au modèle.
     ///
     /// # Errors
-    /// Renvoie une erreur si le device ou les pipelines Metal sont indisponibles.
+    /// Renvoie une erreur si un flag retiré est activé ou si le device ou les
+    /// pipelines Metal sont indisponibles.
     pub fn new_with_kernel_profile(kernel_profile: crate::KernelProfile) -> Result<Self> {
+        super::flags::validate_linear_chunked_flag()?;
         let device = Device::system_default()
             .ok_or_else(|| InferError::Metal("aucun device Metal disponible".to_string()))?;
         let queue = device.new_command_queue();
