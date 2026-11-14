@@ -37,7 +37,7 @@ pub(super) struct ResidentDecodeInflight {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) struct ResidentLogitsReadback {
-    pub(super) buffer: metal::Buffer,
+    pub(super) lease: crate::decode_resident::ScratchLease,
     pub(super) len: usize,
 }
 
