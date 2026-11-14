@@ -21,6 +21,7 @@ def stdlib_checks():
     assert "mlx.core" not in sys.modules
     dense = mixed_quant.parse_args(["--input", "src", "--output", "dst", "--target-bpw", "4.8"])
     assert dense.high_bits == 6 and dense.force_high == mixed_quant.DENSE_FORCE_HIGH
+    assert dense.base_bits == dense.low_bits == 4
     assert mixed_quant.parse_args(["--input", "src", "--output", "dst"]).high_bits == 4
     assert not dense.imatrix_blend
     blended = mixed_quant.parse_args(["--input", "src", "--output", "dst",
@@ -36,14 +37,37 @@ def stdlib_checks():
             raise AssertionError("blend sans allocation calibrée accepté")
         except SystemExit as error:
             assert "exigent --target-bpw" in str(error)
+        matrix = root / "imatrix.safetensors"
+        matrix.touch()
+        cli = ["--input", str(root), "--output", str(root / "out"),
+               "--target-bpw", "4.2", "--base-bits", "3", "--imatrix", str(matrix),
+               "--force-high", "embed|lm_head"]
+        args = mixed_quant.parse_args(cli)
+        mixed_quant.validate(args)
+        assert args.low_bits == args.base_bits == 3 and args.force_high == "embed|lm_head"
+        for extra in (["--low-bits", "4"], ["--base-bits", "8"], ["--target-bpw", "nan"]):
+            try:
+                mixed_quant.validate(mixed_quant.parse_args(cli + extra))
+                raise AssertionError("options contradictoires acceptées")
+            except SystemExit:
+                pass
+        try:
+            mixed_quant.validate(mixed_quant.parse_args(
+                ["--input", str(root), "--output", str(root / "out"), "--base-bits", "3"]))
+            raise AssertionError("base calibrée sans target-bpw acceptée")
+        except SystemExit as error:
+            assert "exige --target-bpw" in str(error)
     # Des scores identiques gardent une allocation reproductible quel que soit l'ordre d'entrée.
-    scores = {n: {4: 20, 5: 19, 6: 3, 8: 1} for n in ("b", "a", "c")}
+    scores = {n: {3: 40, 4: 20, 5: 19, 6: 3, 8: 1} for n in ("b", "a", "c")}
     sizes = {"b": 128, "a": 64, "c": 256}
     a = sensitivity.allocate(scores, sizes, 448, 0, 5.1)
     b = sensitivity.allocate(dict(reversed(list(scores.items()))), sizes, 448, 0, 5.1)
     assert a == b and a[1] <= 5.1
     # Les petits modules peuvent utiliser le budget restant après un gros module trop coûteux.
     assert a[0]["a"] == 8
+    a = sensitivity.allocate(scores, sizes, 448, 0, 4.2, base_bits=3)
+    b = sensitivity.allocate(dict(reversed(list(scores.items()))), sizes, 448, 0, 4.2, base_bits=3)
+    assert a == b and a[1] <= 4.2 and 3 in a[0].values()
     # Une importance mal dimensionnée ne doit pas devenir silencieusement uniforme.
     class Vector:
         shape = (1, 64)
@@ -149,10 +173,20 @@ def mlx_checks():
         source = root / "source"
         source.mkdir()
         mx.save_safetensors(str(source / "model.safetensors"), original)
-        for blend in (False, True):
-            assignment, report = sensitivity.scan(model, matrix, "lm_head", 6.0, 6, blend)
-            assert assignment == {embed: 5, head: 6}
-            assert report["imatrix_blend"] == blend and report["widths"] == [4, 5, 6, 8]
+        (source / "config.json").write_text("{}")
+        for base_bits, target, forced, blend in (
+                (4, 6.0, "lm_head", False), (4, 6.0, "lm_head", True),
+                (3, 4.2, "", False), (3, 4.2, "", True), (3, 5.0, "lm_head", False)):
+            assignment, report = sensitivity.scan(model, matrix, forced, target, 6, blend,
+                                                   base_bits=base_bits)
+            if base_bits == 4:
+                assert assignment == {embed: 5, head: 6}
+            elif forced:
+                assert assignment == {embed: 3, head: 6}
+            else:
+                assert 3 in assignment.values() and report["actual_bpw"] <= 4.2
+            assert report["base_bits"] == base_bits
+            assert report["imatrix_blend"] == blend and report["widths"] == [3, 4, 5, 6, 8]
             for name, module in imatrix.language_modules(model).items():
                 w = module.weight.astype(mx.float32)
                 for bits in sensitivity.WIDTHS:
@@ -169,17 +203,19 @@ def mlx_checks():
                             a = a * mx.sqrt((w * w).mean(-1, keepdims=True) + w * w)
                         expected = (a * (back - w) ** 2).sum().item()
                     assert abs(report["scores"][name][bits] - expected) < 1e-5
-            template, destination = (root / (p + str(blend)) for p in ("template", "destination"))
-            template.mkdir()
-            quantized = {}
-            config = {"quantization": {"bits": 4, "group_size": 64, "mode": "affine"}}
-            for name, bits in assignment.items():
-                config["quantization"][name] = {"bits": bits, "group_size": 64, "mode": "affine"}
-                values = mx.quantize(original[name + ".weight"], group_size=64, bits=bits)
-                quantized.update((name + suffix, v) for suffix, v in zip((".weight", ".scales", ".biases"), values))
-            mx.save_safetensors(str(template / "model.safetensors"), quantized)
-            (template / "config.json").write_text(json.dumps(config))
-            (template / "allocation.json").write_text(json.dumps(report))
+            template, destination = (root / f"{p}-{base_bits}-{target}-{blend}"
+                                     for p in ("template", "destination"))
+            cli = ["--input", str(source), "--output", str(template),
+                   "--imatrix", str(matrix_file), "--target-bpw", str(target),
+                   "--base-bits", str(base_bits), "--force-high", forced]
+            if blend:
+                cli.append("--imatrix-blend")
+            with patch.object(imatrix, "load_bf16", return_value=(Tiny(), Tokenizer())):
+                assert mixed_quant.main(cli) == 0
+            config = json.loads((template / "config.json").read_text())["quantization"]
+            assert config["bits"] == base_bits
+            assert all(config[name]["bits"] == bits for name, bits in assignment.items())
+            assert json.loads((template / "allocation.json").read_text()) == json.loads(json.dumps(report))
             try:
                 convert_ls.convert(source, template, destination)
                 raise AssertionError("template calibré sans imatrix accepté")
@@ -193,7 +229,7 @@ def mlx_checks():
             convert_ls.convert(source, template, destination, matrix_file, blend)
             result = mx.load(str(destination / "model.safetensors"))
             bpw = sum(v.nbytes * 8 for v in result.values()) / sum(v.size for v in original.values())
-            assert abs(bpw - report["actual_bpw"]) < 1e-9 and bpw <= 6.0
+            assert abs(bpw - report["actual_bpw"]) < 1e-9 and bpw <= target
             assert json.loads((destination / "allocation.json").read_text()) == json.loads(json.dumps(report))
             for name in assignment:
                 expected = opt_quant.fit(original[name + ".weight"], bits=assignment[name],
@@ -207,7 +243,7 @@ def mlx_checks():
         _, repeated = sensitivity.scan(model, matrix, "", 4.5, 6)
         for bits in sensitivity.WIDTHS:
             assert abs(repeated["scores"][embed][bits] - report["scores"][embed][bits]) < 1e-5
-    print("test_quant: MLX CPU, capture, fit 4/5/6/8 brut et blend, embedding, template et conversion ok")
+    print("test_quant: MLX CPU, capture, fit 3/4/5/6/8 brut et blend, embedding, template et conversion ok")
 
 
 if __name__ == "__main__":

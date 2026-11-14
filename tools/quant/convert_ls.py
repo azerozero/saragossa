@@ -4,7 +4,7 @@
 
 Recalcule les tenseurs quantifiés language_model du modèle de base ; recopie
 les autres tenseurs et fichiers du checkpoint MLX u4 fourni comme template.
-La largeur (4, 5, 6 ou 8 bits) de chaque tenseur suit le template ; les experts
+La largeur (3, 4, 5, 6 ou 8 bits) de chaque tenseur suit le template ; les experts
 fusionnés gate_up_proj (Gemma 4) sont découpés comme mlx-lm.
 L'échelle peut être négative. Le meilleur groupe entre min-max et ajustement
 est conservé après arrondi BF16, sans changer les kernels ni le format.
@@ -74,9 +74,9 @@ def quantization_spec(config, base):
     if not isinstance(override, dict):
         raise ValueError(f"configuration quantifiée invalide : {base}")
     spec.update(override)
-    if (spec.get("bits") not in (4, 5, 6, 8) or spec.get("group_size") != 64
+    if (spec.get("bits") not in (3, 4, 5, 6, 8) or spec.get("group_size") != 64
             or spec.get("mode", "affine") != "affine"):
-        raise ValueError(f"format non pris en charge : {base} (affine gs64 4/5/6/8 requis)")
+        raise ValueError(f"format non pris en charge : {base} (affine gs64 3/4/5/6/8 requis)")
     return spec["bits"]
 
 
@@ -284,7 +284,7 @@ def _self_check():
     opt_quant._self_check()
     config = {"quantization": {"bits": 4, "group_size": 64, base: {"bits": 6}}}
     assert quantization_spec(config, base) == 6
-    for bits in (4, 5, 6, 8):
+    for bits in (3, 4, 5, 6, 8):
         assert quantization_spec({"quantization": {"bits": bits, "group_size": 64}}, base) == bits
         shard = {base + suffix: Mock(shape=(2, columns)) for suffix, columns in (
             (".weight", 128 * bits // 32), (".scales", 2), (".biases", 2))}
@@ -310,7 +310,7 @@ def main():
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--src", type=pathlib.Path, required=True, help="checkpoint BF16")
-    parser.add_argument("--template", type=pathlib.Path, required=True, help="checkpoint MLX affine gs64 (4/5/6/8 bits)")
+    parser.add_argument("--template", type=pathlib.Path, required=True, help="checkpoint MLX affine gs64 (3/4/5/6/8 bits)")
     parser.add_argument("--dst", type=pathlib.Path, required=True, help="destination inexistante")
     parser.add_argument("--imatrix", type=pathlib.Path, help="importance E[x²] par colonne ; linéaires manquants refusés")
     parser.add_argument("--imatrix-blend", action="store_true",

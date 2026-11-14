@@ -1,4 +1,4 @@
-"""Allocation 4/5/6/8 bits au gain d'erreur pondérée par bit stocké, budget langage.
+"""Allocation 3/4/5/6/8 bits au gain d'erreur pondérée par bit stocké, budget langage.
 
 Sans argument : auto-tests stdlib. Utilisé par mixed_quant.py --target-bpw.
 Le score somme_j E[x_j²] (W_quant - W)² approxime l'erreur de sortie avec une
@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import opt_quant
 from imatrix import importance_for, is_embedding, language_modules
 
-WIDTHS = (4, 5, 6, 8)
+WIDTHS = (3, 4, 5, 6, 8)
 
 
 def storage_bits(size, bits):
@@ -35,9 +35,11 @@ def decision_units(names):
     return list(groups.values())
 
 
-def allocate(scores, sizes, total_params, fixed_bits, target_bpw, forced=(), high_bits=6):
-    """Glouton déterministe, promotions 4→5→6→8 ; jamais de dépassement."""
+def allocate(scores, sizes, total_params, fixed_bits, target_bpw, forced=(), high_bits=6,
+             base_bits=4):
+    """Glouton déterministe, promotions 3→4→5→6→8 ; base 4 par défaut."""
     if (not math.isfinite(target_bpw) or target_bpw <= 0 or high_bits not in (5, 6, 8)
+            or base_bits not in WIDTHS or base_bits > high_bits
             or total_params <= 0 or fixed_bits < 0 or not sizes
             or set(scores) != set(sizes) or not set(forced) <= set(sizes)):
         raise ValueError("budget, modules ou largeur d'épinglage invalides")
@@ -49,7 +51,7 @@ def allocate(scores, sizes, total_params, fixed_bits, target_bpw, forced=(), hig
     units = decision_units(sizes)
     assignment = {}
     for members in units:
-        width = high_bits if any(name in forced for name in members) else 4
+        width = high_bits if any(name in forced for name in members) else base_bits
         assignment.update((name, width) for name in members)
     used = fixed_bits + sum(storage_bits(sizes[n], b) for n, b in assignment.items())
     budget = math.floor(target_bpw * total_params)
@@ -80,7 +82,7 @@ def allocate(scores, sizes, total_params, fixed_bits, target_bpw, forced=(), hig
     return assignment, used / total_params
 
 
-def scan(model, matrix, force_high, target_bpw, high_bits, imatrix_blend=False):
+def scan(model, matrix, force_high, target_bpw, high_bits, imatrix_blend=False, base_bits=4):
     """Score le fit réellement utilisé par convert_ls, par blocs pour borner la mémoire."""
     if imatrix_blend and matrix is None:
         raise ValueError("imatrix_blend exige une imatrix")
@@ -93,9 +95,9 @@ def scan(model, matrix, force_high, target_bpw, high_bits, imatrix_blend=False):
     total = sum(v.size for v in params.values())
     fixed = sum(v.nbytes * 8 for k, v in params.items() if k.removesuffix(".weight") not in modules)
     forced = {name for name in modules if force_high and re.search(force_high, name)}
-    # Vérifier la faisabilité et toute l'imatrix avant les quatre fits par module.
+    # Vérifier la faisabilité et toute l'imatrix avant les cinq fits par module.
     zeros = {name: dict.fromkeys(WIDTHS, 0.0) for name in modules}
-    allocate(zeros, sizes, total, fixed, target_bpw, forced, high_bits)
+    allocate(zeros, sizes, total, fixed, target_bpw, forced, high_bits, base_bits)
     for name, module in modules.items():
         importance_for(matrix, name, module.weight.shape[-1], is_embedding(module))
     scores = {}
@@ -121,10 +123,10 @@ def scan(model, matrix, force_high, target_bpw, high_bits, imatrix_blend=False):
         scores[name] = errors
         mx.clear_cache()
         print(f"score {name} : {errors}", flush=True)
-    assignment, bpw = allocate(scores, sizes, total, fixed, target_bpw, forced, high_bits)
+    assignment, bpw = allocate(scores, sizes, total, fixed, target_bpw, forced, high_bits, base_bits)
     report = dict(target_bpw=target_bpw, actual_bpw=bpw, total_parameters=total,
                   fixed_bits=fixed, scores=scores, sizes=sizes, assignment=assignment,
-                  forced=sorted(forced), pinned_bits=high_bits,
+                  forced=sorted(forced), pinned_bits=high_bits, base_bits=base_bits,
                   widths=list(WIDTHS), imatrix_blend=imatrix_blend,
                   metric=("sum E[x²] * sqrt(mean_row(W²) + W_ij²) * (W_quant-W)²"
                           if imatrix_blend else "sum E[x²] * (W_quant-W)²"),
@@ -133,7 +135,7 @@ def scan(model, matrix, force_high, target_bpw, high_bits, imatrix_blend=False):
 
 
 def _self_check():
-    scores = {"a": {4: 10, 5: 5, 6: 2, 8: 0}, "b": {4: 2, 5: 1.5, 6: 1, 8: 0}}
+    scores = {"a": {3: 30, 4: 10, 5: 5, 6: 2, 8: 0}, "b": {3: 3, 4: 2, 5: 1.5, 6: 1, 8: 0}}
     sizes = {"a": 64, "b": 64}
     result, bpw = allocate(scores, sizes, 128, 0, 5.5)
     assert result == {"a": 6, "b": 4} and bpw == 5.5
@@ -145,15 +147,34 @@ def _self_check():
     result, bpw = allocate(scores, sizes, 192, 64 * 16, 9)
     assert bpw <= 9 and result == {"a": 6, "b": 4}
     names = ["layer.switch_mlp." + p + "_proj" for p in ("gate", "up", "down")]
-    trio_scores = {n: {4: 10, 5: 5, 6: 2, 8: 0} for n in names}
+    trio_scores = {n: scores["a"] for n in names}
     result, bpw = allocate(trio_scores, dict.fromkeys(names, 64), 192, 0, 6.5, {names[0]})
     assert set(result.values()) == {6} and bpw == 6.5
     # Chaque pas doit apporter un gain ; pas de saut au-dessus d'un pas nuisible.
-    result, bpw = allocate({"a": {4: 10, 5: 12, 6: 2, 8: 0}}, {"a": 64}, 64, 0, 8.5)
+    result, bpw = allocate({"a": {3: 30, 4: 10, 5: 12, 6: 2, 8: 0}}, {"a": 64}, 64, 0, 8.5)
     assert result == {"a": 4} and bpw == 4.5
     for width in WIDTHS:
-        result, bpw = allocate({"a": scores["a"]}, {"a": 64}, 64, 0, width + 0.5)
+        result, bpw = allocate({"a": scores["a"]}, {"a": 64}, 64, 0, width + 0.5, base_bits=3)
         assert result == {"a": width} and bpw == width + 0.5
+    result, bpw = allocate(scores, sizes, 128, 0, 4.2, base_bits=3)
+    assert result == {"a": 4, "b": 3} and bpw == 4.0
+    result, bpw = allocate(scores, sizes, 128, 0, 5.0, {"b"}, base_bits=3)
+    assert result == {"a": 3, "b": 6} and bpw == 5.0
+    # Le coût fixe peut rendre impossible même une base 3 bits.
+    for target, fixed, forced, base in ((3.49, 0, (), 3), (4.2, 128, (), 3),
+                                        (4.2, 0, {"b"}, 3), (9, 0, (), 2),
+                                        (9, 0, (), 8)):
+        try:
+            allocate(scores, sizes, 128, fixed, target, forced, base_bits=base)
+            raise AssertionError("base ou budget invalide accepté")
+        except ValueError:
+            pass
+    plateau = {"a": {3: 10, 4: 12, 5: 5, 6: 2, 8: 0}}
+    assert allocate(plateau, {"a": 64}, 64, 0, 8.5, base_bits=3) == ({"a": 3}, 3.5)
+    result, bpw = allocate(trio_scores, dict.fromkeys(names, 64), 192, 0, 4.2, base_bits=3)
+    assert set(result.values()) == {3} and bpw == 3.5
+    result, bpw = allocate(trio_scores, dict.fromkeys(names, 64), 192, 0, 4.5, base_bits=3)
+    assert set(result.values()) == {4} and bpw == 4.5
     for target in (4.49, -1, math.nan, math.inf):
         try:
             allocate(scores, sizes, 128, 0, target)

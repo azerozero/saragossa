@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 r"""Quantification mixte par sensibilité au format MLX affine.
 
---target-bpw et --imatrix activent l'allocation 4/5/6/8 calibrée (sensitivity.py),
+--target-bpw et --imatrix activent l'allocation 3/4/5/6/8 calibrée (sensitivity.py),
 échelles/biais et modules épinglés inclus dans le budget. Sans ces options,
 la recette historique ci-dessous reste indépendante d'un corpus.
 
@@ -195,9 +195,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output", required=True, type=Path, help="répertoire du modèle quantifié"
     )
-    parser.add_argument("--low-bits", type=int, default=None, help="largeur basse (défaut 3 ; 4 avec --target-bpw)")
+    parser.add_argument("--low-bits", type=int, default=None, help="largeur basse (défaut 3 ; --base-bits avec --target-bpw)")
+    parser.add_argument("--base-bits", type=int, choices=(3, 4, 5, 6, 8), default=4,
+                        help="largeur de départ avec --target-bpw (défaut 4)")
     parser.add_argument("--high-bits", type=int, default=None, help="largeur haute (défaut 4 ; 6 avec --target-bpw)")
-    parser.add_argument("--target-bpw", type=float, help="budget langage réel, allocation 4/5/6/8 gs64")
+    parser.add_argument("--target-bpw", type=float, help="budget langage réel, allocation 3/4/5/6/8 gs64")
     parser.add_argument("--imatrix", type=Path, help="E[x²] par colonne, requise avec --target-bpw")
     parser.add_argument("--imatrix-blend", action="store_true",
                         help="pondérer E[x²] par sqrt(moyenne_ligne(W²) + W_ij²) pendant le fit")
@@ -226,7 +228,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     if args.low_bits is None:
-        args.low_bits = 4 if args.target_bpw is not None else 3
+        args.low_bits = args.base_bits if args.target_bpw is not None else 3
     if args.high_bits is None:
         args.high_bits = 6 if args.target_bpw is not None else 4
     if args.force_high is None:
@@ -248,15 +250,19 @@ def validate(args: argparse.Namespace) -> None:
     if args.target_bpw is not None:
         import math
         if (not math.isfinite(args.target_bpw) or args.target_bpw <= 0
-                or args.low_bits != 4 or args.high_bits not in (5, 6, 8) or args.group_size != 64):
-            raise SystemExit("--target-bpw positif et fini, --low-bits 4, --high-bits 5/6/8 et --group-size 64 requis")
+                or args.low_bits != args.base_bits or args.high_bits not in (5, 6, 8)
+                or args.base_bits > args.high_bits or args.group_size != 64):
+            raise SystemExit("--target-bpw positif et fini, --low-bits égal à --base-bits, "
+                             "--base-bits <= --high-bits 5/6/8 et --group-size 64 requis")
         if args.imatrix is None or not args.imatrix.is_file():
             raise SystemExit("--target-bpw exige --imatrix FICHIER")
     elif args.imatrix is not None or args.imatrix_blend:
         raise SystemExit("--imatrix et --imatrix-blend exigent --target-bpw")
+    elif args.base_bits != 4:
+        raise SystemExit("--base-bits exige --target-bpw")
     if not 0.0 <= args.high_fraction <= 1.0:
         raise SystemExit(f"--high-fraction hors de [0, 1]: {args.high_fraction}")
-    if args.low_bits >= args.high_bits:
+    if args.target_bpw is None and args.low_bits >= args.high_bits:
         raise SystemExit(
             f"--low-bits ({args.low_bits}) doit être inférieur à "
             f"--high-bits ({args.high_bits})"
@@ -339,13 +345,13 @@ def target_template(args):
     model, _ = load_bf16(args.input)
     config = json.loads((args.input / "config.json").read_text())
     assignment, report = scan(model, matrix, args.force_high, args.target_bpw, args.high_bits,
-                              imatrix_blend=args.imatrix_blend)
+                              imatrix_blend=args.imatrix_blend, base_bits=args.base_bits)
 
     def predicate(path, module):
         bits = assignment.get(path)
         return {"group_size": 64, "bits": bits, "mode": "affine"} if bits else False
 
-    model, config = quantize_model(model, config, 64, 4, quant_predicate=predicate)
+    model, config = quantize_model(model, config, 64, args.base_bits, quant_predicate=predicate)
     actual = config["quantization"]
     for name, bits in assignment.items():
         if actual.get(name, {}).get("bits") != bits:

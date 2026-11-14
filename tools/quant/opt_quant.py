@@ -1,4 +1,4 @@
-"""Échelle et biais affines ajustés aux moindres carrés, format MLX affine gs64 (4/5/6/8 bits).
+"""Échelle et biais affines ajustés aux moindres carrés, format MLX affine gs64 (3/4/5/6/8 bits).
 
 Le min-max de MLX cale la grille sur les extrêmes du groupe. Ici, q et (s, b)
 sont réajustés en alternance, puis chaque groupe garde la meilleure des deux
@@ -36,9 +36,9 @@ def validate_weight(weight, columns):
 
 
 def pack_codes(mx, q, shape, bits):
-    """Flux little-endian MLX ; 32 codes 5 bits ou 16 codes 6 bits par bloc."""
+    """Flux little-endian MLX ; 32 codes 3/5 bits ou 16 codes 6 bits par bloc."""
     rows = math.prod(shape[:-1])
-    if bits in (5, 6):
+    if bits in (3, 5, 6):
         count = 32 // math.gcd(bits, 32)
         words_per_block = count * bits // 32
         q = q.astype(mx.uint32).reshape(rows, -1, count)
@@ -104,8 +104,8 @@ def fit(x, iters=8, bits=BITS, weight=None, imatrix_blend=False):
     rows = x.size // shape[-1]
     groups = shape[-1] // GROUP
     w = x.astype(mx.float32).reshape(rows, groups, GROUP)
-    if bits not in (4, 5, 6, 8):
-        raise ValueError(f"largeur non prise en charge : {bits} bits (4, 5, 6 ou 8)")
+    if bits not in (3, 4, 5, 6, 8):
+        raise ValueError(f"largeur non prise en charge : {bits} bits (3, 4, 5, 6 ou 8)")
     if imatrix_blend and weight is None:
         raise ValueError("imatrix_blend exige une importance par colonne")
     importance = None
@@ -224,9 +224,9 @@ def fit_group(weights, scale, bias, iters=8, weight=None, bits=BITS, imatrix_ble
 
 def _self_check():
     # Oracle indépendant : sérialisation LE, y compris les codes à cheval sur u32.
-    for bits, count in ((5, 32), (6, 16)):
+    for bits, count in ((3, 32), (5, 32), (6, 16)):
         maximum = (1 << bits) - 1
-        for values in ([maximum]*count, list(range(count)),
+        for values in ([maximum]*count, [i & maximum for i in range(count)],
                        [(i*37+11) & maximum for i in range(count)]):
             nwords = bits * count // 32
             blob = sum(v << (bits*i) for i, v in enumerate(values)).to_bytes(4*nwords, "little")
@@ -256,7 +256,7 @@ def _self_check():
     assert weighted[-1] < weighted[-2]
     assert weighted[:3] != fit_group(noisy, 1.5, -3)[:3]
     assert fit_group([2.0]*64, 0, 2, weight=[1]+[0]*63)[-1] == 0
-    for bits in (4, 5, 6, 8):
+    for bits in (3, 4, 5, 6, 8):
         blended = fit_group(noisy, 23 / (2**bits - 1), -3, weight=importance,
                             bits=bits, imatrix_blend=True)
         sigma2 = sum(w*w for w in noisy) / 64
