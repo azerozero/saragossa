@@ -5672,21 +5672,18 @@ impl CausalDecoder {
         if !prefill_resident_enabled() {
             return self.resident_prefill_ineligible("SARAGOSSA_RUST_PREFILL_RESIDENT=0");
         }
-        if self.config.is_gemma4 && !prefill_resident_gemma4_enabled() {
-            return Ok(None);
-        }
-        if self.config.is_gemma4 {
+        if self.config.is_gemma4
+            && !crate::runtime_flags::prefill_resident_gemma4_eligible(prompt.len())
+        {
             let max_tokens = crate::runtime_flags::prefill_resident_gemma4_max_tokens();
-            if prompt.len() > max_tokens {
-                if trace_prefill_enabled() {
-                    eprintln!(
-                        "prefill résident Gemma 4 inéligible: tokens={} > \
+            if prefill_resident_gemma4_enabled() && trace_prefill_enabled() {
+                eprintln!(
+                    "prefill résident Gemma 4 inéligible: tokens={} > \
                          SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS={max_tokens}; per-op",
-                        prompt.len()
-                    );
-                }
-                return Ok(None);
+                    prompt.len()
+                );
             }
+            return Ok(None);
         }
         self.ensure_prompt_within_prefill_cap(prompt.len())?;
         let Some(spec) = self.resident_prefill_spec(prompt.len(), self.final_norm.data().len())

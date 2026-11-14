@@ -1,21 +1,26 @@
 # Qualification du prefill Gemma 4
 
-## Décision appliquée : résident opt-in, défaut OFF
+## Décision appliquée : résident par défaut jusqu'à 4100 tokens
 
 **Cas (c)** : à 4100 tokens, résident **et** per-op échouent contre MLX f32
 au même garde top-1 : **126/128 contre 127/128 pour MLX bf16**. Leurs KL et
 p99 passent. Les deux chemins passent les trois gardes à 1024 et 2048 tokens.
-Le per-op ne peut donc pas servir d'oracle de vérité pour qualifier le résident.
+Le résident n'introduit donc aucune régression de verdict par rapport au
+per-op sur ces trois mesures. **L'échec à 4100 est préexistant, commun au
+per-op et au résident, et doit être traité séparément.** Le per-op ne peut
+pas servir d'oracle de vérité pour qualifier le résident.
 Le seuil de bruit court n'est pas applicable à la qualification longue ;
 même avec le bruit recalibré sur le prompt long, le top-1 échoue à 4100.
 Cela ne démontre pas un défaut propre au résident et ne justifie aucun
 relâchement du garde top-1.
 
-`SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4` est désormais **OFF par défaut** ;
-`=1` active explicitement le résident expérimental. La borne arbitraire de
-3000 est remplacée par **4100 uniquement comme plafond d'allocation de cet
-opt-in**, longueur effectivement exécutée. Ce plafond n'est **pas une
-qualification numérique**, ni une garantie sur tous les prompts plus courts.
+Sur décision du mainteneur, `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4` est
+**ON par défaut jusqu'à 4100 tokens inclus**, enveloppe chat comprise ;
+**au-delà, le dispatch utilise le per-op**. Le kill-switch `=0` rétablit le
+per-op à toute longueur. Ce plafond correspond à la longueur effectivement
+exécutée ; il n'est **pas une qualification numérique**, ni une garantie sur
+tous les prompts plus courts. Aucun seuil n'est relâché et aucun golden
+n'est régénéré pour cette activation.
 La surcharge positive `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS`
 reste disponible ; zéro, valeur invalide ou absente conservent 4100.
 Le refus avant embedding/allocation et la propagation des erreurs après
@@ -42,7 +47,7 @@ La campagne réelle termine avec **4 succès et 2 échecs numériques conservés
 donc d'échouer lorsqu'on les lance explicitement ; aucune assertion n'a été
 supprimée et aucun golden n'a été ajusté aux sorties de saragossa.
 
-Après application du défaut OFF et du plafond d'opt-in, `cargo fmt --all --
+Lors de la précédente décision OFF avec plafond d'opt-in, `cargo fmt --all --
 --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
 `cargo build` et la compilation release des tests passent. Les trois tests
 actifs des références KL, le test du parsing de la borne et les cinq tests
@@ -51,6 +56,15 @@ pas les deux échecs numériques ignorés à 4100.
 Sous verrou GPU, les deux tests d'admission à 4100/refus à 4101 avant
 embedding et de propagation des erreurs passent aussi, sans surcharge
 de la borne par l'environnement.
+
+Le test CPU `gemma4_prefill_default_dispatch_and_kill_switch` vérifie le
+défaut ON, l'activation explicite et le kill-switch dans des processus
+isolés : admission jusqu'à 4100 inclus, refus dès 4101. Il exerce le prédicat
+utilisé par le dispatch avant embedding/allocation, sans initialiser Metal.
+Le test `gemma4_prefill_max_tokens_defaults_and_override` conserve la
+vérification du plafond par défaut et de sa surcharge. Les vérifications
+de cette activation restent sur CPU ; la campagne GPU ci-dessus n'est pas
+relancée.
 
 ## Référence indépendante longue du 2026-11-14
 

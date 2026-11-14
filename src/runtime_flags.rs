@@ -1555,11 +1555,11 @@ pub(crate) fn override_prefill_resident_gemma4_for_test(
 
 /// Active le prefill résident Gemma 4.
 ///
-/// Défaut OFF : les deux chemins échouent au garde top-1 contre MLX f32
-/// à 4100 tokens, avec le bruit bf16 mesuré sur le même prompt long.
-/// La calibration courte ne qualifie pas les prompts longs ; le per-op
-/// n'est pas une vérité numérique (voir docs/perf/gemma4-prefill.md).
-/// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=1` active l'expérimentation.
+/// Défaut ON jusqu'à 4100 tokens : mêmes verdicts que le per-op à 1024,
+/// 2048 et 4100 tokens. L'échec top-1 à 4100 est préexistant et commun aux
+/// deux chemins ; il reste à traiter séparément, sans relâcher les seuils
+/// ni régénérer les goldens (voir docs/perf/gemma4-prefill.md).
+/// Kill-switch : `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0` rétablit le per-op.
 /// Une erreur d'exécution résidente est propagée, sans repli silencieux.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn prefill_resident_gemma4_enabled() -> bool {
@@ -1568,13 +1568,19 @@ pub(super) fn prefill_resident_gemma4_enabled() -> bool {
         return forced;
     }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", true))
+}
+
+/// Admission Gemma 4 avant embedding/allocation, sans initialiser Metal.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_resident_gemma4_eligible(tokens: usize) -> bool {
+    prefill_resident_gemma4_enabled() && tokens <= prefill_resident_gemma4_max_tokens()
 }
 
 /// Longueur maximale du prefill résident Gemma 4, enveloppe chat comprise.
 /// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS` vaut 4100 par défaut.
-/// Ce plafond borne les allocations de l'opt-in à la longueur expérimentée,
-/// sans qualification numérique de cette plage : voir
+/// Ce plafond borne les allocations à la longueur mesurée, sans garantir
+/// la qualification numérique de tous les prompts de cette plage : voir
 /// `docs/perf/gemma4-prefill.md`. Zéro, valeur invalide ou absente gardent
 /// cette borne ; une valeur positive la remplace explicitement.
 /// Au-delà, le résident est inéligible AVANT embedding/allocation : `Ok(None)`
@@ -2377,6 +2383,54 @@ fn hash_environment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn gemma4_prefill_default_dispatch_and_kill_switch() {
+        const CHILD: &str = "GEMMA4_PREFILL_DISPATCH_CHILD";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let enabled = expected == "true";
+            assert_eq!(super::prefill_resident_gemma4_enabled(), enabled);
+            assert_eq!(super::prefill_resident_gemma4_max_tokens(), 4100);
+            for tokens in [1, 1024, 2048, 4099, 4100] {
+                assert_eq!(super::prefill_resident_gemma4_eligible(tokens), enabled);
+            }
+            for tokens in [4101, 8192, usize::MAX] {
+                assert!(!super::prefill_resident_gemma4_eligible(tokens));
+            }
+            return;
+        }
+        // Chaque processus isole les OnceLock et l'environnement, sans GPU.
+        for (value, enabled) in [(None, true), (Some("1"), true), (Some("0"), false)] {
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("invariant: binaire de test"),
+            );
+            command
+                .args([
+                    "--exact",
+                    "runtime_flags::tests::gemma4_prefill_default_dispatch_and_kill_switch",
+                ])
+                .env(CHILD, enabled.to_string());
+            for flag in [
+                "SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4",
+                "SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS",
+            ] {
+                command
+                    .env_remove(flag)
+                    .env_remove(flag.replacen("SARAGOSSA_", "RETI_", 1));
+            }
+            if let Some(value) = value {
+                command.env("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", value);
+            }
+            let output = command.output().expect("invariant: sous-processus de test");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     #[test]
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn gemma4_prefill_max_tokens_defaults_and_override() {
