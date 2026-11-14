@@ -304,18 +304,18 @@ kernel void gemm_nax_coop_qb(device const bfloat* A [[buffer(0)]],
                              device float* C         [[buffer(4)]],
                              constant uint3& mnk     [[buffer(5)]],
                              uint2 tgid [[threadgroup_position_in_grid]]) {
-  uint N = mnk.y, K = mnk.z;
+  uint M = mnk.x, N = mnk.y, K = mnk.z;
   uint m0 = tgid.x * 16u, n0 = tgid.y * 32u;
   metal::vec<float,8> Cn0 = float(0), Cn1 = float(0);
   for (uint k = 0; k < K; k += 16u) {
     metal::vec<bfloat,8> Af, Bn0, Bn1;
-    NaxFrag::load_a(Af, A + m0 * K + k, int(K));
+    NaxFrag::load_a_masked(Af, A, m0, k, K, M);
     NaxFrag::load_b_quant(Bn0, Bp, Bs, Bb, n0, k, K);
     NaxFrag::load_b_quant(Bn1, Bp, Bs, Bb, n0 + 16u, k, K);
     NaxFrag::mma(Cn0, Cn1, Af, Bn0, Bn1);
   }
-  NaxFrag::store_c(Cn0, C + m0 * N + n0, int(N));
-  NaxFrag::store_c(Cn1, C + m0 * N + n0 + 16u, int(N));
+  NaxFrag::store_c_masked(Cn0, C, m0, n0, N, M);
+  NaxFrag::store_c_masked(Cn1, C, m0, n0 + 16u, N, M);
 }
 // Variante dense gs128. M et N doivent être alignés 16×32 côté gate Rust.
 kernel void gemm_nax_coop_qb_gs128(device const bfloat* A [[buffer(0)]],

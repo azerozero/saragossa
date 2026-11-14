@@ -162,3 +162,35 @@ fn qmv_argmax_partial_groups_ignore_padding() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn coop_qb_u8_gs64_masks_partial_m_tiles() -> Result<()> {
+    let Some(executor) = test_executor()? else { return Ok(()); };
+    let Some(pipeline) = &executor.na_gemm_coop_qb else { return Ok(()); };
+    for m in [1usize, 15, 16, 17, 31] {
+        let (n, k) = (32, 64);
+        let padded_m = m.div_ceil(16) * 16;
+        let mut input = vec![f32::NAN; padded_m * k];
+        input[..m * k].fill(1.0);
+        let lhs = executor.buffer_from_f32_as_bf16(&input, "coop_tail_a")?;
+        let packed = executor.buffer_from_slice(&vec![0x01010101u32; n * k / 4], "coop_tail_packed")?;
+        let scales = executor.buffer_from_f32_as_bf16(&vec![1.0; n], "coop_tail_scales")?;
+        let biases = executor.buffer_from_f32_as_bf16(&vec![0.0; n], "coop_tail_biases")?;
+        // La réserve rend l'ancien store hors de M observable sans faute GPU.
+        let out = executor.buffer_from_slice(&vec![123.0f32; (padded_m + 1) * n], "coop_tail_out")?;
+        let cb = executor.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipeline);
+        for (slot, buf) in [&lhs, &packed, &scales, &biases, &out].iter().enumerate() {
+            enc.set_buffer(slot as u64, Some(buf), 0);
+        }
+        set_u32_bytes(enc, 5, &[m as u32, n as u32, k as u32, 0], "coop_tail_dims")?;
+        enc.dispatch_thread_groups(MTLSize::new(m.div_ceil(16) as u64, 1, 1), MTLSize::new(32, 1, 1));
+        enc.end_encoding();
+        commit_and_wait(cb)?;
+        let output = read_f32_buffer(&out, (padded_m + 1) * n)?;
+        assert!(output[..m * n].iter().all(|&v| v == k as f32), "M={m}");
+        assert!(output[m * n..].iter().all(|&v| v == 123.0), "store après M={m}");
+    }
+    Ok(())
+}
