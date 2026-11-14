@@ -145,6 +145,37 @@ ne pose aucun tag. Le tag `v*` déclenche ensuite le workflow `Release` qui
 recompile, publie l'archive, actualise le tap Homebrew et teste l'installation.
 Aucun paquet n'est publié sur crates.io.
 
+### Reprise après une publication partielle
+
+Le workflow `Release` n'est pas idempotent après `gh release create` : une
+relance du job `release` échoue si la release existe déjà. Inspecter les
+jobs et les assets publiés avant toute reprise.
+
+- Si l'archive, sa somme SHA256, le SBOM et `CHECKSUMS.md` sont présents et
+  valides, conserver la release. Si seul `homebrew` ou `homebrew-test` a
+  échoué, relancer les jobs échoués depuis l'interface Actions, sans rejouer
+  le job `release`. Vérifier d'abord que le tap n'a pas avancé vers une
+  version plus récente ; une reprise ancienne ne doit pas le rétrograder.
+- Si la release est incomplète ou si le job `release` doit être rejoué,
+  supprimer manuellement la release et ses assets après vérification :
+
+  ```bash
+  gh release delete vX.Y.Z --repo azerozero/saragossa --yes
+  ```
+
+  Remplacer `vX.Y.Z` par le tag concerné. **Conserver le tag Git** : ne pas
+  utiliser `--cleanup-tag`, supprimer ou déplacer le tag, ni recréer une PR
+  de version. La suppression retire les liens publics de téléchargement
+  jusqu'à la nouvelle publication ; si le tap référence déjà cette version,
+  ses installations seront indisponibles pendant cette fenêtre.
+  Relancer ensuite le job `release` et ses dépendants via l'interface
+  Actions. Si l'artefact `release-assets` a expiré, relancer tous les jobs
+  pour le reconstruire avant la publication.
+
+Après reprise, contrôler les assets, leurs sommes SHA256 et l'installation
+Homebrew. Ces opérations sont manuelles et réservées au mainteneur ; les
+commandes ci-dessus ne font pas partie de la préparation d'une contribution.
+
 ## Réglages GitHub à appliquer par le mainteneur
 
 - Autoriser les merge commits et l'auto-merge du dépôt.
