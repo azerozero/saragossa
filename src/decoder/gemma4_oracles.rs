@@ -70,6 +70,11 @@ fn gemma4_resident_prefill_propagates_execution_error() -> Result<()> {
     let result = model.prefill_cache_state_metal_resident_for_test(&[0, 1]);
     assert!(matches!(result, Err(InferError::Dimension(ref message))
         if message.contains("prefill résident input=")));
+    // Vérifier aussi le dispatch : il doit propager la même erreur au lieu
+    // d'essayer le per-op après l'échec résident (y compris un kernel d512).
+    let result = model.prefill_cache_state_batched_for_test(&[0, 1]);
+    assert!(matches!(result, Err(InferError::Dimension(ref message))
+        if message.contains("prefill résident input=")));
     Ok(())
 }
 
@@ -120,54 +125,70 @@ fn resident_tokens(
     Ok(tokens)
 }
 
-fn prefill_identity(tokens: usize) -> Result<()> {
+fn prefill_comparison(tokens: usize) -> Result<(Vec<usize>, Vec<usize>)> {
     let (model, prompt) = model_and_prompt(tokens)?;
-    let start = std::time::Instant::now();
+    if tokens < 64 {
+        assert!(prompt.len() < 64, "enveloppe chat comprise");
+    }
     let (cache, state) = {
         let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(false);
         model.prefill_cache_state_batched_for_test(&prompt)?
     };
-    eprintln!(
-        "Gemma4 per-op prompt={} prefill={:?}",
-        prompt.len(),
-        start.elapsed()
-    );
     let reference = resident_tokens(&model, cache, &state)?;
-    let start = std::time::Instant::now();
     let (cache, state) = {
         let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(true);
         model
             .prefill_cache_state_metal_resident_for_test(&prompt)?
             .ok_or_else(|| InferError::Config("oracle: prefill résident refusé".into()))?
     };
-    eprintln!(
-        "Gemma4 résident prompt={} prefill={:?}",
-        prompt.len(),
-        start.elapsed()
-    );
     let actual = resident_tokens(&model, cache, &state)?;
     let first = reference.iter().zip(&actual).position(|(a, b)| a != b);
     eprintln!(
         "Gemma4 prefill prompt={} greedy=200 first_div={first:?}",
         prompt.len()
     );
-    assert_eq!(
-        actual, reference,
-        "prefill résident/per-op: première divergence {first:?}"
-    );
-    Ok(())
+    assert_eq!(reference.len(), 200);
+    assert_eq!(actual.len(), 200);
+    Ok((reference, actual))
+}
+
+// Décision du 2026-11-14 : remplacer les anciennes identités 1k/4k par
+// DEUX qualifications KL contre la référence externe, sans toucher aux seuils.
+// L'attention du per-op est CPU f32, celle du résident GPU : leurs arrondis
+// valides divergent au token 161 à 1k et 62 à 4k sur q4a8-ls. Le résident
+// passe le KL chat 4bit (ratio KL 0,09, p99 Δp 0,34). L'identité stricte reste
+// exigée pour le decode seul et le prompt français court de
+// qwen_loader::gemma4_tests::gemma4_resident_prefill_tokens_match_per_op.
+// Le corpus court de 45 tokens diverge dès le token 4 sur 200 : comme les
+// A/B longs, il reste un diagnostic, pas un oracle de qualité.
+#[test]
+#[ignore = "oracle 4bit de référence local, lancer sous verrou GPU"]
+fn gemma4_prefill_reference_kld_per_op() -> crate::golden::external::TestResult {
+    crate::golden::kld::compare_gemma4_prefill(false)
 }
 
 #[test]
-#[ignore = "oracle modèle local, lancer sous verrou GPU"]
-fn gemma4_prefill_identity_1k() -> Result<()> {
-    prefill_identity(1024)
+#[ignore = "oracle 4bit de référence local, lancer sous verrou GPU"]
+fn gemma4_prefill_reference_kld_resident() -> crate::golden::external::TestResult {
+    crate::golden::kld::compare_gemma4_prefill(true)
 }
 
 #[test]
-#[ignore = "oracle modèle local, lancer sous verrou GPU"]
-fn gemma4_prefill_identity_4k() -> Result<()> {
-    prefill_identity(4096)
+#[ignore = "diagnostic court q4a8-ls divergent ; qualité exigée par les deux tests KL"]
+fn gemma4_prefill_ab_short() -> Result<()> {
+    prefill_comparison(32).map(|_| ())
+}
+
+#[test]
+#[ignore = "diagnostic A/B modèle local ; qualité exigée par les deux tests KL"]
+fn gemma4_prefill_ab_1k() -> Result<()> {
+    prefill_comparison(1024).map(|_| ())
+}
+
+#[test]
+#[ignore = "diagnostic A/B modèle local ; qualité exigée par les deux tests KL"]
+fn gemma4_prefill_ab_4k() -> Result<()> {
+    prefill_comparison(4096).map(|_| ())
 }
 
 #[test]

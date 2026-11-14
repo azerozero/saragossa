@@ -151,6 +151,41 @@ fn external_kld_ratio_gate() {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn compare(name: &str, env: &str) -> TestResult {
+    compare_with_prefill(name, env, |model, prompt| model.prefill_cache(prompt))
+}
+
+/// Même référence, provenance et seuils que l'oracle externe ; les deux chemins
+/// doivent réellement s'exécuter. Une absence de poids ou un refus résident
+/// fait échouer cette qualification même sans SARAGOSSA_REQUIRE_REAL_MODELS.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn compare_gemma4_prefill(resident: bool) -> TestResult {
+    let env = "SARAGOSSA_GEMMA4_DIR";
+    local(env)?.ok_or("SARAGOSSA_GEMMA4_DIR requis pour cet oracle")?;
+    let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(resident);
+    eprintln!("kld/gemma4: prefill résident={resident}");
+    compare_with_prefill("gemma4", env, |model, prompt| {
+        let (cache, state) = if resident {
+            model
+                .prefill_cache_state_metal_resident_for_test(prompt)?
+                .ok_or_else(|| {
+                    crate::InferError::Config("oracle: prefill résident refusé".into())
+                })?
+        } else {
+            model.prefill_cache_state_batched_for_test(prompt)?
+        };
+        Ok((cache, model.logits_from_final_state(&state)?))
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn compare_with_prefill(
+    name: &str,
+    env: &str,
+    prefill: impl Fn(
+        &crate::CausalDecoder,
+        &[usize],
+    ) -> crate::Result<(crate::CausalDecoderCache, crate::Tensor)>,
+) -> TestResult {
     let Some(path) = local(env)? else {
         return Ok(());
     };
@@ -166,7 +201,7 @@ fn compare(name: &str, env: &str) -> TestResult {
     for chunk in &meta.chunks {
         // Même découpe que kld.py : prefill du contexte, puis decode token par token.
         let start = chunk.len() - meta.scored;
-        let (mut cache, mut logits) = model.prefill_cache(&chunk[..start])?;
+        let (mut cache, mut logits) = prefill(&model, &chunk[..start])?;
         for position in start..chunk.len() {
             let (ids, logprobs) = rows.next().ok_or("référence trop courte")?;
             let values = logits.data();
