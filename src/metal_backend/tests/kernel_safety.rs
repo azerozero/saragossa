@@ -273,3 +273,49 @@ fn qmm_na_dequant_budget_preserves_qmv_fallback() -> Result<()> {
     }
     Ok(())
 }
+
+/// Pipeline réel limité à 512 threads, pour tester le refus sans exécuter de GPU.
+pub(crate) fn limited_threadgroup_pipeline(device: &metal::Device) -> Result<ComputePipelineState> {
+    let lib = device.new_library_with_source(
+        "#include <metal_stdlib>\nusing namespace metal; kernel void limited(device float* out [[buffer(0)]], uint tid [[thread_position_in_grid]]) { if (tid == 0) out[0] = 0; }",
+        &compile_options(true),
+    ).map_err(InferError::Metal)?;
+    let function = lib.get_function("limited", None).map_err(InferError::Metal)?;
+    let descriptor = metal::ComputePipelineDescriptor::new();
+    descriptor.set_compute_function(Some(&function));
+    descriptor.set_max_total_threads_per_threadgroup(512);
+    let pipeline = device.new_compute_pipeline_state(&descriptor).map_err(InferError::Metal)?;
+    assert_eq!(pipeline.max_total_threads_per_threadgroup(), 512);
+    check_threadgroup_size(&pipeline, 512, "limite exacte")?;
+    Ok(pipeline)
+}
+
+#[test]
+fn whisper_rejects_insufficient_threadgroup_limit() -> Result<()> {
+    let Some(mut executor) = test_executor()? else { return Ok(()); };
+    executor.whisper_attn_decode_vec64_f32 = limited_threadgroup_pipeline(&executor.device)?;
+    let buffer = executor.uncached_f32_buffer(64, "limited_whisper")?;
+    let cb = executor.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    let result = executor.encode_whisper_attn_decode(enc, &buffer, &buffer, &buffer, &buffer, 1, 64, 1);
+    enc.end_encoding();
+    assert!(matches!(result, Err(InferError::Metal(message)) if message.contains("1024") && message.contains("512")));
+    Ok(())
+}
+
+#[test]
+fn whisper_vec64_supported_threadgroup_matches_exact_oracle() -> Result<()> {
+    let Some(executor) = test_executor()? else { return Ok(()); };
+    if executor.whisper_attn_decode_vec64_f32.max_total_threads_per_threadgroup() < 1024 { return Ok(()); }
+    let q = executor.buffer_from_slice(&[0.0f32; 64], "whisper_q")?;
+    let keys = executor.buffer_from_slice(&vec![0.0f32; 64 * 17], "whisper_keys")?;
+    let values = executor.buffer_from_slice(&vec![1.0f32; 64 * 17], "whisper_values")?;
+    let out = executor.uncached_f32_buffer(64, "whisper_out")?;
+    let cb = executor.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    executor.encode_whisper_attn_decode(enc, &q, &keys, &values, &out, 1, 64, 17)?;
+    enc.end_encoding();
+    commit_and_wait(cb)?;
+    assert_eq!(read_f32_buffer(&out, 64)?, vec![1.0; 64]);
+    Ok(())
+}

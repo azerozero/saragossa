@@ -48,6 +48,7 @@ const U6_QMM_BATCH_TILE: usize = 8;
 
 mod attention;
 mod attention_checks;
+pub(crate) use attention_checks::check_threadgroup_size;
 mod barriers;
 mod buffers;
 mod byte_helpers;
