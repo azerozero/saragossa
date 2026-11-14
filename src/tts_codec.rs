@@ -466,7 +466,7 @@ impl TtsCodec {
                 .layers
                 .resize_with(layers, CodecAttentionStreamState::default);
         }
-        for layer in 0..layers {
+        for (layer, layer_state) in state.layers.iter_mut().enumerate().take(layers) {
             let prefix = format!("decoder.pre_transformer.layers.{layer}");
             let residual = h.clone();
             let hn = self.rms_norm_nlc(
@@ -474,11 +474,8 @@ impl TtsCodec {
                 &format!("{prefix}.input_layernorm.weight"),
                 self.cfg.rms_norm_eps,
             )?;
-            let attn = self.codec_attention_stream(
-                &mut state.layers[layer],
-                &hn,
-                &format!("{prefix}.self_attn"),
-            )?;
+            let attn =
+                self.codec_attention_stream(layer_state, &hn, &format!("{prefix}.self_attn"))?;
             let attn = self.mul_channel(&attn, &format!("{prefix}.self_attn_layer_scale.scale"))?;
             h = residual.add(&attn)?;
 

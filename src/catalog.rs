@@ -161,7 +161,7 @@ mod tests {
 
         let keys = read_safetensors_keys(tmp.path()).expect("invariant: header lisible");
         assert_eq!(keys.len(), 3);
-        assert!(keys.contains(&"model.embed_tokens.weight".to_string()));
+        assert!(keys.iter().any(|key| key == "model.embed_tokens.weight"));
     }
 
     #[test]

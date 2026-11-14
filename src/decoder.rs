@@ -1922,11 +1922,11 @@ impl CausalDecoder {
         }
         let plan = Arc::new(ModelPlan::build(&config));
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for layer_index in 0..config.num_hidden_layers {
+        for layer_plan in plan.layers.iter().take(config.num_hidden_layers) {
             layers.push(DecoderLayer::from_tensors(
                 &mut tensors,
                 &config,
-                &plan.layers[layer_index],
+                layer_plan,
             )?);
         }
         let final_norm = take_dense(&mut tensors, "norm.weight")?;
