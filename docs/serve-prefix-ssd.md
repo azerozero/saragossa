@@ -120,7 +120,17 @@ Les tests synthétiques couvrent les bits KV et récurrents, les tokens greedy,
 la reprise dans des processus distincts, les checksums, versions, dtypes,
 modèles incompatibles, tailles hostiles, interruptions, LRU/priorités,
 concurrence et limites d'admission. Les tests existants du format couvrent
-aussi l'historique MTP et les captures DFlash.
+aussi l'historique MTP et les captures DFlash. Le test de reprise AR vérifie
+l'isolation A/B via `load_persistent_prefix`, puis le retour à A.
+L'oracle ignoré `synthetic_metal_bf16_greedy_survives_restart` ne requiert aucun
+poids externe : il compare les identifiants greedy sur Metal après réouverture
+du store et reconstruction du modèle, avec KV bf16 partagé et récurrence GPU.
+
+```sh
+python3 -I -B tools/gpulock.py run --owner prefix-ssd-test --prio 10 -- \
+  cargo test --all-features synthetic_metal_bf16_greedy_survives_restart \
+  -- --ignored --nocapture
+```
 
 ```sh
 cargo test --all-features decoder::state_snapshot

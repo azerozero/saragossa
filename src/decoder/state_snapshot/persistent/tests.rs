@@ -419,6 +419,23 @@ fn process_oracle(dflash: bool) {
                 .unwrap()
                 .unwrap();
             assert_eq!(prefix.position(), 2, "frontière SSD après éviction RAM");
+            {
+                let _other = PrefixDiskSession::enter(Some("session-B"));
+                assert!(
+                    model
+                        .load_persistent_prefix(&[0, 1, 2], 1, 0)
+                        .unwrap()
+                        .is_none(),
+                    "la frontière de session A doit être invisible à B"
+                );
+            }
+            assert!(
+                model
+                    .load_persistent_prefix(&[0, 1, 2], 1, 0)
+                    .unwrap()
+                    .is_some(),
+                "le retour en session A doit retrouver la même frontière"
+            );
             assert!(model
                 .load_persistent_prefix(&[0, 1, 2], 1, 2)
                 .unwrap()
@@ -558,6 +575,132 @@ fn priority_refusal_is_memoized_before_staging() {
     }
     assert!(!candidate.root.exists());
     assert_eq!(store.disk.lock().unwrap().refused.len(), 1);
+}
+
+/// Sans poids externes : le KV est arrondi une seule fois puis placé en
+/// mémoire Metal partagée. Baseline et reprise voient les mêmes bits bf16.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal et verrou GPU requis, modèle hybride synthétique"]
+fn synthetic_metal_bf16_greedy_survives_restart() -> Result<()> {
+    crate::force_resident_full_linear_decode();
+    let root = private_dir();
+    let store = Store::open(root.path(), 64 << 20, 0)?;
+    let (_, request, _) = fixture(&store, 1);
+    let load = || {
+        let mut weights = crate::decoder::tests::hybrid_weights(2, 2);
+        for layer in 0..2 {
+            weights.insert(
+                format!("layers.{layer}.post_attention_layernorm.weight"),
+                Tensor::from_vec(vec![2], vec![1.0; 2])?,
+            );
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                weights.insert(
+                    format!("layers.{layer}.mlp.{projection}.weight"),
+                    Tensor::from_vec(vec![2, 2], vec![0.25, 0.0, 0.0, 0.25])?,
+                );
+            }
+        }
+        for norm in ["q_norm", "k_norm"] {
+            weights.insert(
+                format!("layers.1.self_attn.{norm}.weight"),
+                Tensor::from_vec(vec![2], vec![1.0; 2])?,
+            );
+        }
+        CausalDecoder::from_tensors(
+            weights,
+            CausalDecoderConfig {
+                head_dim: Some(2),
+                rope_theta: Some(10_000.0),
+                ..crate::decoder::tests::hybrid_config(2)
+            },
+        )?
+        .with_metal_runtime()
+    };
+    let model = load()?;
+    let mut state = model.prefill_prompt_state_uncached(&[0, 1])?;
+    let metal = model.forward_runtime().metal_executor().unwrap();
+    assert!(state.cache.layers[0].linear.metal_state().is_some());
+    for layer in &mut state.cache.layers {
+        for rows in [&mut layer.keys, &mut layer.values] {
+            if rows.len() == 0 {
+                continue;
+            }
+            let bits: Vec<u16> = rows
+                .to_vec()
+                .iter()
+                .map(|value| {
+                    let bits = value.to_bits();
+                    ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) >> 16) as u16
+                })
+                .collect();
+            let buffer = metal.weight_buffer_from_bf16_bytes(bytemuck::cast_slice(&bits))?;
+            // SAFETY: buffer partagé de bits.len() u16 initialisés, alignés ;
+            // aucune écriture GPU en vol ni autre vue, la vue possède le buffer.
+            #[expect(unsafe_code, reason = "vue partagée sur les bits bf16 de la fixture")]
+            let shared =
+                unsafe { crate::metal_backend::SharedBf16Rows::new(buffer, 0, bits.len())? };
+            *rows = kv_rows::KvRows::default();
+            rows.push_prefill(crate::metal_backend::PrefillKvRows::SharedBf16(shared));
+            assert!(rows.adoptable_bf16_prefix().is_some());
+        }
+    }
+    let data = payload(&model, &request, &state);
+    let (disk_estimate, _) = staging_estimate(&state.cache, &state.final_state, None, None);
+    assert!(disk_estimate >= data.bytes());
+    publish(&store, &request, data);
+    let generate = |model: &CausalDecoder, mut state: CausalDecoderPromptState| {
+        assert!(model.supports_resident_full_decode());
+        assert!(model.setup_resident_full_decode(&mut state.cache, 12, 0, true)?);
+        crate::decode_resident::with_kv_format_override(
+            crate::decode_resident::KvFormat::Bf16,
+            || {
+                model
+                    .generate_greedy_timed_from_prompt_state_with_options(
+                        state,
+                        std::time::Duration::ZERO,
+                        12,
+                        &GenerationOptions::default(),
+                    )
+                    .map(|output| output.tokens)
+            },
+        )
+    };
+    let expected_linear = state.cache.layers[0]
+        .linear
+        .metal_state()
+        .unwrap()
+        .disk_parts(metal)?;
+    let expected_kv = state.cache.layers[1].keys.snapshot_segments()[0].1.to_vec();
+    let expected = generate(&model, state)?;
+    assert_eq!(expected.len(), 12);
+    drop(model);
+    drop(store);
+    let restarted = Store::open(root.path(), 64 << 20, 0)?;
+    let model = load()?;
+    let restored = restarted
+        .read(&model, &request)
+        .expect("invariant: snapshot Metal valide");
+    let restored_linear = restored.cache.layers[0]
+        .linear
+        .metal_state()
+        .expect("invariant: récurrence reconstruite sur Metal")
+        .disk_parts(model.forward_runtime().metal_executor().unwrap())?;
+    assert_eq!(expected_linear.1, restored_linear.1);
+    assert_eq!(expected_linear.2, restored_linear.2);
+    assert!(restored.cache.layers[1].keys.has_bf16());
+    assert_eq!(
+        expected_kv,
+        restored.cache.layers[1].keys.snapshot_segments()[0].1
+    );
+    assert_eq!(
+        expected,
+        generate(
+            &model,
+            CausalDecoderPromptState::new(restored.cache, restored.final_state)
+        )?
+    );
+    Ok(())
 }
 
 #[test]
