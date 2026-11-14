@@ -513,6 +513,7 @@ impl MetalExecutor {
         in_dim: usize,
         samples: [DuoSampleParams; 2],
         slots: [u64; 2],
+        softcap: Option<f32>,
     ) -> Result<()> {
         let out_dim = self.linear_weight_out_dim(lm_head);
         let logits2 = self.private_f32_buffer(2 * out_dim, "lightbatch_sample_logits2")?;
@@ -552,6 +553,7 @@ impl MetalExecutor {
                 sample.temperature,
                 sample.top_p,
                 sample.rng_state,
+                softcap,
             )?;
         }
         Ok(())

@@ -295,6 +295,7 @@ impl CausalDecoder {
                     hidden,
                     params,
                     slots,
+                    self.config.final_logit_softcapping,
                 )?;
             }
             None => {

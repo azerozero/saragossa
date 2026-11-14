@@ -12,6 +12,7 @@ include!("tests/na_gemm_delta.rs");
 include!("tests/small_m_qmm.rs");
 include!("tests/coop_moe.rs");
 include!("tests/quant_qmv_sampling.rs");
+include!("tests/softcap_sampling.rs");
 include!("tests/qmv_u5.rs");
 include!("tests/qmm_u56.rs");
 include!("tests/qmv_bandwidth.rs");
