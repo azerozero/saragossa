@@ -104,3 +104,69 @@ explicite du mainteneur.
 
 Pour une vulnérabilité, suivez [SECURITY.md](SECURITY.md) plutôt que d'ouvrir
 une issue publique.
+
+## Préparation et regroupement des releases
+
+Le workflow `Release-plz` prépare la PR de version après un succès du workflow
+`Rust` sur `main`. Il ignore les succès dont le SHA ne correspond plus au
+checkout de `main`. Un lancement manuel est possible sur `main`, mais exige
+également une CI `Rust` verte pour ce SHA.
+
+`release-plz release-pr` prépare ou actualise la PR ouverte `release-plz-*`.
+Les changements s'y accumulent jusqu'à sa fusion. Le filtre `release_commits`
+exige au moins un commit `feat`, `fix`, `refactor` ou `perf` correspondant à
+l'expression configurée ; il ne définit aucune fréquence de publication.
+Les commits filtrés peuvent néanmoins apparaître dans le changelog.
+Voir la [configuration de release-plz](https://release-plz.dev/docs/config#the-release_commits-field)
+et le [fonctionnement des PR de release](https://release-plz.dev/docs/usage/release-pr).
+
+**Le label `release` seul n'active pas l'auto-merge.** Le mainteneur ajoute
+`release-ready` lorsque le lot est prêt. Le workflow active alors l'auto-merge
+avec un commit de merge, après les checks requis. Retirer `release-ready` ou
+`release` désactive l'auto-merge tant que la PR n'est pas fusionnée. Ne pas
+attribuer le label générique `automerge` aux PR de release.
+
+Sans cette décision, la PR reste ouverte pour regrouper les contributions.
+Un auto-merge systématique dès l'ajout de `release` pourrait au contraire
+produire une release par merge éligible de `main` : release-plz n'impose ni
+délai ni nombre minimal de commits. `release_always = false` réserve la
+publication à une PR de release fusionnée ; ce réglage ne crée pas de délai.
+
+La PR de release conserve la CI ordinaire et compile en plus le binaire avec
+`--locked --release --target aarch64-apple-darwin --bin saragossa --features metal,devtools`,
+puis exécute `--help`. Le job `gpu-synthetic` est sauté sur `release-plz-*` :
+ces branches sont réservées aux versions, au changelog et au lock du workspace,
+sans changement des dépendances externes ni du code. Les tests nocturnes et
+manuels restent actifs.
+
+Seule la fusion d'une PR `release-plz-*` du dépôt, étiquetée `release`, lance
+le job de tag, à partir de son commit de merge. Un merge ordinaire de `main`
+ne pose aucun tag. Le tag `v*` déclenche ensuite le workflow `Release` qui
+recompile, publie l'archive, actualise le tap Homebrew et teste l'installation.
+Aucun paquet n'est publié sur crates.io.
+
+## Réglages GitHub à appliquer par le mainteneur
+
+- Autoriser les merge commits et l'auto-merge du dépôt.
+- Protéger `main` avec le statut agrégé **`Required checks`** du workflow
+  `Rust`, sans contournement pour le compte de livraison. Ce job dépend de
+  `release-build-check` : son échec bloque la fusion et son statut `skipped`
+  sur les PR ordinaires reste non fatal. Ne pas ajouter
+  **`Release build (Apple Silicon)`** comme check requis séparé ; retirer
+  cette exigence si elle avait déjà été configurée. Conserver les autres
+  protections et contrôles concernés (GPU, CodeQL et documentation).
+- Créer les labels `release` et `release-ready`. Seul `release` figure dans
+  `pr_labels` ; `release-ready` reste une décision du mainteneur. Désactiver
+  l'auto-merge des éventuelles PR de release déjà ouvertes avant ce changement
+  si leur lot n'est pas prêt.
+- Configurer `RELEASE_PLZ_TOKEN` avec les droits de création/mise à jour des
+  PR, de fusion et d'écriture des tags dans ce dépôt, ainsi que d'écriture
+  dans `azerozero/homebrew-tap`. Utiliser un PAT ou un jeton d'application
+  permettant aux PR et tags créés de déclencher les workflows suivants.
+- Autoriser les workflows à créer des PR selon la politique du dépôt et de
+  l'organisation. Le job de préparation utilise aussi `actions: read` pour
+  vérifier la CI lors d'un lancement manuel.
+
+Ces réglages sont externes aux fichiers versionnés. Modifier les workflows
+localement ne les applique pas. Le déclencheur `workflow_run` devient actif
+une fois le workflow présent sur la branche par défaut.

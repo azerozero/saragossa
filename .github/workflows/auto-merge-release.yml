@@ -1,8 +1,9 @@
 name: Auto-merge release PRs
 
+# Laisser release-plz regrouper les changements jusqu'au feu vert du mainteneur.
 on:
   pull_request:
-    types: [labeled, synchronize]
+    types: [opened, labeled, unlabeled, synchronize, ready_for_review]
     branches: [main]
 
 permissions:
@@ -12,13 +13,26 @@ permissions:
 jobs:
   auto-merge:
     if: >-
-      contains(github.event.pull_request.labels.*.name, 'release')
+      startsWith(github.head_ref, 'release-plz-')
       && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Enable auto-merge
-        run: gh pr merge --auto --merge "$PR_URL"
+        if: >-
+          contains(github.event.pull_request.labels.*.name, 'release')
+          && contains(github.event.pull_request.labels.*.name, 'release-ready')
+          && github.event.pull_request.draft == false
+        run: gh pr merge --auto --merge --match-head-commit "$HEAD_SHA" "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Disable auto-merge when approval is withdrawn
+        if: >-
+          github.event.action == 'unlabeled'
+          && (github.event.label.name == 'release-ready' || github.event.label.name == 'release')
+        run: gh pr merge --disable-auto "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
