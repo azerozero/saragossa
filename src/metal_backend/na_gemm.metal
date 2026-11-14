@@ -304,18 +304,18 @@ kernel void gemm_nax_coop_qb(device const bfloat* A [[buffer(0)]],
                              device float* C         [[buffer(4)]],
                              constant uint3& mnk     [[buffer(5)]],
                              uint2 tgid [[threadgroup_position_in_grid]]) {
-  uint N = mnk.y, K = mnk.z;
+  uint M = mnk.x, N = mnk.y, K = mnk.z;
   uint m0 = tgid.x * 16u, n0 = tgid.y * 32u;
   metal::vec<float,8> Cn0 = float(0), Cn1 = float(0);
   for (uint k = 0; k < K; k += 16u) {
     metal::vec<bfloat,8> Af, Bn0, Bn1;
-    NaxFrag::load_a(Af, A + m0 * K + k, int(K));
+    NaxFrag::load_a_masked(Af, A, m0, k, K, M);
     NaxFrag::load_b_quant(Bn0, Bp, Bs, Bb, n0, k, K);
     NaxFrag::load_b_quant(Bn1, Bp, Bs, Bb, n0 + 16u, k, K);
     NaxFrag::mma(Cn0, Cn1, Af, Bn0, Bn1);
   }
-  NaxFrag::store_c(Cn0, C + m0 * N + n0, int(N));
-  NaxFrag::store_c(Cn1, C + m0 * N + n0 + 16u, int(N));
+  NaxFrag::store_c_masked(Cn0, C, m0, n0, N, M);
+  NaxFrag::store_c_masked(Cn1, C, m0, n0 + 16u, N, M);
 }
 // Variante dense gs128. M et N doivent être alignés 16×32 côté gate Rust.
 kernel void gemm_nax_coop_qb_gs128(device const bfloat* A [[buffer(0)]],
@@ -1361,213 +1361,4 @@ kernel void gemm_nax_coop_qb_grouped(device const bfloat* A [[buffer(0)]],
   }
   NaxFrag::store_c(Cn0, C + m0 * N + n0, int(N));
   NaxFrag::store_c(Cn1, C + m0 * N + n0 + 16u, int(N));
-}
-// Port chunked-DeltaNet brique 4 : version LAYOUT RÉEL. 1 threadgroup/value_head, boucle
-// chunks. Lit les vrais buffers : k/q_norm [T, key_dim] par key_head (GQA repeat), v depuis
-// conv_out interleavé [T, conv_dim] à 2*key_dim+value_base, beta/decay [T, value_heads],
-// ssm_state [value_dim, 128] par tête. dims=(value_heads, value_head_dim, repeat, steps).
-// value_head_dim=128 requis (buffers threadgroup). Remplace linear_attn_gated_delta_seq.
-kernel void chunk_delta_seq_layout(device const float* conv_out [[buffer(0)]],
-                                   device const float* q_norm [[buffer(1)]],
-                                   device const float* k_norm [[buffer(2)]],
-                                   device const float* beta [[buffer(3)]],
-                                   device const float* decay [[buffer(4)]],
-                                   device float* ssm_state [[buffer(5)]],
-                                   device float* y [[buffer(6)]],
-                                   constant uint4& dims [[buffer(7)]], // (vheads, vhd, repeat, steps)
-                                   uint gid [[threadgroup_position_in_grid]],
-                                   uint tid [[thread_index_in_threadgroup]],
-                                   uint nthreads [[threads_per_threadgroup]]) {
-  const uint vheads = dims.x, vhd = dims.y, repeat = dims.z, steps = dims.w;
-  const uint dk = 128u, CM = 16u;
-  const uint vh = gid;
-  if (vh >= vheads || repeat == 0u) { return; }
-  const uint key_heads = vheads / repeat;
-  const uint key_dim = key_heads * dk;
-  const uint value_dim = vheads * vhd;
-  const uint conv_dim = 2u * key_dim + value_dim;
-  const uint key_base = (vh / repeat) * dk;
-  const uint value_base = vh * vhd;
-  threadgroup float gamma[16];
-  threadgroup float A[16 * 16];
-  threadgroup float P[16 * 16];
-  threadgroup float u[16 * 128];
-  threadgroup float delta[16 * 128];
-  threadgroup float qs[16 * 128];
-  const uint c = tid;
-  for (uint c0 = 0; c0 < steps; c0 += CM) {
-    const uint nc = min(CM, steps - c0);
-    if (tid == 0) {
-      float g = 1.0f;
-      for (uint i = 0; i < nc; i++) { g *= decay[(c0 + i) * vheads + vh]; gamma[i] = g; }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (c < vhd) {
-      const uint srow = (value_base + c) * dk;
-      for (uint i = 0; i < nc; i++) {
-        float ks = 0.0f, qsv = 0.0f;
-        const uint kq = (c0 + i) * key_dim + key_base;
-        for (uint k = 0; k < dk; k++) {
-          float s = ssm_state[srow + k];
-          ks += s * k_norm[kq + k];
-          qsv += s * q_norm[kq + k];
-        }
-        float vv = conv_out[(c0 + i) * conv_dim + 2u * key_dim + value_base + c];
-        u[i * vhd + c] = beta[(c0 + i) * vheads + vh] * (vv - gamma[i] * ks);
-        qs[i * vhd + c] = qsv;
-      }
-    }
-    for (uint e = tid; e < nc * nc; e += nthreads) {
-      uint i = e / nc, j = e % nc;
-      float kk = 0.0f, qk = 0.0f;
-      const uint ki = (c0 + i) * key_dim + key_base;
-      const uint kj = (c0 + j) * key_dim + key_base;
-      for (uint k = 0; k < dk; k++) {
-        kk += k_norm[ki + k] * k_norm[kj + k];
-        qk += q_norm[ki + k] * k_norm[kj + k];
-      }
-      float r = gamma[i] / gamma[j];
-      A[i * CM + j] = (j < i) ? (beta[(c0 + i) * vheads + vh] * r * kk) : 0.0f;
-      P[i * CM + j] = (j <= i) ? (r * qk) : 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (c < vhd) {
-      for (uint i = 0; i < nc; i++) {
-        float acc = u[i * vhd + c];
-        for (uint j = 0; j < i; j++) { acc -= A[i * CM + j] * delta[j * vhd + c]; }
-        delta[i * vhd + c] = acc;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (c < vhd) {
-      for (uint i = 0; i < nc; i++) {
-        float yv = gamma[i] * qs[i * vhd + c];
-        for (uint j = 0; j <= i; j++) { yv += P[i * CM + j] * delta[j * vhd + c]; }
-        y[(c0 + i) * value_dim + value_base + c] = yv;
-      }
-      const uint srow = (value_base + c) * dk;
-      const float glast = gamma[nc - 1];
-      for (uint k = 0; k < dk; k++) {
-        float s = glast * ssm_state[srow + k];
-        for (uint j = 0; j < nc; j++) {
-          s += (glast / gamma[j]) * delta[j * vhd + c] * k_norm[(c0 + j) * key_dim + key_base + k];
-        }
-        ssm_state[srow + k] = s;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-}
-// Brique 6c : chunk_delta_seq_layout en TENSOR-CORES (KS/QS + state-update sur
-// simdgroup_matrix, avec les offsets
-// multi-tête/GQA). 128 threads = 4 simdgroups. value_head_dim=128 requis.
-kernel void chunk_delta_seq_layout_tc(device const float* conv_out [[buffer(0)]],
-                                      device const float* q_norm [[buffer(1)]],
-                                      device const float* k_norm [[buffer(2)]],
-                                      device const float* beta [[buffer(3)]],
-                                      device const float* decay [[buffer(4)]],
-                                      device float* ssm_state [[buffer(5)]],
-                                      device float* y [[buffer(6)]],
-                                      constant uint4& dims [[buffer(7)]], // (vheads,vhd,repeat,steps)
-                                      uint gid [[threadgroup_position_in_grid]],
-                                      uint tid [[thread_index_in_threadgroup]],
-                                      uint nthreads [[threads_per_threadgroup]]) {
-  const uint vheads = dims.x, vhd = dims.y, repeat = dims.z, steps = dims.w;
-  const uint dk = 128u, CM = 16u;
-  const uint vh = gid;
-  if (vh >= vheads || repeat == 0u) { return; }
-  const uint key_heads = vheads / repeat;
-  const uint key_dim = key_heads * dk;
-  const uint value_dim = vheads * vhd;
-  const uint conv_dim = 2u * key_dim + value_dim;
-  const uint key_base = (vh / repeat) * dk;
-  const uint value_base = vh * vhd;
-  threadgroup float gamma[16];
-  threadgroup float A[16 * 16];
-  threadgroup float P[16 * 16];
-  threadgroup float u[16 * 128];
-  threadgroup float delta[16 * 128];
-  threadgroup float qs[16 * 128];
-  const uint c = tid;
-  const uint sgid = tid / 32u;
-  for (uint c0 = 0; c0 < steps; c0 += CM) {
-    const uint nc = min(CM, steps - c0);
-    if (tid == 0) {
-      float g = 1.0f;
-      for (uint i = 0; i < nc; i++) { g *= decay[(c0 + i) * vheads + vh]; gamma[i] = g; }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint tt = sgid; tt < (16u / 8u) * (vhd / 8u); tt += 4u) {
-      uint i0 = (tt / (vhd / 8u)) * 8u, c0t = (tt % (vhd / 8u)) * 8u;
-      metal::simdgroup_float8x8 acck = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-      metal::simdgroup_float8x8 accq = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-      for (uint kt = 0; kt < dk / 8u; kt++) {
-        uint k0 = kt * 8u;
-        metal::simdgroup_float8x8 ak, aq, bs;
-        metal::simdgroup_load(ak, k_norm + (c0 + i0) * key_dim + key_base + k0, key_dim);
-        metal::simdgroup_load(aq, q_norm + (c0 + i0) * key_dim + key_base + k0, key_dim);
-        metal::simdgroup_load(bs, ssm_state + (value_base + c0t) * dk + k0, dk, ulong2(0, 0), true);
-        metal::simdgroup_multiply_accumulate(acck, ak, bs, acck);
-        metal::simdgroup_multiply_accumulate(accq, aq, bs, accq);
-      }
-      metal::simdgroup_store(acck, u + i0 * vhd + c0t, vhd);
-      metal::simdgroup_store(accq, qs + i0 * vhd + c0t, vhd);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (c < vhd) {
-      for (uint i = 0; i < nc; i++) {
-        float vv = conv_out[(c0 + i) * conv_dim + 2u * key_dim + value_base + c];
-        u[i * vhd + c] = beta[(c0 + i) * vheads + vh] * (vv - gamma[i] * u[i * vhd + c]);
-      }
-    }
-    for (uint e = tid; e < nc * nc; e += nthreads) {
-      uint i = e / nc, j = e % nc;
-      float kk = 0.0f, qk = 0.0f;
-      const uint ki = (c0 + i) * key_dim + key_base;
-      const uint kj = (c0 + j) * key_dim + key_base;
-      for (uint k = 0; k < dk; k++) {
-        kk += k_norm[ki + k] * k_norm[kj + k];
-        qk += q_norm[ki + k] * k_norm[kj + k];
-      }
-      float r = gamma[i] / gamma[j];
-      A[i * CM + j] = (j < i) ? (beta[(c0 + i) * vheads + vh] * r * kk) : 0.0f;
-      P[i * CM + j] = (j <= i) ? (r * qk) : 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (c < vhd) {
-      for (uint i = 0; i < nc; i++) {
-        float acc = u[i * vhd + c];
-        for (uint j = 0; j < i; j++) { acc -= A[i * CM + j] * delta[j * vhd + c]; }
-        delta[i * vhd + c] = acc;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float glast = gamma[nc - 1];
-    if (c < vhd) {
-      for (uint i = 0; i < nc; i++) {
-        float yv = gamma[i] * qs[i * vhd + c];
-        for (uint j = 0; j <= i; j++) { yv += P[i * CM + j] * delta[j * vhd + c]; }
-        y[(c0 + i) * value_dim + value_base + c] = yv;
-      }
-      for (uint j = 0; j < CM; j++) {
-        delta[j * vhd + c] = (j < nc) ? (glast / gamma[j]) * delta[j * vhd + c] : 0.0f;
-      }
-      const uint srow = (value_base + c) * dk;
-      for (uint k = 0; k < dk; k++) { ssm_state[srow + k] *= glast; }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint t = sgid; t < (vhd / 8u) * (dk / 8u); t += 4u) {
-      uint c0t = (t / (dk / 8u)) * 8u, k0t = (t % (dk / 8u)) * 8u;
-      metal::simdgroup_float8x8 acc;
-      metal::simdgroup_load(acc, ssm_state + (value_base + c0t) * dk + k0t, dk);
-      for (uint jt = 0; jt < CM / 8u; jt++) {
-        metal::simdgroup_float8x8 a, b;
-        metal::simdgroup_load(a, delta + (jt * 8u) * vhd + c0t, vhd, ulong2(0, 0), true);
-        metal::simdgroup_load(b, k_norm + (c0 + jt * 8u) * key_dim + key_base + k0t, key_dim);
-        metal::simdgroup_multiply_accumulate(acc, a, b, acc);
-      }
-      metal::simdgroup_store(acc, ssm_state + (value_base + c0t) * dk + k0t, dk);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
 }

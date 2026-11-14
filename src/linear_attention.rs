@@ -46,29 +46,16 @@
 //! `κ = ⌊h/repeat⌋`, mais chacune garde son propre état `S`, ses gates
 //! `g_t, β_t` et sa tranche `v_t`.
 //!
-//! # Forme chunkée (kernel Metal `chunk_delta_seq_layout`, chunk C=16)
+//! # Ancien chemin chunké
 //!
-//! Le prefill batché (opt-in `SARAGOSSA_RUST_LINEAR_CHUNKED`, dispatché par
-//! `MetalExecutor::encode_chunk_delta_seq_layout`) déroule la récurrence par
-//! blocs de C tokens depuis l'état de début de chunk `S₀`. Avec le decay cumulé
-//! intra-chunk `γ_i = ∏_{j≤i} g_j` (indices locaux `i, j ∈ [0, C)`) :
-//!
-//! ```text
-//! u_i  = β_i·(v_i − γ_i·(S₀·k_i))                    (delta mesuré contre S₀ décayé)
-//! A_ij = β_i·(γ_i/γ_j)·(k_i·k_j)         j<i         (couplage intra-chunk)
-//! Δ_i  = u_i − Σ_{j<i} A_ij·Δ_j                      (substitution avant ≡ (I+A)⁻¹·u)
-//! P_ij = (γ_i/γ_j)·(q_i·k_j)             j≤i
-//! y_i  = γ_i·(S₀·q_i) + Σ_{j≤i} P_ij·Δ_j             (lecture : part S₀ + parts intra-chunk)
-//! S_C  = γ_{C−1}·S₀ + Σ_j (γ_{C−1}/γ_j)·Δ_j·k_jᵀ     (état de fin de chunk)
-//! ```
-//!
-//! Équivalence avec la forme séquentielle : en déroulant `S_i = g_i·S_{i−1} +
-//! Δ_i·k_iᵀ` on obtient `S_i = γ_i·S₀ + Σ_{j≤i} (γ_i/γ_j)·Δ_j·k_jᵀ` où
-//! `Δ_j = β_j·(v_j − g_j·S_{j−1}·k_j)` ; substituer cette expansion dans `Δ_i`
-//! donne le système triangulaire ci-dessus. Les sorties coïncident à la
-//! ré-association f32 près — vérifié contre l'oracle CPU naïf token-par-token de
-//! `linear_attention/tests.rs` (mêmes équations, zéro chunking) et par le test GPU direct de
-//! `metal_backend/tests.rs` (`chunk_delta_seq_layout_gqa_matches_naive_oracle`).
+//! Les kernels `chunk_delta_seq_layout` et `_tc` ont été retirés. Leurs ratios
+//! de produits cumulés de decay pouvaient diviser par zéro ; la variante TC
+//! lisait au-delà des queues de 16 tokens et synchronisait mal l'état device.
+//! `SARAGOSSA_RUST_LINEAR_CHUNKED=1` est désormais refusé explicitement.
+//! Supprimer ce flag conserve les chemins par défaut : NAX pour ses formes
+//! déjà prises en charge, scan séquentiel sinon. Le NAX n'est pas élargi.
+//! Les oracles CPU GQA, aux frontières de 16 tokens et au-delà de 256 tokens,
+//! restent appliqués au scan séquentiel avec leurs tolérances inchangées.
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use crate::runtime_flags::{env_flag, trace_linear_attn_enabled};

@@ -148,7 +148,7 @@ fn sample_topk_topp_matches_cpu() -> Result<()> {
     let logits = linear.forward(&input)?;
     let mut sampler = crate::DeterministicSampler::new(1234);
     let cpu = crate::sample_token_top_k_top_p(logits.as_row()?, 0.7, 0.95, 20, &mut sampler)?;
-    let gpu = executor.sample_linear_biasless_topk_topp(&input, &linear, 0.7, 0.95, 20, 1234)?;
+    let gpu = executor.sample_linear_biasless_topk_topp(&input, &linear, 0.7, 0.95, 20, 1234, None)?;
 
     assert_eq!(gpu, cpu);
     Ok(())
@@ -183,7 +183,7 @@ fn sample_topk32_topp_multiblock_matches_cpu() -> Result<()> {
     let logits = linear.forward(&input)?;
     let mut sampler = crate::DeterministicSampler::new(0x5eed);
     let cpu = crate::sample_token_top_k_top_p(logits.as_row()?, 0.7, 0.95, 32, &mut sampler)?;
-    let gpu = executor.sample_linear_biasless_topk_topp(&input, &linear, 0.7, 0.95, 32, 0x5eed)?;
+    let gpu = executor.sample_linear_biasless_topk_topp(&input, &linear, 0.7, 0.95, 32, 0x5eed, None)?;
 
     assert_eq!(gpu, cpu);
     Ok(())
@@ -231,8 +231,8 @@ fn sample_gumbel_matches_cpu_and_distribution() -> Result<()> {
     let mut counts = vec![0_usize; logits.len()];
 
     for seed in 0..1024_u64 {
-        let gpu = executor.sample_linear_biasless_gumbel(&input, &linear, temperature, seed)?;
-        let repeat = executor.sample_linear_biasless_gumbel(&input, &linear, temperature, seed)?;
+        let gpu = executor.sample_linear_biasless_gumbel(&input, &linear, temperature, seed, None)?;
+        let repeat = executor.sample_linear_biasless_gumbel(&input, &linear, temperature, seed, None)?;
         let cpu = cpu_gumbel_argmax_for_test(&logits, temperature, seed);
         assert_eq!(gpu, repeat, "seed {seed}");
         assert_eq!(gpu, cpu, "seed {seed}");
@@ -4590,78 +4590,98 @@ fn sample_rows_with_states_match_isolated_and_cpu() -> Result<()> {
         })
         .collect();
     const SENTINEL: u32 = u32::MAX;
-    for (temperature, top_p, top_k) in [
-        (0.7_f32, 1.0_f32, 0_usize),
-        (0.7, 0.9, 20),
-        (1.3, 0.5, 2),
-        (0.7, 0.9, 1),
-        (0.7, 1.0, 32),
-    ] {
-        for seed in [1_u64, 0xdead_beef] {
-            let states: Vec<u64> = depths
-                .iter()
-                .map(|&depth| crate::sampling::rng_state_for_draw(seed, 5 + depth))
-                .collect();
-            let logits_buffer = executor.upload_f32_buffer(&logits, "rows_test_logits")?;
-            let index_buffer =
-                executor.upload_u32_buffer(&vec![SENTINEL; rows + 2], "rows_test_index")?;
-            for concurrent in [false, true] {
-            let command_buffer = executor.queue.new_command_buffer();
-            let _barrier_guard = concurrent.then(install_dispatch_barrier_scope);
-            let encoder = if concurrent {
-                command_buffer
-                    .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
-            } else {
-                command_buffer.new_compute_command_encoder()
-            };
-            executor.encode_sample_rows_with_states(
-                encoder,
-                &logits_buffer,
-                vocab,
-                &index_buffer,
-                4,
-                (temperature, top_p, top_k),
-                &states,
-            )?;
-            encoder.end_encoding();
-            commit_and_wait(command_buffer)?;
-            let out = read_u32_buffer(&index_buffer, rows + 2)?;
-            write_u32_buffer(&index_buffer, &vec![SENTINEL; rows + 2])?;
-            assert_eq!(out[0], SENTINEL);
-            assert_eq!(out[rows + 1], SENTINEL);
-            for (row, &state) in states.iter().enumerate() {
-                let line = &logits[row * vocab..(row + 1) * vocab];
-                let single_logits = executor.upload_f32_buffer(line, "rows_test_single")?;
-                let single_index = executor.new_u32_buffer(1, "rows_test_single_index")?;
-                let command_buffer = executor.queue.new_command_buffer();
-                let encoder = command_buffer.new_compute_command_encoder();
-                executor.encode_sample_topk_topp_with_offsets(
-                    encoder,
-                    &single_logits,
-                    0,
-                    &single_index,
-                    0,
-                    vocab,
-                    top_k,
-                    temperature,
-                    top_p,
-                    state,
-                )?;
-                encoder.end_encoding();
-                commit_and_wait(command_buffer)?;
-                let isolated = read_u32_buffer(&single_index, 1)?[0];
-                let cpu = if top_k == 0 {
-                    cpu_gumbel_argmax_for_test(line, temperature, state)
-                } else {
-                    let mut sampler = crate::DeterministicSampler::new(state);
-                    crate::sample_token_top_k_top_p(line, temperature, top_p, top_k, &mut sampler)?
-                };
-                let params = format!(
-                    "T={temperature} top_p={top_p} top_k={top_k} seed={seed} concurrent={concurrent}"
-                );
-                assert_eq!(out[row + 1], isolated, "ligne {row} {params}");
-                assert_eq!(out[row + 1] as usize, cpu, "ligne {row} {params}");
-            }
+    for softcap in [None, Some(0.0_f32), Some(-1.0), Some(0.75), Some(30.0)] {
+        for (temperature, top_p, top_k) in [
+            (0.7_f32, 1.0_f32, 0_usize),
+            (0.7, 0.9, 20),
+            (1.3, 0.5, 2),
+            (0.7, 0.9, 1),
+            (0.7, 1.0, 32),
+        ] {
+            for seed in [1_u64, 0xdead_beef] {
+                let states: Vec<u64> = depths
+                    .iter()
+                    .map(|&depth| crate::sampling::rng_state_for_draw(seed, 5 + depth))
+                    .collect();
+                let logits_buffer = executor.upload_f32_buffer(&logits, "rows_test_logits")?;
+                let index_buffer =
+                    executor.upload_u32_buffer(&vec![SENTINEL; rows + 2], "rows_test_index")?;
+                for concurrent in [false, true] {
+                    let command_buffer = executor.queue.new_command_buffer();
+                    let _barrier_guard = concurrent.then(install_dispatch_barrier_scope);
+                    let encoder = if concurrent {
+                        command_buffer.compute_command_encoder_with_dispatch_type(
+                            metal::MTLDispatchType::Concurrent,
+                        )
+                    } else {
+                        command_buffer.new_compute_command_encoder()
+                    };
+                    executor.encode_sample_rows_with_states(
+                        encoder,
+                        &logits_buffer,
+                        vocab,
+                        &index_buffer,
+                        4,
+                        (temperature, top_p, top_k),
+                        &states,
+                        softcap,
+                    )?;
+                    encoder.end_encoding();
+                    commit_and_wait(command_buffer)?;
+                    let out = read_u32_buffer(&index_buffer, rows + 2)?;
+                    write_u32_buffer(&index_buffer, &vec![SENTINEL; rows + 2])?;
+                    assert_eq!(out[0], SENTINEL);
+                    assert_eq!(out[rows + 1], SENTINEL);
+                    for (row, &state) in states.iter().enumerate() {
+                        let line = &logits[row * vocab..(row + 1) * vocab];
+                        let single_logits = executor.upload_f32_buffer(line, "rows_test_single")?;
+                        let single_index = executor.new_u32_buffer(1, "rows_test_single_index")?;
+                        let command_buffer = executor.queue.new_command_buffer();
+                        let encoder = command_buffer.new_compute_command_encoder();
+                        executor.encode_sample_topk_topp_with_offsets(
+                            encoder,
+                            &single_logits,
+                            0,
+                            &single_index,
+                            0,
+                            vocab,
+                            top_k,
+                            temperature,
+                            top_p,
+                            state,
+                            softcap,
+                        )?;
+                        encoder.end_encoding();
+                        commit_and_wait(command_buffer)?;
+                        let isolated = read_u32_buffer(&single_index, 1)?[0];
+                        let capped: Vec<f32> = line
+                            .iter()
+                            .map(|&x| match softcap {
+                                Some(cap) if cap > 0.0 => cap * (x / cap).tanh(),
+                                _ => x,
+                            })
+                            .collect();
+                        let line = &capped;
+                        let cpu = if top_k == 0 {
+                            cpu_gumbel_argmax_for_test(line, temperature, state)
+                        } else {
+                            let mut sampler = crate::DeterministicSampler::new(state);
+                            crate::sample_token_top_k_top_p(
+                                line,
+                                temperature,
+                                top_p,
+                                top_k,
+                                &mut sampler,
+                            )?
+                        };
+                        let params = format!(
+                            "T={temperature} top_p={top_p} top_k={top_k} seed={seed} \
+                             concurrent={concurrent} softcap={softcap:?}"
+                        );
+                        assert_eq!(out[row + 1], isolated, "ligne {row} {params}");
+                        assert_eq!(out[row + 1] as usize, cpu, "ligne {row} {params}");
+                    }
+                }
             }
         }
     }
