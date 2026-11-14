@@ -177,6 +177,101 @@ pub(crate) fn compare_gemma4_prefill(resident: bool) -> TestResult {
     })
 }
 
+/// Équivalent interne record/compare : référence per-op en mémoire, puis
+/// replay forcé des mêmes tokens après un prefill résident sans repli.
+/// La partition top-K + reste et le p99 des Δp maximaux par position sont
+/// exactement ceux du golden, contrairement aux métriques plein vocab CLI.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn compare_gemma4_long_prefill(
+    model: &crate::CausalDecoder,
+    prompt: &[usize],
+) -> TestResult {
+    let meta: Meta = json("kld/gemma4_meta")?;
+    assert_eq!(meta.model, "gemma4");
+    assert!((4096..=4128).contains(&prompt.len()), "prompt long attendu");
+    assert!(
+        prompt.len() <= crate::runtime_flags::prefill_resident_gemma4_max_tokens(),
+        "relever explicitement SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS pour cet oracle"
+    );
+    let n = meta.scored;
+    let mut rows = Vec::with_capacity(n);
+    let mut forced = Vec::with_capacity(n);
+    crate::MetalExecutor::take_long_d512_dispatches_for_test();
+    {
+        let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(false);
+        let (mut cache, state) = model.prefill_cache_state_batched_for_test(prompt)?;
+        let mut logits = model.logits_from_final_state(&state)?;
+        for position in 0..n {
+            let values = logits.data();
+            assert!(values.iter().all(|v| v.is_finite()));
+            let token = crate::argmax(values)?;
+            let max = f64::from(values[token]);
+            let log_z = max
+                + values
+                    .iter()
+                    .map(|&v| (f64::from(v) - max).exp())
+                    .sum::<f64>()
+                    .ln();
+            let mut ids: Vec<usize> = (0..values.len()).collect();
+            ids.sort_by(|&a, &b| values[b].total_cmp(&values[a]).then(a.cmp(&b)));
+            ids.truncate(meta.top_k);
+            let logprobs: Vec<f64> = ids
+                .iter()
+                .map(|&id| f64::from(values[id]) - log_z)
+                .collect();
+            rows.push((ids, logprobs));
+            forced.push(token);
+            if position + 1 < n {
+                logits = model.next_logits_cached(&mut cache, token)?;
+            }
+        }
+    }
+    assert!(
+        crate::MetalExecutor::take_long_d512_dispatches_for_test().is_empty(),
+        "la référence doit utiliser le per-op (attention CPU f32)"
+    );
+    eprintln!(
+        "kld/gemma4-long: référence per-op enregistrée, prompt={} positions={n}",
+        prompt.len()
+    );
+    let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(true);
+    let (mut cache, state) = model
+        .prefill_cache_state_metal_resident_for_test(prompt)?
+        .ok_or("oracle long: prefill résident refusé")?;
+    let trace = crate::MetalExecutor::take_long_d512_dispatches_for_test();
+    eprintln!("kld/gemma4-long: trace causal_attention_prefill_long_d512_f32 {trace:?}");
+    assert!(!trace.is_empty(), "aucun dispatch du kernel long d512");
+    assert!(trace
+        .iter()
+        .all(|&(seq, dim)| seq == prompt.len() && dim == 512));
+    let mut logits = model.logits_from_final_state(&state)?;
+    let (mut kls, mut deltas, mut same) = (Vec::new(), Vec::new(), 0);
+    for (position, ((ids, logprobs), &token)) in rows.iter().zip(&forced).enumerate() {
+        assert!(logits.data().iter().all(|v| v.is_finite()));
+        let (kl, delta) = metrics(logits.data(), ids, logprobs);
+        kls.push(kl);
+        deltas.push(delta);
+        same += usize::from(crate::argmax(logits.data())? == token);
+        if position + 1 < n {
+            logits = model.next_logits_cached(&mut cache, token)?;
+        }
+    }
+    let engine = summarize(&kls, &mut deltas, same);
+    let noise = meta.mlx_bf16_noise;
+    eprintln!("kld/gemma4-long: résident vs per-op {engine:?}");
+    eprintln!("kld/gemma4-long: mlx bf16 {noise:?}");
+    eprintln!(
+        "kld/gemma4-long: ratio KL {:.6}, ratio p99 Δp {:.6}, limite {MAX_NOISE_RATIO}",
+        engine.mean_kl / noise.mean_kl,
+        engine.p99_delta_p / noise.p99_delta_p
+    );
+    assert!(
+        within_noise(engine, noise),
+        "kld/gemma4-long: hors du bruit bf16"
+    );
+    Ok(())
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn compare_with_prefill(
     name: &str,

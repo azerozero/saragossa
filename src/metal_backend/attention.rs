@@ -3,6 +3,21 @@
 use super::attention_checks::TailMoeSharedShape;
 use super::*;
 
+// Trace locale au thread qui encode : aucun faux positif d'un oracle parallèle.
+#[cfg(test)]
+thread_local! {
+    static LONG_D512_DISPATCHES: std::cell::RefCell<Vec<(usize, usize)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+impl MetalExecutor {
+    pub(crate) fn take_long_d512_dispatches_for_test() -> Vec<(usize, usize)> {
+        LONG_D512_DISPATCHES.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+    }
+}
+
 const FULL_ATTN_PREFILL_TG_WIDTH: u64 = 256;
 const FULL_ATTN_PREFILL_BATCH_LONG_TG_WIDTH: u64 = 32;
 const STEEL_ATTN_BQ: usize = 32;
@@ -1347,6 +1362,18 @@ impl MetalExecutor {
             ),
             MTLSize::new(tg_width, 1, 1),
         );
+        if std::ptr::eq(pipeline, &self.causal_attention_prefill_long_d512_f32) {
+            if crate::runtime_flags::trace_prefill_enabled() {
+                eprintln!(
+                    "prefill dispatch causal_attention_prefill_long_d512_f32 seq={} head_dim={}",
+                    spec.seq, spec.head_dim
+                );
+            }
+            #[cfg(test)]
+            LONG_D512_DISPATCHES.with(|trace| {
+                trace.borrow_mut().push((spec.seq, spec.head_dim));
+            });
+        }
         post_dispatch_barrier(encoder);
         Ok(())
     }

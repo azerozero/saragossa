@@ -178,15 +178,14 @@ fn prefill_comparison(tokens: usize) -> Result<(Vec<usize>, Vec<usize>)> {
     Ok((reference, actual))
 }
 
-// Décision du 2026-11-14 : remplacer les anciennes identités 1k/4k par
-// DEUX qualifications KL contre la référence externe, sans toucher aux seuils.
-// L'attention du per-op est CPU f32, celle du résident GPU : leurs arrondis
-// valides divergent au token 161 à 1k et 62 à 4k sur q4a8-ls. Le résident
-// passe le KL chat 4bit (ratio KL 0,09, p99 Δp 0,34). L'identité stricte reste
-// exigée pour le decode seul et le prompt français court de
-// qwen_loader::gemma4_tests::gemma4_resident_prefill_tokens_match_per_op.
-// Le corpus court de 45 tokens diverge dès le token 4 sur 200 : comme les
-// A/B longs, il reste un diagnostic, pas un oracle de qualité.
+// Les deux oracles externes ci-dessous ne préremplissent que 88–96 tokens
+// (chunks de 216–224 moins 128 positions notées). Ils couvrent le kernel court,
+// ni mid (>256), ni long d512 (>2048). Les A/B 1k/4k restent des diagnostics
+// greedy sans seuil de qualité. L'oracle long séparé enregistre le per-op f32
+// à ~4100 tokens et compare le résident, avec trace du dispatch long d512 et
+// les mêmes seuils KL/p99/top-1 ; ce n'est pas une référence MLX longue.
+// L'identité stricte reste exigée pour le decode seul et le prompt français
+// court historique (32 tokens générés).
 #[test]
 #[ignore = "oracle 4bit de référence local, lancer sous verrou GPU"]
 fn gemma4_prefill_reference_kld_per_op() -> crate::golden::external::TestResult {
@@ -197,6 +196,13 @@ fn gemma4_prefill_reference_kld_per_op() -> crate::golden::external::TestResult 
 #[ignore = "oracle 4bit de référence local, lancer sous verrou GPU"]
 fn gemma4_prefill_reference_kld_resident() -> crate::golden::external::TestResult {
     crate::golden::kld::compare_gemma4_prefill(true)
+}
+
+#[test]
+#[ignore = "oracle long sur poids réels, borne explicite >4096, lancer sous verrou GPU"]
+fn gemma4_prefill_long_per_op_kld_resident() -> crate::golden::external::TestResult {
+    let (model, prompt) = model_and_prompt(4096)?;
+    crate::golden::kld::compare_gemma4_long_prefill(&model, &prompt)
 }
 
 #[test]
