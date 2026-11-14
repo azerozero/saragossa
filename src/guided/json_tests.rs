@@ -320,3 +320,91 @@ fn assert_eot_masked(constraint: &JsonTokenConstraint) {
         .expect("invariant: état non final contraignable");
     assert!(logits[EOT].is_infinite() && logits[EOT].is_sign_negative());
 }
+
+/// Oracle historique : clone indépendant par candidat, sans préfiltre.
+#[test]
+fn reused_automaton_preserves_every_mask_bit() -> Result<()> {
+    let mut tokens: Vec<Vec<u8>> = (0..=255).map(|byte| vec![byte]).collect();
+    tokens.extend([
+        Vec::new(),
+        b"{}".to_vec(),
+        b"\"x\": [".to_vec(),
+        b"true,".to_vec(),
+        b"null}".to_vec(),
+        b"-1.2e+3}".to_vec(),
+        b"\\uD83D\\uDE00\"}".to_vec(),
+        b"\n{".to_vec(),
+        vec![0xff, b'}'],
+        b"]}}".to_vec(),
+    ]);
+    let slices: Vec<&[u8]> = tokens.iter().map(Vec::as_slice).collect();
+    let catalog = Arc::new(JsonTokenCatalog::from_token_bytes_for_tests(&slices));
+    let eot = tokens.len();
+    for repeat in [false, true] {
+        for document in [
+            br#"{"a":[{"b":true},null,-1.25e+3],"s":"\uD83D\uDE00"}"#.as_slice(),
+            "{\"é\":\"😀\"}\n{}".as_bytes(),
+        ] {
+            let constraint = JsonTokenConstraint::new(catalog.clone(), &[eot], repeat);
+            let mut state = JsonAutomaton::new(repeat);
+            for offset in 0..=document.len() {
+                *constraint.state.lock().expect("invariant: mutex sain") = state.clone();
+                let mut logits: Vec<f32> = (0..=eot + 1)
+                    .map(|i| match i % 5 {
+                        0 => f32::NAN,
+                        1 => f32::NEG_INFINITY,
+                        2 => f32::INFINITY,
+                        3 => -0.0,
+                        _ => 0.0,
+                    })
+                    .collect();
+                let mut expected = logits.clone();
+                let mut allowed = 0;
+                for (token, logit) in expected.iter_mut().enumerate() {
+                    let admissible = if token == eot {
+                        state.is_final()
+                    } else if state.is_final() && !repeat {
+                        false
+                    } else {
+                        tokens.get(token).is_some_and(|bytes| {
+                            !bytes.is_empty() && state.clone().advance_bytes(bytes)
+                        })
+                    };
+                    if admissible {
+                        allowed += 1;
+                    } else {
+                        *logit = f32::NEG_INFINITY;
+                    }
+                }
+                assert_eq!(constraint.mask_logits(&mut logits).is_ok(), allowed > 0);
+                assert_eq!(
+                    logits.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "repeat={repeat}, offset={offset}"
+                );
+                if offset == document.len() || !state.advance_bytes(&document[offset..offset + 1]) {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn clone_from_reuses_nested_stack_after_rejected_candidates() {
+    let mut source = JsonAutomaton::new(false);
+    assert!(source.advance_bytes(br#"{"a":[{"b":["#));
+    let mut scratch = source.clone();
+    scratch.stack.reserve(16);
+    let pointer = scratch.stack.as_ptr();
+    let capacity = scratch.stack.capacity();
+    for candidate in [b"]}]}garbage".as_slice(), b"[[]]", b"null", b"invalid"] {
+        assert_eq!(
+            source.can_accept_bytes(candidate, &mut scratch),
+            source.clone().advance_bytes(candidate)
+        );
+        assert_eq!(scratch.stack.as_ptr(), pointer);
+        assert_eq!(scratch.stack.capacity(), capacity);
+    }
+}

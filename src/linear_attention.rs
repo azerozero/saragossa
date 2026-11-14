@@ -791,25 +791,6 @@ impl LinearAttentionCache {
         self.metal.as_ref()
     }
 
-    /// Copie l'état résident GPU (rollback spéculatif d'une couche isolée).
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si la copie de buffers Metal échoue.
-    #[allow(
-        dead_code,
-        reason = "fallback single-layer conservé pour debug/tests Metal"
-    )]
-    pub(crate) fn snapshot_metal_state(
-        &self,
-        metal: &crate::MetalExecutor,
-    ) -> Result<Option<crate::metal_backend::LinearAttentionMetalState>> {
-        self.metal
-            .as_ref()
-            .map(|state| metal.snapshot_linear_attn_state(state))
-            .transpose()
-    }
-
     /// Restaure l'état résident GPU depuis un snapshot (rollback spéculatif).
     ///
     /// # Errors

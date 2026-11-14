@@ -827,6 +827,7 @@ impl MetalExecutor {
         let na_gemm_skinny_u4 = compile_na("gemm_nax_skinny_u4");
         let na_gemm_skinny_u4_x3 = compile_na("gemm_nax_skinny_u4_x3");
         let na_gemm_skinny_u4_x2 = compile_na("gemm_nax_skinny_u4_x2");
+        #[cfg(test)]
         let na_gemm_coop_qb_grouped = compile_na("gemm_nax_coop_qb_grouped");
         let na_gemm_coop_qb_grouped_gather = compile_na("gemm_nax_coop_qb_grouped_gather");
         let na_gemm_coop_qb_grouped_gate_up_swiglu =
@@ -841,8 +842,6 @@ impl MetalExecutor {
         let na_gemm_coop_qb_grouped_scatter_u4_tiled = compile_na(
             format!("gemm_nax_coop_qb_grouped_scatter_u4_bm{MOE_COOP_TILED_BM}").as_str(),
         );
-        let moe_coop_gather_padded = compile_na("moe_coop_gather_padded");
-        let moe_coop_scatter_padded = compile_na("moe_coop_scatter_padded");
         let moe_g_fill_u32 = compile_na("moe_g_fill_u32");
         let moe_g_histogram = compile_na("moe_g_histogram");
         let moe_g_offsets = compile_na("moe_g_offsets");
@@ -1042,6 +1041,7 @@ impl MetalExecutor {
             na_gemm_skinny_u4_x2,
             na_gemm_coop_qb_tiled_u4_align64,
             na_gemm_coop_qb_tiled_u4_gate_up_swiglu,
+            #[cfg(test)]
             na_gemm_coop_qb_grouped,
             na_gemm_coop_qb_grouped_gather,
             na_gemm_coop_qb_grouped_gate_up_swiglu,
@@ -1050,8 +1050,6 @@ impl MetalExecutor {
             na_gemm_coop_qb_grouped_scatter_u4,
             na_gemm_coop_qb_grouped_gate_up_swiglu_u4_tiled,
             na_gemm_coop_qb_grouped_scatter_u4_tiled,
-            moe_coop_gather_padded,
-            moe_coop_scatter_padded,
             moe_g_fill_u32,
             moe_g_histogram,
             moe_g_offsets,

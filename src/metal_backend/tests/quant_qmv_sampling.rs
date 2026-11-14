@@ -4753,3 +4753,54 @@ fn legacy_public_preset_api_applies_to_executor(
     assert_eq!(before, std::env::vars_os().collect::<Vec<_>>());
     Ok(())
 }
+
+#[test]
+fn readback_logits_reuse_pool_without_aliasing_or_changing_bits() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let arena = crate::decode_resident::DecodeResidentState::new(executor.device.clone())?;
+    let vocab = 257;
+    let linear = Linear::new(
+        Tensor::from_vec(
+            vec![vocab, 2],
+            (0..vocab * 2).map(|i| (i as f32 - 100.0) / 32.0).collect(),
+        )?,
+        None,
+    )?;
+    let weights = executor.resolve_linear_weight_buffers(linear.weight(), "readback_test")?;
+    let project = |input: &BufferRef, output: &BufferRef| -> Result<Vec<f32>> {
+        let command = executor.queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        let len =
+            executor.encode_lm_head_logits_readback_buffers(encoder, input, &weights, 2, output)?;
+        encoder.end_encoding();
+        commit_and_wait(command)?;
+        read_f32_buffer(output, len)
+    };
+    let mut pointer = None;
+    for values in [[1.0, 2.0], [-3.0, 0.5], [0.0, -1.0]] {
+        let input = executor.buffer_from_f32(&values, "readback_input")?;
+        let lease = arena
+            .scratch()
+            .lease(vocab, crate::decode_resident::GpuElement::F32)?;
+        let buffer = lease.tensor().buffer();
+        if let Some(pointer) = pointer {
+            assert_eq!(buffer.contents(), pointer);
+        }
+        pointer = Some(buffer.contents());
+        let overlapping = arena
+            .scratch()
+            .lease(vocab, crate::decode_resident::GpuElement::F32)?;
+        assert_ne!(buffer.contents(), overlapping.tensor().buffer().contents());
+        let fresh = executor.uncached_f32_buffer(vocab, "readback_reference")?;
+        let expected = project(&input, &fresh)?;
+        let actual = project(&input, buffer)?;
+        assert_eq!(
+            actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(crate::argmax(&actual)?, crate::argmax(&expected)?);
+    }
+    Ok(())
+}

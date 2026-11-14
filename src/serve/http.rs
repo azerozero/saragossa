@@ -1622,6 +1622,99 @@ mod tests {
     }
 
     #[test]
+    fn logit_bias_returns_400_before_model_loading() {
+        for streaming in [false, true] {
+            for bias in [
+                serde_json::json!({"42": -100}),
+                serde_json::json!({"42": 0}),
+                serde_json::json!(false),
+            ] {
+                let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+                let mut state = ServeState::new(&args);
+                let body = serde_json::json!({
+                    "model": "modele-inexistant", "messages": [], "max_tokens": 1,
+                    "stream": streaming, "logit_bias": bias
+                })
+                .to_string();
+                let raw = format!(
+                    "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let mut stream = Cursor::new(raw.into_bytes());
+                handle_connection(&mut stream, &mut state, None, far_deadline())
+                    .expect_err("invariant: biais non pris en charge");
+                let response = String::from_utf8(stream.into_inner()).expect("invariant: UTF-8");
+                let start = response
+                    .rfind("HTTP/1.1 400 Bad Request")
+                    .expect("invariant: HTTP 400");
+                assert!(!response[start..].contains("text/event-stream"));
+                let (_, body) = response[start..]
+                    .split_once("\r\n\r\n")
+                    .expect("invariant: corps HTTP");
+                let value: serde_json::Value = serde_json::from_str(body).expect("invariant: JSON");
+                assert_eq!(value["error"]["type"], "invalid_request_error");
+                assert_eq!(value["error"]["param"], "logit_bias");
+                assert!(value["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("logit_bias")));
+            }
+        }
+    }
+
+    #[test]
+    fn neutral_or_anthropic_logit_bias_reaches_model_lookup() {
+        for route in ["/v1/chat/completions", "/v1/messages"] {
+            for streaming in [false, true] {
+                let mut biases = vec![
+                    None,
+                    Some(serde_json::json!(null)),
+                    Some(serde_json::json!({})),
+                ];
+                if route == "/v1/messages" {
+                    biases.extend([
+                        Some(serde_json::json!({"42": -100})),
+                        Some(serde_json::json!(false)),
+                    ]);
+                }
+                for bias in biases {
+                    let args =
+                        ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+                    let mut state = ServeState::new(&args);
+                    let mut body = serde_json::json!({
+                        "model": "modele-inexistant", "messages": [], "max_tokens": 1,
+                        "stream": streaming
+                    });
+                    if let Some(bias) = bias {
+                        body["logit_bias"] = bias;
+                    }
+                    let body = body.to_string();
+                    let raw = format!(
+                        "POST {route} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let mut stream = Cursor::new(raw.into_bytes());
+                    let _ = handle_connection(&mut stream, &mut state, None, far_deadline());
+                    let response =
+                        String::from_utf8(stream.into_inner()).expect("invariant: UTF-8");
+                    let start = response
+                        .rfind("HTTP/1.1 404 Not Found")
+                        .expect("invariant: recherche du modèle atteinte");
+                    let (_, body) = response[start..]
+                        .split_once("\r\n\r\n")
+                        .expect("invariant: corps HTTP");
+                    let value: serde_json::Value =
+                        serde_json::from_str(body).expect("invariant: JSON");
+                    let message = value["error"]["message"]
+                        .as_str()
+                        .expect("invariant: message d'erreur");
+                    assert!(message.contains("modele-inexistant"));
+                    assert!(!message.contains("logit_bias"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn unsupported_sampling_returns_permanent_400() {
         for (field, value) in [
             ("min_p", 0.1),

@@ -75,22 +75,41 @@ pub(super) fn can_use_fast_affine_qmv(
     in_dim: usize,
     weight: &AffineQuantizedTensor,
 ) -> bool {
-    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
-        return false;
-    };
-    fast_affine_qmv_enabled(out_dim) && can_use_fast_affine_qmv_shape(batch, in_dim, weight)
+    can_use_fast_affine_qmv_preferred(batch, in_dim, weight, false)
 }
 
-pub(super) fn can_use_fast_affine_qmv_shape(
+pub(super) fn can_use_fast_affine_qmv_preferred(
     batch: usize,
     in_dim: usize,
     weight: &AffineQuantizedTensor,
+    prefer_fast_affine: bool,
 ) -> bool {
-    batch > 0
-        && weight.bits() == FAST_QMV_BITS
-        && weight.group_size() == FAST_QMV_GROUP_SIZE
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_fast_affine_qmv_buffers(
+        batch,
+        in_dim,
+        out_dim,
+        weight.group_size(),
+        weight.bits(),
+        prefer_fast_affine,
+    ) && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
+}
+
+pub(super) fn can_use_fast_affine_qmv_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+    prefer_fast_affine: bool,
+) -> bool {
+    (fast_affine_qmv_enabled(out_dim) || prefer_fast_affine)
+        && batch > 0
+        && bits == FAST_QMV_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
-        && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
 pub(super) fn can_use_fast_affine_qmv_u5(

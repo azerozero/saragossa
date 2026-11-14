@@ -380,3 +380,48 @@ fn affine_offsets_residual_bit_exact() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn fast_qmv_u4_owned_resident_selection_parity() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    for in_dim in [64, 448, 512, 576, 1024, 2048] {
+        for out_dim in [8, 64, 512, 2048] {
+            let weight = test_affine(out_dim, in_dim, 0.01)?;
+            for batch in [0, 1, 2, 4, 8, 16, 33] {
+                for prefer in [false, true] {
+                    let old_predicate = (fast_affine_qmv_enabled(out_dim) || prefer)
+                        && batch > 0
+                        && in_dim % 512 == 0;
+                    assert_eq!(
+                        can_use_fast_affine_qmv_preferred(batch, in_dim, &weight, prefer),
+                        old_predicate
+                    );
+                    assert_eq!(
+                        executor.select_owned_affine_matmul_kernel(batch, in_dim, &weight, prefer),
+                        executor.select_resident_affine_matmul_kernel(
+                            batch, in_dim, out_dim, 64, 4, prefer
+                        ),
+                        "batch={batch}, in={in_dim}, out={out_dim}, prefer={prefer}"
+                    );
+                }
+            }
+            assert!(!can_use_fast_affine_qmv_preferred(
+                1,
+                in_dim + 512,
+                &weight,
+                true
+            ));
+        }
+    }
+    for bits in [2, 3, 4, 5, 6, 8] {
+        for group_size in [32, 64, 128] {
+            assert_eq!(
+                can_use_fast_affine_qmv_buffers(1, 512, 64, group_size, bits, true),
+                bits == 4 && group_size == 64
+            );
+        }
+    }
+    Ok(())
+}
