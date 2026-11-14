@@ -1,6 +1,112 @@
 # Qualification du prefill Gemma 4
 
-## Décision du 2026-11-14
+## Décision appliquée : résident opt-in, défaut OFF
+
+**Cas (c)** : à 4100 tokens, résident **et** per-op échouent contre MLX f32
+au même garde top-1 : **126/128 contre 127/128 pour MLX bf16**. Leurs KL et
+p99 passent. Les deux chemins passent les trois gardes à 1024 et 2048 tokens.
+Le per-op ne peut donc pas servir d'oracle de vérité pour qualifier le résident.
+Le seuil de bruit court n'est pas applicable à la qualification longue ;
+même avec le bruit recalibré sur le prompt long, le top-1 échoue à 4100.
+Cela ne démontre pas un défaut propre au résident et ne justifie aucun
+relâchement du garde top-1.
+
+`SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4` est désormais **OFF par défaut** ;
+`=1` active explicitement le résident expérimental. La borne arbitraire de
+3000 est remplacée par **4100 uniquement comme plafond d'allocation de cet
+opt-in**, longueur effectivement exécutée. Ce plafond n'est **pas une
+qualification numérique**, ni une garantie sur tous les prompts plus courts.
+La surcharge positive `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS`
+reste disponible ; zéro, valeur invalide ou absente conservent 4100.
+Le refus avant embedding/allocation et la propagation des erreurs après
+admission restent inchangés.
+
+| Tokens chat | Chemin | KL moyen | Ratio KL | p99 Δp | Ratio p99 | same_top | Verdict |
+|---:|---|---:|---:|---:|---:|---:|---|
+| 1024 | per-op | 0.000230716059 | 0.095434 | 0.023367565224 | 0.307056 | 127/128 (99.21875 %) | OK |
+| 1024 | résident | 0.000188774714 | 0.078086 | 0.020021204803 | 0.263084 | 128/128 (100.00000 %) | OK |
+| 2048 | per-op | 0.000970578525 | 0.380340 | 0.054804076179 | 0.560845 | 127/128 (99.21875 %) | OK |
+| 2048 | résident | 0.001238943176 | 0.485504 | 0.055583954085 | 0.568826 | 127/128 (99.21875 %) | OK |
+| 4100 | per-op | 0.000906119148 | 0.299575 | 0.044342982916 | 0.568522 | 126/128 (98.43750 %) | **ÉCHEC top-1** |
+| 4100 | résident | 0.000942595969 | 0.311635 | 0.044431076360 | 0.569652 | 126/128 (98.43750 %) | **ÉCHEC top-1** |
+
+Ratios calculés contre le bruit bf16 **de la même longueur**, limite 1,5.
+Chaque ligne note 128 positions. Le decode per-op est commun aux deux chemins,
+après un prefill forcé sans repli. Le résident à 4100 a produit exactement
+cinq dispatches `(4100, 512)` de `causal_attention_prefill_long_d512_f32` ;
+le per-op n'en produit aucun. Les mismatches à 4100 se trouvent aux positions
+76 et 82 (indices à partir de zéro), dans les deux chemins.
+
+La campagne réelle termine avec **4 succès et 2 échecs numériques conservés**
+(code 101), en 1123,10 s hors capture MLX. Les tests ignorés à 4100 continuent
+donc d'échouer lorsqu'on les lance explicitement ; aucune assertion n'a été
+supprimée et aucun golden n'a été ajusté aux sorties de saragossa.
+
+Après application du défaut OFF et du plafond d'opt-in, `cargo fmt --all --
+--check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo build` et la compilation release des tests passent. Les trois tests
+actifs des références KL, le test du parsing de la borne et les cinq tests
+Python des versions de capture passent également. Ces contrôles ne masquent
+pas les deux échecs numériques ignorés à 4100.
+Sous verrou GPU, les deux tests d'admission à 4100/refus à 4101 avant
+embedding et de propagation des erreurs passent aussi, sans surcharge
+de la borne par l'environnement.
+
+## Référence indépendante longue du 2026-11-14
+
+La comparaison résident/per-op historique ne fait pas du per-op une vérité
+numérique. Ses échecs non monotones ne justifient pas une borne à 3000 tokens.
+La qualification longue utilise désormais **mlx-lm float32 sur les mêmes
+poids q4a8-ls**, avec un bruit bf16 mesuré séparément à chaque longueur.
+
+Le script `tools/goldens/gemma4_long.py` construit trois prompts chat de
+**1024, 2048 et 4100 tokens, enveloppe comprise** : demande d'analyse littéraire
+et préfixes réels, non répétés, de « A Scandal in Bohemia », corpus public
+déjà utilisé par `kld.py`. Il effectue un prefill entier, puis conserve les
+128 premières positions de la continuation greedy f32. MLX bf16, saragossa
+per-op et saragossa résident rejouent exactement cette continuation.
+
+Les métriques sont celles de `src/golden/kld.rs` : normalisation f64, partition
+top-64 de référence + masse restante, KL moyen et p99 des Δp maximaux par
+position (indice 125 sur 128). Le gate reste **KL et p99 <= 1,5 × bruit bf16**,
+avec **same_top >= bf16**, sans relâcher aucun seuil ni remplacer les goldens
+courts. Le dénominateur est le bruit long correspondant, pas le bruit court.
+
+| Tokens chat | KL moyen MLX bf16/f32 | p99 Δp MLX bf16/f32 | same_top bf16 | Limite KL | Limite p99 Δp |
+|---:|---:|---:|---:|---:|---:|
+| 1024 | 0.002417533340 | 0.076102004155 | 125/128 (97.65625 %) | 0.003626300009 | 0.114153006232 |
+| 2048 | 0.002551869460 | 0.097716918224 | 127/128 (99.21875 %) | 0.003827804190 | 0.146575377336 |
+| 4100 | 0.003024680852 | 0.077996916379 | 127/128 (99.21875 %) | 0.004537021278 | 0.116995374569 |
+
+Capture et reproduction indépendante `--verify` exécutées sous verrou GPU,
+propriétaire `g4ref`, priorité 5, sur Apple M5 Max, 128 Gio. Versions vérifiées :
+mlx 0.32.4, mlx-lm 0.32.2, transformers 5.22.2, tokenizers 0.23.3,
+Jinja2 3.1.6 et NumPy 2.5.4. Les trois payloads f32, les tokens, les métriques
+bf16 et la provenance se reproduisent **exactement**.
+
+Le modèle conserve **90 modules 4 bits et 236 modules 8 bits**, poids packés
+uint32 : 13 813 448 704 octets. Les paramètres flottants passent de
+1 578 428 476 octets bf16 à 3 156 856 952 octets f32, soit 15,80 Gio de
+paramètres au total. Logits et caches f32 sont vérifiés pendant l'exécution.
+Le pic MLX mesuré est **25 082 660 676 octets (23,36 Gio)**, sous le plafond
+de 64 Gio et avec un cache allocateur de 2 Gio. Le modèle f32 est libéré avant
+le chargement bf16. Aucune déquantification complète des poids n'est utilisée.
+
+Les couples `.bin`/`.json` `tests/fixtures/goldens/kld/gemma4_long_*` portent
+les SHA256 des poids safetensors, des configurations, du tokenizer et du
+corpus. Rust vérifie les poids en flux avant chaque comparaison. Les six
+tests `golden::kld::external_kld_gemma4_long_*_{per_op,resident}` sont ignorés
+par défaut ; les contrôles de structure et de continuation greedy restent
+actifs sans modèle. Les commandes de capture, de reproduction et de mesure
+sont dans [tools/goldens/README.md](../../tools/goldens/README.md#chat-long-gemma-4-q4a8-ls).
+
+## Historique : décision précédente et oracle interne
+
+**Les sections suivantes décrivent l'état antérieur à la qualification MLX
+longue. Leurs verdicts résident/per-op ne constituent pas un gate externe,
+et la borne empirique de 3000 ne constitue pas une preuve de qualité.**
+
+### Décision précédente du 2026-11-14
 
 Le prefill résident Gemma 4 est **activé par défaut**, sur décision du
 mainteneur. `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0` rétablit le per-op.
@@ -110,7 +216,7 @@ et vérifie aussi le dispatch qui pourrait déclencher ce repli.
 `gemma4_prefill_max_tokens_defaults_and_override` couvre le défaut 3000 et
 le parsing de la surcharge.
 
-## Diagnostic par longueur et par variante
+### Diagnostic historique par longueur et par variante
 
 Mesures sur le snapshot `mlx-community/gemma-4-26b-a4b-it-4bit`
 `efbeee6e582ebfd06abc9d65e90839c4b5d2116b`, sous verrou GPU, le
@@ -198,7 +304,7 @@ Le plafond est donc ramené à 3000, le plus grand point passant mesuré dans
 cette série ; le défaut et le parsing de sa surcharge sont testés. L'oracle
 long reste ignoré avec son échec connu, ainsi que les points courts en échec.
 
-## Validation sous verrou GPU, sans benchmark
+### Validation historique sous verrou GPU, sans benchmark
 
 Après changement du défaut à 3000, un rejeu sans surcharge de borne et avec
 référence recalculée reproduit exactement les métriques du point 3000.

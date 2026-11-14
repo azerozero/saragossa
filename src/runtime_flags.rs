@@ -1555,12 +1555,11 @@ pub(crate) fn override_prefill_resident_gemma4_for_test(
 
 /// Active le prefill résident Gemma 4.
 ///
-/// Défaut ON (décision du 2026-11-14) : l'oracle KL externe qualifie
-/// les prefills courts des deux chemins, avec les mêmes seuils. L'attention
-/// per-op CPU f32 et l'attention résidente GPU ont des arrondis différents :
-/// l'identité greedy
-/// à 1k/4k n'est pas le critère de qualité (voir docs/perf/gemma4-prefill.md).
-/// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0` rétablit le per-op.
+/// Défaut OFF : les deux chemins échouent au garde top-1 contre MLX f32
+/// à 4100 tokens, avec le bruit bf16 mesuré sur le même prompt long.
+/// La calibration courte ne qualifie pas les prompts longs ; le per-op
+/// n'est pas une vérité numérique (voir docs/perf/gemma4-prefill.md).
+/// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=1` active l'expérimentation.
 /// Une erreur d'exécution résidente est propagée, sans repli silencieux.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn prefill_resident_gemma4_enabled() -> bool {
@@ -1569,12 +1568,13 @@ pub(super) fn prefill_resident_gemma4_enabled() -> bool {
         return forced;
     }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", false))
 }
 
 /// Longueur maximale du prefill résident Gemma 4, enveloppe chat comprise.
-/// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS` vaut 3000 par défaut.
-/// Ce plafond d'admission ne qualifie pas tous les prompts plus courts : voir
+/// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS` vaut 4100 par défaut.
+/// Ce plafond borne les allocations de l'opt-in à la longueur expérimentée,
+/// sans qualification numérique de cette plage : voir
 /// `docs/perf/gemma4-prefill.md`. Zéro, valeur invalide ou absente gardent
 /// cette borne ; une valeur positive la remplace explicitement.
 /// Au-delà, le résident est inéligible AVANT embedding/allocation : `Ok(None)`
@@ -1596,7 +1596,7 @@ fn parse_gemma4_prefill_max_tokens(value: Option<&str>) -> usize {
     value
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&max| max > 0)
-        .unwrap_or(3000)
+        .unwrap_or(4100)
 }
 
 /// Active le tail MLP dense du prefill résident (27B hybride `qwen3_5`).
@@ -2381,7 +2381,7 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn gemma4_prefill_max_tokens_defaults_and_override() {
         for value in [None, Some(""), Some("0"), Some("-1"), Some("invalid")] {
-            assert_eq!(super::parse_gemma4_prefill_max_tokens(value), 3000);
+            assert_eq!(super::parse_gemma4_prefill_max_tokens(value), 4100);
         }
         assert_eq!(super::parse_gemma4_prefill_max_tokens(Some(" 4109 ")), 4109);
         assert_eq!(super::parse_gemma4_prefill_max_tokens(Some("256")), 256);
