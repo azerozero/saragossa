@@ -545,6 +545,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nucleus_prefix_stops_at_exact_top_p() {
+        // Fractions binaires exactes : aucun arrondi softmax ne masque l'égalité.
+        let ranked = [(3, 0.5_f32), (1, 0.25), (0, 0.125), (2, 0.125)];
+        // Exercer le tri direct et la sélection partielle (au-delà de 256).
+        for len in [4, 300] {
+            let mut probs = vec![0.0_f32; len];
+            probs[..4].copy_from_slice(&[0.125, 0.25, 0.125, 0.5]);
+            for (top_p, kept) in [(0.5_f32, 1), (0.75, 2), (0.875, 3)] {
+                let expected = &ranked[..kept];
+                assert_eq!(expected.iter().map(|(_, prob)| *prob).sum::<f32>(), top_p);
+                let got = nucleus_prefix(probs.iter().copied().enumerate().collect(), top_p);
+                // Inclut le token qui atteint le seuil et exclut son successeur.
+                assert_eq!(got, expected, "len={len} top_p={top_p}");
+            }
+        }
+    }
+
+    #[test]
     fn nucleus_prefix_matches_full_sort() {
         // Oracle : l'ancien chemin, tri stable complet puis cumul.
         fn reference(probs: &[f32], top_p: f32) -> TokenDistribution {
