@@ -208,25 +208,9 @@ pub fn token_distribution_top_k_top_p(
             indexed_probs.retain(|(_, prob)| *prob > 0.0);
             return normalize_distribution(indexed_probs, logits);
         }
-        indexed_probs.sort_by(|(_, left), (_, right)| right.total_cmp(left));
-        let mut nucleus = Vec::new();
-        let mut cumulative = 0.0_f32;
-        for item in indexed_probs {
-            cumulative += item.1;
-            nucleus.push(item);
-            if cumulative >= top_p {
-                break;
-            }
-        }
-        return normalize_distribution(nucleus, logits);
+        return normalize_distribution(nucleus_prefix(indexed_probs, top_p), logits);
     }
 
-    // Ordre total (probabilité décroissante, puis indice) : les `top_k` premiers
-    // sont uniques, donc la sélection partielle puis le tri des seuls élus rend
-    // exactement le tri complet tronqué, en O(V + k log k) au lieu de O(V log V).
-    let by_rank = |(left_idx, left): &(usize, f32), (right_idx, right): &(usize, f32)| {
-        right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
-    };
     indexed_probs.select_nth_unstable_by(top_k - 1, by_rank);
     indexed_probs.truncate(top_k);
     indexed_probs.sort_by(by_rank);
@@ -448,6 +432,45 @@ pub fn lossless_speculative_sample_dense(
     })
 }
 
+/// Ordre total (probabilité décroissante, puis indice) : identique au tri
+/// stable par probabilité décroissante de la distribution énumérée, et sans
+/// ex aequo, donc une sélection partielle en rend exactement le préfixe.
+fn by_rank(
+    (left_idx, left): &(usize, f32),
+    (right_idx, right): &(usize, f32),
+) -> std::cmp::Ordering {
+    right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
+}
+
+/// Préfixe nucleus du tri complet par [`by_rank`], cumul compris : même
+/// résultat bit à bit que trier tout le vocabulaire puis tronquer, mais les
+/// `k` premiers seuls sont triés, `k` quadruplant tant que leur masse
+/// n'atteint pas `top_p`. Sur 248k tokens, le noyau tient presque toujours
+/// dans les 256 premiers : O(V) au lieu de O(V log V) par token.
+fn nucleus_prefix(mut indexed_probs: TokenDistribution, top_p: f32) -> TokenDistribution {
+    let len = indexed_probs.len();
+    let mut k = len.min(256);
+    loop {
+        if k < len {
+            indexed_probs.select_nth_unstable_by(k - 1, by_rank);
+        }
+        let head = &mut indexed_probs[..k];
+        head.sort_by(by_rank);
+        let mut cumulative = 0.0_f32;
+        for (rank, (_, prob)) in head.iter().enumerate() {
+            cumulative += prob;
+            if cumulative >= top_p {
+                indexed_probs.truncate(rank + 1);
+                return indexed_probs;
+            }
+        }
+        if k == len {
+            return indexed_probs;
+        }
+        k = len.min(k.saturating_mul(4));
+    }
+}
+
 fn normalize_distribution(
     mut distribution: TokenDistribution,
     fallback_logits: &[f32],
@@ -520,6 +543,65 @@ fn residual_distribution(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nucleus_prefix_stops_at_exact_top_p() {
+        // Fractions binaires exactes : aucun arrondi softmax ne masque l'égalité.
+        let ranked = [(3, 0.5_f32), (1, 0.25), (0, 0.125), (2, 0.125)];
+        // Exercer le tri direct et la sélection partielle (au-delà de 256).
+        for len in [4, 300] {
+            let mut probs = vec![0.0_f32; len];
+            probs[..4].copy_from_slice(&[0.125, 0.25, 0.125, 0.5]);
+            for (top_p, kept) in [(0.5_f32, 1), (0.75, 2), (0.875, 3)] {
+                let expected = &ranked[..kept];
+                assert_eq!(expected.iter().map(|(_, prob)| *prob).sum::<f32>(), top_p);
+                let got = nucleus_prefix(probs.iter().copied().enumerate().collect(), top_p);
+                // Inclut le token qui atteint le seuil et exclut son successeur.
+                assert_eq!(got, expected, "len={len} top_p={top_p}");
+            }
+        }
+    }
+
+    #[test]
+    fn nucleus_prefix_matches_full_sort() {
+        // Oracle : l'ancien chemin, tri stable complet puis cumul.
+        fn reference(probs: &[f32], top_p: f32) -> TokenDistribution {
+            let mut indexed: TokenDistribution = probs.iter().copied().enumerate().collect();
+            indexed.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+            let mut nucleus = Vec::new();
+            let mut cumulative = 0.0_f32;
+            for item in indexed {
+                cumulative += item.1;
+                nucleus.push(item);
+                if cumulative >= top_p {
+                    break;
+                }
+            }
+            nucleus
+        }
+        let mut state = 0x9e37_79b9_u32;
+        for &len in &[1_usize, 7, 256, 257, 1024, 5000, 70_000] {
+            for &temperature in &[0.05_f32, 0.7, 5.0, 1000.0] {
+                // Logits quantifiés : nombreux ex aequo, noyaux courts et longs.
+                let logits: Vec<f32> = (0..len)
+                    .map(|_| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        f32::from((state >> 24) as u8) / 16.0
+                    })
+                    .collect();
+                let probs = softmax(&logits, temperature);
+                for &top_p in &[0.01_f32, 0.5, 0.9, 0.999, 1.0 - f32::EPSILON] {
+                    let got = nucleus_prefix(probs.iter().copied().enumerate().collect(), top_p);
+                    let want = reference(&probs, top_p);
+                    assert_eq!(got.len(), want.len(), "len={len} t={temperature} p={top_p}");
+                    for (g, w) in got.iter().zip(&want) {
+                        assert_eq!(g.0, w.0);
+                        assert_eq!(g.1.to_bits(), w.1.to_bits());
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn top_k_partial_selection_matches_full_sort() {
