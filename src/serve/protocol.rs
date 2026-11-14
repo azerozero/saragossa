@@ -72,6 +72,9 @@ pub(super) struct ChatCompletionRequest {
     /// Filtre min-p : non implémenté, seule la valeur neutre 0 est admise.
     #[serde(default)]
     pub(super) min_p: Option<f32>,
+    /// Biais de logits non implémenté : toute valeur non nulle est refusée.
+    #[serde(default)]
+    pub(super) logit_bias: Option<Value>,
     /// Pénalité de présence OpenAI : non implémentée, neutre 0 seulement.
     #[serde(default)]
     pub(super) presence_penalty: Option<f32>,
@@ -166,6 +169,12 @@ impl ChatCompletionRequest {
     /// budget plafonné, format de sortie et stop sequences bornées. Rend le
     /// budget effectif.
     pub(super) fn validate(&self, max_tokens_cap: usize) -> ServeResult<usize> {
+        if self.logit_bias.is_some() {
+            return Err(ServeError::InvalidParameter {
+                param: "logit_bias",
+                message: "le biais de logits n'est pas implémenté",
+            });
+        }
         if self.n.is_some_and(|n| n != 1) {
             return Err(ServeError::InvalidParameter {
                 param: "n",
@@ -1193,5 +1202,20 @@ mod tests {
         assert!(value["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("max_tokens")));
+    }
+}
+
+#[cfg(test)]
+mod logit_bias_tests {
+    use super::*;
+
+    #[test]
+    fn omitted_or_null_logit_bias_preserves_validation() {
+        for suffix in ["", ", \"logit_bias\":null"] {
+            let body = format!(r#"{{"model":"m", "messages":[], "max_tokens":1{suffix}}}"#);
+            let request =
+                ChatCompletionRequest::parse(body.as_bytes()).expect("invariant: JSON valide");
+            assert_eq!(request.validate(1).expect("invariant: sans biais"), 1);
+        }
     }
 }

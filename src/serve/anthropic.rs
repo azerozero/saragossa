@@ -28,6 +28,7 @@ pub(super) fn handle_anthropic_messages<S: Write>(
     body: &[u8],
 ) -> ServeResult<()> {
     let (chat, session_key, stream_enabled) = anthropic_chat(body, session_header)?;
+    chat.validate(state.max_tokens_cap())?;
     let parser = state.output_parser(&chat)?;
     if stream_enabled {
         send_anthropic_sse_streaming(stream, state, chat, session_key.as_deref(), parser)
@@ -157,6 +158,8 @@ struct AnthropicMessagesRequest {
     #[serde(default)]
     top_p: Option<f32>,
     #[serde(default)]
+    logit_bias: Option<Value>,
+    #[serde(default)]
     stop_sequences: Vec<String>,
     #[serde(default)]
     tools: Vec<Value>,
@@ -221,6 +224,7 @@ impl AnthropicMessagesRequest {
             chat_template_kwargs: None,
             stream_options: None,
             min_p: None,
+            logit_bias: self.logit_bias.clone(),
             presence_penalty: None,
             frequency_penalty: None,
             repetition_penalty: None,
