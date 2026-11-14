@@ -771,6 +771,16 @@ impl MetalExecutor {
     ) -> Result<()> {
         // PREFILL : GEMM bf16 sur Neural Accelerators (matmul2d). Dé-quant
         // u8→bf16 transposée du poids + activations bf16 → tensor-cores.
+        // Le sélecteur replie sur qmv. Refuser aussi un appel forcé avant allocation.
+        if !qmm_na_dequant_fits(
+            in_dim,
+            out_dim,
+            crate::runtime_flags::qmm_na_dequant_max_bytes(),
+        ) {
+            return Err(InferError::Config(
+                "qmm na: plafond de déquantification bf16 dépassé".into(),
+            ));
+        }
         trace_dispatch_path("qmm_na", batch, out_dim, in_dim);
         let wt_bf16 =
             self.private_bf16_buffer(checked_len(in_dim, out_dim, "qmm na wt")?, "qmm_na_wt_bf16")?;

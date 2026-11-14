@@ -359,6 +359,14 @@ variables — see [`src/runtime_flags.rs`](src/runtime_flags.rs) for the exact
 names and defaults (block size, LRU capacity, pool size, host headroom, static
 memory cap, …).
 
+The NA matmul path that materializes a full bf16 weight is limited to
+512 MiB per weight by `SARAGOSSA_RUST_QMM_NA_DEQUANT_MAX_BYTES` (bytes).
+Above the limit, selection falls back to qmv before allocating the scratch.
+Set it to `0` to disable this dequantization path; an absent or invalid value
+uses the default. Fused NA kernels do not materialize that weight and keep
+their existing selection rules. This currently applies to `QmmNaU8`; u5/u6
+have no full-weight NA dequantization path in this revision.
+
 ## Features
 
 | Feature | Default | Purpose |

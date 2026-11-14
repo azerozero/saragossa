@@ -242,3 +242,34 @@ fn moe_coop_rejects_unaligned_projection_shapes() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn qmm_na_dequant_budget_preserves_qmv_fallback() -> Result<()> {
+    const CHILD: &str = "SARAGOSSA_TEST_DEQUANT_BUDGET";
+    if let Ok(cap) = std::env::var(CHILD) {
+        let cap: usize = cap.parse().expect("test cap");
+        let weight = test_affine_varied_u8_group(64, 512, 64)?;
+        assert_eq!(can_use_qmm_na_u8(32, 512, &weight), cap >= 65536);
+        if let Some(executor) = test_executor()? {
+            if executor.na_gemm_bf16.is_some() {
+                assert_eq!(executor.select_owned_affine_matmul_kernel(32, 512, &weight, false),
+                    if cap >= 65536 { AffineMatmulKernel::QmmNaU8 } else { AffineMatmulKernel::FastQmvU8 });
+            }
+        }
+        return Ok(());
+    }
+    // Processus séparés : aucune mutation concurrente de l'environnement ou OnceLock.
+    for cap in [0, 65535, 65536, 65537] {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "metal_backend::tests::qmm_na_dequant_budget_preserves_qmv_fallback", "--nocapture"])
+            .env(CHILD, cap.to_string())
+            .env("SARAGOSSA_RUST_QMM_NA_DEQUANT_MAX_BYTES", cap.to_string())
+            .env("SARAGOSSA_RUST_QMM_NA", "1")
+            .env("SARAGOSSA_RUST_QMM_NA_MIN_BATCH", "32")
+            .env("SARAGOSSA_RUST_QMM_NA_FUSED_TILED", "0")
+            .env("SARAGOSSA_RUST_QMV_FAST", "1")
+            .output().expect("run budget regression");
+        assert!(output.status.success(), "cap={cap}: {}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(())
+}
