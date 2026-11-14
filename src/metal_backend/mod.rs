@@ -643,11 +643,7 @@ impl MetalMoeSharedWeights {
     /// retomber sur le chemin générique quand c'est faux. Le shared passe déjà par
     /// le matmul générique (toute quantification), donc seuls les experts comptent.
     pub(crate) fn coop_compatible(&self) -> bool {
-        let bits = self.stacked.gate.bits;
-        let ok = |b: &StackedAffineBuffers| b.bits == bits && b.group_size == 64;
-        let quant_ok = bits == 8
-            || (bits == FAST_QMV_BITS && moe_coop_u4_enabled() && moe_coop_fused_swiglu_enabled());
-        ok(&self.stacked.gate) && ok(&self.stacked.up) && ok(&self.stacked.down) && quant_ok
+        MetalMoeRoutedWeights::stacked_coop_compatible(&self.stacked)
     }
 }
 
@@ -667,7 +663,15 @@ impl MetalMoeRoutedWeights {
     pub(crate) fn stacked_coop_compatible(stacked: &StackedMoeBuffers) -> bool {
         let bits = stacked.gate.bits;
         let ok = |b: &StackedAffineBuffers| {
-            b.bits == bits && b.group_size == 64 && b.in_dim % b.group_size == 0
+            // Les chargeurs ne masquent ni les groupes quantifiés (64), ni
+            // les fragments K (16), ni les colonnes de sortie N (32).
+            b.bits == bits
+                && b.group_size == 64
+                && b.in_dim > 0
+                && b.out_dim > 0
+                && b.in_dim % 64 == 0
+                && b.in_dim % 16 == 0
+                && b.out_dim % 32 == 0
         };
         let dims_ok = stacked.gate.experts == stacked.up.experts
             && stacked.gate.experts == stacked.down.experts

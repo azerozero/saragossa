@@ -194,3 +194,51 @@ fn coop_qb_u8_gs64_masks_partial_m_tiles() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn moe_coop_rejects_unaligned_projection_shapes() -> Result<()> {
+    let Some(executor) = test_executor()? else { return Ok(()); };
+    // Métadonnées seules : aucune projection n'est encodée avec ces buffers.
+    let buffer = executor.uncached_u32_buffer(1, "coop_shape_metadata")?;
+    let projection = |n, k| StackedAffineBuffers {
+        packed: buffer.clone(), packed_offset: 0,
+        scales: buffer.clone(), scales_offset: 0,
+        biases: buffer.clone(), biases_offset: 0,
+        experts: 2, out_dim: n, in_dim: k, packed_cols: k / 4,
+        group_size: 64, bits: 8, groups: k / 64,
+    };
+    let dense = MetalLinearWeightBuffers::Dense {
+        rhs: buffer.clone(), rhs_bf16: None, out_dim: 1, in_dim: 1,
+    };
+    let check = |stacked: StackedMoeBuffers, expected| {
+        let shared = MetalMoeSharedWeights {
+            router: dense.clone(), stacked: stacked.clone(),
+            shared_gate: dense.clone(), shared_gate_proj: dense.clone(),
+            shared_up_proj: dense.clone(), shared_down_proj: dense.clone(),
+        };
+        assert_eq!(shared.coop_compatible(), expected, "shared: formes incompatibles");
+        assert_eq!(MetalMoeRoutedWeights::stacked_coop_compatible(&stacked), expected, "routed: formes incompatibles");
+    };
+    let valid = StackedMoeBuffers {
+        gate: projection(128, 256), up: projection(128, 256), down: projection(256, 128),
+    };
+    check(valid.clone(), true);
+    for which in 0..3 {
+        for (n, k) in [(127, 256), (128, 255), (128, 240), (128, 224), (0, 256), (128, 0)] {
+            let mut stacked = valid.clone();
+            let target = match which { 0 => &mut stacked.gate, 1 => &mut stacked.up, _ => &mut stacked.down };
+            *target = projection(n, k);
+            check(stacked, false);
+        }
+    }
+    // Une dimension de sortie non alignée reste interdite même si K est valide.
+    let mut stacked = valid.clone();
+    stacked.down.out_dim = 257;
+    check(stacked, false);
+    for (hidden, inter) in [(2048, 512), (2048, 768), (2816, 704)] {
+        check(StackedMoeBuffers {
+            gate: projection(inter, hidden), up: projection(inter, hidden), down: projection(hidden, inter),
+        }, true);
+    }
+    Ok(())
+}
