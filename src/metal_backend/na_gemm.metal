@@ -598,6 +598,55 @@ kernel void gemm_nax_coop_qb_tiled_u4_x3(device const float* A [[buffer(0)]],
   NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
   NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
 }
+// GEMM NA à poids bf16 denses B[N,K] (modèles BF16 non quantifiés), même
+// tuilage 64×64×64 que `gemm_nax_coop_qb_tiled_u4_x3`. A f32 est scindé en
+// hi + lo bf16 et chaque pas fait hi·B + lo·B : le poids est exact en bf16,
+// seule l'activation perd sa mantisse, ramenée vers 2⁻¹⁶ comme le qmv f32
+// qu'il remplace en prefill. Exige K%64=0 et N%64=0.
+kernel void gemm_nax_bf16_nt_tiled_x2(device const float* A  [[buffer(0)]],
+                                      device const bfloat* B [[buffer(1)]],
+                                      device float* C        [[buffer(2)]],
+                                      constant uint3& mnk    [[buffer(3)]],
+                                      uint2 tgid [[threadgroup_position_in_grid]],
+                                      uint lid [[thread_index_in_threadgroup]],
+                                      uint sgid [[simdgroup_index_in_threadgroup]]) {
+  uint M = mnk.x, K = mnk.z;
+  constexpr uint BN = 64, BK = 64, BKP = BK + 8, WN = 2;
+  threadgroup metal::vec<bfloat,8> Ws8[BN * BKP / 8];
+  threadgroup bfloat* Ws = (threadgroup bfloat*)Ws8;
+  uint sg_m = sgid / WN;
+  uint sg_n = sgid - sg_m * WN;
+  uint m0 = tgid.x * 64u + sg_m * 32u;
+  uint n0 = tgid.y * BN;
+  uint ns = sg_n * 32u;
+  metal::vec<float,8> c0a = float(0), c0b = float(0), c1a = float(0), c1b = float(0);
+  for (uint k = 0; k < K; k += BK) {
+    // 64 lignes × 8 vecteurs de 8 bf16 = 512 vecteurs pour 128 threads.
+    for (uint idx = lid; idx < BN * (BK / 8u); idx += 128u) {
+      uint nl = idx >> 3u, kv = idx & 7u;
+      Ws8[nl * (BKP / 8u) + kv] =
+          *((const device metal::vec<bfloat,8>*)(B + (n0 + nl) * K + k) + kv);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kk = 0; kk < BK; kk += 16u) {
+      metal::vec<bfloat,8> a0h, a0l, a1h, a1l, b0, b1;
+      NaxFrag::load_a_f32_masked<true>(a0h, a0l, A, m0, k + kk, K, M);
+      NaxFrag::load_a_f32_masked<true>(a1h, a1l, A, m0 + 16u, k + kk, K, M);
+      NaxFrag::load_a_tg(b0, Ws + ns * BKP + kk, int(BKP));
+      NaxFrag::load_a_tg(b1, Ws + (ns + 16u) * BKP + kk, int(BKP));
+      NaxFrag::mma(c0a, c0b, a0h, b0, b1);
+      NaxFrag::mma(c0a, c0b, a0l, b0, b1);
+      NaxFrag::mma(c1a, c1b, a1h, b0, b1);
+      NaxFrag::mma(c1a, c1b, a1l, b0, b1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  uint N = mnk.y;
+  NaxFrag::store_c_masked(c0a, C, m0, n0 + ns, N, M);
+  NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
+  NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
+  NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+}
 // MLP dense fusionné gate+up+SwiGLU (prefill) : mêmes tuiles 64×64×64 et
 // fragments que `gemm_nax_coop_qb_tiled_u4`, deux tuiles B (gate, up) par pas
 // de K, SwiGLU en f32 sur les accumulateurs et sortie H bf16 [M, N] prête pour

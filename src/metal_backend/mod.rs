@@ -435,6 +435,9 @@ pub struct MetalExecutor {
     /// GEMM tuilé u4 bf16×3 à lhs f32, réservé aux projections sous le
     /// plancher par défaut (petites formes de flint).
     na_gemm_coop_qb_tiled_u4_x3: Option<ComputePipelineState>,
+    /// GEMM tuilé à poids bf16 denses `[N,K]` et lhs f32 scindé hi + lo,
+    /// pour le prefill des modèles BF16.
+    na_gemm_bf16_nt_tiled_x2: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_align64: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_gate_up_swiglu: Option<ComputePipelineState>,
     #[cfg(test)]
