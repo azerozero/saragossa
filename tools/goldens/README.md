@@ -236,7 +236,7 @@ restent des échecs. Une amélioration du nombre de mismatches est acceptée.
 ## KL sur corpus
 
 Protocole inspiré de `llama-perplexity --kl-divergence` et du test par ratio
-du guide de précision vLLM d'AWS Neuron. `kld.py` note 2 048 positions :
+du guide de précision vLLM d'AWS Neuron. Hors Gemma 4 (voir plus bas), `kld.py` note 2 048 positions :
 8 morceaux de 512 tokens de `kld/corpus.txt`, un extrait du domaine public
 (Project Gutenberg n°1661, « A Scandal in Bohemia »), dont les 256 dernières
 positions de chaque morceau sont notées. La référence est mlx-lm float32 ;
@@ -264,10 +264,14 @@ bouclent, alors que le chat répond juste. Arbitré contre les poids Google bf16
 dans transformers 5.22.2 : perplexité d'environ 10⁵ sur le même corpus, sur
 CPU comme sur MPS, et « The capital of France is » → « a bit is a bit is… » ;
 le chat répond « Paris ». C'est donc le modèle instruct qui ne prédit pas le
-texte brut, pas un bug commun à mlx-lm et saragossa. L'oracle Gemma 4 sur ce
-corpus vérifie l'accord avec mlx-lm, pas la qualité ; la perte de
-quantification se mesure en régime chat (tools/quant/README.md, section
-Gemma 4).
+texte brut, pas un bug commun à mlx-lm et saragossa.
+
+**Gemma 4 en régime chat (14 nov. 2026).** L'oracle Gemma 4 n'utilise donc plus
+le corpus : ses morceaux sont les 8 prompts de `tools/quant/chat_kl.py` suivis
+de la réponse greedy (192 tokens au plus) de la référence float32, dont les 128
+derniers tokens sont notés, soit 1 024 positions. mlx-lm bf16 y suit le float32
+sur 98,8 % des top-1 (80 % sur le corpus). La perte de quantification contre
+les poids Google se mesure à part (tools/quant/README.md, section Gemma 4).
 
 Mesure du 13 nov. 2026 (M5 Max) :
 
@@ -276,7 +280,7 @@ Mesure du 13 nov. 2026 (M5 Max) :
 | qwen38 (u4ls) | 99,95 % | 98,88 % | 0,000044 | 0,0016 | 0,03 | 0,18 |
 | gemma3 | 100 % | 97,85 % | 0,0000077 | 0,0016 | 0,005 | 0,08 |
 | qwen36_moe | 98,19 % | 97,71 % | 0,010 | 0,022 | 0,45 | 0,76 |
-| gemma4 | 85,84 % | 80,03 % | 0,23 | 0,43 | 0,52 | 0,88 |
+| gemma4 (chat, 14 nov.) | 99,61 % | 98,83 % | 0,00015 | 0,0014 | 0,11 | 0,36 |
 
 ```sh
 SARAGOSSA_GOLDEN_CAPTURE=1 python -I tools/goldens/kld.py --model qwen38

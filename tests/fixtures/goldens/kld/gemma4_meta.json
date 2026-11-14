@@ -1,7 +1,7 @@
 {
   "dtype": "utf8",
   "shape": [
-    20950
+    9529
   ],
   "source": {
     "model": "mlx-community/gemma-4-26b-a4b-it-4bit",
@@ -25,6 +25,6 @@
   },
   "tolerance": "ratio au bruit mlx bf16 / f32, voir README",
   "mlx_sha": "not-applicable",
-  "captured": "2026-11-13",
-  "payload_sha256": "c28ab91594823fb75af139691b897ded108d3f7801d34aa364c5bee4d7195d4d"
+  "captured": "2026-11-14",
+  "payload_sha256": "0383f5d2a5118a08747fffa134dd89257284696f00906b7cde7367380977a65c"
 }

@@ -172,7 +172,7 @@ python -I tools/e2e/run.py --target qwen38 --modes ar,mtp,dflash --list
 | même endpoint | `max_tokens`, `stop`, `seed_temperature_zero` | usage entier cohérent, budget, finish_reason=length ; stop issu d'une réponse de référence et retiré ; deux réponses et usages identiques à seed=42/température 0 |
 | même endpoint | `stream`, `stream_usage` | SSE UTF-8, chunks JSON, id/created stables, delta.role initial, contenu, finish_reason final, `[DONE]` unique/final ; usage final et choices vide si demandé |
 | même endpoint | `n_rejected` | n=2 doit échouer HTTP 400 avec erreur explicite ; acceptation silencieuse = ÉCHEC |
-| même endpoint | `json_object`, `json_schema` | objet JSON parsable avec greeting ; json_schema HTTP 501 avec erreur explicite |
+| même endpoint | `json_object`, `json_schema` | objet JSON parsable (contenu libre, comme chez OpenAI) ; json_schema HTTP 501 avec erreur explicite |
 | même endpoint | `tools_auto`, `tools_none`, `tools_required`, `tools_named` | sélection selon capacité ; required/nommé doivent être refusés sur flint |
 | même endpoint | `tools_roundtrip`, `tools_stream` | id unique, type=function, nom, arguments JSON/Paris ; résultat corrélé par tool_call_id, réponse contenant 17 ; assemblage des fragments indexés |
 | `/v1/messages` | `simple`, `system`, `multi_turn`, `max_tokens`, `stop_sequences` | type=message, rôle, modèle, blocs, input/output_tokens, stop_reason, stop_sequence corrélée ; mêmes contrôles de contenu |
@@ -247,12 +247,11 @@ le code prouve ce blocage, mais la prochaine campagne devra confirmer le message
 effectif du binaire utilisé. Les assertions d'enveloppe et de stabilité SSE sont
 couvertes par des fixtures négatives locales et ne sont pas assouplies.
 
-L'échec Gemma3 `json_object` (« objet JSON/contenu attendu ») ne prouve pas un bug
-du protocole : `json.loads` a réussi avant cette assertion. Le test vérifie aussi
-`greeting == "Bonjour"`, alors que `json_object` impose une forme JSON, pas ce
-contenu (`src/serve/state.rs:1389`). La réponse n'étant pas enregistrée, cet échec
-reste un échec de contenu à examiner lors de la relance, sans classement comme
-défaut serveur confirmé.
+L'échec Gemma3 `json_object` (« objet JSON/contenu attendu ») venait du
+contenu : le 4B répondait `{}`, objet JSON valide. `json_object` impose une forme
+JSON, pas un contenu (grammaire `src/guided/json.rs`), donc le test ne vérifie plus
+que la forme. Le contenu imposé relèvera de `json_schema`, encore refusé en
+HTTP 501.
 
 ## Rapports et codes de sortie
 

@@ -1,7 +1,7 @@
 {
   "dtype": "f32",
   "shape": [
-    2048,
+    1024,
     2,
     64
   ],
@@ -27,7 +27,7 @@
   },
   "tolerance": "ratio au bruit mlx bf16 / f32, voir README",
   "mlx_sha": "not-applicable",
-  "captured": "2026-11-13",
-  "payload_sha256": "810573e9af00afa5228b7ac31d7dd3e86603225aaedb5ebe345aa564bbaef61f",
+  "captured": "2026-11-14",
+  "payload_sha256": "d014ce0fe5b3cd34df3018e4d7ad43961c83c1fe4b7009bb5c1ea9b025764ba4",
   "layout": "par position : K ids (entiers exacts en f32) puis K logprobs float32"
 }
