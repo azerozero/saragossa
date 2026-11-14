@@ -2370,6 +2370,70 @@ fn resident_test_model() -> Option<CausalDecoder> {
     }
 }
 
+/// Le cap du modèle doit atteindre le sampler non résident partagé avec MTP.
+/// Le greedy conserve son argmax et n'avance pas le RNG.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn softcap_sampling_decoder_routes_and_greedy() -> Result<()> {
+    let Some(mut model) = resident_test_model() else {
+        return Ok(());
+    };
+    model.config.final_logit_softcapping = Some(30.0);
+    model.lm_head = Linear::new(
+        Tensor::from_vec(
+            vec![3, 4],
+            vec![
+                45.0, 0.0, 0.0, 0.0, 38.0, 0.0, 0.0, 0.0, 31.0, 0.0, 0.0, 0.0,
+            ],
+        )?,
+        None,
+    )?;
+    let state = Tensor::row(vec![1.0, 0.0, 0.0, 0.0])?;
+    let logits = model.logits_from_final_state(&state)?;
+    let options = GenerationOptions {
+        temperature: 2.5,
+        top_k: 2,
+        top_p: 0.9,
+        ..GenerationOptions::default()
+    };
+    let mut differences = 0;
+    for seed in 0..128 {
+        let mut cpu_rng = DeterministicSampler::new(seed);
+        let expected = sample_token_top_k_top_p(
+            logits.as_row()?,
+            options.temperature,
+            options.top_p,
+            options.top_k,
+            &mut cpu_rng,
+        )?;
+        let raw = sample_token_top_k_top_p(
+            &[45.0, 38.0, 31.0],
+            options.temperature,
+            options.top_p,
+            options.top_k,
+            &mut DeterministicSampler::new(seed),
+        )?;
+        differences += usize::from(raw != expected);
+        let mut rng = DeterministicSampler::new(seed);
+        assert_eq!(
+            model.sample_token_from_state(&state, &options, &mut rng)?,
+            expected
+        );
+        assert_eq!(rng.state(), cpu_rng.state());
+    }
+    assert!(differences > 10, "l'oracle doit détecter l'absence de cap");
+    for cap in [None, Some(30.0)] {
+        model.config.final_logit_softcapping = cap;
+        let mut rng = DeterministicSampler::new(123);
+        assert_eq!(
+            model.sample_token_from_state(&state, &GenerationOptions::default(), &mut rng)?,
+            0
+        );
+        assert_eq!(rng.state(), 123);
+    }
+    Ok(())
+}
+
 /// Décode `n` tokens en greedy T=0, chemin résident forcé (`resident`) ou CPU.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn greedy_resident_ab(

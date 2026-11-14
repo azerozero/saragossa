@@ -1822,6 +1822,8 @@ impl FullAttentionMetalState {
                 )));
             }
         };
+        let threads = if use_flash { 1024 } else { 256 };
+        crate::metal_backend::check_threadgroup_size(pipeline, threads, "attention decode")?;
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q_buf), 0);
         encoder.set_buffer(1, Some(self.keys.buffer()), 0);
@@ -1842,7 +1844,6 @@ impl FullAttentionMetalState {
             );
         }
         crate::metal_backend::profile_dispatch();
-        let threads = if use_flash { 1024 } else { 256 };
         encoder.dispatch_thread_groups(
             MTLSize::new(u64::from(to_u32(self.q_heads, "q_heads")?), 1, 1),
             MTLSize::new(threads, 1, 1),
@@ -2394,4 +2395,33 @@ impl FullAttentionMetalState {
         crate::metal_backend::post_dispatch_barrier(encoder);
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn flash_decode_rejects_insufficient_threadgroup_limit() -> Result<()> {
+    let Some(state) = super::tests::try_state()? else {
+        return Ok(());
+    };
+    let limited = crate::metal_backend::tests::limited_threadgroup_pipeline(state.device())?;
+    for head_dim in [128, 256] {
+        for format in [KvFormat::F32, KvFormat::Bf16] {
+            let mut kv = state.full_attention_format_for_test(2, 1, 1, head_dim, format)?;
+            kv.seed(&vec![0.0; head_dim], &vec![0.0; head_dim], 1)?;
+            kv.attention_flash = limited.clone();
+            kv.attention_flash_d256 = limited.clone();
+            kv.attention_flash_bf16 = limited.clone();
+            kv.attention_flash_d256_bf16 = limited.clone();
+            let buffer = state.scratch().lease(head_dim, GpuElement::F32)?;
+            let cb = state.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            let buf = buffer.tensor().buffer();
+            let result = kv.encode_attention_decode(enc, buf, buf, buf);
+            enc.end_encoding();
+            assert!(
+                matches!(result, Err(InferError::Metal(message)) if message.contains("1024") && message.contains("512"))
+            );
+        }
+    }
+    Ok(())
 }

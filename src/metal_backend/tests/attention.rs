@@ -906,20 +906,11 @@ fn causal_attention_prefill_steel_d256_matches_cpu_selected_rows() -> Result<()>
     Ok(())
 }
 
-/// Oracle CPU direct du kernel chunké-GQA `chunk_delta_seq_layout` (celui que
-/// dispatche `encode_chunk_delta_seq_layout`, opt-in `SARAGOSSA_RUST_LINEAR_CHUNKED`) :
-/// compare y ET l'état SSM final contre `naive_gdn_reference` (récurrence GDN
-/// séquentielle token-par-token, zéro chunking — voir la doc de module de
-/// `linear_attention`). Longueurs aux frontières du chunk C=16 (1, 15, 16, 17,
-/// 3×16+7) × deux découpages GQA (repeat 2 et 4), état initial non nul inclus.
-///
-/// Tolérance 5e-4 ABSOLUE, justifiée : entrées d'échelle réaliste O(1) (q/k
-/// post-norm ~d_k^(−1)/d_k^(−1/2), v ∈ [−1,1]) ; le chunking ré-associe des
-/// sommes f32 de 128 (dots sur d_k) + 16 (corrections intra-chunk) termes et
-/// introduit des ratios γ_i/γ_j bornés ≤ 0,9⁻¹⁶ ≈ 5,4 (decay ∈ [0,9, 0,999)) →
-/// bruit attendu ~1e-5, marge ×50, alignée sur le test batch résident dk128.
+/// Oracle CPU du scan GQA conservé après le retrait des kernels chunkés.
+/// Les longueurs 1,15,16,17,55 et l'état initial non nul restent couverts,
+/// avec la même tolérance absolue de 5e-4.
 #[test]
-fn chunk_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
+fn gated_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
     use crate::linear_attention::tests::{
         naive_gdn_reference, synthetic_gdn_inputs, DeterministicF32, CHUNK_BOUNDARY_LENGTHS,
     };
@@ -993,7 +984,7 @@ fn chunk_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
 
             let cb = executor.queue.new_command_buffer();
             let encoder = cb.new_compute_command_encoder();
-            let encoded = executor.encode_chunk_delta_seq_layout(
+            let encoded = executor.encode_linear_attn_gated_delta_seq_dk128(
                 encoder,
                 &conv_out_buf,
                 &q_buf,
@@ -1001,6 +992,7 @@ fn chunk_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
                 &beta_buf,
                 &decay_buf,
                 &state_buf,
+                false,
                 &y_buf,
                 steps,
                 LinearAttentionStepSpec {
@@ -1014,12 +1006,7 @@ fn chunk_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
                 },
             );
             encoder.end_encoding();
-            match encoded {
-                Ok(()) => {}
-                // Pipeline chunké non compilé sur cette machine → test sans objet.
-                Err(InferError::Config(_)) => return Ok(()),
-                Err(error) => return Err(error),
-            }
+            encoded?;
             commit_and_wait(cb)?;
 
             let gpu_y = read_f32_buffer(&y_buf, steps * value_dim)?;
@@ -1031,18 +1018,9 @@ fn chunk_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
     Ok(())
 }
 
-// Verrouille la CLASSE caractérisée dans `docs/reviews/35b-prefill-drift-dossier.md` :
-// AU-DELÀ de 256 tokens, la forme CHUNKÉE de l'attention linéaire (kernel
-// `chunk_delta_seq_layout`, empruntée par les chemins prefill résident ET batché du
-// 35B) reste dans la tolérance 5e-4 du SCAN séquentiel token-par-token (la référence
-// per-op). Les cas de frontière de chunk existants plafonnent à seq=55 ; ce cas
-// traverse 256 (seq=300 = 18 chunks pleins + 12), soit le régime où la ré-association
-// f32 inter-chunk était soupçonnée de dériver. Il prouve que l'écart observé au niveau
-// modèle (dossier) est un near-tie (flip d'argmax sur clusters serrés), PAS une
-// divergence numérique du kernel : le prefill résident du 35B reste byte-identique au
-// scan per-op sur texte réel à 608/1329/6007 tokens.
+// Conserver le cas long (300 pas) et sa tolérance de 5e-4 sur le scan sûr.
 #[test]
-fn chunk_delta_seq_layout_matches_scan_beyond_256() -> Result<()> {
+fn gated_delta_seq_layout_matches_scan_beyond_256() -> Result<()> {
     use crate::linear_attention::tests::{
         naive_gdn_reference, synthetic_gdn_inputs, DeterministicF32,
     };
@@ -1109,7 +1087,7 @@ fn chunk_delta_seq_layout_matches_scan_beyond_256() -> Result<()> {
 
     let cb = executor.queue.new_command_buffer();
     let encoder = cb.new_compute_command_encoder();
-    let encoded = executor.encode_chunk_delta_seq_layout(
+    let encoded = executor.encode_linear_attn_gated_delta_seq_dk128(
         encoder,
         &conv_out_buf,
         &q_buf,
@@ -1117,6 +1095,7 @@ fn chunk_delta_seq_layout_matches_scan_beyond_256() -> Result<()> {
         &beta_buf,
         &decay_buf,
         &state_buf,
+        false,
         &y_buf,
         steps,
         LinearAttentionStepSpec {
@@ -1130,12 +1109,7 @@ fn chunk_delta_seq_layout_matches_scan_beyond_256() -> Result<()> {
         },
     );
     encoder.end_encoding();
-    match encoded {
-        Ok(()) => {}
-        // Pipeline chunké non compilé sur cette machine → test sans objet.
-        Err(InferError::Config(_)) => return Ok(()),
-        Err(error) => return Err(error),
-    }
+    encoded?;
     commit_and_wait(cb)?;
 
     let gpu_y = read_f32_buffer(&y_buf, steps * value_dim)?;
