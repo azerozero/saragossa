@@ -7,6 +7,9 @@ use saragossa::ModelAssets;
 use super::error::{ServeError, ServeResult};
 use super::state::ServedCompletion;
 
+#[cfg(test)]
+pub(super) mod incremental_tests;
+
 /// Métadonnées connues avant le premier token streamé.
 #[derive(Debug)]
 pub(crate) struct StreamingCompletionStart {
@@ -125,6 +128,12 @@ pub(crate) struct StreamingTextDetokenizer<'a> {
     assets: &'a ModelAssets,
     stop_texts: &'a [String],
     generated: Vec<u32>,
+    stream: Option<saragossa::tokenizer::ByteLevelDecodeStream<'a>>,
+    decoded: String,
+    stable_len: usize,
+    max_stop_len: usize,
+    fallback_decodes: usize,
+    controls: Vec<(u32, &'static str)>,
     emitter: StreamingTextEmitter,
     stopped: bool,
 }
@@ -139,6 +148,14 @@ impl<'a> StreamingTextDetokenizer<'a> {
             assets,
             stop_texts,
             generated: Vec::with_capacity(max_tokens),
+            stream: (!assets.config.is_gemma4())
+                .then(|| assets.tokenizer.byte_level_decode_stream(true))
+                .flatten(),
+            decoded: String::new(),
+            stable_len: 0,
+            max_stop_len: stop_texts.iter().map(String::len).max().unwrap_or(0),
+            fallback_decodes: 0,
+            controls: completion_controls(assets),
             emitter: StreamingTextEmitter::default(),
             stopped: false,
         }
@@ -149,12 +166,56 @@ impl<'a> StreamingTextDetokenizer<'a> {
         token: usize,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<()> {
+        if self.stopped {
+            return Ok(());
+        }
         let token = u32::try_from(token)
             .map_err(|_| ServeError::args(format!("token généré hors plage: {token}")))?;
         self.generated.push(token);
-        let decoded = decode_completion_tokens(self.assets, &self.generated)?;
-        self.stopped = contains_stop(strip_empty_think_streaming(&decoded), self.stop_texts);
-        let visible = streaming_visible_text(&decoded, self.stop_texts);
+        let previous_len = strip_empty_think_streaming(&self.decoded).len();
+        if let Some(stream) = &mut self.stream {
+            match stream.step(token) {
+                Ok(delta) if stream.pending_tokens() <= 64 => {
+                    self.decoded.truncate(self.stable_len);
+                    if let Some(delta) = delta {
+                        self.decoded.push_str(&delta);
+                        self.stable_len = self.decoded.len();
+                    } else {
+                        self.decoded.push_str(&stream.pending_text()?);
+                    }
+                }
+                // Une fenêtre pathologique (U+FFFD répété) ou une divergence
+                // ne doit ni croître sans borne ni compromettre l'oracle.
+                _ => self.stream = None,
+            }
+        }
+        if self.stream.is_none() {
+            self.fallback_decodes += 1;
+            let decoded = decode_with_controls(self.assets, &self.generated, &self.controls)?;
+            self.emitter.check_prefix(
+                strip_empty_think_streaming(&self.decoded),
+                strip_empty_think_streaming(&decoded),
+            )?;
+            self.decoded = decoded;
+        }
+        let text = strip_empty_think_streaming(&self.decoded);
+        // Un nouvel appariement commence au plus L-1 octets avant le delta.
+        // Trois octets supplémentaires couvrent U+FFFD remplacé par un UTF-8
+        // complété ; reculer à une frontière char coûte au plus trois octets.
+        let mut start = if self.stream.is_some() {
+            previous_len.saturating_sub(self.max_stop_len.saturating_add(3))
+        } else {
+            0 // Aucun invariant de stabilité pour les décodeurs non qualifiés.
+        };
+        start = start.min(text.len());
+        while !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let stop = first_stop(&text[start..], self.stop_texts).map(|index| start + index);
+        self.stopped = stop.is_some();
+        let visible = &text[..stop.unwrap_or(text.len())];
+        let hold = longest_stop_prefix_suffix_len(visible, self.stop_texts);
+        let visible = &visible[..visible.len() - hold];
         self.emitter.emit_streaming(visible, on_event)
     }
 
@@ -169,16 +230,39 @@ impl<'a> StreamingTextDetokenizer<'a> {
         content: &str,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<()> {
+        self.emitter
+            .check_prefix(strip_empty_think_streaming(&self.decoded), content)?;
         self.emitter.emit_final(content, on_event)
+    }
+}
+
+impl Drop for StreamingTextDetokenizer<'_> {
+    fn drop(&mut self) {
+        if self.fallback_decodes != 0 {
+            eprintln!(
+                "saragossa serve detokenizer fallback_decodes={} generated_tokens={}",
+                self.fallback_decodes,
+                self.generated.len()
+            );
+        }
     }
 }
 
 #[derive(Default)]
 struct StreamingTextEmitter {
-    emitted: String,
+    emitted: usize,
 }
 
 impl StreamingTextEmitter {
+    fn check_prefix(&self, previous: &str, next: &str) -> ServeResult<()> {
+        if previous.get(..self.emitted) != next.get(..self.emitted) {
+            return Err(ServeError::args(
+                "désynchronisation du detokenizer streaming",
+            ));
+        }
+        Ok(())
+    }
+
     fn emit_streaming(
         &mut self,
         visible: &str,
@@ -201,7 +285,7 @@ impl StreamingTextEmitter {
         final_snapshot: bool,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<()> {
-        let Some(delta) = visible.strip_prefix(&self.emitted) else {
+        let Some(delta) = visible.get(self.emitted..) else {
             return Err(ServeError::args(
                 "désynchronisation du detokenizer streaming",
             ));
@@ -213,11 +297,12 @@ impl StreamingTextEmitter {
             return Ok(());
         }
         on_event(CompletionStreamEvent::Delta(delta))?;
-        self.emitted = visible.to_string();
+        self.emitted = visible.len();
         Ok(())
     }
 }
 
+#[cfg(test)]
 fn streaming_visible_text<'a>(decoded: &'a str, stop_texts: &[String]) -> &'a str {
     let text = strip_empty_think_streaming(decoded);
     let text = strip_after_first_stop(text, stop_texts);
@@ -236,22 +321,24 @@ fn strip_empty_think_streaming(text: &str) -> &str {
     text
 }
 
+#[cfg(test)]
 fn contains_stop(text: &str, stop_texts: &[String]) -> bool {
     stop_texts
         .iter()
         .any(|stop| !stop.is_empty() && text.contains(stop.as_str()))
 }
 
-fn strip_after_first_stop<'a>(text: &'a str, stop_texts: &[String]) -> &'a str {
-    let Some(index) = stop_texts
+fn first_stop(text: &str, stop_texts: &[String]) -> Option<usize> {
+    stop_texts
         .iter()
         .filter(|stop| !stop.is_empty())
         .filter_map(|stop| text.find(stop))
         .min()
-    else {
-        return text;
-    };
-    &text[..index]
+}
+
+#[cfg(test)]
+fn strip_after_first_stop<'a>(text: &'a str, stop_texts: &[String]) -> &'a str {
+    &text[..first_stop(text, stop_texts).unwrap_or(text.len())]
 }
 
 fn longest_stop_prefix_suffix_len(text: &str, stop_texts: &[String]) -> usize {
@@ -272,23 +359,37 @@ fn longest_stop_prefix_suffix_len(text: &str, stop_texts: &[String]) -> usize {
 /// Conserve les seuls tokens de contrôle nécessaires au parseur Gemma 4.
 /// Les EOS et autres tokens spéciaux restent invisibles comme auparavant.
 pub(super) fn decode_completion_tokens(assets: &ModelAssets, ids: &[u32]) -> ServeResult<String> {
+    decode_with_controls(assets, ids, &completion_controls(assets))
+}
+
+fn completion_controls(assets: &ModelAssets) -> Vec<(u32, &'static str)> {
     if !assets.config.is_gemma4() {
-        return Ok(assets.decode_tokens(ids, true)?);
+        return Vec::new();
     }
-    let controls = [
+    [
         "<|tool_call>",
         "<tool_call|>",
         "<|\"|>",
         "<|channel>",
         "<channel|>",
-    ];
+    ]
+    .into_iter()
+    .filter_map(|marker| assets.tokenizer.token_to_id(marker).map(|id| (id, marker)))
+    .collect()
+}
+
+fn decode_with_controls(
+    assets: &ModelAssets,
+    ids: &[u32],
+    controls: &[(u32, &'static str)],
+) -> ServeResult<String> {
+    if controls.is_empty() {
+        return Ok(assets.decode_tokens(ids, true)?);
+    }
     let mut out = String::new();
     let mut start = 0;
     for (index, id) in ids.iter().enumerate() {
-        if let Some(marker) = controls
-            .iter()
-            .find(|marker| assets.tokenizer.token_to_id(marker) == Some(*id))
-        {
+        if let Some((_, marker)) = controls.iter().find(|(control, _)| control == id) {
             out.push_str(&assets.decode_tokens(&ids[start..index], true)?);
             out.push_str(marker);
             start = index + 1;
