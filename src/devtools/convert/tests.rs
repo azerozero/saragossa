@@ -490,8 +490,9 @@ fn resume_after_partial_run_is_byte_identical() {
     let second = convert_qwen4exp(&full).expect("invariant: reprise");
     assert!(second
         .units_resumed
-        .contains(&"model-00001-of-00002".to_string()));
-    assert!(second.units_resumed.contains(&"ngram-003".to_string()));
+        .iter()
+        .any(|unit| unit == "model-00001-of-00002"));
+    assert!(second.units_resumed.iter().any(|unit| unit == "ngram-003"));
     let digest = |files: &[super::OutputFile]| {
         files
             .iter()
@@ -713,7 +714,8 @@ fn finalize_invalidates_corrupt_shard_then_resume_repairs_it() {
     let third = convert_qwen4exp(&options(src.path(), dst.path())).expect("invariant: réparation");
     assert!(third
         .units_written
-        .contains(&"model-00001-of-00002".to_string()));
+        .iter()
+        .any(|unit| unit == "model-00001-of-00002"));
     assert_eq!(digests(&third.files), digests(&first.files));
 }
 
@@ -1095,7 +1097,8 @@ fn corrupt_shard_header_is_invalidated_then_repaired() {
     let third = convert_qwen4exp(&options(src.path(), dst.path())).expect("invariant: réparation");
     assert!(third
         .units_written
-        .contains(&"model-00002-of-00002".to_string()));
+        .iter()
+        .any(|unit| unit == "model-00002-of-00002"));
     assert_eq!(digests(&third.files), digests(&first.files));
 }
 
@@ -1119,8 +1122,9 @@ fn verify_repairs_corrupt_shard_and_segment_in_one_run() {
     let second = convert_qwen4exp(&verify).expect("invariant: réparation --verify");
     assert!(second
         .units_written
-        .contains(&"model-00001-of-00002".to_string()));
-    assert!(second.units_written.contains(&"ngram-000".to_string()));
+        .iter()
+        .any(|unit| unit == "model-00001-of-00002"));
+    assert!(second.units_written.iter().any(|unit| unit == "ngram-000"));
     assert!(second.finalized);
     assert_eq!(digests(&second.files), digests(&first.files));
 }

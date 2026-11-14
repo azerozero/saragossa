@@ -2507,7 +2507,8 @@ impl CausalDecoder {
 
         let hidden = self.final_norm.len();
         let mut layer_diffs = Vec::with_capacity(self.layers.len());
-        for layer_index in 0..self.layers.len() {
+        let plans = self.plan.layers.iter().take(self.layers.len());
+        for (layer_index, layer_plan) in plans.enumerate() {
             let start = layer_index.checked_mul(hidden).ok_or_else(|| {
                 InferError::Dimension("xray résident-linear offset déborde".to_string())
             })?;
@@ -2527,7 +2528,7 @@ impl CausalDecoder {
                 ))
             })?;
             let (max_abs, mean_abs) = diff_stats_same_len(reference_slice, resident_slice)?;
-            let attention_kind = if self.plan.layers[layer_index].is_full() {
+            let attention_kind = if layer_plan.is_full() {
                 "full"
             } else {
                 "linear"
