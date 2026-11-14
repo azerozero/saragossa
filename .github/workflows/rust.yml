@@ -107,10 +107,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-macos
-          save-if: false
       # Même commande que release.yml : échouer avant le merge et le tag.
       - name: Build and check release CLI
         run: |

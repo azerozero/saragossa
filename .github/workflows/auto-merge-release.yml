@@ -6,9 +6,7 @@ on:
     types: [opened, labeled, unlabeled, synchronize, ready_for_review]
     branches: [main]
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 jobs:
   auto-merge:
