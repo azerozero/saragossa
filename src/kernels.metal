@@ -10081,7 +10081,7 @@ kernel void topk_softmax_serial_f32(
     uint best_indices[16];
     for (uint slot = 0u; slot < topk; ++slot) {
         best_values[slot] = -3.402823466e38f;
-        best_indices[slot] = 0u;
+        best_indices[slot] = 0xffffffffu;
     }
 
     for (uint idx = 0u; idx < count; ++idx) {
@@ -10102,12 +10102,13 @@ kernel void topk_softmax_serial_f32(
     const float max_value = best_values[0];
     float denom = 0.0f;
     for (uint slot = 0u; slot < topk; ++slot) {
-        denom += exp(best_values[slot] - max_value);
+        denom += (best_indices[slot] < count) ? exp(best_values[slot] - max_value) : 0.0f;
     }
     denom = max(denom, 1.0e-20f);
     for (uint slot = 0u; slot < topk; ++slot) {
-        indices[slot] = best_indices[slot];
-        scores[slot] = exp(best_values[slot] - max_value) / denom;
+        // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+        indices[slot] = (best_indices[slot] < count) ? best_indices[slot] : 0u;
+        scores[slot] = (best_indices[slot] < count) ? exp(best_values[slot] - max_value) / denom : 0.0f;
     }
 }
 
@@ -10191,12 +10192,13 @@ kernel void topk_softmax_f32(
         const float max_value = partial_values[0];
         float denom = 0.0f;
         for (uint slot = 0u; slot < topk; ++slot) {
-            denom += exp(partial_values[slot] - max_value);
+            denom += (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) : 0.0f;
         }
         denom = max(denom, 1.0e-20f);
         for (uint slot = 0u; slot < topk; ++slot) {
-            indices[slot] = partial_indices[slot];
-            scores[slot] = exp(partial_values[slot] - max_value) / denom;
+            // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+            indices[slot] = (partial_indices[slot] < count) ? partial_indices[slot] : 0u;
+            scores[slot] = (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) / denom : 0.0f;
         }
     }
 }
@@ -10284,12 +10286,13 @@ kernel void topk_sigmoid_f32(
     if (tid == 0u) {
         float denom = 0.0f;
         for (uint slot = 0u; slot < topk; ++slot) {
-            denom += partial_values[slot];
+            denom += (partial_indices[slot] < count) ? partial_values[slot] : 0.0f;
         }
         denom += 1.0e-20f;
         for (uint slot = 0u; slot < topk; ++slot) {
-            indices[slot] = partial_indices[slot];
-            scores[slot] = partial_values[slot] / denom;
+            // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+            indices[slot] = (partial_indices[slot] < count) ? partial_indices[slot] : 0u;
+            scores[slot] = (partial_indices[slot] < count) ? partial_values[slot] / denom : 0.0f;
         }
     }
 }
@@ -10365,12 +10368,13 @@ kernel void topk_softmax_wide_f32(
         const float max_value = chosen_values[0];
         float denom = 0.0f;
         for (uint slot = 0u; slot < topk; ++slot) {
-            denom += exp(chosen_values[slot] - max_value);
+            denom += (chosen_indices[slot] < count) ? exp(chosen_values[slot] - max_value) : 0.0f;
         }
         denom = max(denom, 1.0e-20f);
         for (uint slot = 0u; slot < topk; ++slot) {
-            indices[slot] = chosen_indices[slot];
-            scores[slot] = exp(chosen_values[slot] - max_value) / denom;
+            // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+            indices[slot] = (chosen_indices[slot] < count) ? chosen_indices[slot] : 0u;
+            scores[slot] = (chosen_indices[slot] < count) ? exp(chosen_values[slot] - max_value) / denom : 0.0f;
         }
     }
 }
@@ -10456,12 +10460,13 @@ kernel void topk8_softmax_256_f32(
         const float max_value = partial_values[0];
         float denom = 0.0f;
         for (uint slot = 0u; slot < 8u; ++slot) {
-            denom += exp(partial_values[slot] - max_value);
+            denom += (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) : 0.0f;
         }
         denom = max(denom, 1.0e-20f);
         for (uint slot = 0u; slot < 8u; ++slot) {
-            indices[slot] = partial_indices[slot];
-            scores[slot] = exp(partial_values[slot] - max_value) / denom;
+            // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+            indices[slot] = (partial_indices[slot] < count) ? partial_indices[slot] : 0u;
+            scores[slot] = (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) / denom : 0.0f;
         }
     }
 }
@@ -10557,12 +10562,13 @@ kernel void topk8_softmax_256_rows_f32(
         const float max_value = partial_values[0];
         float denom = 0.0f;
         for (uint slot = 0u; slot < 8u; ++slot) {
-            denom += exp(partial_values[slot] - max_value);
+            denom += (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) : 0.0f;
         }
         denom = max(denom, 1.0e-20f);
         for (uint slot = 0u; slot < 8u; ++slot) {
-            indices[slot] = partial_indices[slot];
-            scores[slot] = exp(partial_values[slot] - max_value) / denom;
+            // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+            indices[slot] = (partial_indices[slot] < count) ? partial_indices[slot] : 0u;
+            scores[slot] = (partial_indices[slot] < count) ? exp(partial_values[slot] - max_value) / denom : 0.0f;
         }
     }
 }
@@ -10587,7 +10593,7 @@ kernel void topk_softmax_rows_f32(
     uint best_indices[16];
     for (uint slot = 0u; slot < topk; ++slot) {
         best_values[slot] = -3.402823466e38f;
-        best_indices[slot] = 0u;
+        best_indices[slot] = 0xffffffffu;
     }
 
     for (uint idx = 0u; idx < count; ++idx) {
@@ -10608,12 +10614,13 @@ kernel void topk_softmax_rows_f32(
     const float max_value = best_values[0];
     float denom = 0.0f;
     for (uint slot = 0u; slot < topk; ++slot) {
-        denom += exp(best_values[slot] - max_value);
+        denom += (best_indices[slot] < count) ? exp(best_values[slot] - max_value) : 0.0f;
     }
     denom = max(denom, 1.0e-20f);
     for (uint slot = 0u; slot < topk; ++slot) {
-        indices[row_topk + slot] = best_indices[slot];
-        scores[row_topk + slot] = exp(best_values[slot] - max_value) / denom;
+        // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+        indices[row_topk + slot] = (best_indices[slot] < count) ? best_indices[slot] : 0u;
+        scores[row_topk + slot] = (best_indices[slot] < count) ? exp(best_values[slot] - max_value) / denom : 0.0f;
     }
 }
 
@@ -10644,7 +10651,7 @@ kernel void topk_sigmoid_rows_f32(
     uint best_indices[16];
     for (uint slot = 0u; slot < topk; ++slot) {
         best_values[slot] = -3.402823466e38f;
-        best_indices[slot] = 0u;
+        best_indices[slot] = 0xffffffffu;
     }
 
     for (uint idx = 0u; idx < count; ++idx) {
@@ -10664,12 +10671,13 @@ kernel void topk_sigmoid_rows_f32(
 
     float denom = 0.0f;
     for (uint slot = 0u; slot < topk; ++slot) {
-        denom += best_values[slot];
+        denom += (best_indices[slot] < count) ? best_values[slot] : 0.0f;
     }
     denom += 1.0e-20f;
     for (uint slot = 0u; slot < topk; ++slot) {
-        indices[row_topk + slot] = best_indices[slot];
-        scores[row_topk + slot] = best_values[slot] / denom;
+        // Un slot vide ne doit jamais devenir un indice de gather hors bornes.
+        indices[row_topk + slot] = (best_indices[slot] < count) ? best_indices[slot] : 0u;
+        scores[row_topk + slot] = (best_indices[slot] < count) ? best_values[slot] / denom : 0.0f;
     }
 }
 
