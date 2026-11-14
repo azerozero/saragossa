@@ -900,13 +900,18 @@ mod tests {
         .expect("invariant: projection dense valide");
         assert_eq!(resident_projection_unsupported_bits(&dense), None);
 
-        for (bits, packed_cols) in [(2, 1), (3, 3), (4, 1), (6, 3), (8, 1)] {
+        for (bits, packed_cols) in [(2, 1), (3, 3), (4, 1), (5, 5), (6, 3), (8, 1)] {
             let projection = quantized_projection(bits, packed_cols);
             assert_eq!(resident_projection_unsupported_bits(&projection), None);
         }
 
-        // u5 (overrides oQ4 sur linear_attn.in_proj_a/b) : aucun kernel résident.
-        let projection = quantized_projection(5, 5);
-        assert_eq!(resident_projection_unsupported_bits(&projection), Some(5));
+        // Formats affines valides, mais sans kernel résident spécialisé.
+        for bits in [1, 16] {
+            let projection = quantized_projection(bits, 1);
+            assert_eq!(
+                resident_projection_unsupported_bits(&projection),
+                Some(bits)
+            );
+        }
     }
 }
