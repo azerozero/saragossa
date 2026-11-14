@@ -79,7 +79,14 @@ blob, le lecteur valide la clé complète, les dimensions par couche, les
 longueurs, les dtypes et le budget géométrique du modèle. Le manifeste est
 limité à 16 Mio ; la taille totale de l'entrée est limitée au budget SSD.
 Les liens sortant du répertoire et les chemins de blobs arbitraires sont
-refusés. Une entrée invalide est supprimée et le prefill ordinaire reprend.
+refusés. Une entrée invalide (format, dimensions, identité, checksum) est
+supprimée et le prefill ordinaire reprend. Une erreur d'E/S en lecture, y compris
+un fichier momentanément inaccessible, conserve au contraire l'entrée et sa
+comptabilisation pour une nouvelle tentative. Les erreurs de ressources Metal
+sont également conservées : elles ne prouvent pas que les octets sont corrompus.
+Cette politique évite de détruire un cache sain lors d'une indisponibilité ;
+aucun état partiellement lu n'est exposé. Le nettoyage de démarrage reste
+conservateur et peut éliminer les entrées impossibles à valider à l'ouverture.
 Les fichiers ne sont pas chiffrés : ils contiennent des états dérivés des
 prompts, à conserver dans un emplacement privé choisi par l'opérateur.
 

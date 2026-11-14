@@ -704,6 +704,42 @@ fn synthetic_metal_bf16_greedy_survives_restart() -> Result<()> {
 }
 
 #[test]
+fn transient_read_error_keeps_entry_for_retry() {
+    let root = private_dir();
+    let store = Store::open(root.path(), 64 << 20, 0).unwrap();
+    let (model, request, state) = fixture(&store, 1);
+    publish(&store, &request, payload(&model, &request, &state));
+    let checksum = request.root.join("manifest.sha256");
+    let saved = fs::read(&checksum).unwrap();
+    let bytes = store.disk.lock().unwrap().entries[0].bytes;
+    // Une indisponibilité temporaire est reproductible sans changer les droits
+    // du processus (le test fonctionne aussi sous un utilisateur privilégié).
+    fs::remove_file(&checksum).unwrap();
+    assert!(store.read(&model, &request).is_none());
+    assert!(request.root.exists());
+    assert_eq!(store.disk.lock().unwrap().entries[0].bytes, bytes);
+    fs::write(checksum, saved).unwrap();
+    assert!(store.read(&model, &request).is_some());
+    assert!(!invalidates_entry(&InferError::Metal(
+        "device temporairement indisponible".into()
+    )));
+    let json_io =
+        serde_json::from_reader::<_, serde_json::Value>(std::io::Read::take(UnavailableReader, 1))
+            .unwrap_err();
+    assert!(!invalidates_entry(&InferError::Json {
+        path: "manifest.json".into(),
+        source: json_io
+    }));
+}
+
+struct UnavailableReader;
+impl std::io::Read for UnavailableReader {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+}
+
+#[test]
 fn repeated_persistent_hits_do_not_copy_refused_states() {
     if let Ok(failure) = std::env::var("SSD_REFUSAL_CHILD") {
         let root = private_dir();

@@ -448,6 +448,12 @@ impl Store {
                 Some(state)
             }
             Err(error) => {
+                // Une erreur d'E/S ou de ressources ne prouve pas une corruption.
+                // Garder l'entrée comptée permet une reprise après rétablissement.
+                if !invalidates_entry(&error) {
+                    eprintln!("prefix_ssd read_deferred: {error}");
+                    return None;
+                }
                 if let Err(cleanup) = remove(&disk.entries[index].path) {
                     // Les octets restent comptés si le disque refuse la suppression.
                     eprintln!("prefix_ssd cleanup_refused: {cleanup}");
@@ -587,6 +593,16 @@ impl Disk {
         Ok(())
     }
 }
+/// Seules les erreurs structurelles/incompatibilités invalident les octets.
+/// Une erreur JSON de lecture peut elle-même encapsuler une E/S transitoire.
+fn invalidates_entry(error: &InferError) -> bool {
+    match error {
+        InferError::Config(_) | InferError::Shape(_) | InferError::Dimension(_) => true,
+        InferError::Json { source, .. } => !source.is_io(),
+        _ => false,
+    }
+}
+
 fn check_staging_limits(disk: u64, ram: u64, budget: u64, staging: u64, free: u64) -> Result<()> {
     if disk > budget {
         return Err(invalid("entrée plus grande que le budget SSD"));
