@@ -323,13 +323,20 @@ impl Store {
         disk_bytes: u64,
         ram_bytes: u64,
     ) -> Result<crate::memory_guard::MemoryReservation> {
-        check_staging_limits(
+        self.admit_staging_with_space(
+            request,
             disk_bytes,
             ram_bytes,
-            self.budget,
-            self.staging_limit,
             io(&self.root, fs2::available_space(&self.root))?,
-        )?;
+        )
+    }
+    fn admit_staging_with_space(
+        &self,
+        request: &Request,
+        disk_bytes: u64,
+        ram_bytes: u64,
+        free: u64,
+    ) -> Result<crate::memory_guard::MemoryReservation> {
         {
             let disk = self
                 .disk
@@ -340,6 +347,21 @@ impl Store {
                 .iter()
                 .filter(|entry| entry.priority)
                 .fold(0u64, |sum, entry| sum.saturating_add(entry.bytes));
+            // Le worker évince avant de publier : ces octets seront disponibles
+            // sans staging supplémentaire. Respecter sa protection des priorités.
+            let priority = request.key.tokens <= self.priority_tokens;
+            let reclaimable = disk
+                .entries
+                .iter()
+                .filter(|entry| priority || !entry.priority)
+                .fold(0u64, |sum, entry| sum.saturating_add(entry.bytes));
+            check_staging_limits(
+                disk_bytes,
+                ram_bytes,
+                self.budget,
+                self.staging_limit,
+                free.saturating_add(reclaimable),
+            )?;
             if request.key.tokens > self.priority_tokens
                 && protected.saturating_add(disk_bytes) > self.budget
             {

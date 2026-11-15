@@ -558,6 +558,52 @@ fn staging_budget_respects_memory_cap_override_and_fallback() {
 }
 
 #[test]
+fn staging_reclaims_lru_space_without_counting_protected_entries() {
+    let root = private_dir();
+    let initial = Store::open(root.path(), 1 << 20, 0).unwrap();
+    let (model, first, state) = fixture(&initial, 1);
+    let size = payload(&model, &first, &state).bytes();
+    drop(initial);
+    let mut store = Store::open(root.path(), size * 2, 0).unwrap();
+    let (_, second, _) = fixture(&store, 2);
+    let (_, mut candidate, _) = fixture(&store, 3);
+    publish(&store, &first, payload(&model, &first, &state));
+    publish(&store, &second, payload(&model, &second, &state));
+    store.disk.lock().unwrap().entries[0].used = SystemTime::UNIX_EPOCH;
+
+    // Le volume est plein, mais l'éviction précédant l'écriture libère le LRU.
+    let reservation = store
+        .admit_staging_with_space(&candidate, size, 1, 0)
+        .unwrap();
+    publish(&store, &candidate, payload(&model, &candidate, &state));
+    drop(reservation);
+    assert!(!first.root.exists());
+    assert!(second.root.exists());
+    assert!(store.read(&model, &candidate).is_some());
+
+    // Isoler la capacité physique de la limite du cache : même avec un budget
+    // disponible, un candidat ordinaire ne peut pas récupérer les prioritaires.
+    store.budget = size * 4;
+    for entry in &mut store.disk.lock().unwrap().entries {
+        entry.priority = true;
+    }
+    let error = store
+        .admit_staging_with_space(&candidate, size, 1, 0)
+        .unwrap_err();
+    assert!(error.to_string().contains("espace libre"));
+    candidate.key.tokens = 0;
+    assert!(store
+        .admit_staging_with_space(&candidate, size, 1, 0)
+        .is_ok());
+    assert!(store
+        .admit_staging_with_space(&candidate, size * 3, 1, 0)
+        .is_err());
+    assert!(store
+        .admit_staging_with_space(&candidate, size, 1, u64::MAX)
+        .is_ok());
+}
+
+#[test]
 fn staging_limits_and_memory_guard_refuse_before_copy() {
     assert!(check_staging_limits(11, 20, 10, 30, 100).is_err());
     assert!(check_staging_limits(10, 20, 10, 30, 9).is_err());
