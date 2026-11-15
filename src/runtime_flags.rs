@@ -2424,7 +2424,7 @@ fn hash_environment(
             hash.update(bytes);
         }
     }
-    format!("{:x}", hash.finalize())
+    crate::hex(hash.finalize())
 }
 
 #[cfg(test)]

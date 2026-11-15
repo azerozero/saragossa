@@ -117,7 +117,7 @@ pub(crate) fn check_family(
         hash.update(std::fs::read(file)?);
     }
     assert_eq!(
-        format!("{:x}", hash.finalize()),
+        crate::hex(hash.finalize()),
         header.tokenizer_sha256,
         "{family}: tokenizer différent de la référence ({})",
         header.source
