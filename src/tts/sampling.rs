@@ -40,7 +40,7 @@ fn apply_talker_repetition_penalty(
     eos: Option<i32>,
     repetition_penalty: f32,
 ) {
-    if !repetition_penalty.is_finite() || repetition_penalty <= 1.0 {
+    if !repetition_penalty.is_finite() || repetition_penalty <= 0.0 || repetition_penalty == 1.0 {
         return;
     }
     let eos_idx = eos.and_then(|token| usize::try_from(token).ok());
@@ -115,5 +115,49 @@ fn mlx_greedy_logit(value: f32) -> f32 {
         (value * 4.0).floor() * 0.25
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod penalty_tests {
+    use super::*;
+
+    #[test]
+    fn repetition_penalty_is_sign_aware_unique_and_preserves_eos() {
+        let mut logits = [4.0, -4.0, 3.0, 2.0];
+        apply_talker_repetition_penalty(&mut logits, &[0, 0, 1, 3], Some(3), 2.0);
+        assert_eq!(logits, [2.0, -8.0, 3.0, 2.0]);
+        apply_talker_repetition_penalty(&mut logits, &[0, 1], Some(3), 0.5);
+        assert_eq!(logits, [4.0, -4.0, 3.0, 2.0]);
+    }
+
+    #[test]
+    fn seeded_sampling_repeats_and_penalty_precedes_top_k() -> Result<()> {
+        let params = TtsSampleParams {
+            temperature: 0.9,
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 2.0,
+            seed: 11,
+        };
+        let mut sampler = DeterministicSampler::new(params.seed);
+        assert_eq!(
+            sample_talker_token(&[4.0, 3.0, 100.0], &params, &[2], &[0], None, &mut sampler)?,
+            1
+        );
+        let params = TtsSampleParams {
+            top_k: 0,
+            repetition_penalty: 1.0,
+            ..params
+        };
+        let draw = |seed| -> Result<Vec<i32>> {
+            let mut sampler = DeterministicSampler::new(seed);
+            (0..32)
+                .map(|_| sample_talker_token(&[0.0; 8], &params, &[], &[], None, &mut sampler))
+                .collect()
+        };
+        assert_eq!(draw(11)?, draw(11)?);
+        assert_ne!(draw(11)?, draw(12)?);
+        Ok(())
     }
 }

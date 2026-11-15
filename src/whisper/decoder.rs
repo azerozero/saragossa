@@ -799,6 +799,8 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    mod quality;
+
     #[test]
     fn embed_tokens_adds_positional_offset() {
         let decoder = tiny_decoder_without_layers();

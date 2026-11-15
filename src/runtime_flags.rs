@@ -28,6 +28,39 @@ pub(crate) fn force_resident_full_linear_decode() {}
 /// Préfixe canonique des variables d'environnement du moteur.
 const ENV_PREFIX: &str = "SARAGOSSA_";
 
+thread_local! {
+    static DECISION_NONCAUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Masque propre à un appel joint, sans modifier les autres threads de génération.
+pub(crate) fn decision_noncausal() -> bool {
+    DECISION_NONCAUSAL.with(std::cell::Cell::get)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn decision_nax_enabled() -> bool {
+    env_flag("SARAGOSSA_DECISION_NAX", true)
+}
+
+/// GEMM matmul2d bf16 (activation arrondie en bf16) pendant une décision ;
+/// `SARAGOSSA_DECISION_GEMM_BF16=0` rétablit le GEMM NAX hi + lo f32.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn decision_gemm_bf16_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    decision_noncausal() && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DECISION_GEMM_BF16", true))
+}
+
+pub(crate) fn with_decision_noncausal<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DECISION_NONCAUSAL.with(|value| value.set(self.0));
+        }
+    }
+    let _restore = Restore(DECISION_NONCAUSAL.with(|value| value.replace(true)));
+    run()
+}
+
 /// Préfixe historique, hérité de l'époque où le moteur vivait dans le binaire
 /// `reti`. Conservé en repli pour ne casser ni les scripts de bench, ni les
 /// presets machine, ni les canaries déjà déployés.
@@ -2424,7 +2457,7 @@ fn hash_environment(
             hash.update(bytes);
         }
     }
-    format!("{:x}", hash.finalize())
+    crate::hex(hash.finalize())
 }
 
 #[cfg(test)]
@@ -2917,4 +2950,33 @@ pub(crate) fn prefix_ssd_staging_bytes(
     mib.checked_mul(1 << 20)
         .filter(|&bytes| bytes > 0)
         .ok_or_else(|| crate::InferError::Config("staging SSD : plafond invalide".into()))
+}
+
+/// Force le décodage glouton TTS historique pour les oracles.
+#[must_use]
+pub fn tts_greedy_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TTS_GREEDY_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    env_flag("SARAGOSSA_TTS_GREEDY", false)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TTS_GREEDY_OVERRIDE: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_tts_greedy_for_test<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TTS_GREEDY_OVERRIDE.with(|flag| flag.set(self.0));
+        }
+    }
+    let _reset = Reset(TTS_GREEDY_OVERRIDE.with(|flag| flag.replace(Some(enabled))));
+    run()
 }

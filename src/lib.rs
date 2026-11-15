@@ -41,6 +41,8 @@ pub mod runtime_flags;
 pub mod runtime_preset;
 pub mod safetensor;
 pub mod sampling;
+#[doc(hidden)]
+pub mod sse;
 pub mod tensor;
 pub mod text_embedder;
 pub mod tokenizer;
@@ -52,6 +54,8 @@ pub(crate) mod tts_codec_gpu;
 pub mod tts_mimi;
 pub mod tts_speaker;
 pub mod whisper;
+#[doc(hidden)]
+pub mod wire_audio;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -126,8 +130,21 @@ pub use text_embedder::{TextEmbedError, TextEmbedder, DEFAULT_TEXT_EMBED_REPO, T
 pub use tokenizer::RustTokenizer;
 pub use tts::{
     TtsAssets, TtsCodecCatalog, TtsForwardOutput, TtsModel, TtsModelConfig, TtsModelKind,
-    TtsPayloadSummary, TtsSynthesisOutput, TtsTalkerCatalog,
+    TtsPayloadSummary, TtsStopReason, TtsSynthesisOutput, TtsTalkerCatalog,
 };
 pub use whisper::{
     log_mel_spectrogram, WhisperConfig, WhisperDecoder, WhisperEncoder, WhisperModel,
 };
+pub mod decision;
+
+/// Encode une empreinte en hexadécimal minuscule.
+///
+/// `sha2` 0.11 renvoie un `hybrid_array::Array` sans `LowerHex` : ce format
+/// explicite conserve l'encodage historique de `{:x}` octet par octet.
+pub(crate) fn hex(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}

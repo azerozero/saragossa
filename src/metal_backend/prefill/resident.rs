@@ -459,6 +459,13 @@ impl MetalExecutor {
         let chunk_tokens = layout_override.map_or(chunk_tokens, |(chunk, _)| chunk);
         let chunk_rows = self.resident_prefill_chunk_rows(layers, rows, chunk_tokens);
         let chunk_count = rows.div_ceil(chunk_rows);
+        if crate::runtime_flags::decision_noncausal()
+            && (chunk_count != 1 || start != 0 || last_row_only || mtp_seed.is_some())
+        {
+            return Err(InferError::Config(
+                "décision non causale : prefill entier sans cache requis".into(),
+            ));
+        }
         // Sans sortie partagée dans l'ancien chemin, la norme finale était
         // CPU. Garder ce repli évite de changer ses bits sur un prefill monobloc.
         if mtp_seed.is_some() && chunk_count == 1 && !private_scratch_enabled() {

@@ -20,6 +20,9 @@ pub struct TtsModel {
     pub(super) codec_payload: TtsPayloadSummary,
     pub(super) clone_ctx: Option<TtsCloneContext>,
     pub(super) voice_design_instruction: String,
+    pub(super) speaker_id: Option<i32>,
+    pub(super) generation_config: Option<super::config::TtsGenerationConfig>,
+    pub(super) seed: Option<u64>,
     // Le cache appartient aux poids chargés : aucun état ne survit au modèle.
     pub(super) prefill_memo: std::sync::Mutex<super::prefill::TtsPrefillMemo>,
 }
@@ -53,6 +56,8 @@ pub struct TtsSynthesisOutput {
     /// Le budget effectif a été consommé sans observer EOS. Le PCM reste utile,
     /// mais peut être incomplet. `false` n'exclut pas l'arrêt anti-répétition.
     pub frame_limit_reached: bool,
+    /// Cause effective de la fin de génération.
+    pub stop_reason: TtsStopReason,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -97,4 +102,28 @@ impl TtsCloneMode {
             Self::XVectorOnly => "clone-xvec-only",
         }
     }
+}
+
+/// Cause effective de la fin de génération TTS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TtsStopReason {
+    Eos,
+    Repeat,
+    Cap,
+}
+
+impl TtsStopReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Eos => "eos",
+            Self::Repeat => "repeat",
+            Self::Cap => "cap",
+        }
+    }
+}
+
+pub(super) struct GeneratedCodes {
+    pub codes: Vec<Vec<i32>>,
+    pub stop_reason: TtsStopReason,
 }

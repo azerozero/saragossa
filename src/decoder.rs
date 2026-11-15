@@ -1351,17 +1351,14 @@ impl CausalDecoder {
             .copied()
             .filter(|&v| v > 0)
             .ok_or_else(|| InferError::Config("vocabulaire KL vide".into()))?;
-        let config = format!(
-            "{:x}",
-            Sha256::digest(format!("{:?}", self.config).as_bytes())
-        );
+        let config = crate::hex(Sha256::digest(format!("{:?}", self.config).as_bytes()));
         let mut weights = Sha256::new();
         // Le gather existant fonctionne aussi après libération des poids CPU.
         let sample = self.embed_scaled(&[0, vocab / 2, vocab - 1])?;
         for value in sample.data().iter().chain(self.final_norm.data()) {
             weights.update(value.to_le_bytes());
         }
-        Ok((vocab, config, format!("{:x}", weights.finalize())))
+        Ok((vocab, config, crate::hex(weights.finalize())))
     }
 }
 
@@ -2028,6 +2025,66 @@ impl CausalDecoder {
         self.finalize_logits(&logits)
     }
 
+    /// Hidden normalisés des positions `rows` d'une décision texte jointe.
+    /// Les couches complètes voient toute la séquence, les gated-delta restent
+    /// causales. Aucun cache de préfixe ni tête de vocabulaire n'est utilisé.
+    ///
+    /// # Errors
+    /// Refuse les séquences hors contrat et les architectures non Qwen3.5.
+    pub fn decision_hidden(&self, token_ids: &[usize], rows: &[usize]) -> Result<Tensor> {
+        let hidden_dim = self.final_norm.len();
+        // Seules les lignes lues par le readout passent par la norme finale.
+        let normed = |data: &[f32]| -> Result<Tensor> {
+            let mut picked = Vec::with_capacity(rows.len() * hidden_dim);
+            for &row in rows {
+                let slice = data
+                    .get(row * hidden_dim..(row + 1) * hidden_dim)
+                    .ok_or_else(|| InferError::Config("ligne de décision hors séquence".into()))?;
+                picked.extend_from_slice(slice);
+            }
+            let picked = Tensor::from_vec(vec![rows.len(), hidden_dim], picked)?;
+            rms_norm(&picked, &self.final_norm, self.config.rms_eps)
+        };
+        if token_ids.is_empty()
+            || token_ids.len() > 2048
+            || !self.config.is_qwen
+            || !self.config.attn_output_gate
+        {
+            return Err(InferError::Config(
+                "décision Qwen3.5 : 1 à 2048 tokens requis".into(),
+            ));
+        }
+        crate::runtime_flags::with_decision_noncausal(|| {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            if self.resident_metal().is_some() {
+                let (_, hidden, _) = self
+                    .prefill_resident_cache_hidden_and_captures(
+                        token_ids,
+                        &[],
+                        usize::MAX,
+                        false,
+                        0,
+                    )?
+                    .ok_or_else(|| {
+                        InferError::Config("prefill décision résident indisponible".into())
+                    })?;
+                return match &hidden {
+                    crate::metal_backend::PrefillKvRows::Owned(data) => normed(data),
+                    crate::metal_backend::PrefillKvRows::Shared(rows) => normed(rows.as_slice()),
+                    _ => Err(InferError::Config(
+                        "hidden de décision bf16 inattendu".into(),
+                    )),
+                };
+            }
+            let runtime = self.forward_runtime();
+            let mut hidden = self.embed_scaled(token_ids)?;
+            for layer in &self.layers {
+                hidden = layer.forward(&self.config, &hidden, runtime)?;
+            }
+            normed(hidden.data())
+        })
+    }
+
     /// Pré-remplit le cache depuis des embeddings déjà préparés.
     ///
     /// Qwen3-TTS prépare ses entrées comme un overlay texte+codec ; elles ne
@@ -2175,9 +2232,9 @@ impl CausalDecoder {
                 Some(crate::decoder::resident::ResidentEmbeddingOut::State(state)) => {
                     Ok(Some(state))
                 }
-                Some(crate::decoder::resident::ResidentEmbeddingOut::Token(_)) => Err(
-                    InferError::Metal("pas résident embedding: token inattendu".to_string()),
-                ),
+                Some(_) => Err(InferError::Metal(
+                    "pas résident embedding: token inattendu".to_string(),
+                )),
                 None => Ok(None),
             }
         }
@@ -2213,19 +2270,108 @@ impl CausalDecoder {
                 return Ok(None);
             };
             let head_buffers = metal.resolve_linear_weight_buffers(head.weight(), "tts_cp_head")?;
-            match self.next_resident_embedding_step(cache, embedding, Some(&head_buffers))? {
+            match self.next_resident_embedding_step(
+                cache,
+                embedding,
+                Some(resident::ResidentEmbeddingHead::Greedy(&head_buffers)),
+            )? {
                 Some(crate::decoder::resident::ResidentEmbeddingOut::Token(token)) => {
                     Ok(Some(token))
                 }
-                Some(crate::decoder::resident::ResidentEmbeddingOut::State(_)) => Err(
-                    InferError::Metal("pas résident tête: état inattendu".to_string()),
-                ),
+                Some(_) => Err(InferError::Metal(
+                    "pas résident tête: état inattendu".to_string(),
+                )),
                 None => Ok(None),
             }
         }
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (cache, embedding, head);
+            Ok(None)
+        }
+    }
+
+    /// Décode un embedding et projette la tête dans le même command buffer.
+    /// Seuls les logits sont relus ; le sampler CPU conserve son ordre de tirage.
+    /// Renvoie `None` si le résident est indisponible, sans avancer le cache.
+    ///
+    /// # Errors
+    /// Renvoie une erreur pour une tête avec biais ou un encodage Metal invalide.
+    pub fn decode_logits_resident_from_embedding_head(
+        &self,
+        cache: &mut CausalDecoderCache,
+        embedding: &Tensor,
+        head: &crate::Linear,
+    ) -> Result<Option<Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if head.bias().is_some() {
+                return Err(InferError::Config(
+                    "tête résidente avec biais non supportée".into(),
+                ));
+            }
+            let Some(metal) = self.forward_runtime().metal_executor() else {
+                return Ok(None);
+            };
+            let buffers = metal.resolve_linear_weight_buffers(head.weight(), "tts_cp_head")?;
+            match self.next_resident_embedding_step(
+                cache,
+                embedding,
+                Some(resident::ResidentEmbeddingHead::Logits(&buffers)),
+            )? {
+                Some(resident::ResidentEmbeddingOut::Logits(logits)) => Ok(Some(logits)),
+                Some(_) => Err(InferError::Metal(
+                    "pas résident tête: logits absents".into(),
+                )),
+                None => Ok(None),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, embedding, head);
+            Ok(None)
+        }
+    }
+
+    /// Décode un embedding avec la tête du modèle, et relit état et logits.
+    /// Le talker TTS a besoin de l'état pour amorcer son code predictor.
+    ///
+    /// # Errors
+    /// Renvoie une erreur pour une tête avec biais ou un encodage Metal invalide.
+    pub fn decode_state_logits_resident_from_embedding(
+        &self,
+        cache: &mut CausalDecoderCache,
+        embedding: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if self.lm_head.bias().is_some() {
+                return Err(InferError::Config(
+                    "tête résidente avec biais non supportée".into(),
+                ));
+            }
+            let Some(metal) = self.forward_runtime().metal_executor() else {
+                return Ok(None);
+            };
+            let buffers =
+                metal.resolve_linear_weight_buffers(self.lm_head.weight(), "tts_talker_head")?;
+            match self.next_resident_embedding_step(
+                cache,
+                embedding,
+                Some(resident::ResidentEmbeddingHead::StateLogits(&buffers)),
+            )? {
+                Some(resident::ResidentEmbeddingOut::StateLogits(state, logits)) => {
+                    Ok(Some((state, self.finalize_logits(&logits)?)))
+                }
+                Some(_) => Err(InferError::Metal(
+                    "pas résident tête: état/logits absents".into(),
+                )),
+                None => Ok(None),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, embedding);
             Ok(None)
         }
     }

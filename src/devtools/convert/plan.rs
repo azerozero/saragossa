@@ -45,13 +45,7 @@ pub(crate) fn io_err(path: &Path, source: std::io::Error) -> InferError {
     }
 }
 
-pub(crate) fn hex(digest: impl AsRef<[u8]>) -> String {
-    digest
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
+pub(crate) use crate::hex;
 
 fn dtype_name(dtype: Dtype) -> String {
     format!("{dtype:?}")

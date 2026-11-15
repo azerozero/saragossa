@@ -1234,6 +1234,21 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
     ) -> Result<()> {
+        if crate::runtime_flags::decision_noncausal() {
+            if spec.seq > 2048 || spec.window.is_some() {
+                return Err(InferError::Config(
+                    "prefill décision hors contrat non causal".into(),
+                ));
+            }
+            return self.encode_noncausal_attention_prefill(
+                encoder,
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                spec,
+            );
+        }
         let spec = spec.with_effective_window(spec.seq);
         if spec.window.is_some() {
             return Err(InferError::Config(
@@ -1709,6 +1724,11 @@ impl MetalExecutor {
         &self,
         spec: PrefillAttentionSpec,
     ) -> Option<&NaxCausalAttention> {
+        if crate::runtime_flags::decision_noncausal() {
+            return (spec.head_dim == 256 && spec.window.is_none())
+                .then_some(self.decision_attention_nax.as_ref())
+                .flatten();
+        }
         if !crate::runtime_flags::prefill_attn_steel_d256_enabled()
             || !prefill_attn_steel_shape_supported(spec)
         {
@@ -1784,6 +1804,9 @@ impl MetalExecutor {
             }
             None => {
                 // Le Steel f32 existant est spécialisé d256 ; d128 reprend le naïf.
+                if crate::runtime_flags::decision_noncausal() {
+                    return Ok(false);
+                }
                 if spec.head_dim != 256 {
                     return Ok(false);
                 }
@@ -1835,6 +1858,21 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
     ) -> Result<()> {
+        if crate::runtime_flags::decision_noncausal()
+            && self.encode_steel_causal_attention_prefill(
+                encoder,
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                spec,
+                spec.seq,
+                spec.seq,
+                None,
+            )?
+        {
+            return Ok(());
+        }
         if self.encode_steel_noncausal_attention_prefill(
             encoder,
             q_buffer,
@@ -1844,6 +1882,13 @@ impl MetalExecutor {
             spec,
         )? {
             return Ok(());
+        }
+        // Limites du repli f32 uniquement : le Steel d64 accepte aussi les
+        // séquences longues des autres utilisateurs de l'attention non causale.
+        if spec.seq == 0 || spec.seq > 2048 || spec.head_dim == 0 || spec.head_dim > 256 {
+            return Err(InferError::Dimension(
+                "attention non causale f32 : seq 1..=2048 et head_dim 1..=256 requis".into(),
+            ));
         }
         let dims = [
             checked_u32(spec.seq, "attention seq")?,
