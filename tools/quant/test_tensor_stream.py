@@ -64,6 +64,10 @@ def stdlib_checks():
         except ValueError:
             pass
         with patch.object(tensor_stream.shutil, "disk_usage") as usage:
+            usage.return_value.free = 100 * 2**30
+            tensor_stream.check_space(root / "absent" / "nested", 30)
+            usage.assert_called_with(root)
+            assert not (root / "absent").exists()
             usage.return_value.free = 29 * 2**30
             try:
                 tensor_stream.copy_shard(path, root / "out", 30)

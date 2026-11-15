@@ -89,6 +89,10 @@ def catalog(paths):
 
 
 def check_space(path, minimum):
+    # La destination peut avoir des parents encore absents : mkdir(parents=True)
+    # les créera après la validation, sur le volume de cet ancêtre existant.
+    while not path.exists():
+        path = path.parent
     free = shutil.disk_usage(path).free
     if free < minimum * 2**30:
         raise OSError(f"arrêt disque : {free / 2**30:.2f} Gio libres < {minimum} Gio")
