@@ -7,6 +7,15 @@ mod macos {
     use sha2::{Digest, Sha256};
     use std::{fs, path::Path};
 
+    /// sha2 0.11 renvoie un `hybrid_array::Array` sans `LowerHex`.
+    fn hex(digest: impl AsRef<[u8]>) -> String {
+        digest
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
     #[derive(Deserialize, Serialize)]
@@ -25,7 +34,7 @@ mod macos {
     }
 
     fn hash(path: &Path) -> Result<String> {
-        Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
+        Ok(hex(Sha256::digest(fs::read(path)?)))
     }
 
     fn partition(values: &[f32], top: usize) -> Result<(Vec<usize>, Vec<f64>)> {
@@ -73,7 +82,7 @@ mod macos {
         // changer leur contenu.
         let mut vocab = serde_json::json!({"vocab":tokenizer_json["model"]["vocab"],"added_tokens":tokenizer_json["added_tokens"]});
         vocab.sort_all_objects();
-        let vocab_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&vocab)?));
+        let vocab_sha256 = hex(Sha256::digest(serde_json::to_vec(&vocab)?));
         // Les IDs du protocole sont ceux du banc MLX. Les conversions mlx_lm
         // réécrivent le pré-tokenizer : on compare donc le vocabulaire, sans
         // re-tokeniser le corpus avec le tokenizer du candidat.
