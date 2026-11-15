@@ -84,18 +84,26 @@ the **single-user latency × Apple Silicon** quadrant:
 
 ### Streaming audio HTTP
 
+CustomVoice accepte `voice` (défaut : `serena`) et refuse les voix inconnues avec
+HTTP 400. VoiceDesign et CustomVoice utilisent le sampling du snapshot avec
+une graine déterministe ; `seed` permet de la choisir par requête.
+Voir [la politique de génération TTS](docs/tts-generation.md) pour les
+paramètres, le flag glouton des oracles et les raisons d'arrêt.
+
 `POST /v1/audio/speech` conserve le WAV complet par défaut (`stream` absent ou
 `false`). L'extension explicite `{"input":"Bonjour.","stream":true}` émet chaque
 lot dès son décodage, en HTTP/1.1 `Transfer-Encoding: chunked`, sans
 `Content-Length`. Le corps déchunké est du **PCM brut signé 16 bits little-endian,
 mono, sans en-tête WAV** (`Content-Type: audio/pcm`). Le taux natif du codec est
 indiqué par `X-Saragossa-Audio-Sample-Rate` (habituellement 24000 Hz) ; chaque
-échantillon utilise la même conversion que le WAV. `model` et `voice` restent
-acceptés sans effet. `stream: true` sélectionne ce format PCM à lui seul.
+échantillon utilise la même conversion que le WAV. `model` reste accepté sans
+effet. `stream: true` sélectionne ce format PCM à lui seul.
 
 Le plafond audio existant et `SARAGOSSA_TTS_MAX_FRAMES` s'appliquent aux deux
 modes. En streaming, `X-Saragossa-TTS-Frame-Limit-Reached` est un **trailer HTTP**
 annoncé par `Trailer`, transmis après le chunk zéro ; en WAV, il reste un en-tête.
+`X-Saragossa-TTS-Stop-Reason` suit le même transport et distingue `eos`, `repeat`
+et `cap`.
 Un client qui ignore les trailers ne reçoit pas cette indication. Une erreur
 après le début de la réponse ferme le flux sans chunk terminal : le client doit
 traiter ce corps comme incomplet. Une déconnexion arrête la synthèse dès l'échec

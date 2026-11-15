@@ -9,10 +9,14 @@ VoiceDesign et Base ignorent ce champ, car ils n'ont pas de locuteur nommé.
 Le préfixe CustomVoice français est : `think, think_bos, langue, think_eos,
 locuteur, pad, bos`. Le locuteur est un embedding codec du `spk_id`, pas un
 embedding texte. Le préfixe VoiceDesign reste identique.
-Source de cet ordre : contrat du correctif TTS du 15 novembre 2026 ; aucun
-paquet Python `qwen_tts`, `qwen3_tts` ou `mlx_audio` trouvé dans les installations
-locales inspectées. Les identifiants viennent exclusivement du `config.json`
-du snapshot chargé. Il ne s'agit pas d'une vérification de la référence amont.
+Source vérifiée localement : `mlx_audio 0.4.3`,
+`tts/models/qwen3_tts/qwen3_tts.py`, `_prepare_inputs` (lignes 348–436) et
+`_sample_token` (lignes 750–780). Le locuteur utilise les embeddings codec et
+précède le suffixe pad/bos. La pénalité porte une fois sur chaque identifiant
+présent dans l’historique : multiplication si négatif, division sinon.
+SHA-256 de cette source :
+`fcb37415039f5f0b67377c6fe5cb19010f3d91b7c8a3f1bdc623fccf688e13d2`.
+Les identifiants viennent exclusivement du `config.json` du snapshot chargé.
 
 VoiceDesign et CustomVoice chargent `generation_config.json` : `do_sample`,
 `temperature`, `top_k`, `top_p`, `repetition_penalty`, les quatre réglages
