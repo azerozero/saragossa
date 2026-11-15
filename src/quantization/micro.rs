@@ -310,6 +310,18 @@ mod tests {
         )?;
         assert_eq!(&w.row(0)?[..4], &[1.0, -1.0, 448.0, -480.0]);
         assert_eq!(&w.row(0)?[32..36], &[2.0, -2.0, 896.0, -960.0]);
+        let tiny =
+            MicroQuantizedTensor::new([1, 32], vec![0x7654_3210; 4], vec![0], MicroMode::Mxfp4)?;
+        assert_eq!(
+            tiny.row(0)?[..8]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            [0, 0x20_0000, 0x40_0000, 0x60_0000, 0x80_0000, 0xc0_0000, 0x100_0000, 0x140_0000]
+        );
+        let tiny =
+            MicroQuantizedTensor::new([1, 32], vec![0x0101_0101; 8], vec![0], MicroMode::Mxfp8)?;
+        assert_eq!(tiny.row(0)?[0].to_bits(), 0x2000); // 2^-9 × 2^-127 = 2^-136.
         Ok(())
     }
 
