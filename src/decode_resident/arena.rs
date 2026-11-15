@@ -385,6 +385,7 @@ impl DecodeResidentState {
             rows_kernels: OnceLock::new(),
             kv_quant_kernels: OnceLock::new(),
             sink_kernels: OnceLock::new(),
+            tts_sampler_kernel: OnceLock::new(),
             timer,
             scratch_namespace: 0,
         })

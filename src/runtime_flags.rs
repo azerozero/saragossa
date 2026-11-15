@@ -2952,6 +2952,24 @@ pub(crate) fn prefix_ssd_staging_bytes(
         .ok_or_else(|| crate::InferError::Config("staging SSD : plafond invalide".into()))
 }
 
+/// Trame échantillonnée du code predictor TTS en un command buffer : projection,
+/// 15 têtes, tirage top-k/top-p et gather d'embedding sur GPU, un seul
+/// readback par trame. Défaut ON ; `SARAGOSSA_TTS_CP_FUSED=0` rétablit le
+/// chemin pas à pas (projection et tirage CPU). Sans effet sur le glouton.
+pub(crate) fn tts_cp_fused_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CP_FUSED", true))
+}
+
+/// Codec TTS streaming sur un thread dédié, en recouvrement de la génération
+/// des trames suivantes ; les lots en attente sont fusionnés quand le codec
+/// prend du retard. Défaut ON ; `SARAGOSSA_TTS_CODEC_OVERLAP=0` rétablit le
+/// décodage synchrone dans le callback de trame. PCM identique par causalité.
+pub(crate) fn tts_codec_overlap_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CODEC_OVERLAP", true))
+}
+
 /// Force le décodage glouton TTS historique pour les oracles.
 #[must_use]
 pub fn tts_greedy_enabled() -> bool {

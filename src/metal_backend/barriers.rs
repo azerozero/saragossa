@@ -1,6 +1,6 @@
 //! Barrières, fins d'encodage et synchronisation des command buffers Metal.
 
-use super::profiling::{DECODE_PROFILE_CB, DECODE_PROFILE_WAIT_NS};
+use super::profiling::{DECODE_PROFILE_CB, DECODE_PROFILE_GPU_NS, DECODE_PROFILE_WAIT_NS};
 use super::*;
 use crate::runtime_flags::env_flag;
 
@@ -28,6 +28,34 @@ pub(crate) fn suspend_dispatch_barrier_scope() -> DispatchBarrierScopeGuard {
         let previous = slot.replace(false);
         DispatchBarrierScopeGuard(previous)
     })
+}
+
+/// Durée GPU d'un command buffer terminé (`GPUEndTime - GPUStartTime`), en ns.
+#[allow(
+    unsafe_code,
+    reason = "metal-rs 0.33 n'expose pas GPUStartTime ni GPUEndTime"
+)]
+fn command_buffer_gpu_ns(command_buffer: &metal::CommandBufferRef) -> u64 {
+    type TimeGetter = unsafe extern "C" fn(*mut Object, Sel) -> f64;
+    static START: OnceLock<Sel> = OnceLock::new();
+    static END: OnceLock<Sel> = OnceLock::new();
+
+    unsafe extern "C" {
+        fn objc_msgSend();
+    }
+
+    // SAFETY: `command_buffer` est un `id<MTLCommandBuffer>` valide et terminé ;
+    // `GPUStartTime` et `GPUEndTime` sont des propriétés `CFTimeInterval`
+    // (double) sans argument, disponibles depuis macOS 10.15. Sur arm64,
+    // `objc_msgSend` renvoie un double dans d0 sans variante `fpret`.
+    let (start, end) = unsafe {
+        let send: TimeGetter = std::mem::transmute(objc_msgSend as *const ());
+        let object = command_buffer.as_ptr().cast::<Object>();
+        let start = *START.get_or_init(|| sel_registerName(c"GPUStartTime".as_ptr()));
+        let end = *END.get_or_init(|| sel_registerName(c"GPUEndTime".as_ptr()));
+        (send(object, start), send(object, end))
+    };
+    ((end - start).max(0.0) * 1e9) as u64
 }
 
 #[allow(
@@ -187,6 +215,7 @@ pub(crate) fn commit_and_wait(command_buffer: &metal::CommandBufferRef) -> Resul
         command_buffer.commit();
         command_buffer.wait_until_completed();
         DECODE_PROFILE_WAIT_NS.fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        DECODE_PROFILE_GPU_NS.fetch_add(command_buffer_gpu_ns(command_buffer), Relaxed);
     } else {
         command_buffer.commit();
         command_buffer.wait_until_completed();

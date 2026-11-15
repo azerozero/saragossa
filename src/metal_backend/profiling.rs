@@ -17,6 +17,9 @@ pub(super) static DECODE_PROFILE_CB: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(super) static DECODE_PROFILE_WAIT_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Temps GPU cumulé des command buffers synchronisés (horodatage Metal).
+pub(super) static DECODE_PROFILE_GPU_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(super) static DECODE_PROFILE_READ_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static DECODE_PROFILE_DISPATCHES: std::sync::atomic::AtomicU64 =
@@ -116,6 +119,13 @@ pub fn decode_profile_snapshot() -> (u64, u64, u64, u64) {
         DECODE_PROFILE_READ_NS.load(Relaxed),
         DECODE_PROFILE_DISPATCHES.load(Relaxed),
     )
+}
+
+/// Temps GPU cumulé (ns) des command buffers passés par `commit_and_wait`
+/// sous `SARAGOSSA_RUST_DECODE_PROFILE` ; zéro sinon.
+#[doc(hidden)]
+pub fn decode_profile_gpu_ns() -> u64 {
+    DECODE_PROFILE_GPU_NS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[doc(hidden)]

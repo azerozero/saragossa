@@ -57,6 +57,7 @@ mod layers;
 mod moe_tail;
 mod multi;
 mod rows;
+mod tts_sampler;
 mod types;
 mod utils;
 
@@ -82,6 +83,7 @@ pub(crate) use self::kv_quant::KvFormat;
 #[cfg(test)]
 pub(crate) use self::layers::QKV_CONCAT_NO_GATE_HITS;
 pub(crate) use self::multi::MultiFullAttnStream;
+pub(crate) use self::tts_sampler::{TtsCodebookSample, TTS_SAMPLER_MAX_VOCAB, TTS_SAMPLER_TRACE_K};
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
     GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,
@@ -134,6 +136,8 @@ pub(crate) struct DecodeResidentState {
     kv_quant_kernels: OnceLock<kv_quant::KvQuantKernels>,
     /// Kernels d'attention avec sinks appris (flint), compilés au premier usage.
     sink_kernels: OnceLock<attention::SinkKernels>,
+    /// Tirage des codebooks TTS sur GPU, compilé au premier usage.
+    tts_sampler_kernel: OnceLock<tts_sampler::TtsSamplerKernel>,
     /// Instrumentation per-section (tranche 3), active si `SARAGOSSA_RUST_GPU_COUNTERS`.
     timer: Option<GpuSectionTimer>,
     /// Slot de flux (light-batch) : namespace du scratch label-keyed de

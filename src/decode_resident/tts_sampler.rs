@@ -1,0 +1,293 @@
+//! Tirage top-k/top-p sur GPU des codebooks du code predictor Qwen3-TTS.
+//!
+//! Un threadgroup reproduit `token_distribution_top_k_top_p` puis
+//! `sample_from_token_distribution` (`crate::sampling`) sur un vocabulaire d'au
+//! plus [`TTS_SAMPLER_MAX_VOCAB`] logits : softmax avec température sur tout le
+//! vocabulaire, tri complet par (probabilité décroissante, indice croissant),
+//! troncature top-k, noyau top-p, renormalisation puis tirage cumulatif.
+//! L'uniforme est `splitmix_unit_f32` sur l'état SplitMix64 du tirage, le
+//! même que `DeterministicSampler::next_unit_f32`.
+//!
+//! Seuls diffèrent les arrondis : le maximum et la somme de la softmax sont
+//! réduits en arbre au lieu d'un cumul séquentiel, et `exp` vient de Metal.
+//! Les tirages peuvent donc basculer sur une quasi-égalité ; l'oracle
+//! `fused_codebooks_match_cpu_oracle` mesure l'écart sur les probabilités et
+//! les tirages. Le kernel est compilé sans fast-math.
+//!
+//! La pénalité de répétition n'existe pas ici : la référence ne l'applique
+//! qu'à cb0 (historique talker), jamais aux codebooks du code predictor.
+
+use super::kernels::compile_kernels;
+use super::*;
+
+/// Vocabulaire maximal trié dans un threadgroup (2 éléments par thread).
+pub(crate) const TTS_SAMPLER_MAX_VOCAB: usize = 2048;
+/// Couples (probabilité, indice) écrits par tirage dans la trace d'oracle.
+pub(crate) const TTS_SAMPLER_TRACE_K: usize = 64;
+const THREADS: usize = TTS_SAMPLER_MAX_VOCAB / 2;
+
+const TTS_SAMPLER_KERNEL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint SORT_N = 2048u;
+constant uint THREADS = 1024u;
+constant uint TRACE_K = 64u;
+
+static inline float tts_splitmix_unit_f32(ulong state) {
+    state += 0x9E3779B97F4A7C15ul;
+    ulong z = state;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ul;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBul;
+    z = z ^ (z >> 31);
+    const uint mantissa = uint(z >> 40) & 0x00ffffffu;
+    return float(mantissa) / 16777216.0f;
+}
+
+// Ordre `by_rank` du CPU : probabilité décroissante, puis indice croissant.
+static inline bool tts_ranks_before(float pa, uint ia, float pb, uint ib) {
+    return pa > pb || (pa == pb && ia < ib);
+}
+
+// dims = (count, top_k, slot, trace), params = (temperature, top_p).
+// `rng_state` est l'état AVANT le tirage (DeterministicSampler::state()).
+kernel void tts_sample_codebook_f32(
+    device const float* logits [[buffer(0)]],
+    device uint* codes [[buffer(1)]],
+    device float* trace [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]],
+    constant float2& params [[buffer(4)]],
+    constant ulong& rng_state [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float probs[SORT_N];
+    threadgroup uint ids[SORT_N];
+    threadgroup float reduce[THREADS];
+
+    const uint count = dims.x;
+    const float temperature = max(params.x, 0.0001f);
+    const float top_p = params.y;
+
+    float local_max = -INFINITY;
+    for (uint i = tid; i < count; i += THREADS) {
+        local_max = fmax(local_max, logits[i]);
+    }
+    reduce[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = THREADS / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            reduce[tid] = fmax(reduce[tid], reduce[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float max_value = reduce[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < SORT_N; i += THREADS) {
+        float value = -1.0f;
+        if (i < count) {
+            value = precise::exp((logits[i] - max_value) / temperature);
+            local_sum += value;
+        }
+        probs[i] = value;
+        ids[i] = i;
+    }
+    reduce[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = THREADS / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            reduce[tid] += reduce[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float total = reduce[0];
+    for (uint i = tid; i < count; i += THREADS) {
+        probs[i] = probs[i] / total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tri bitonique complet, décroissant par rang ; le bourrage (-1) finit en queue.
+    for (uint k = 2u; k <= SORT_N; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            const uint a = (tid / j) * 2u * j + (tid % j);
+            const uint b = a + j;
+            const float pa = probs[a];
+            const float pb = probs[b];
+            const uint ia = ids[a];
+            const uint ib = ids[b];
+            const bool a_first = tts_ranks_before(pa, ia, pb, ib);
+            if (((a & k) == 0u) != a_first) {
+                probs[a] = pb;
+                probs[b] = pa;
+                ids[a] = ib;
+                ids[b] = ia;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (tid != 0u) {
+        return;
+    }
+    const uint top_k = min(dims.y, count);
+    float top_sum = 0.0f;
+    for (uint r = 0u; r < top_k; ++r) {
+        top_sum += probs[r];
+    }
+    uint kept = 1u;
+    if (top_sum > FLT_EPSILON) {
+        float cumulative = 0.0f;
+        for (uint r = 0u; r < top_k; ++r) {
+            cumulative += probs[r] / top_sum;
+            kept = r + 1u;
+            if (r == 0u || cumulative < top_p) {
+                continue;
+            }
+            break;
+        }
+    }
+    float kept_sum = 0.0f;
+    for (uint r = 0u; r < kept; ++r) {
+        kept_sum += probs[r];
+    }
+    // Repli CPU sur une masse dégénérée : argmax, ici le premier rang.
+    const bool degenerate = top_sum <= FLT_EPSILON || kept_sum <= FLT_EPSILON;
+    if (degenerate) {
+        kept = 1u;
+    }
+    float normalized_sum = 0.0f;
+    for (uint r = 0u; r < kept; ++r) {
+        normalized_sum += degenerate ? 1.0f : probs[r] / kept_sum;
+    }
+    const float roll = tts_splitmix_unit_f32(rng_state) * normalized_sum;
+    float acc = 0.0f;
+    uint chosen = ids[kept - 1u];
+    for (uint r = 0u; r < kept; ++r) {
+        const float prob = degenerate ? 1.0f : probs[r] / kept_sum;
+        if (prob <= 0.0f) {
+            continue;
+        }
+        acc += prob;
+        if (roll <= acc) {
+            chosen = ids[r];
+            break;
+        }
+    }
+    const uint slot = dims.z;
+    codes[slot] = chosen;
+    if (dims.w != 0u) {
+        device float* row = trace + slot * 2u * TRACE_K;
+        for (uint r = 0u; r < TRACE_K; ++r) {
+            const bool live = r < kept;
+            row[r] = live ? (degenerate ? 1.0f : probs[r] / kept_sum) : 0.0f;
+            row[TRACE_K + r] = as_type<float>(live ? ids[r] : 0xffffffffu);
+        }
+    }
+}
+"#;
+
+/// Paramètres d'un tirage de codebook ; `top_k` dans `1..count`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TtsCodebookSample {
+    pub(crate) temperature: f32,
+    pub(crate) top_k: usize,
+    pub(crate) top_p: f32,
+}
+
+pub(crate) struct TtsSamplerKernel {
+    pipeline: ComputePipelineState,
+}
+
+impl std::fmt::Debug for TtsSamplerKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TtsSamplerKernel").finish_non_exhaustive()
+    }
+}
+
+impl DecodeResidentState {
+    fn tts_sampler_kernel(&self) -> Result<&TtsSamplerKernel> {
+        if let Some(kernel) = self.tts_sampler_kernel.get() {
+            return Ok(kernel);
+        }
+        let pipeline = compile_kernels(
+            &self.device,
+            TTS_SAMPLER_KERNEL,
+            &["tts_sample_codebook_f32"],
+            false,
+        )?
+        .pop()
+        .ok_or_else(|| InferError::Metal("pipeline tts_sample_codebook_f32 absent".into()))?;
+        if (pipeline.max_total_threads_per_threadgroup() as usize) < THREADS {
+            return Err(InferError::Metal(format!(
+                "tirage TTS: {THREADS} threads par threadgroup requis"
+            )));
+        }
+        Ok(self
+            .tts_sampler_kernel
+            .get_or_init(|| TtsSamplerKernel { pipeline }))
+    }
+
+    /// Encode le tirage d'un codebook : lit `count` logits, écrit l'indice tiré
+    /// dans `codes[slot]` et, si `trace`, la distribution retenue dans
+    /// `trace_buffer[slot]` (64 probabilités puis 64 indices en bits f32).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `count` dépasse [`TTS_SAMPLER_MAX_VOCAB`], si
+    /// `top_k` sort de `1..count` ou si le kernel ne compile pas.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "buffers d'entrée, de sortie et de trace, slot et paramètres de tirage"
+    )]
+    pub(crate) fn encode_tts_codebook_sample(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        logits: &BufferRef,
+        count: usize,
+        codes: &BufferRef,
+        slot: usize,
+        trace: Option<&BufferRef>,
+        sample: TtsCodebookSample,
+        rng_state: u64,
+    ) -> Result<()> {
+        if count == 0 || count > TTS_SAMPLER_MAX_VOCAB || sample.top_k == 0 || sample.top_k >= count
+        {
+            return Err(InferError::Config(format!(
+                "tirage TTS GPU: vocab={count}, top_k={} hors domaine",
+                sample.top_k
+            )));
+        }
+        let to_u32 = |value: usize, label: &str| {
+            u32::try_from(value).map_err(|_| InferError::Dimension(format!("{label} hors u32")))
+        };
+        let dims = [
+            to_u32(count, "tirage TTS vocab")?,
+            to_u32(sample.top_k, "tirage TTS top_k")?,
+            to_u32(slot, "tirage TTS slot")?,
+            u32::from(trace.is_some()),
+        ];
+        let params = [sample.temperature, sample.top_p];
+        let kernel = self.tts_sampler_kernel()?;
+        encoder.set_compute_pipeline_state(&kernel.pipeline);
+        encoder.set_buffer(0, Some(logits), 0);
+        encoder.set_buffer(1, Some(codes), 0);
+        // Sans trace, le kernel n'écrit jamais l'argument 2 ; il reste lié.
+        encoder.set_buffer(2, Some(trace.unwrap_or(codes)), 0);
+        set_bytes(encoder, 3, &dims);
+        set_bytes(encoder, 4, &params);
+        set_bytes(encoder, 5, &[rng_state]);
+        crate::metal_backend::profile_dispatch();
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(THREADS as u64, 1, 1));
+        crate::metal_backend::post_dispatch_barrier(encoder);
+        Ok(())
+    }
+}
+
+fn set_bytes<T: Copy>(encoder: &ComputeCommandEncoderRef, index: u64, values: &[T]) {
+    encoder.set_bytes(
+        index,
+        std::mem::size_of_val(values) as u64,
+        values.as_ptr().cast::<c_void>(),
+    );
+}
