@@ -1102,6 +1102,7 @@ impl MetalExecutor {
             moe_stacks: Mutex::new(HashMap::new()),
             concat_buffers: Mutex::new(HashMap::new()),
             library: library.clone(),
+            micro_library: Mutex::new(None),
             qmvt_pipelines: Mutex::new(HashMap::new()),
             preserve_weight_caches: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

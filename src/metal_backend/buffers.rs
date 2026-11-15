@@ -20,6 +20,9 @@ impl MetalExecutor {
         embedding: &EmbeddingWeight,
     ) -> Result<MetalEmbeddingWeightBuffers> {
         match embedding {
+            EmbeddingWeight::MicroScaled(weight) => Ok(MetalEmbeddingWeightBuffers::MicroScaled(
+                self.resolve_micro(weight)?,
+            )),
             EmbeddingWeight::DenseBf16(table) => Ok(MetalEmbeddingWeightBuffers::DenseBf16 {
                 table: table.buffer().clone(),
                 vocab: table.shape()[0],
@@ -396,6 +399,7 @@ impl MetalExecutor {
 
     pub(crate) fn linear_weight_out_dim(&self, weight: &MetalLinearWeightBuffers) -> usize {
         match weight {
+            MetalLinearWeightBuffers::MicroScaled(weight) => weight.out_dim,
             MetalLinearWeightBuffers::DenseBf16 { out_dim, .. }
             | MetalLinearWeightBuffers::Dense { out_dim, .. }
             | MetalLinearWeightBuffers::AffineQuantized { out_dim, .. } => *out_dim,
@@ -404,6 +408,7 @@ impl MetalExecutor {
 
     pub(crate) fn linear_weight_in_dim(&self, weight: &MetalLinearWeightBuffers) -> usize {
         match weight {
+            MetalLinearWeightBuffers::MicroScaled(weight) => weight.in_dim,
             MetalLinearWeightBuffers::DenseBf16 { in_dim, .. }
             | MetalLinearWeightBuffers::Dense { in_dim, .. }
             | MetalLinearWeightBuffers::AffineQuantized { in_dim, .. } => *in_dim,
@@ -995,6 +1000,7 @@ impl MetalExecutor {
             return Ok(entry.buffer.clone());
         }
         let bytes = match element {
+            MetalBufferElement::U8 => byte_len::<u8>(len)?,
             MetalBufferElement::F32 => byte_len::<f32>(len)?,
             MetalBufferElement::U32 => byte_len::<u32>(len)?,
             MetalBufferElement::Bf16 => byte_len::<u16>(len)?,
@@ -1192,6 +1198,12 @@ fn describe_stacked_affine_buffers(weight: &StackedAffineBuffers) -> String {
 
 fn describe_linear_weight_buffers(weight: &MetalLinearWeightBuffers) -> String {
     match weight {
+        MetalLinearWeightBuffers::MicroScaled(weight) => format!(
+            "{} {}x{}",
+            weight.mode.name(),
+            weight.out_dim,
+            weight.in_dim
+        ),
         MetalLinearWeightBuffers::DenseBf16 {
             out_dim, in_dim, ..
         } => format!("dense bf16 out={out_dim} in={in_dim}"),
