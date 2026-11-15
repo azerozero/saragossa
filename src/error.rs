@@ -12,6 +12,9 @@ pub type Result<T> = std::result::Result<T, InferError>;
 #[derive(Debug, Error)]
 /// Décrit les erreurs produites par le moteur d'inférence.
 pub enum InferError {
+    /// Signale un mode de quantification inconnu, sans repli affine implicite.
+    #[error("mode de quantification non supporté: {0}")]
+    UnsupportedQuantization(String),
     /// Signale une forme de tenseur invalide.
     #[error("forme tensor invalide: {0}")]
     Shape(String),

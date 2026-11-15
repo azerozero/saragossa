@@ -5,6 +5,9 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod micro;
+pub use micro::{decode_e2m1, decode_e4m3, decode_e8m0, MicroMode, MicroQuantizedTensor};
+
 const PARALLEL_QUANT_MATMUL_OUTPUT_THRESHOLD: usize = 1024;
 const PARALLEL_QUANT_MATMUL_INNER_THRESHOLD: usize = 128;
 static NEXT_WEIGHT_ID: AtomicU64 = AtomicU64::new(1);

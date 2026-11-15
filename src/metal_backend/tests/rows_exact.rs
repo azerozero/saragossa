@@ -247,6 +247,7 @@ fn rows_exact_matmul_formats_body() -> Result<()> {
     for (kernel, case, weight) in &cases {
         let in_dim = match weight {
             LinearWeight::AffineQuantized(w) => w.shape()[1],
+            LinearWeight::MicroScaled(w) => w.shape()[1],
             LinearWeight::Dense(t) => t.shape()[1],
             LinearWeight::DenseBf16(t) => t.shape()[1],
             LinearWeight::DenseShared(t) => t.shape()[1],
