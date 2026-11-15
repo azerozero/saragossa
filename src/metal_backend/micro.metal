@@ -55,6 +55,44 @@ inline void micro_store_c(const thread metal::vec<float, 8>& src, device float* 
     }
 }
 
+// Une ligne par simdgroup, un mot U32 par lane et par pas. L'échelle est
+// décodée une fois par mot : dans la plage normale, `code * échelle` est le
+// même produit f32 exact que `micro_scaled`, et l'ordre des additions ne
+// change pas. Les échelles extrêmes gardent le chemin entier de `micro_scaled`.
+template<uint B, uint G>
+inline void micro_qmv(device const float* x, device const uint* w, device const uchar* scales,
+                      device float* y, constant uint3& dims, uint2 tg, uint sg, uint lane) {
+    constexpr uint P = 32 / B;
+    uint row = tg.x * 4 + sg, K = dims.z;
+    if (row >= dims.y) return;
+    device const uint* wr = w + size_t(row) * (K / P);
+    device const uchar* sr = scales + size_t(row) * (K / G);
+    device const float* xr = x + size_t(tg.y) * K;
+    float acc = 0;
+    for (uint k = lane * P; k < K; k += 32 * P) {
+        uint word = wr[k / P];
+        uchar scale = sr[k / G];
+        device const float4* xv = (device const float4*)(xr + k);
+        if (G == 16 || (scale >= 10 && scale <= 246)) {
+            float s = micro_scale<G>(scale);
+            for (uint v = 0; v < P / 4; ++v) {
+                float4 xs = xv[v];
+                for (uint j = 0; j < 4; ++j) {
+                    uint q = (word >> ((v * 4 + j) * B)) & ((1u << B) - 1u);
+                    acc += xs[j] * (micro_code<B>(q) * s);
+                }
+            }
+        } else {
+            for (uint j = 0; j < P; ++j) {
+                float value = micro_scaled<B, G>((word >> (j * B)) & ((1u << B) - 1u), scale);
+                acc += xr[k + j] * value;
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[size_t(tg.y) * dims.y + row] = acc;
+}
+
 // Chaque thread charge une demi-ligne (32 poids) et écrit quatre vecteurs
 // bf16 alignés. K est multiple de 64 ; le masque N traite les dernières lignes.
 template<uint B, uint G>
@@ -87,20 +125,7 @@ inline void micro_load_b(threadgroup bfloat* tile, device const uint* w,
 }
 
 kernel void micro_qmv_mxfp4(device const float* x [[buffer(0)]], device const uint* w [[buffer(1)]], device const uchar* scales [[buffer(2)]], device float* y [[buffer(4)]], constant uint3& dims [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint B = 4, G = 32, P = 32 / B;
-    uint row = tg.x * 4 + sg, K = dims.z;
-    if (row >= dims.y) return;
-    float acc = 0;
-    for (uint k = lane * P; k < K; k += 32 * P) {
-        uint word = w[(size_t(row) * K + k) / P];
-        uchar scale = scales[(size_t(row) * K + k) / G];
-        for (uint j = 0; j < P; ++j) {
-            float value = micro_scaled<B, G>((word >> (j * B)) & ((1u << B) - 1u), scale);
-            acc += x[size_t(tg.y) * K + k + j] * value;
-        }
-    }
-    acc = simd_sum(acc);
-    if (lane == 0) y[size_t(tg.y) * dims.y + row] = acc;
+    micro_qmv<4, 32>(x, w, scales, y, dims, tg, sg, lane);
 }
 kernel void micro_embed_mxfp4(device const uint* w [[buffer(0)]], device const uchar* scales [[buffer(1)]], device const uint* ids [[buffer(2)]], device float* y [[buffer(3)]], constant uint2& dims [[buffer(4)]], constant float& factor [[buffer(5)]], constant uint& recast [[buffer(6)]], uint2 i [[thread_position_in_grid]]) {
     uint row = ids[i.y];
@@ -155,20 +180,7 @@ kernel void micro_gemm_mxfp4(device const bfloat* A [[buffer(0)]],
 }
 
 kernel void micro_qmv_nvfp4(device const float* x [[buffer(0)]], device const uint* w [[buffer(1)]], device const uchar* scales [[buffer(2)]], device float* y [[buffer(4)]], constant uint3& dims [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint B = 4, G = 16, P = 32 / B;
-    uint row = tg.x * 4 + sg, K = dims.z;
-    if (row >= dims.y) return;
-    float acc = 0;
-    for (uint k = lane * P; k < K; k += 32 * P) {
-        uint word = w[(size_t(row) * K + k) / P];
-        uchar scale = scales[(size_t(row) * K + k) / G];
-        for (uint j = 0; j < P; ++j) {
-            float value = micro_scaled<B, G>((word >> (j * B)) & ((1u << B) - 1u), scale);
-            acc += x[size_t(tg.y) * K + k + j] * value;
-        }
-    }
-    acc = simd_sum(acc);
-    if (lane == 0) y[size_t(tg.y) * dims.y + row] = acc;
+    micro_qmv<4, 16>(x, w, scales, y, dims, tg, sg, lane);
 }
 kernel void micro_embed_nvfp4(device const uint* w [[buffer(0)]], device const uchar* scales [[buffer(1)]], device const uint* ids [[buffer(2)]], device float* y [[buffer(3)]], constant uint2& dims [[buffer(4)]], constant float& factor [[buffer(5)]], constant uint& recast [[buffer(6)]], uint2 i [[thread_position_in_grid]]) {
     uint row = ids[i.y];
@@ -223,20 +235,7 @@ kernel void micro_gemm_nvfp4(device const bfloat* A [[buffer(0)]],
 }
 
 kernel void micro_qmv_mxfp8(device const float* x [[buffer(0)]], device const uint* w [[buffer(1)]], device const uchar* scales [[buffer(2)]], device float* y [[buffer(4)]], constant uint3& dims [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    constexpr uint B = 8, G = 32, P = 32 / B;
-    uint row = tg.x * 4 + sg, K = dims.z;
-    if (row >= dims.y) return;
-    float acc = 0;
-    for (uint k = lane * P; k < K; k += 32 * P) {
-        uint word = w[(size_t(row) * K + k) / P];
-        uchar scale = scales[(size_t(row) * K + k) / G];
-        for (uint j = 0; j < P; ++j) {
-            float value = micro_scaled<B, G>((word >> (j * B)) & ((1u << B) - 1u), scale);
-            acc += x[size_t(tg.y) * K + k + j] * value;
-        }
-    }
-    acc = simd_sum(acc);
-    if (lane == 0) y[size_t(tg.y) * dims.y + row] = acc;
+    micro_qmv<8, 32>(x, w, scales, y, dims, tg, sg, lane);
 }
 kernel void micro_embed_mxfp8(device const uint* w [[buffer(0)]], device const uchar* scales [[buffer(1)]], device const uint* ids [[buffer(2)]], device float* y [[buffer(3)]], constant uint2& dims [[buffer(4)]], constant float& factor [[buffer(5)]], constant uint& recast [[buffer(6)]], uint2 i [[thread_position_in_grid]]) {
     uint row = ids[i.y];
