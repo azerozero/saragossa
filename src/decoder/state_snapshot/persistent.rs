@@ -448,7 +448,8 @@ impl Store {
                 Some(state)
             }
             Err(error) => {
-                // Une erreur d'E/S ou de ressources ne prouve pas une corruption.
+                // Une E/S transitoire ou un manque de ressources ne prouve pas
+                // une corruption ; un fichier absent rend l'entrée inutilisable.
                 // Garder l'entrée comptée permet une reprise après rétablissement.
                 if !invalidates_entry(&error) {
                     eprintln!("prefix_ssd read_deferred: {error}");
@@ -598,6 +599,7 @@ impl Disk {
 fn invalidates_entry(error: &InferError) -> bool {
     match error {
         InferError::Config(_) | InferError::Shape(_) | InferError::Dimension(_) => true,
+        InferError::Io { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
         InferError::Json { source, .. } => !source.is_io(),
         _ => false,
     }

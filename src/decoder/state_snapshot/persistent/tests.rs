@@ -758,22 +758,55 @@ fn synthetic_metal_bf16_greedy_survives_restart() -> Result<()> {
 }
 
 #[test]
+fn missing_blob_removes_entry_from_disk_and_index() {
+    let root = private_dir();
+    let store = Store::open(root.path(), 1 << 20, 0).unwrap();
+    let (model, request, state) = fixture(&store, 1);
+    publish(&store, &request, payload(&model, &request, &state));
+    let manifest = verify_manifest(&request.root).unwrap();
+    fs::remove_file(request.root.join(&manifest.final_state.data.file)).unwrap();
+    assert!(verify_manifest(&request.root).is_ok());
+
+    assert!(store.read(&model, &request).is_none());
+    assert!(!request.root.exists());
+    assert!(store.disk.lock().unwrap().entries.is_empty());
+    assert!(store.boundaries(2, 1, 0).is_empty());
+    assert!(store.read(&model, &request).is_none());
+    assert!(!store.skip_save(&request));
+}
+
+#[test]
+#[cfg(unix)]
 fn transient_read_error_keeps_entry_for_retry() {
+    use std::os::unix::fs::PermissionsExt;
+
     let root = private_dir();
     let store = Store::open(root.path(), 64 << 20, 0).unwrap();
     let (model, request, state) = fixture(&store, 1);
     publish(&store, &request, payload(&model, &request, &state));
     let checksum = request.root.join("manifest.sha256");
-    let saved = fs::read(&checksum).unwrap();
+    let permissions = fs::metadata(&checksum).unwrap().permissions();
     let bytes = store.disk.lock().unwrap().entries[0].bytes;
-    // Une indisponibilité temporaire est reproductible sans changer les droits
-    // du processus (le test fonctionne aussi sous un utilisateur privilégié).
-    fs::remove_file(&checksum).unwrap();
-    assert!(store.read(&model, &request).is_none());
+    fs::set_permissions(&checksum, fs::Permissions::from_mode(0o000)).unwrap();
+    let inaccessible = fs::read(&checksum).is_err();
+    let restored = store.read(&model, &request);
+    fs::set_permissions(&checksum, permissions).unwrap();
+    // Sous root, les permissions ne provoquent pas de refus de lecture.
+    if inaccessible {
+        assert!(restored.is_none());
+    }
     assert!(request.root.exists());
     assert_eq!(store.disk.lock().unwrap().entries[0].bytes, bytes);
-    fs::write(checksum, saved).unwrap();
     assert!(store.read(&model, &request).is_some());
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::Interrupted,
+    ] {
+        assert!(!invalidates_entry(&InferError::Io {
+            path: checksum.clone(),
+            source: std::io::Error::from(kind),
+        }));
+    }
     assert!(!invalidates_entry(&InferError::Metal(
         "device temporairement indisponible".into()
     )));
