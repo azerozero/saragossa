@@ -1390,14 +1390,15 @@ impl MetalExecutor {
             ),
             MTLSize::new(tg_width, 1, 1),
         );
-        if std::ptr::eq(pipeline, &self.causal_attention_prefill_long_d512_f32) {
-            if crate::runtime_flags::trace_prefill_enabled() {
-                eprintln!(
-                    "prefill dispatch causal_attention_prefill_long_d512_f32 seq={} head_dim={}",
-                    spec.seq, spec.head_dim
-                );
-            }
-            #[cfg(test)]
+        let long_d512 = std::ptr::eq(pipeline, &self.causal_attention_prefill_long_d512_f32);
+        if long_d512 && crate::runtime_flags::trace_prefill_enabled() {
+            eprintln!(
+                "prefill dispatch causal_attention_prefill_long_d512_f32 seq={} head_dim={}",
+                spec.seq, spec.head_dim
+            );
+        }
+        #[cfg(test)]
+        if long_d512 {
             LONG_D512_DISPATCHES.with(|trace| {
                 trace.borrow_mut().push((spec.seq, spec.head_dim));
             });
