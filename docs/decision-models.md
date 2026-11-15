@@ -146,8 +146,8 @@ tenseurs `visual.*` ignorés, pas de tête de vocabulaire. Différences :
   `permutation_average` n'est pas pris en charge.
 
 Oracle : `tests/fixtures/decision/d3/`, 39 questions et prompts de 128, 512
-et 2048 tokens, tolérance figée 0,0184 (deux fois le bruit bf16 mesuré
-+ 1e-6).
+et 2048 tokens, tolérance figée 0,0184 (deux fois le bruit bf16 mesuré,
+plus 1e-6).
 
 ```sh
 SARAGOSSA_DECISION_D3_MODEL=DOSSIER cargo test --release --all-features \
