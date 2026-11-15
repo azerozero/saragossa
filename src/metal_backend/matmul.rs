@@ -327,7 +327,7 @@ impl MetalExecutor {
                 "matmul bf16 x=[{batch},{in_dim}] rhs=[{out_dim},{rhs_in_dim}]"
             )));
         }
-        // NOTE: les décisions THX-02 tolèrent un GEMM bf16 classique (oracle
+        // NOTE: les modèles de décision tolèrent un GEMM bf16 classique (oracle
         // f32 figé) ; les autres modèles gardent la correction hi + lo.
         if let Some(pso) = self.na_gemm_bf16_nt_bn128.as_ref().filter(|_| {
             crate::runtime_flags::decision_gemm_bf16_enabled()
@@ -352,8 +352,8 @@ impl MetalExecutor {
             profile_dispatch();
             encoder.dispatch_thread_groups(
                 MTLSize::new(
-                    checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?,
                     checked_nsuint(out_dim / 128, "bf16 gemm out tiles")?,
+                    checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?,
                     1,
                 ),
                 MTLSize::new(pso.thread_execution_width().max(1) * 8, 1, 1),
