@@ -210,3 +210,115 @@ fn fused_codebooks_match_cpu_oracle() -> Result<()> {
     }
     Ok(())
 }
+
+/// Couches TTS fusionnées (`SARAGOSSA_TTS_CP_FUSED_KERNELS`) contre le chemin
+/// général : mêmes logits au bit et mêmes codes sur 3 graines × 16 trames.
+#[test]
+#[ignore = "inférence: snapshots TTS locaux et verrou GPU requis"]
+fn tts_cp_fused_kernels_match_general_layers() -> Result<()> {
+    for (env, repo) in [
+        (
+            "SARAGOSSA_QWEN3_TTS_CUSTOMVOICE_DIR",
+            "models--mlx-community--Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit",
+        ),
+        (
+            "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
+            "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
+        ),
+    ] {
+        let path = local_tts_snapshot(env, repo)
+            .ok_or_else(|| InferError::Config(format!("snapshot requis: {repo}")))?;
+        let model = TtsModel::load_local(path)?;
+        let config = model
+            .generation_config
+            .as_ref()
+            .expect("invariant: snapshot avec sampling");
+        let resolve = || {
+            model
+                .code_predictor
+                .resolve_tts_codebook_weights(
+                    &model.code_predictor_projection,
+                    &model.code_predictor_heads,
+                    &model.code_predictor_embeddings,
+                )
+                .map(|weights| weights.expect("invariant: trame fusionnée disponible"))
+        };
+        let fused_weights = resolve()?;
+        let mut general_weights = resolve()?;
+        assert!(
+            general_weights.take_fused_kernels(),
+            "couches fusionnées inactives sur {repo}"
+        );
+        let prepared = model.prepare_inputs("Bonjour, comment allez-vous ?")?;
+        let mut frames = 0_usize;
+        for seed in [0, 17, 42] {
+            let sub = config.subtalker_params(seed);
+            let sample = TtsCodebookSample {
+                temperature: sub.temperature,
+                top_k: sub.top_k,
+                top_p: sub.top_p,
+            };
+            let mut rng = DeterministicSampler::new(seed);
+            let (mut talker, mut state) = model.prefill_talker(&prepared.input)?;
+            assert!(model
+                .talker
+                .setup_resident_decode_from_prefill(&mut talker, 16)?);
+            let mut caches = [(); 2].map(|()| {
+                model
+                    .code_predictor
+                    .new_resident_decode_cache(17)
+                    .map(|cache| cache.expect("invariant: code predictor résident"))
+            });
+            let [Ok(fused_cp), Ok(general_cp)] = &mut caches else {
+                return Err(InferError::Config("cache code predictor".into()));
+            };
+            let mut trailing = 0;
+            for frame in 0..16 {
+                let tok = (seed as i32 + frame) % 2048;
+                let e0 = model.codec_embed(&[tok])?;
+                let run = |cache: &mut _, weights| {
+                    model
+                        .code_predictor
+                        .decode_tts_codebooks_resident(
+                            cache,
+                            weights,
+                            state.data(),
+                            e0.data(),
+                            sample,
+                            rng.state(),
+                            true,
+                        )
+                        .map(|out| out.expect("invariant: arène résidente"))
+                };
+                let (codes, fused_trace) = run(fused_cp, &fused_weights)?;
+                let (general_codes, general_trace) = run(general_cp, &general_weights)?;
+                let (fused_trace, general_trace) = (
+                    fused_trace.expect("invariant: trace"),
+                    general_trace.expect("invariant: trace"),
+                );
+                assert_eq!(codes, general_codes, "{repo} seed={seed} frame={frame}");
+                assert!(
+                    fused_trace
+                        .logits
+                        .iter()
+                        .zip(&general_trace.logits)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "logits {repo} seed={seed} frame={frame}"
+                );
+                for _ in 0..codes.len() {
+                    rng.advance();
+                }
+                let mut frame_codes = vec![tok];
+                frame_codes.extend(codes.iter().map(|&code| code as i32));
+                let next = model.next_talker_input(&prepared, &mut trailing, &frame_codes)?;
+                (state, _) = model
+                    .talker
+                    .decode_state_logits_resident_from_embedding(&mut talker, &next)?
+                    .expect("invariant: talker résident");
+                frames += 1;
+            }
+        }
+        eprintln!("couches TTS fusionnées {repo}: {frames} trames identiques au bit");
+    }
+    Ok(())
+}

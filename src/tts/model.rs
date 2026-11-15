@@ -31,7 +31,11 @@ pub struct TtsModel {
 
 pub(super) enum TtsStreamDecodeState {
     Incremental(TtsCodecStreamState),
-    FullPrefixDelta { emitted: usize },
+    /// `exact` : préfixe codec CPU (glouton).
+    FullPrefixDelta {
+        emitted: usize,
+        exact: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

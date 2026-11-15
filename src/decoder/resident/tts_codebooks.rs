@@ -22,6 +22,9 @@ pub(crate) struct TtsCodebookWeights {
     embeddings: Vec<MetalEmbeddingWeightBuffers>,
     talker_hidden: usize,
     vocab: usize,
+    /// QKV concaténé par couche pour [`DecodeResidentState::encode_tts_cp_layer`] ;
+    /// `None` : chemin général (kill-switch ou couche non éligible).
+    fused_qkv: Option<Vec<MetalLinearWeightBuffers>>,
 }
 
 /// Distributions et logits relus pour l'oracle des tests.
@@ -43,6 +46,13 @@ impl TtsCodebookWeights {
     /// Taille du vocabulaire de chaque tête.
     pub(crate) fn vocab(&self) -> usize {
         self.vocab
+    }
+
+    /// Retire les couches fusionnées (référence des tests) ; `true` si elles
+    /// étaient actives.
+    #[cfg(test)]
+    pub(crate) fn take_fused_kernels(&mut self) -> bool {
+        self.fused_qkv.take().is_some()
     }
 }
 
@@ -126,6 +136,11 @@ impl CausalDecoder {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let fused_qkv = if crate::runtime_flags::tts_cp_fused_kernels_enabled() {
+            self.resolve_tts_cp_fused_qkv(metal)?
+        } else {
+            None
+        };
         Ok(Some(TtsCodebookWeights {
             projection: projection_buffers,
             projection_bias,
@@ -133,7 +148,69 @@ impl CausalDecoder {
             embeddings,
             talker_hidden: *talker_hidden,
             vocab,
+            fused_qkv,
         }))
+    }
+
+    /// QKV concaténé de chaque couche si toutes relèvent de la couche TTS
+    /// fusionnée : Qwen3 sans gate de sortie, sans sinks ni norme de V, MLP
+    /// dense et projections u6 gs64 alignées. `None` sinon.
+    fn resolve_tts_cp_fused_qkv(
+        &self,
+        metal: &crate::metal_backend::MetalExecutor,
+    ) -> Result<Option<Vec<MetalLinearWeightBuffers>>> {
+        use crate::metal_backend::MetalExecutor;
+        if self.config.attn_output_gate || self.config.attention_sinks {
+            return Ok(None);
+        }
+        let hidden = self.final_norm.len();
+        let mut fused = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let (AttentionBlock::Full(attention), Some(FeedForward::Dense(mlp))) =
+                (&layer.attention, layer.mlp.as_ref())
+            else {
+                return Ok(None);
+            };
+            let Some(v_proj) = attention.v_proj.as_ref() else {
+                return Ok(None);
+            };
+            if attention.value_norm || !matches!(mlp.activation(), crate::mlp::Activation::Silu) {
+                return Ok(None);
+            }
+            let (gate_proj, up_proj, down_proj) = mlp.projections();
+            let qkv = match metal.resolve_concat_linear_weight_buffers(
+                &[
+                    attention.q_proj.weight(),
+                    attention.k_proj.weight(),
+                    v_proj.weight(),
+                ],
+                "tts_cp_qkv_proj",
+            ) {
+                Ok(qkv) => qkv,
+                Err(InferError::Dimension(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let o_proj =
+                metal.resolve_linear_weight_buffers(attention.o_proj.weight(), "tts_cp_o")?;
+            let gate = metal.resolve_linear_weight_buffers(gate_proj.weight(), "tts_cp_gate")?;
+            let up = metal.resolve_linear_weight_buffers(up_proj.weight(), "tts_cp_up")?;
+            let down = metal.resolve_linear_weight_buffers(down_proj.weight(), "tts_cp_down")?;
+            let inter = metal.linear_weight_out_dim(&gate);
+            let q_dim = metal.linear_weight_in_dim(&o_proj);
+            if !MetalExecutor::is_aligned_u6_weight(&qkv, hidden)
+                || !MetalExecutor::is_aligned_u6_weight(&o_proj, q_dim)
+                || !MetalExecutor::is_aligned_u6_weight(&gate, hidden)
+                || !MetalExecutor::is_aligned_u6_weight(&up, hidden)
+                || !MetalExecutor::is_aligned_u6_weight(&down, inter)
+                || metal.linear_weight_out_dim(&up) != inter
+                || metal.linear_weight_out_dim(&down) != hidden
+                || metal.linear_weight_out_dim(&o_proj) != hidden
+            {
+                return Ok(None);
+            }
+            fused.push(qkv);
+        }
+        Ok(Some(fused))
     }
 
     /// Décode les codebooks d'une trame en un command buffer et renvoie les
@@ -242,18 +319,35 @@ impl CausalDecoder {
                 let dims = self.plan.layers[index]
                     .resident
                     .resident_windowed_full_attn_layer_dims(hidden, position, eps, theta)?;
-                self.encode_resident_full_layer(
-                    metal,
-                    arena,
-                    &mut layers[index],
-                    layer,
-                    index,
-                    encoder,
-                    &mut owned,
-                    dims,
-                    current.buffer(),
-                    other.buffer(),
-                )?;
+                let fused = match &weights.fused_qkv {
+                    Some(fused_qkv) => self.encode_tts_cp_fused_layer(
+                        metal,
+                        arena,
+                        &mut layers[index],
+                        index,
+                        &fused_qkv[index],
+                        encoder,
+                        &mut owned,
+                        dims,
+                        current.buffer(),
+                        other.buffer(),
+                    )?,
+                    None => false,
+                };
+                if !fused {
+                    self.encode_resident_full_layer(
+                        metal,
+                        arena,
+                        &mut layers[index],
+                        layer,
+                        index,
+                        encoder,
+                        &mut owned,
+                        dims,
+                        current.buffer(),
+                        other.buffer(),
+                    )?;
+                }
                 std::mem::swap(&mut current, &mut other);
             }
             *cache_position += 1;
@@ -337,5 +431,56 @@ impl CausalDecoder {
             }
         };
         Ok(Some((codes, trace)))
+    }
+    /// Couche `index` par [`DecodeResidentState::encode_tts_cp_layer`] avec les
+    /// poids résidents de l'arène et le QKV concaténé de la trame.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "routage résident: état couche + arena + ping-pong + encoder"
+    )]
+    fn encode_tts_cp_fused_layer(
+        &self,
+        metal: &crate::metal_backend::MetalExecutor,
+        arena: &ResidentArena,
+        layer_cache: &mut LayerKvCache,
+        index: usize,
+        qkv_proj: &MetalLinearWeightBuffers,
+        encoder: &metal::ComputeCommandEncoderRef,
+        owned: &mut Vec<metal::Buffer>,
+        dims: FullAttnLayerDims,
+        layer_in: &metal::BufferRef,
+        layer_out: &metal::BufferRef,
+    ) -> Result<bool> {
+        let Some(ResidentLayerBuffers::FullDense(resolved)) = arena.layers.get(index) else {
+            return Err(InferError::Config(format!(
+                "poids full-attn dense résidents absents couche {index} (trame TTS)"
+            )));
+        };
+        if resolved.pre_feedforward_norm.is_some()
+            || resolved.parallel_moe.is_some()
+            || resolved.sigmoid_moe.is_some()
+            || resolved.value_norm
+        {
+            // Hors périmètre : le chemin général encode la couche.
+            return Ok(false);
+        }
+        let kv = layer_cache.full.as_mut().ok_or_else(|| {
+            InferError::Metal("KV full-attn résident absent (trame TTS)".to_string())
+        })?;
+        let weights = crate::decode_resident::TtsCpLayerWeights {
+            rope_frequencies: &resolved.rope_frequencies,
+            input_norm: &resolved.input_norm,
+            qkv_proj,
+            q_norm: &resolved.q_norm,
+            k_norm: &resolved.k_norm,
+            o_proj: &resolved.o_proj,
+            post_norm: &resolved.post_norm,
+            gate_proj: &resolved.gate_proj,
+            up_proj: &resolved.up_proj,
+            down_proj: &resolved.down_proj,
+        };
+        arena.state.encode_tts_cp_layer(
+            metal, encoder, owned, kv, weights, dims, layer_in, layer_out,
+        )
     }
 }

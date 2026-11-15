@@ -57,6 +57,7 @@ mod layers;
 mod moe_tail;
 mod multi;
 mod rows;
+mod tts_layer;
 mod tts_sampler;
 mod types;
 mod utils;
@@ -83,6 +84,7 @@ pub(crate) use self::kv_quant::KvFormat;
 #[cfg(test)]
 pub(crate) use self::layers::QKV_CONCAT_NO_GATE_HITS;
 pub(crate) use self::multi::MultiFullAttnStream;
+pub(crate) use self::tts_layer::TtsCpLayerWeights;
 pub(crate) use self::tts_sampler::{TtsCodebookSample, TTS_SAMPLER_MAX_VOCAB, TTS_SAMPLER_TRACE_K};
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
@@ -127,7 +129,7 @@ pub(crate) struct DecodeResidentState {
     copy_at_bf16_kernel: ComputePipelineState,
     copy_at_bf16_to_f32_kernel: ComputePipelineState,
     /// Rotation de K et append K/V fusionnés, KV f32 puis bf16.
-    rope_append_kv_kernels: [ComputePipelineState; 2],
+    rope_append_kv_kernels: [ComputePipelineState; 4],
     /// Kernels position GPU (bloc MTP), compilés au premier usage seulement.
     gpu_position_kernels: OnceLock<gpu_position::GpuPositionKernels>,
     /// Kernels du chemin full-attn en lignes fusionné, compilés au premier usage.

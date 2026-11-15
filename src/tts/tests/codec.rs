@@ -17,6 +17,29 @@ fn codec_at_server_frame_cap() -> Result<()> {
     Ok(())
 }
 
+/// Le batch au préfixe GPU découpe en lots fixes (mémoire bornée) : PCM
+/// identique au bit à un lot unique, sur une séquence longue.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "parité: lots du préfixe codec GPU, snapshot local et Metal requis"]
+fn codec_gpu_prefix_lots_match_single_lot() -> Result<()> {
+    let codec = load_voicedesign_codec()
+        .ok_or_else(|| InferError::Config("snapshot codec local requis".to_string()))?;
+    assert!(codec.gpu_active(), "le test exige le codec Metal");
+    let codes = synthetic_codes(300, 16);
+    let lots = codec.decode_codes(&codes)?;
+    let single = codec.decode_codes_in_lots(&codes, codes.len())?;
+    assert_eq!(lots.len(), codes.len() * 1920);
+    assert_eq!(lots.len(), single.len());
+    assert!(
+        lots.iter()
+            .zip(&single)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "préfixe GPU: lots de 64 != lot unique"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "inférence: snapshot VoiceDesign local et Metal requis"]
 fn synthesis_reports_frame_limit_with_audio() -> Result<()> {
@@ -383,7 +406,7 @@ d'obtenir un nombre de frames représentatif et une mesure stable.";
         let codes = rust.generate_codes_greedy(&text, max_frames)?;
         let gen = gen_start.elapsed();
         let codec_start = Instant::now();
-        let samples = rust.decode_codes_for_mode(&codes)?;
+        let samples = rust.decode_codes_for_mode(&codes, true)?;
         let codec = codec_start.elapsed();
         frames = codes.len();
         audio_s = samples.len() as f64 / sample_rate;
@@ -553,5 +576,93 @@ fn payload_summary_checksum_hashes_raw_tensor_bytes_fnv1a64() -> Result<()> {
     assert_eq!(summary.bytes_read, 4);
     assert_eq!(summary.checksum, expected);
     assert_eq!(summary.checksum, 0x4b72477f9c5c2f98);
+    Ok(())
+}
+
+/// Préfixe codec GPU (`SARAGOSSA_TTS_CODEC_GPU_PREFIX`) contre le préfixe CPU,
+/// tous deux suivis de la section GPU, sur codes réels décodés par lots de 4,
+/// pour VoiceDesign (glouton) et CustomVoice (tirage à graine fixe), sur plus
+/// de 160 trames.
+///
+/// Seuils : `max_abs <= 3e-5` (un pas int16) et `rms <= 1e-4` (PCM dans
+/// [-1, 1]) ; écart mesuré 2,1e-6 sur 160 trames, 5,3e-6 sur 256. Le streaming GPU est
+/// en outre identique au bit au batch, et à lui-même pour un autre découpage.
+#[test]
+#[ignore = "parité: préfixe codec GPU vs CPU (cache HF + Metal requis)"]
+fn codec_gpu_prefix_matches_cpu_prefix() -> Result<()> {
+    let text = "D'accord, je vérifie l'état du projet et je te donne le point utile. La priorité est de garder la réponse courte pour lancer l'audio plus vite. Ensuite, je relis les mesures une par une, je compare les deux variantes sur la même machine, et je te rends un résumé clair avec les chiffres, les risques et la suite proposée.";
+    for (env, repo) in [
+        (
+            "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
+            "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
+        ),
+        (
+            "SARAGOSSA_QWEN3_TTS_CUSTOMVOICE_DIR",
+            "models--mlx-community--Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit",
+        ),
+    ] {
+        let model_dir = local_tts_snapshot(env, repo)
+            .ok_or_else(|| InferError::Config(format!("snapshot local requis: {repo}")))?;
+        let mut rust = TtsModel::load_local(model_dir)?;
+        assert!(rust.codec.gpu_active(), "le test exige le codec Metal");
+        // CustomVoice s'arrête vers 31 trames en glouton : tirage à graine fixe.
+        let codes = if repo.contains("CustomVoice") {
+            rust.set_seed(Some(7));
+            crate::runtime_flags::with_tts_greedy_for_test(false, || {
+                rust.synthesize_default(text, 400)
+            })?
+            .codes
+        } else {
+            rust.generate_codes_greedy(text, 400)?
+        };
+        assert!(
+            codes.len() > 160,
+            "{repo}: séquence trop courte {}",
+            codes.len()
+        );
+        let stream = |lot: usize, cpu_prefix: bool| -> Result<Vec<f32>> {
+            let mut state = if cpu_prefix {
+                rust.codec.new_stream_state_exact()
+            } else {
+                rust.codec.new_stream_state()
+            };
+            let mut pcm = Vec::new();
+            let mut end = 0;
+            while end < codes.len() {
+                end = (end + lot).min(codes.len());
+                pcm.extend(
+                    rust.codec
+                        .decode_codes_streaming(&mut state, &codes[..end])?,
+                );
+            }
+            Ok(pcm)
+        };
+        let gpu = stream(4, false)?;
+        let cpu = stream(4, true)?;
+        assert_eq!(gpu.len(), cpu.len(), "longueur préfixe GPU != CPU");
+        let (max_abs, rms, mean_abs, signal_max) = drift_stats(&cpu, &gpu);
+        eprintln!(
+            "préfixe codec GPU vs CPU {repo}: frames={} samples={} signal_max={signal_max:.4} max_abs={max_abs:.3e} rms={rms:.3e} mean_abs={mean_abs:.3e}",
+            codes.len(),
+            gpu.len(),
+        );
+        assert!(max_abs <= 3e-5, "{repo}: max_abs préfixe GPU {max_abs:e}");
+        assert!(rms <= 1e-4, "{repo}: rms préfixe GPU {rms:e}");
+        let identical = |left: &[f32], right: &[f32]| {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+        };
+        assert!(
+            identical(&gpu, &rust.codec.decode_codes(&codes)?),
+            "{repo}: préfixe GPU streaming != batch"
+        );
+        assert!(
+            identical(&gpu, &stream(7, false)?),
+            "{repo}: préfixe GPU lots 4 != 7"
+        );
+    }
     Ok(())
 }
