@@ -666,3 +666,98 @@ fn codec_gpu_prefix_matches_cpu_prefix() -> Result<()> {
     }
     Ok(())
 }
+
+/// Profil par kernel du codec GPU streaming (lots de 4 trames, état chaud) :
+/// FLOP, octets et durée GPU par trame, débit atteint. `SARAGOSSA_TTS_PROFILE_FRAMES`
+/// et `SARAGOSSA_TTS_PROFILE_LOT` règlent la séquence (64 et 4 par défaut).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "perf: profil par kernel du codec GPU (snapshot local + Metal requis)"]
+fn codec_gpu_kernel_profile() -> Result<()> {
+    let codec = load_voicedesign_codec()
+        .ok_or_else(|| InferError::Config("snapshot codec local requis".to_string()))?;
+    let env = |key: &str, default: usize| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let frames = env("SARAGOSSA_TTS_PROFILE_FRAMES", 64);
+    let lot = env("SARAGOSSA_TTS_PROFILE_LOT", 4);
+    let codes = synthetic_codes(frames, 16);
+    let (kernels, single_ns, profiled) = codec.profile_gpu_tail(&codes, lot)?;
+    let per_frame = profiled.max(1) as f64;
+    let mut rows: Vec<(String, f64, f64, f64, usize)> = Vec::new();
+    for k in &kernels {
+        match rows.iter_mut().find(|row| row.0 == k.label) {
+            Some(row) => {
+                row.1 += k.flop;
+                row.2 += k.bytes;
+                row.3 += k.ns;
+                row.4 += 1;
+            }
+            None => rows.push((k.label.clone(), k.flop, k.bytes, k.ns, 1)),
+        }
+    }
+    let total_ns: f64 = rows.iter().map(|row| row.3).sum();
+    eprintln!("kernel | appels/trame | MFLOP/trame | Mo/trame | µs/trame | TFLOPS | Go/s | part");
+    for (label, flop, bytes, ns, calls) in &rows {
+        eprintln!(
+            "{label} | {:.2} | {:.1} | {:.2} | {:.1} | {:.2} | {:.0} | {:.1} %",
+            *calls as f64 / per_frame,
+            flop / per_frame / 1e6,
+            bytes / per_frame / 1e6,
+            ns / per_frame / 1e3,
+            flop / ns / 1e3,
+            bytes / ns,
+            100.0 * ns / total_ns,
+        );
+    }
+    eprintln!(
+        "total kernels séparés {:.3} ms/trame ; command buffer unique {:.3} ms/trame ({profiled} trames, lots de {lot})",
+        total_ns / per_frame / 1e6,
+        single_ns / per_frame / 1e6,
+    );
+    Ok(())
+}
+
+/// Convolutions en tuiles contre le kernel gather : PCM identique au bit en
+/// batch au préfixe CPU (chemin du glouton), en batch au préfixe GPU et en
+/// streaming par lots de 4, sur 150 trames.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "parité: codec GPU en tuiles vs gather (snapshot local + Metal requis)"]
+fn codec_gpu_tiled_conv_matches_gather() -> Result<()> {
+    let mut codec = load_voicedesign_codec()
+        .ok_or_else(|| InferError::Config("snapshot codec local requis".to_string()))?;
+    assert!(codec.gpu_active(), "le test exige le codec Metal");
+    let codes = synthetic_codes(150, 16);
+    let run = |codec: &TtsCodec| -> Result<[Vec<f32>; 3]> {
+        let mut state = codec.new_stream_state_exact();
+        let mut stream = Vec::new();
+        let mut end = 0;
+        while end < codes.len() {
+            end = (end + 4).min(codes.len());
+            stream.extend(codec.decode_codes_streaming(&mut state, &codes[..end])?);
+        }
+        Ok([
+            codec.decode_codes_exact(&codes)?,
+            codec.decode_codes(&codes)?,
+            stream,
+        ])
+    };
+    codec.set_gpu_conv_tiled(false);
+    let gather = run(&codec)?;
+    codec.set_gpu_conv_tiled(true);
+    let tiled = run(&codec)?;
+    for (name, (a, b)) in ["batch exact", "batch préfixe GPU", "streaming exact"]
+        .iter()
+        .zip(gather.iter().zip(&tiled))
+    {
+        let same = a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+        let (max_abs, rms, _, _) = drift_stats(a, b);
+        eprintln!("tuiles vs gather {name}: identique={same} max_abs={max_abs:.3e} rms={rms:.3e}");
+        assert!(same, "{name}: tuiles != gather");
+    }
+    Ok(())
+}
