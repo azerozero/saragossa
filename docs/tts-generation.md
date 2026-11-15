@@ -20,8 +20,10 @@ Les identifiants viennent exclusivement du `config.json` du snapshot chargé.
 
 VoiceDesign et CustomVoice chargent `generation_config.json` : `do_sample`,
 `temperature`, `top_k`, `top_p`, `repetition_penalty`, les quatre réglages
-`subtalker_*` et `max_new_tokens`. Un fichier absent ou invalide est une erreur
-explicite. Les budgets serveur restent prioritaires s'ils sont plus courts.
+`subtalker_*` et `max_new_tokens`. En l’absence du fichier, le moteur reprend
+la génération gloutonne historique et avertit une seule fois sur stderr. Un
+fichier présent mais illisible ou invalide reste une erreur explicite. Les budgets
+serveur restent prioritaires s'ils sont plus courts.
 La pénalité du talker porte sur les cb0 déjà générés, une fois par identifiant :
 logit négatif multiplié, logit positif divisé, avant température et top-k/top-p.
 EOS reste exempt ; le code predictor n'a pas de pénalité inter-codebooks.

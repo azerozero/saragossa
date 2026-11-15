@@ -339,10 +339,7 @@ impl TtsModel {
             assets.model_kind(),
             TtsModelKind::VoiceDesign | TtsModelKind::CustomVoice
         ) {
-            let config: super::config::TtsGenerationConfig =
-                super::read_json(&assets.model_dir.join("generation_config.json"))?;
-            config.validate()?;
-            Some(config)
+            load_generation_config(&assets.model_dir.join("generation_config.json"))?
         } else {
             None
         };
@@ -456,5 +453,60 @@ impl TtsModel {
     #[must_use]
     pub fn payload_summary(&self) -> &TtsPayloadSummary {
         &self.codec_payload
+    }
+}
+
+/// Seule l'absence du fichier autorise le repli historique. Une erreur de
+/// lecture, un JSON mal formé ou des paramètres invalides restent des erreurs.
+fn load_generation_config(path: &Path) -> Result<Option<super::config::TtsGenerationConfig>> {
+    let config: super::config::TtsGenerationConfig = match super::read_json(path) {
+        Ok(config) => config,
+        Err(InferError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            static WARN_MISSING: std::sync::Once = std::sync::Once::new();
+            WARN_MISSING.call_once(|| {
+                eprintln!("saragossa TTS: generation_config.json absent ; repli sur la génération gloutonne historique");
+            });
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    config.validate()?;
+    Ok(Some(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_generation_config_falls_back_but_invalid_file_fails(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("generation_config.json");
+        assert!(load_generation_config(&path)?.is_none());
+        assert!(load_generation_config(&path)?.is_none());
+        std::fs::write(&path, "{")?;
+        assert!(matches!(
+            load_generation_config(&path),
+            Err(InferError::Json { .. })
+        ));
+        std::fs::write(
+            &path,
+            r#"{"do_sample":true,"temperature":0.9,"top_k":50,"top_p":1.0,"repetition_penalty":1.05,"subtalker_dosample":true,"subtalker_temperature":0.9,"subtalker_top_k":50,"subtalker_top_p":1.0,"max_new_tokens":2048}"#,
+        )?;
+        assert!(load_generation_config(&path)?.is_some());
+        let invalid = std::fs::read_to_string(&path)?.replace("0.9", "-1.0");
+        std::fs::write(&path, invalid)?;
+        assert!(matches!(
+            load_generation_config(&path),
+            Err(InferError::Config(_))
+        ));
+        std::fs::remove_file(&path)?;
+        std::fs::create_dir(&path)?;
+        assert!(
+            load_generation_config(&path).is_err(),
+            "un dossier n'est pas un fichier absent"
+        );
+        Ok(())
     }
 }
