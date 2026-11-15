@@ -8,6 +8,7 @@
 //! seule fois sur chaque caractère, hors préfixes de marqueurs de taille fixe.
 use super::flint_output::{FlintEvent, FlintOutput, FlintOutputParser};
 use super::protocol::{ToolCall, ToolCallFunction};
+use saragossa::chat_template::canonical_json;
 use serde_json::{Map, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -211,7 +212,8 @@ impl FramedParser {
                     parse_gemma(body)
                 };
                 if let Some((name, arguments)) = parsed {
-                    let arguments = arguments.to_string();
+                    // Ces arguments peuvent revenir tels quels dans l'historique du client.
+                    let arguments = canonical_json::to_string(&arguments);
                     if self.calls < self.max_calls
                         && arguments.len() <= MAX_ARGUMENT_BYTES
                         && declared(&self.tools, &name).is_some()

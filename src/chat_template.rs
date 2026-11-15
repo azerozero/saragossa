@@ -1,5 +1,6 @@
 //! Rendu des templates de chat (ChatML Qwen, tours Gemma, flint) du backend Rust pur.
 
+pub mod canonical_json;
 mod gemma4;
 mod python_json;
 pub use gemma4::render_gemma4_chat_with_tools;

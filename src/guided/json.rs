@@ -35,6 +35,15 @@ impl JsonTokenCatalog {
         self.tokens.get(token).map(|token| token.bytes.as_slice())
     }
 
+    pub(super) fn from_bytes(tokens: Vec<Vec<u8>>) -> Self {
+        Self {
+            tokens: tokens
+                .into_iter()
+                .map(|bytes| TokenBytes { bytes })
+                .collect(),
+        }
+    }
+
     #[cfg(test)]
     fn from_token_bytes_for_tests(tokens: &[&[u8]]) -> Self {
         Self {

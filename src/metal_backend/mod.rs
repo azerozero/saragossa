@@ -239,6 +239,8 @@ pub struct MetalExecutor {
     na_gemm_skinny_u4: Option<ComputePipelineState>,
     na_gemm_skinny_u4_x3: Option<ComputePipelineState>,
     na_gemm_skinny_u4_x2: Option<ComputePipelineState>,
+    na_gemm_skinny_u3_x2: Option<ComputePipelineState>,
+    na_gemm_skinny_u2_x2: Option<ComputePipelineState>,
     affine_qmm2_fast_aligned_u3_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs128_f32: ComputePipelineState,
@@ -383,6 +385,8 @@ pub struct MetalExecutor {
     /// K/V des couches glissantes à sinks borné à la fenêtre (lu du flag,
     /// forcé en test).
     prefill_window_kv: bool,
+    /// NAX d128 sans sinks ; repli naïf si absent.
+    causal_attention_prefill_nax_d128: Option<attention::NaxCausalAttention>,
     causal_attention_prefill_steel_nax_d256: Option<attention::NaxCausalAttention>,
     /// NAX d128 avec sinks (couches pleines flint, K/V bf16) ; `None` hors
     /// flag ou s'il ne compile pas, le Steel d128 bf16 prend alors le relais.
