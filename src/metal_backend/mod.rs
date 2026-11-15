@@ -110,6 +110,7 @@ pub(crate) use self::matmul::with_concat_vram_fraction_override;
 pub(crate) use self::moe_na::moe_coop_tiled_trace_for_test;
 #[cfg(test)]
 pub(crate) use self::prefill::routed_coop_trace_for_test;
+pub(crate) use self::prefill::with_decision_segments;
 #[cfg(test)]
 pub(crate) use self::prefill::with_prefill_kv_layout_override;
 pub(crate) use self::prefill::with_prefill_kv_reserve;

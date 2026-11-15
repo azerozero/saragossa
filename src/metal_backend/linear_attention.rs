@@ -73,7 +73,7 @@ pub(crate) fn linear_tree_refusal(
     if !kernels {
         return Some("delta dk128 ou chemin linéaire batché désactivé".to_string());
     }
-    if !journal_len.is_some_and(|len| len <= shape.ssm_len) {
+    if journal_len.is_none_or(|len| len > shape.ssm_len) {
         return Some("journal arbre plus grand que l'état SSM".to_string());
     }
     None

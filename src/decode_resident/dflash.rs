@@ -307,7 +307,7 @@ impl DFlashResident {
     pub(crate) fn rebase(&mut self, base: usize) -> Result<()> {
         if self.context_len != 0
             || self.layers.iter().any(|layer| {
-                !layer.sliding_window.is_some_and(|w| w > 0)
+                layer.sliding_window.is_none_or(|w| w == 0)
                     || !layer.kv.dflash_dense_unadopted()
                     || layer.kv.len() != 0
             })
