@@ -698,6 +698,8 @@ impl MetalExecutor {
             pipeline(&library, &device, "causal_attention_prefill_mid_f32")?;
         let causal_attention_prefill_long_f32 =
             pipeline(&library, &device, "causal_attention_prefill_long_f32")?;
+        let causal_attention_prefill_long_d512_f32 =
+            pipeline(&library, &device, "causal_attention_prefill_long_d512_f32")?;
         let windowed_attention_prefill_f32 =
             pipeline(&library, &device, "windowed_attention_prefill_f32")?;
         let windowed_attention_prefill_mid_f32 =
@@ -1014,6 +1016,7 @@ impl MetalExecutor {
             causal_attention_prefill_f32,
             causal_attention_prefill_mid_f32,
             causal_attention_prefill_long_f32,
+            causal_attention_prefill_long_d512_f32,
             windowed_attention_prefill_f32,
             windowed_attention_prefill_mid_f32,
             windowed_attention_prefill_long_f32,

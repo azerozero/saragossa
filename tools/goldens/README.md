@@ -39,6 +39,61 @@ templates reste actif et ne lit aucun modèle.
 
 ## Versions de capture
 
+### Chat long Gemma 4 q4a8-ls
+
+`gemma4_long.py` produit trois références distinctes `kld/gemma4_long_{1024,2048,4100}`.
+Le checkpoint est `gemma-4-26b-a4b-it-q4a8-ls`, indiqué par
+`SARAGOSSA_GEMMA4_DIR`. Les empreintes SHA256 des shards safetensors sont
+enregistrées et vérifiées en flux par Rust, en plus de la configuration et
+du tokenizer. Aucun poids n'est copié. Les références courtes restent intactes.
+
+Les prompts sont une demande d'analyse littéraire en chat et des préfixes
+non répétés de `kld/corpus.txt` (même provenance publique que le corpus court).
+La consigne, le texte exact et les IDs sont conservés. La longueur inclut
+l'enveloppe du template local. Chaque référence note les **128 premières
+positions après le prefill**, sur la continuation greedy f32 ; un EOS précoce
+interrompt la capture avec une erreur.
+
+MLX fait un seul prefill de la longueur entière, puis du decode avec cache.
+`set_dtype(float32)` conserve les poids packés uint32 4/8 bits et convertit
+les paramètres flottants en f32. Le script vérifie les dtypes des paramètres,
+des logits et du cache f32. Le facteur d'embedding suit `kld.py`. Il affiche
+les octets des paramètres et le pic mémoire MLX, limite l'allocateur à
+64 Gio (ou au budget recommandé inférieur) et son cache à 2 Gio. Le modèle
+f32 est libéré avant de recharger les poids natifs bf16.
+
+Le bruit bf16 est mesuré sur **chaque prompt long et les mêmes 128 tokens**,
+contre sa référence f32. Comme `src/golden/kld.rs`, la normalisation des
+logits est en f64, la partition est top-64 f32 + masse restante, et le p99
+est l'élément `floor(0.99 * (128 - 1))` des 128 Δp maximaux triés. Le gate
+conserve KL moyen et p99 Δp <= 1,5 fois le bruit local, et same_top >= bf16.
+Les seuils courts ne servent pas de dénominateur à cette qualification.
+Ce script épingle aussi NumPy 2.5.4 pour le calcul f64 des métriques.
+
+Avec `GPU_LOCK`, `REF_PYTHON` et `SARAGOSSA_GEMMA4_DIR` configurés localement :
+
+```sh
+export SARAGOSSA_GOLDEN_CAPTURE=1
+python3 -I -B tools/gpulock.py run --owner g4ref --prio 5 -- \
+  "$REF_PYTHON" -I -B tools/goldens/gemma4_long.py
+python3 -I -B tools/gpulock.py run --owner g4ref --prio 5 -- \
+  "$REF_PYTHON" -I -B tools/goldens/gemma4_long.py --verify
+SARAGOSSA_REQUIRE_REAL_MODELS=1 SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS=4100 \
+  python3 -I -B tools/gpulock.py run --owner g4ref --prio 5 -- \
+  cargo test --release --offline --locked --lib external_kld_gemma4_long_ \
+  -- --ignored --nocapture --test-threads=1
+```
+
+`--verify` recalcule indépendamment f32 et bf16, puis exige les mêmes octets
+f32, les mêmes tokens, les mêmes métriques bf16 et la même provenance,
+sans écraser les fichiers. Les six tests ignorés forcent chaque chemin de
+prefill sans repli et conservent le decode per-op commun. À 4100 tokens,
+le candidat résident doit produire cinq dispatches du kernel long d512.
+Les tests actifs contrôlent la structure, la provenance et la continuation
+greedy des trois références sans charger de modèle.
+
+### Distributions épinglées
+
 Avant tout import de moteur ou chargement local, chaque script vérifie ses
 versions avec `importlib.metadata` et refuse toute version différente ou absente :
 
@@ -504,12 +559,12 @@ python3 -I -B tools/gpulock.py run --owner gemma4-layers-metal --prio 10 -- \
 ```
 
 Le backend par défaut du binaire est `metal`. `cpu` n'instancie aucun executor
-Metal. Le chemin Metal capturé est le prefill **per-op par défaut de Gemma 4**,
-identique au choix de `prefill_cache` à cache froid. Le diagnostic court-circuite
+Metal. Le chemin Metal capturé est le prefill **per-op**, forcé par
+`SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0`. Le diagnostic court-circuite
 uniquement le prefix cache et les snapshots disque ; il conserve les réglages
 usuels de batching/chunking. Les captures sont agrégées par position si le
-prefill est découpé ou tokenwise. Le chemin résident fusionné optionnel
-`SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=1` est explicitement refusé, car ses
+prefill est découpé ou tokenwise. Le chemin résident fusionné, par défaut
+jusqu'à 4100 tokens, est explicitement refusé, car ses
 sous-étapes ne sont pas instrumentées. Ce diagnostic ne qualifie pas le decode
 entièrement résident.
 
