@@ -1,6 +1,9 @@
 //! Contraintes de génération guidée appliquées côté CPU.
 
 mod json;
+mod schema;
+
+pub use schema::{JsonSchema, SchemaTokenCatalog, SchemaTokenConstraint};
 
 pub use json::{JsonTokenCatalog, JsonTokenConstraint};
 

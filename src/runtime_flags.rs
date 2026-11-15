@@ -1082,8 +1082,8 @@ pub(crate) fn prefill_attn_batch_mid_30b_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_BATCH_MID_30B", true))
 }
 
-/// Active la variante Steel causale d256 du prefill 35B (16/2 têtes) et 27B
-/// (24/4 têtes, depuis le 2026-10-21).
+/// Active le prefill causal Steel/NAX d128/d256 sans sinks, pour tout GQA
+/// entier. Le nom historique du flag reste le kill-switch global.
 ///
 /// Défaut ON : cette voie reprend le kernel Steel tuilé (Q/K/V en blocs,
 /// softmax online par tuile KV, causalité par tuile diagonale) pour remplacer le
@@ -1098,13 +1098,17 @@ pub(crate) fn prefill_attn_steel_d256_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_STEEL_D256", true))
 }
 
-/// Attention causale d256 du prefill (même périmètre que le Steel d256) sur les
-/// accélérateurs neuronaux : kernel NAX dsplit de MLX, Q/K/V bf16, accumulation
-/// f32. Défaut ON depuis le 2026-10-23 (M5 Max, 27B) : attention 26,6 → 6,7 s
+/// Attention causale d128/d256 du prefill sans sinks, pour tout GQA entier, sur les
+/// accélérateurs neuronaux : kernels NAX de MLX (plein d128, dsplit d256),
+/// Q/K/V bf16, accumulation f32. Défaut d256 ON depuis le 2026-10-23
+/// (M5 Max, 27B) : attention 26,6 → 6,7 s
 /// à 32k, TTFT 83 → 63 s ; oracle CPU 2,05e-3. Textes greedy identiques sur 4
 /// contextes sur 7 (4k-32k), les 3 autres divergent sur un near-tie (marges
 /// 0,0001-0,011 contre 2,3 en médiane), même politique que le `batch_long`.
-/// Kill-switch `SARAGOSSA_RUST_PREFILL_ATTN_NAX=0` (retour au Steel f32).
+/// Kill-switch `SARAGOSSA_RUST_PREFILL_ATTN_NAX=0` (Steel f32 en d256, naïf
+/// en d128). La variante d128 compile avec 302=false ; même tolérance oracle
+/// de 1e-3 à entrées bf16 que le d256. Identité greedy d128 non qualifiée
+/// faute de modèle local.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_attn_nax_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -1288,7 +1292,8 @@ pub(crate) fn prefill_kv_bf16_mirror_enabled() -> bool {
 }
 
 /// Stocke en bf16 le K/V full-attention du prefill résident par morceaux,
-/// au lieu du f32. Seulement si le NAX d256 lit déjà ce K/V en bf16 et que
+/// au lieu du f32. Seulement si le NAX causal (d256, ou d128 sans sinks) lit
+/// déjà ce K/V en bf16 et que
 /// l'arène de decode sera bf16 (prompt ≥ [`kv_bf16_greedy_min_tokens`], ni
 /// `SARAGOSSA_RUST_KV_BF16=0` ni KV quantifié) : sorties du prefill et arène
 /// bit-identiques, 2 octets au lieu de 4 par valeur. Défaut ON depuis le
@@ -1398,18 +1403,31 @@ pub(crate) fn prefix_extend_resident_min_tokens() -> usize {
     })
 }
 
-/// Récurrence gated delta du prefill linéaire (27B : 16/48 têtes, dk = dv =
+/// Récurrence gated delta du prefill linéaire (16/48 têtes, dk = dv =
 /// 128, état f32) sur les accélérateurs neuronaux : noyau
 /// `gated_delta_fused_nax` de MLX figé. Défaut ON depuis le 2026-10-25 (M5 Max,
 /// 27B 4 bits) : prefill 32k 588-598 → 630-651 tok/s, TTFT serve 32k 55,8 →
 /// 52,2 s ; oracle naïf 3,8e-4. Textes greedy AR identiques à 16k et 32k, celui
 /// de 8k diverge au 1 775e caractère sur 1 783 (fin de phrase, near-tie
 /// présumé). Kill-switch `SARAGOSSA_RUST_PREFILL_LINEAR_NAX=0` (retour au
-/// chunk-delta).
+/// séquentiel). Le cas 16/32 exige aussi `SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1`.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn prefill_linear_nax_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_LINEAR_NAX", true))
+}
+
+/// Active le gated delta NAX expérimental hk16/hv32, dk = dv = 128, état f32.
+/// Opt-in `SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1`, défaut OFF : sur le 35B
+/// à 4 709 tokens, KL forcée 2,3e-3 et accord top-1 98,4 % contre main,
+/// avec divergence greedy malgré les oracles synthétiques. Le remède
+/// d'identité reste à l'étude (docs/perf/moe-bm32-hv32.md).
+/// Le kill-switch global `SARAGOSSA_RUST_PREFILL_LINEAR_NAX=0` reste prioritaire.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn gated_delta_nax_hv32_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    prefill_linear_nax_enabled()
+        && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GATED_DELTA_NAX_HV32", false))
 }
 
 /// Émet le premier token MTP au retour du prefill, avant la mise en place des
@@ -1451,8 +1469,9 @@ pub(crate) fn dense_bf16_gemm_enabled() -> bool {
 /// intermédiaires sont dimensionnés sur un morceau au lieu du prompt entier ;
 /// le KV et l'état linéaire passent d'un morceau au suivant. Le prompt est
 /// découpé en morceaux égaux (au plus cette taille, au moins 512). Les modèles
-/// hors périmètre Steel/NAX d256 (fenêtre glissante, autres têtes) restent en
-/// un seul morceau. `SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0` désactive.
+/// hors périmètre Steel/NAX d128/d256 (fenêtre glissante, GQA invalide ou
+/// pipeline absent) restent en un seul morceau.
+/// `SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0` désactive.
 /// Avec l'état SSM bf16 (opt-in), l'état est arrondi à chaque frontière de
 /// morceau au lieu d'une fois : dérive non mesurée.
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2512,6 +2531,52 @@ mod tests {
         // Un nom hors préfixe canonique n'a pas d'alias : il est lu tel quel.
         assert_eq!(legacy_alias("HF_HOME"), None);
         assert_eq!(legacy_alias("RETI_RUST_TRUC"), None);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    fn gated_delta_nax_hv32_requires_opt_in() -> std::io::Result<()> {
+        const CHILD: &str = "SARAGOSSA_TEST_NAX_FLAGS_CHILD";
+        if let Ok(expected) = std::env::var(CHILD) {
+            assert_eq!(gated_delta_nax_hv32_enabled(), expected == "hv32");
+            assert_eq!(prefill_linear_nax_enabled(), expected != "off");
+            return Ok(());
+        }
+        // Un processus neuf par cas évite de partager les OnceLock ou de
+        // modifier l'environnement global des autres oracles GPU.
+        for (hv32, global, expected) in [
+            (None, None, "hv48"),
+            (Some("0"), None, "hv48"),
+            (Some("1"), None, "hv32"),
+            (Some("1"), Some("0"), "off"),
+        ] {
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "runtime_flags::tests::gated_delta_nax_hv32_requires_opt_in",
+                    "--nocapture",
+                ])
+                .env(CHILD, expected);
+            for flag in ["GATED_DELTA_NAX_HV32", "PREFILL_LINEAR_NAX"] {
+                command.env_remove(format!("SARAGOSSA_RUST_{flag}"));
+                command.env_remove(format!("RETI_RUST_{flag}"));
+            }
+            if let Some(value) = hv32 {
+                command.env("SARAGOSSA_RUST_GATED_DELTA_NAX_HV32", value);
+            }
+            if let Some(value) = global {
+                command.env("SARAGOSSA_RUST_PREFILL_LINEAR_NAX", value);
+            }
+            let output = command.output()?;
+            assert!(
+                output.status.success(),
+                "hv32={hv32:?}, global={global:?}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
     }
 
     // Les tests d'env ci-dessous partagent le même processus : un mutex

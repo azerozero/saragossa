@@ -56,6 +56,7 @@ fn template_model(path: &std::path::Path) -> TestResult<LoadedModel> {
         preset: None,
         mtp_active: false,
         json_token_catalog: OnceLock::new(),
+        schema_token_catalog: OnceLock::new(),
         prefix_cache: BlockAwarePrefixCache::from_runtime_flags(),
     })
 }

@@ -1566,7 +1566,9 @@ fn affine_qmv_u3_gs64_dequantizes_like_cpu_bit_exact() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
-    for in_dim in [256_usize, 512_usize] {
+    // 1536 et 1792 : nombre impair de blocs de 512 (dernière paire incomplète) et
+    // demi-bloc final, pour la boucle à deux blocs.
+    for in_dim in [256_usize, 512, 1024, 1536, 1792] {
         let out_dim = 8_usize;
         let weight = test_affine_mlx_u3(out_dim, in_dim)?;
         assert!(matches!(
@@ -1669,7 +1671,7 @@ fn qmm_skinny_u4_gs64_matches_qmv_for_5_to_31_rows() -> Result<()> {
     let in_dim = 1024_usize;
     let out_dim = 64_usize;
     let weight = test_affine_varied(out_dim, in_dim)?;
-    if !executor.qmm_skinny_available() {
+    if !executor.qmm_skinny_available(4) {
         eprintln!("skip: GEMM NA skinny indisponible (macOS < 26 ?)");
         return Ok(());
     }
@@ -1987,38 +1989,204 @@ fn qmm_skinny_u4_x2_and_x3_match_f64_on_qwen_shapes() -> Result<()> {
     Ok(())
 }
 
+/// Poids u2/u3 gs64 pseudo-aléatoire, codes conservés pour l'oracle f64. En
+/// mode `cancel`, 90 % des codes valent le milieu de la plage et le biais
+/// l'annule (`s·q + b ≈ 0`), comme l'oracle d'annulation du skinny u4.
+fn test_affine_random_low_bits(
+    out_dim: usize,
+    in_dim: usize,
+    bits: usize,
+    seed: u64,
+    cancel: bool,
+) -> Result<(AffineQuantizedTensor, Vec<u32>)> {
+    let mut state = seed;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let levels = 1u32 << bits;
+    let mid = levels / 2;
+    let codes: Vec<u32> = (0..out_dim * in_dim)
+        .map(|_| {
+            if cancel && next() < 0.9 {
+                mid
+            } else {
+                (next() * f64::from(levels)) as u32 & (levels - 1)
+            }
+        })
+        .collect();
+    let packed_cols = in_dim * bits / 32;
+    let mut packed = vec![0_u32; out_dim * packed_cols];
+    for (index, &q) in codes.iter().enumerate() {
+        let (row, col) = (index / in_dim, index % in_dim);
+        let bit = col * bits;
+        let word = row * packed_cols + bit / 32;
+        packed[word] |= q << (bit % 32);
+        if bit % 32 + bits > 32 {
+            packed[word + 1] |= q >> (32 - bit % 32);
+        }
+    }
+    let groups = in_dim / 64;
+    let scales: Vec<f32> = (0..out_dim * groups)
+        .map(|_| bf16_round((0.004 + 0.036 * next()) as f32))
+        .collect();
+    let biases = scales
+        .iter()
+        .map(|s| {
+            let offset = if cancel { 0.0 } else { next() as f32 - 0.5 };
+            bf16_round(-s * (mid as f32 + offset))
+        })
+        .collect();
+    let weight = AffineQuantizedTensor::new(
+        &[out_dim, packed_cols],
+        packed,
+        Tensor::from_vec(vec![out_dim, groups], scales)?,
+        Tensor::from_vec(vec![out_dim, groups], biases)?,
+        64,
+        bits,
+    )?;
+    Ok((weight, codes))
+}
+
+/// Oracle f64 du skinny x2 u2/u3 (même borne que le u4 x2) : formes du 27B,
+/// tailles impaires (N = 96, K = 1536, lots 5 à 31), régime d'annulation. Le
+/// qmv répliqué (f32, ~1e-7) est imprimé comme témoin ; le x2 porte l'erreur
+/// 2⁻¹⁶ de l'activation scindée (~4e-6). En u3, les codes chevauchent deux mots.
+#[test]
+fn qmm_skinny_u2_u3_x2_match_f64() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    if !executor.qmm_skinny_available(3) || !executor.qmm_skinny_available(2) {
+        eprintln!("skip: GEMM NA skinny indisponible (macOS < 26 ?)");
+        return Ok(());
+    }
+    let cases: [(usize, usize, &[usize], bool); 6] = [
+        (5120, 17408, &[5, 16], false),
+        (17408, 5120, &[8, 17], false),
+        (6144, 5120, &[5, 16], false),
+        (1536, 96, &[5, 9, 31], false),
+        (512, 32, &[5, 7], false),
+        (5120, 64, &[8, 16], true),
+    ];
+    for bits in [2_usize, 3] {
+        for (index, &(in_dim, out_dim, batches, cancel)) in cases.iter().enumerate() {
+            let (weight, codes) = test_affine_random_low_bits(
+                out_dim,
+                in_dim,
+                bits,
+                0x51ED_270B + (bits * 16 + index) as u64,
+                cancel,
+            )?;
+            let scales = weight.scales_f32();
+            let biases = weight.biases_f32();
+            let groups = in_dim / 64;
+            for &batch in batches {
+                assert!(matches!(
+                    executor.select_owned_affine_matmul_kernel(batch, in_dim, &weight, false),
+                    AffineMatmulKernel::Skinny
+                ));
+                let lhs: Vec<f32> = (0..batch * in_dim)
+                    .map(|i| {
+                        let x = ((i * 2_654_435_761) % 10_007) as f32 / 10_007.0 - 0.5;
+                        if i % 997 == 0 {
+                            x * 40.0
+                        } else {
+                            x
+                        }
+                    })
+                    .collect();
+                let cols: Vec<usize> = (0..out_dim).step_by(37.min(out_dim / 8)).collect();
+                let mut reference = Vec::with_capacity(batch * cols.len());
+                let mut magnitude = Vec::with_capacity(batch * cols.len());
+                for row in 0..batch {
+                    let x = &lhs[row * in_dim..(row + 1) * in_dim];
+                    for &n in &cols {
+                        let (mut acc, mut abs) = (0.0f64, 0.0f64);
+                        for (k, &xk) in x.iter().enumerate() {
+                            let g = n * groups + k / 64;
+                            let w = f64::from(codes[n * in_dim + k]) * f64::from(scales[g])
+                                + f64::from(biases[g]);
+                            acc += f64::from(xk) * w;
+                            abs += (f64::from(xk) * w).abs();
+                        }
+                        reference.push(acc);
+                        magnitude.push(abs);
+                    }
+                }
+                let scale = reference.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+                let error = |actual: &[f32]| {
+                    let mut worst = 0.0f64;
+                    for row in 0..batch {
+                        for (c, &n) in cols.iter().enumerate() {
+                            let r = row * cols.len() + c;
+                            let denom = if cancel { magnitude[r] } else { scale };
+                            let value = f64::from(actual[row * out_dim + n]);
+                            worst = worst.max((value - reference[r]).abs() / denom);
+                        }
+                    }
+                    worst
+                };
+                let skinny = skinny_matmul(
+                    &executor,
+                    SkinnyKernel::X2,
+                    &weight,
+                    &lhs,
+                    batch,
+                    in_dim,
+                    out_dim,
+                )?;
+                let replicated = with_qmm_skinny_min_batch_override(usize::MAX, || {
+                    matmul_via_selected_kernel(&executor, &weight, &lhs, batch, in_dim, out_dim)
+                })?;
+                let (worst, witness) = (error(&skinny), error(&replicated));
+                eprintln!(
+                    "skinny x2 u{bits} {in_dim}→{out_dim} M={batch} cancel={cancel}: \
+                     écart {worst:.2e} (qmv {witness:.2e})"
+                );
+                assert!(worst <= 5.0e-5, "u{bits} {in_dim}→{out_dim} M={batch}: {worst:e}");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn affine_qmm2_u3_gs64_matches_two_qmv_bit_exact() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
-    let in_dim = 256_usize;
-    let out_dim = 40_usize;
-    let weight = test_affine_mlx_u3(out_dim, in_dim)?;
-    assert!(matches!(
-        executor.select_owned_affine_matmul_kernel(2, in_dim, &weight, false),
-        AffineMatmulKernel::Qmm2
-    ));
-    let row0 = varied_row(in_dim, 71);
-    let row1 = varied_row(in_dim, 73);
-    let reference0 =
-        executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row0.clone())?, &weight)?;
-    let reference1 =
-        executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row1.clone())?, &weight)?;
-    let mut lhs = row0;
-    lhs.extend_from_slice(&row1);
-    let actual = executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![2, in_dim], lhs)?, &weight)?;
+    // 1792 : trois blocs et demi, la boucle qmv à deux blocs finit sur un bloc seul.
+    for in_dim in [256_usize, 1792] {
+        let out_dim = 40_usize;
+        let weight = test_affine_mlx_u3(out_dim, in_dim)?;
+        assert!(matches!(
+            executor.select_owned_affine_matmul_kernel(2, in_dim, &weight, false),
+            AffineMatmulKernel::Qmm2
+        ));
+        let row0 = varied_row(in_dim, 71);
+        let row1 = varied_row(in_dim, 73);
+        let reference0 =
+            executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row0.clone())?, &weight)?;
+        let reference1 =
+            executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row1.clone())?, &weight)?;
+        let mut lhs = row0;
+        lhs.extend_from_slice(&row1);
+        let actual = executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![2, in_dim], lhs)?, &weight)?;
 
-    assert_bits_equal(
-        &actual.data()[..out_dim],
-        reference0.data(),
-        "qmm2 u3 ligne 0",
-    );
-    assert_bits_equal(
-        &actual.data()[out_dim..],
-        reference1.data(),
-        "qmm2 u3 ligne 1",
-    );
+        assert_bits_equal(
+            &actual.data()[..out_dim],
+            reference0.data(),
+            "qmm2 u3 ligne 0",
+        );
+        assert_bits_equal(
+            &actual.data()[out_dim..],
+            reference1.data(),
+            "qmm2 u3 ligne 1",
+        );
+    }
     Ok(())
 }
 

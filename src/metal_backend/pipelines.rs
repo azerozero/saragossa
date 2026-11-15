@@ -223,10 +223,10 @@ fn steel_causal_function(
     }
 }
 
-/// Compile l'attention causale NAX d256 (bibliothèque séparée, MPP). `None`
+/// Compile l'attention causale NAX d128/d256 sans sinks (constante 302=false). `None`
 /// si MetalPerformancePrimitives manque (macOS < 26) ou sans accélérateur.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub(super) fn compile_steel_causal_nax_d256_attention(
+pub(super) fn compile_steel_causal_nax_attention(
     device: &Device,
     source: &str,
     shape: attention::NaxCausalAttnShape,
@@ -283,8 +283,9 @@ fn compile_nax_causal_attention(
 pub(super) fn compile_gated_delta_nax(
     device: &Device,
     source: &str,
+    name: &str,
 ) -> Option<ComputePipelineState> {
-    compile_nax_function(device, source, GATED_DELTA_NAX_HK16_HV48, &[(200, false)])
+    compile_nax_function(device, source, name, &[(200, false)])
 }
 
 pub(super) fn compile_nax_function(
@@ -726,9 +727,24 @@ impl MetalExecutor {
             attention_prefill_steel_sink_d128_f32,
             attention_prefill_steel_sink_d128_kv_bf16,
         ) = compile_steel_causal_attentions(&device, sources.steel_attention.as_ref());
+        let causal_attention_prefill_nax_d128 = if crate::runtime_flags::prefill_attn_nax_enabled()
+        {
+            let pipeline = compile_steel_causal_nax_attention(
+                &device,
+                sources.steel_attention_nax.as_ref(),
+                // Le d128 lit (NQ, H) ; 304 ne permute que le dsplit d256.
+                attention::NAX_CAUSAL_ATTN_D128,
+            );
+            if pipeline.is_none() {
+                eprintln!("attention prefill NAX d128 indisponible : repli naïf");
+            }
+            pipeline
+        } else {
+            None
+        };
         let causal_attention_prefill_steel_nax_d256 =
             if crate::runtime_flags::prefill_attn_nax_enabled() {
-                let pipeline = compile_steel_causal_nax_d256_attention(
+                let pipeline = compile_steel_causal_nax_attention(
                     &device,
                     sources.steel_attention_nax.as_ref(),
                     attention::NaxCausalAttnShape::from_flags(),
@@ -806,9 +822,26 @@ impl MetalExecutor {
         let na_gemm_bf16 = compile_na_gemm(&device, na_source);
         let na_gemm_bf16_bn128 = compile_na("gemm_nax_bf16_bn128");
         let gated_delta_nax_hk16_hv48 = if crate::runtime_flags::prefill_linear_nax_enabled() {
-            let pipeline = compile_gated_delta_nax(&device, GATED_DELTA_NAX_KERNELS);
+            let pipeline = compile_gated_delta_nax(
+                &device,
+                GATED_DELTA_NAX_KERNELS,
+                GATED_DELTA_NAX_HK16_HV48,
+            );
             if pipeline.is_none() {
                 eprintln!("gated delta NAX indisponible : repli chunk-delta");
+            }
+            pipeline
+        } else {
+            None
+        };
+        let gated_delta_nax_hk16_hv32 = if crate::runtime_flags::gated_delta_nax_hv32_enabled() {
+            let pipeline = compile_gated_delta_nax(
+                &device,
+                GATED_DELTA_NAX_KERNELS,
+                GATED_DELTA_NAX_HK16_HV32,
+            );
+            if pipeline.is_none() {
+                eprintln!("gated delta NAX hv32 indisponible : repli séquentiel");
             }
             pipeline
         } else {
@@ -827,6 +860,8 @@ impl MetalExecutor {
         let na_gemm_skinny_u4 = compile_na("gemm_nax_skinny_u4");
         let na_gemm_skinny_u4_x3 = compile_na("gemm_nax_skinny_u4_x3");
         let na_gemm_skinny_u4_x2 = compile_na("gemm_nax_skinny_u4_x2");
+        let na_gemm_skinny_u3_x2 = compile_na("gemm_nax_skinny_u3_x2");
+        let na_gemm_skinny_u2_x2 = compile_na("gemm_nax_skinny_u2_x2");
         #[cfg(test)]
         let na_gemm_coop_qb_grouped = compile_na("gemm_nax_coop_qb_grouped");
         let na_gemm_coop_qb_grouped_gather = compile_na("gemm_nax_coop_qb_grouped_gather");
@@ -996,6 +1031,7 @@ impl MetalExecutor {
             qmm_na_u4_min_dim: QMM_NA_U4_DEFAULT_MIN_DIM,
             qmm_na_u4_x3_weights: Vec::new(),
             prefill_window_kv: crate::runtime_flags::flint_window_kv_enabled(),
+            causal_attention_prefill_nax_d128,
             causal_attention_prefill_steel_nax_d256,
             attention_prefill_nax_sink_d128,
             attention_prefill_nax_sink_d128_window,
@@ -1028,6 +1064,7 @@ impl MetalExecutor {
             dequant_u8_to_bf16_t_gs64,
             na_gemm_bf16,
             na_gemm_bf16_bn128,
+            gated_delta_nax_hk16_hv32,
             gated_delta_nax_hk16_hv48,
             na_gemm_coop_qb,
             na_gemm_coop_qb_gs128,
@@ -1039,6 +1076,8 @@ impl MetalExecutor {
             na_gemm_skinny_u4,
             na_gemm_skinny_u4_x3,
             na_gemm_skinny_u4_x2,
+            na_gemm_skinny_u3_x2,
+            na_gemm_skinny_u2_x2,
             na_gemm_coop_qb_tiled_u4_align64,
             na_gemm_coop_qb_tiled_u4_gate_up_swiglu,
             #[cfg(test)]

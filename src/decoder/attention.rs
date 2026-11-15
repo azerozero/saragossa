@@ -530,6 +530,8 @@ impl DecoderLayer {
         let profile = profile_layer_enabled();
         let total_started = profile.then(Instant::now);
         #[cfg(all(target_os = "macos", feature = "metal"))]
+        let (prefill_seq, _) = x.as_matrix()?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
         if position_offset == 0 && !config.attn_output_gate {
             if let (
                 Some(metal),
@@ -554,14 +556,15 @@ impl DecoderLayer {
                 },
                 // Le kernel prefill Metal applique une base RoPE unique
                 // (rotate-half uniquement), des positions brutes et aucun masque
-                // fenêtré : suivre l'override par couche et s'exclure si la couche
-                // est sliding ou scalée (Gemma), ou si l'appariement n'est pas
-                // Halves — fallback CPU correct juste en dessous.
+                // fenêtré : suivre l'override par couche et s'exclure si la fenêtre
+                // masque des clés, si la couche est scalée (Gemma) ou si
+                // l'appariement n'est pas Halves — fallback CPU ci-dessous.
                 match &self.attention {
                     AttentionBlock::Full(attention) => {
                         attention.rope_theta.or(config.rope_theta).filter(|_| {
-                            attention.sliding_window.is_none()
-                                && attention.rope_position_scale.is_none()
+                            attention.sliding_window.is_none_or(|window| {
+                                window >= prefill_seq && attention.sinks.is_none()
+                            }) && attention.rope_position_scale.is_none()
                                 && config.rope_style == RopeStyle::Halves
                         })
                     }
@@ -655,7 +658,9 @@ impl DecoderLayer {
                     attention.k_norm.as_ref(),
                     attention.v_proj.as_ref(),
                     attention.rope_theta.or(config.rope_theta).filter(|_| {
-                        attention.sliding_window.is_none()
+                        attention
+                            .sliding_window
+                            .is_none_or(|window| window >= prefill_seq && attention.sinks.is_none())
                             && attention.rope_position_scale.is_none()
                             && config.rope_style == RopeStyle::Halves
                     }),

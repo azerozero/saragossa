@@ -8,16 +8,17 @@
 // Voir docs/perf/greedy-identity.md.
 
 /// Écarts connus (préfixe « kernel cas », R minimal, écart relatif max) : le
-/// matmul u4 gs64 passe au kernel skinny (MMA bf16 hi+lo) à partir de 5 lignes,
+/// matmul u4 (u3 et u2 aussi) gs64 passe au kernel skinny (MMA bf16 hi+lo) à partir de 5 lignes,
 /// et tout bloc qui en contient un hérite de l'écart. Bornes : 1e-5 pour un
 /// matmul (mesuré 2,4 à 4,6e-6, x2 et x3) et 5e-5 pour un bloc qui en enchaîne
 /// plusieurs (mesuré ≤ 1,7e-5). En mode strict (skinny coupé, mêmes lots),
 /// aucune exception ne s'applique. Il en va de même sans pipeline skinny de la
-/// variante choisie : `qmm_skinny_available()` est la garde matérielle utilisée
+/// variante choisie : `qmm_skinny_available(4)` est la garde matérielle utilisée
 /// par `select_resident_affine_matmul_kernel` (repli qmv sans NAX).
 const ROWS_EXACT_EXCEPTIONS: &[(&str, usize, f32)] = &[
     ("matmul u4", 5, 1.0e-5),
     ("attn QKV u4", 5, 1.0e-5),
+    ("attn QKV u3", 5, 1.0e-5),
     ("linear bloc", 5, 5.0e-5),
     ("linear S1 projection", 5, 1.0e-5),
     ("queue MoE", 5, 5.0e-5),
@@ -114,7 +115,7 @@ fn rows_exact_check_lot(
         .collect();
     let full = format!("{kernel} {case}");
     let strict = ROWS_EXACT_STRICT.with(std::cell::Cell::get);
-    let skinny_available = executor.qmm_skinny_available();
+    let skinny_available = executor.qmm_skinny_available(4);
     let bound = ROWS_EXACT_EXCEPTIONS
         .iter()
         .filter(|(key, from, _)| {

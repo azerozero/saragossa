@@ -828,7 +828,11 @@ kernel void gemm_nax_skinny_u4_x3(device const float* A [[buffer(0)]],
 // A_hi·q et A_lo·q sont exacts en f32 ; l'erreur vient de Â − A (2⁻¹⁶ relatif) et
 // des sommes f32, contre 2⁻¹⁶ sur A **et** sur B pour le ×3.
 // Split-K : span = K/4 multiple de 128 (K % 512 == 0), aucun groupe n'est coupé.
-static inline void gemm_nax_skinny_u4_x2_body(device const float* A, device const uint* Bp,
+// BITS ∈ {2, 3, 4} : q reste un entier exact en bf16. Les 4 codes d'une lane
+// commencent au bit 4·BITS·(kk/4) ; en u3 (12 bits) ils peuvent chevaucher deux
+// mots, lus seulement dans ce cas. En u4 l'extraction est celle d'origine.
+template <uint BITS>
+static inline void gemm_nax_skinny_x2_body(device const float* A, device const uint* Bp,
                                               device const bfloat* Bs, device const bfloat* Bb,
                                               device float* C, uint M, uint N, uint K,
                                               uint2 tgid, uint sgid, uint lid,
@@ -838,7 +842,7 @@ static inline void gemm_nax_skinny_u4_x2_body(device const float* A, device cons
   uint span = K / SG;
   uint kb = sgid * span, ke = kb + span;
   uint groups = K / 64u;
-  uint packed_cols = K / 8u;
+  uint packed_cols = K * BITS / 32u;
   short2 sc = NaxFrag::get_coord();
   // Lignes A de ce thread (fragment A et fragment C partagent le mapping lane→ligne).
   uint row0 = m0 + uint(sc.y), row1 = row0 + 8u;
@@ -870,13 +874,21 @@ static inline void gemm_nax_skinny_u4_x2_body(device const float* A, device cons
         }
         if (i == 0) { sa0 += rs; } else { sa1 += rs; }
       }
-      uint shift = (kk & 7u) * 4u;
+      uint bit = kk * BITS;
+      uint word = bit >> 5u, shift = bit & 31u;
+      bool straddle = shift + 4u * BITS > 32u;
       for (short i = 0; i < 2; i++) {
-        uint w0 = Bp[(nb + uint(i) * 8u) * packed_cols + (kk >> 3)] >> shift;
-        uint w1 = Bp[(nb + 16u + uint(i) * 8u) * packed_cols + (kk >> 3)] >> shift;
+        const device uint* p0 = Bp + (nb + uint(i) * 8u) * packed_cols + word;
+        const device uint* p1 = Bp + (nb + 16u + uint(i) * 8u) * packed_cols + word;
+        uint w0 = p0[0] >> shift;
+        uint w1 = p1[0] >> shift;
+        if (straddle) {
+          w0 |= p0[1] << (32u - shift);
+          w1 |= p1[1] << (32u - shift);
+        }
         for (short j = 0; j < 4; j++) {
-          Q0[i * 4 + j] = bfloat(float((w0 >> (4u * uint(j))) & 0x0fu));
-          Q1[i * 4 + j] = bfloat(float((w1 >> (4u * uint(j))) & 0x0fu));
+          Q0[i * 4 + j] = bfloat(float((w0 >> (BITS * uint(j))) & ((1u << BITS) - 1u)));
+          Q1[i * 4 + j] = bfloat(float((w1 >> (BITS * uint(j))) & ((1u << BITS) - 1u)));
         }
       }
       NaxFrag::mma(P0, P1, Ah, Q0, Q1);
@@ -921,8 +933,21 @@ kernel void gemm_nax_skinny_u4_x2(device const float* A [[buffer(0)]],
                                   uint sgid [[simdgroup_index_in_threadgroup]],
                                   uint lid [[thread_index_in_simdgroup]]) {
   threadgroup float red[4u * 512u];
-  gemm_nax_skinny_u4_x2_body(A, Bp, Bs, Bb, C, batch, dims.x, dims.y, tgid, sgid, lid, red);
+  gemm_nax_skinny_x2_body<4u>(A, Bp, Bs, Bb, C, batch, dims.x, dims.y, tgid, sgid, lid, red);
 }
+#define GEMM_NAX_SKINNY_X2(NAME, BITS)                                                   \
+  kernel void NAME(device const float* A [[buffer(0)]], device const uint* Bp [[buffer(1)]], \
+                   device const bfloat* Bs [[buffer(2)]], device const bfloat* Bb [[buffer(3)]], \
+                   device float* C [[buffer(4)]], constant uint4& dims [[buffer(5)]],      \
+                   constant uint& batch [[buffer(6)]],                                     \
+                   uint2 tgid [[threadgroup_position_in_grid]],                            \
+                   uint sgid [[simdgroup_index_in_threadgroup]],                           \
+                   uint lid [[thread_index_in_simdgroup]]) {                               \
+    threadgroup float red[4u * 512u];                                                      \
+    gemm_nax_skinny_x2_body<BITS>(A, Bp, Bs, Bb, C, batch, dims.x, dims.y, tgid, sgid, lid, red); \
+  }
+GEMM_NAX_SKINNY_X2(gemm_nax_skinny_u3_x2, 3u)
+GEMM_NAX_SKINNY_X2(gemm_nax_skinny_u2_x2, 2u)
 kernel void gemm_nax_coop_qb_tiled_gs128(device const bfloat* A [[buffer(0)]],
                                          device const uint* Bp   [[buffer(1)]],
                                          device const bfloat* Bs [[buffer(2)]],

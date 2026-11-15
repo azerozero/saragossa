@@ -1,11 +1,12 @@
 //! `tojson(ensure_ascii=False)` du Jinja de transformers : `json.dumps` de
 //! Python sur la valeur que `json.loads` a lue dans la requête.
 //!
-//! NOTE: `serde_json::Value` range ses objets dans un `BTreeMap` et trie donc
-//! les clés, alors que Python garde l'ordre du client. Activer la feature
-//! `preserve_order` corrigerait l'ordre, mais pour tout le crate : les octets
-//! des prompts Qwen du shim Anthropic changeraient aussi. D'où ce petit modèle
-//! JSON local, ordonné, lu depuis le texte brut de la requête.
+//! NOTE: llguidance active `serde_json/preserve_order` pour tout le crate :
+//! `Value` conserve désormais l'ordre d'insertion dans un `IndexMap`.
+//! Le JSON historique trié du shim Anthropic et de Gemma utilise le helper
+//! partagé `canonical_json`. Ce modèle local reste nécessaire pour reproduire
+//! `json.dumps` (espaces, flottants, clés répétées) depuis le texte brut,
+//! indépendamment des features de serde_json et sans trier l'ordre du client.
 //!
 //! Fidélité à Python : clés dans l'ordre source, une clé répétée garde la
 //! position de sa première occurrence et la valeur de la dernière, chaînes

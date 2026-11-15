@@ -174,7 +174,7 @@ impl MetalExecutor {
         } else if can_use_qmvt_buffers(batch, in_dim, out_dim, group_size, bits, prefer_fast_affine)
         {
             AffineMatmulKernel::QmvT
-        } else if self.qmm_skinny_available()
+        } else if self.qmm_skinny_available(bits)
             && can_use_qmm_skinny_buffers(batch, in_dim, out_dim, group_size, bits)
         {
             AffineMatmulKernel::Skinny
@@ -265,7 +265,9 @@ impl MetalExecutor {
             AffineMatmulKernel::Qmm2
         } else if can_use_qmvt(batch, in_dim, weight, prefer_fast_affine) {
             AffineMatmulKernel::QmvT
-        } else if self.qmm_skinny_available() && can_use_qmm_skinny(batch, in_dim, weight) {
+        } else if self.qmm_skinny_available(weight.bits())
+            && can_use_qmm_skinny(batch, in_dim, weight)
+        {
             AffineMatmulKernel::Skinny
         } else if can_use_fast_affine_qmm8(batch, in_dim, weight) {
             AffineMatmulKernel::Qmm8

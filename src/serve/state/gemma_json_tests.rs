@@ -25,6 +25,64 @@ fn local_tokenizer() -> Option<PathBuf> {
 }
 
 #[test]
+fn gemma3_local_json_schema_required_content_and_streaming() {
+    let Some(path) = local_tokenizer() else {
+        eprintln!("SKIP: tokenizer Gemma 3 absent ; définir SARAGOSSA_TOKENIZER_GEMMA3");
+        return;
+    };
+    let pieces = [
+        "{\"", "greeting", "\":", "▁\"", "Bonjour", "<0xC3>", "<0xA9>", "<0x22>", "<0x7D>",
+    ];
+    for temperature in [0.0, 0.8] {
+        for streaming in [false, true] {
+            let (mut loaded, length) = scripted_gemma(&path, &pieces);
+            let request = ChatCompletionRequest::parse(
+                serde_json::json!({
+                    "model":"tiny", "temperature":temperature, "top_k":1,
+                    "stream":streaming, "max_tokens":length,
+                    "messages":[{"role":"user", "content":"Return {}"}],
+                    "response_format":{"type":"json_schema", "json_schema":{
+                        "name":"greeting", "strict":true, "schema":{
+                            "type":"object", "properties":{"greeting":{"enum":["Bonjouré"]}},
+                            "required":["greeting"], "additionalProperties":false
+                        }
+                    }}
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .expect("request");
+            let mut deltas = String::new();
+            let result = if streaming {
+                loaded.complete_streaming(
+                    request,
+                    length,
+                    None,
+                    &MemoryGuard::serve(),
+                    &mut |event| {
+                        if let CompletionStreamEvent::Delta(delta) = event {
+                            deltas.push_str(delta);
+                        }
+                        Ok(())
+                    },
+                )
+            } else {
+                loaded.complete(request, length, None, &MemoryGuard::serve())
+            }
+            .expect("completion");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result.content).expect("JSON"),
+                serde_json::json!({"greeting":"Bonjouré"})
+            );
+            assert_eq!(result.finish_reason, "stop");
+            if streaming {
+                assert_eq!(deltas, result.content);
+            }
+        }
+    }
+}
+
+#[test]
 fn gemma3_local_first_json_mask_matches_tokenizer_and_json_parser() {
     let Some(path) = local_tokenizer() else {
         eprintln!("SKIP: tokenizer Gemma 3 absent ; définir SARAGOSSA_TOKENIZER_GEMMA3");

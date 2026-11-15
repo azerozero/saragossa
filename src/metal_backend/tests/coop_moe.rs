@@ -1581,6 +1581,7 @@ fn run_routed_coop_selected(
     top_k: usize,
     select: &dyn Fn(usize) -> Vec<usize>,
     tiled: bool,
+    router_score: crate::RouterScore,
 ) -> Result<(Vec<f32>, Vec<u32>, usize)> {
     let total = rows * top_k;
     let mut input = Vec::with_capacity(rows * hidden);
@@ -1619,7 +1620,7 @@ fn run_routed_coop_selected(
             hidden,
             weights,
             top_k,
-            crate::RouterScore::Sigmoid,
+            router_score,
         )?;
         guard.end();
         commit_and_wait(cb)
@@ -1686,40 +1687,42 @@ fn moe_routed_coop_tiled_matches_16x32() -> Result<()> {
         ("déséquilibré", 300, 6, &unbalanced),
         ("un expert", 5, 1, &single),
     ];
-    for (label, rows, top_k, select) in cases {
-        let run = |tiled| {
-            run_routed_coop_selected(
-                &executor, &weights, rows, hidden, experts, top_k, select, tiled,
-            )
-        };
-        let (base, base_idx, base_calls) = run(false)?;
-        let (tiled, tiled_idx, tiled_calls) = run(true)?;
-        assert_eq!((base_calls, tiled_calls), (0, 1), "{label}: chemin tuilé");
-        assert_eq!(base_idx, tiled_idx, "{label}: routage");
-        let mut counts = vec![0_usize; experts];
-        for &e in &tiled_idx {
-            counts[e as usize] += 1;
-        }
-        let mut expected = vec![0_usize; experts];
-        for t in 0..rows {
-            for e in select(t) {
-                expected[e] += 1;
+    for score in [crate::RouterScore::Sigmoid, crate::RouterScore::Softmax] {
+        for (label, rows, top_k, select) in cases {
+            let run = |tiled| {
+                run_routed_coop_selected(
+                    &executor, &weights, rows, hidden, experts, top_k, select, tiled, score,
+                )
+            };
+            let (base, base_idx, base_calls) = run(false)?;
+            let (tiled, tiled_idx, tiled_calls) = run(true)?;
+            assert_eq!((base_calls, tiled_calls), (0, 1), "{label}: chemin tuilé");
+            assert_eq!(base_idx, tiled_idx, "{label}: routage");
+            let mut counts = vec![0_usize; experts];
+            for &e in &tiled_idx {
+                counts[e as usize] += 1;
             }
+            let mut expected = vec![0_usize; experts];
+            for t in 0..rows {
+                for e in select(t) {
+                    expected[e] += 1;
+                }
+            }
+            assert_eq!(counts, expected, "{label}: histogramme");
+            let gap = base
+                .iter()
+                .zip(&tiled)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            let scale = base.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+            eprintln!("coop tuilé {label}: histogramme {counts:?} écart {gap} échelle {scale}");
+            assert!(scale > 0.0, "{label}: sortie nulle");
+            let same_bits = base
+                .iter()
+                .zip(&tiled)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(same_bits, "{label}: tuilé != 16×32, écart {gap}");
         }
-        assert_eq!(counts, expected, "{label}: histogramme");
-        let gap = base
-            .iter()
-            .zip(&tiled)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f32, f32::max);
-        let scale = base.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
-        eprintln!("coop tuilé {label}: histogramme {counts:?} écart {gap} échelle {scale}");
-        assert!(scale > 0.0, "{label}: sortie nulle");
-        let same_bits = base
-            .iter()
-            .zip(&tiled)
-            .all(|(a, b)| a.to_bits() == b.to_bits());
-        assert!(same_bits, "{label}: tuilé != 16×32, écart {gap}");
     }
     Ok(())
 }

@@ -5556,10 +5556,12 @@ impl CausalDecoder {
                 attention.rope_position_scale.is_some()
             } else {
                 // La fenêtre flint passe par le kernel à sinks, qui la porte ;
-                // les autres fenêtres non-Gemma 4 restent hors contrat.
+                // les autres fenêtres non-Gemma 4 restent hors contrat si
+                // elles masquent des clés de ce prefill.
                 attention.rope_theta.is_some()
                     || attention.rope_position_scale.is_some()
-                    || (attention.sliding_window.is_some() && attention.sinks.is_none())
+                    || (attention.sliding_window.is_some_and(|window| window < seq)
+                        && attention.sinks.is_none())
             }
         });
         if has_unsupported_layer_override {

@@ -198,8 +198,8 @@ pub(super) fn can_use_fast_affine_qmm8(
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
-/// GEMM « skinny » u4 gs64 sur unités matricielles (`gemm_nax_skinny_u4_x2`,
-/// `na_gemm.metal`) pour les largeurs de `qmm_skinny_min_batch()` à
+/// GEMM « skinny » u2/u3/u4 gs64 sur unités matricielles (`gemm_nax_skinny_u4_x2`
+/// et ses variantes u2/u3 en x2, `na_gemm.metal`) pour les largeurs de `qmm_skinny_min_batch()` à
 /// `qmm_na_min_batch() - 1` (vérification spéculative large) : les poids d'une
 /// tuile sont dé-quantifiés une fois pour seize lignes au lieu d'un qmv par ligne.
 /// Mesuré le 2026-10-16 (M5 Max, `small_m_qmm_microbench`) : gate/up M=8 0,19 ms
@@ -228,7 +228,7 @@ pub(super) fn can_use_qmm_skinny_buffers(
         && fast_affine_qmv_enabled(out_dim)
         && batch >= qmm_skinny_min_batch()
         && batch < qmm_na_min_batch()
-        && bits == FAST_QMV_BITS
+        && matches!(bits, 2..=FAST_QMV_BITS)
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
         && out_dim % 32 == 0

@@ -172,7 +172,7 @@ python -I tools/e2e/run.py --target qwen38 --modes ar,mtp,dflash --list
 | même endpoint | `max_tokens`, `stop`, `seed_temperature_zero` | usage entier cohérent, budget, finish_reason=length ; stop issu d'une réponse de référence et retiré ; deux réponses et usages identiques à seed=42/température 0 |
 | même endpoint | `stream`, `stream_usage` | SSE UTF-8, chunks JSON, id/created stables, delta.role initial, contenu, finish_reason final, `[DONE]` unique/final ; usage final et choices vide si demandé |
 | même endpoint | `n_rejected` | n=2 doit échouer HTTP 400 avec erreur explicite ; acceptation silencieuse = ÉCHEC |
-| même endpoint | `json_object`, `json_schema` | objet JSON parsable (contenu libre, comme chez OpenAI) ; json_schema HTTP 501 avec erreur explicite |
+| même endpoint | `json_object`, `json_schema` | objet JSON parsable pour `json_object` ; clés required et enums imposés pour `json_schema`, en greedy et échantillonné |
 | même endpoint | `tools_auto`, `tools_none`, `tools_required`, `tools_named` | sélection selon capacité ; required/nommé doivent être refusés sur flint |
 | même endpoint | `tools_roundtrip`, `tools_stream` | id unique, type=function, nom, arguments JSON/Paris ; résultat corrélé par tool_call_id, réponse contenant 17 ; assemblage des fragments indexés |
 | `/v1/messages` | `simple`, `system`, `multi_turn`, `max_tokens`, `stop_sequences` | type=message, rôle, modèle, blocs, input/output_tokens, stop_reason, stop_sequence corrélée ; mêmes contrôles de contenu |
@@ -205,8 +205,7 @@ Les décisions suivantes viennent du code local, et doivent être revues lorsqu'
 PR modifie une capacité. Elles ne sont jamais inférées d'une exception réseau.
 
 - [protocol.rs](../../src/serve/protocol.rs) : `json_object` disponible,
-  `json_schema` refusé en 501. Le refus est exécuté et vérifié avant attribution
-  du statut non supporté attendu.
+  `json_schema` contraint les clés required et les enums.
 - [http.rs](../../src/serve/http.rs) : le parser d'outils OpenAI est réservé à
   `model_type=flint`. Les familles Qwen et Gemma ignorent `tools/tool_choice`.
   Leurs cas d'outils OpenAI sont donc explicitement non exécutés/non supportés,
@@ -250,8 +249,9 @@ couvertes par des fixtures négatives locales et ne sont pas assouplies.
 L'échec Gemma3 `json_object` (« objet JSON/contenu attendu ») venait du
 contenu : le 4B répondait `{}`, objet JSON valide. `json_object` impose une forme
 JSON, pas un contenu (grammaire `src/guided/json.rs`), donc le test ne vérifie plus
-que la forme. Le contenu imposé relèvera de `json_schema`, encore refusé en
-HTTP 501.
+que la forme. Le cas fonctionnel `json_schema` impose maintenant `city` et
+`greeting`, avec enums, malgré une consigne demandant `{}`. Il est exécuté en
+greedy et échantillonné sur les routes OpenAI et Anthropic (`output_config.format`).
 
 ## Rapports et codes de sortie
 

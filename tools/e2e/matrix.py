@@ -193,12 +193,25 @@ class Matrix:
         # json_object garantit un objet JSON, pas son contenu : `{}` est conforme.
         c.require(type(json.loads(self.output(value))) is dict, "objet JSON attendu")
 
+    def json_schema(self, temperature=0, anthropic=False):
+        schema = {"type": "object", "properties": {
+            "city": {"type": "string", "enum": ["Paris", "Brest"]},
+            "greeting": {"type": "string", "enum": ["Bonjour"]}},
+            "required": ["city", "greeting"], "additionalProperties": False}
+        body = self.chat_body()
+        body["temperature"] = temperature
+        body["messages"] = [{"role": "user", "content": "Return an empty JSON object: {}"}]
+        if anthropic:
+            body["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
+        else:
+            body["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": "weather", "schema": schema, "strict": True}}
+        value = json.loads(self.output(self.complete(body, anthropic), anthropic))
+        c.require(type(value) is dict and set(value) == {"city", "greeting"}, "clés required du schéma absentes")
+        c.require(value["city"] in ("Paris", "Brest") and value["greeting"] == "Bonjour", "enum du schéma violé")
+
     def unsupported_request(self, option):
-        if option == "json_schema":
-            body = self.chat_body(response_format={"type": "json_schema", "json_schema": {
-                "name": "weather", "schema": SCHEMA, "strict": True}})
-            status, contains = 501, "json_schema"
-        elif option == "n":
+        if option == "n":
             body, status, contains = self.chat_body(n=2), 400, "n"
         else:
             choice = "required" if option == "required" else {"type": "function", "function": {"name": "get_weather"}}
@@ -327,9 +340,12 @@ class Matrix:
                                ("n_rejected", lambda: self.unsupported_request("n"))):
             self.add(CHAT, option, action, "" if self.family == "chat" else chat_disabled,
                      smoke=option != "seed_temperature_zero")
-        self.add(CHAT, "json_schema", lambda: self.unsupported_request("json_schema"),
-                 "src/serve/protocol.rs: json_schema refusé avec HTTP 501; contrôle du rejet.", smoke=True,
-                 verify_rejection=True)
+        for anthropic in (False, True):
+            for temperature in (0, 0.8):
+                self.add(MESSAGES if anthropic else CHAT,
+                         "json_schema" if temperature == 0 else "json_schema_sampled",
+                         lambda t=temperature, a=anthropic: self.json_schema(t, a),
+                         "" if self.family == "chat" else chat_disabled, smoke=True)
         self.add(MESSAGES, "auth_x_api_key_only", lambda: self.error_wire(MESSAGES, "auth_x_api_key_only"),
                  "" if self.family == "chat" else chat_disabled, smoke=True)
         no_tools = "" if self.supports_tools else (
