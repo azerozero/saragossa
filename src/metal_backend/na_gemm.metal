@@ -41,6 +41,29 @@ kernel void gemm_nax_bf16_bn128(device const bfloat* Ap [[buffer(0)]],
   auto mC = C.slice(n0, m0);
   op.run(mA, mB, mC);
 }
+// C[M,N] = A[M,K]·B[N,K]^T, A et B bf16 (poids dense non transposé), accum f32.
+// matmul2d MPP tuiles 64×128 sur 8 simdgroups ; exige N%128=0. Réservé aux
+// modèles de décision, dont l'oracle couvre l'arrondi bf16 de l'activation.
+// Grille N en x : les groupes voisins partagent la même tuile A (64×K) ; à
+// M=2048, N=12288, K=4096, 64 TFLOP/s contre 26 avec M en x, à l'identique.
+kernel void gemm_nax_bf16_nt_bn128(device const bfloat* Ap [[buffer(0)]],
+                                   device const bfloat* Bp [[buffer(1)]],
+                                   device float* Cp         [[buffer(2)]],
+                                   constant uint3& mnk       [[buffer(3)]],
+                                   uint2 tgid [[threadgroup_position_in_grid]]) {
+  uint M = mnk.x, N = mnk.y, K = mnk.z;
+  auto A = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>((device bfloat*)Ap, dextents<int32_t,2>(int32_t(K), int32_t(M)));
+  auto B = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>((device bfloat*)Bp, dextents<int32_t,2>(int32_t(K), int32_t(N)));
+  auto C = tensor<device float,  dextents<int32_t,2>, tensor_inline>(Cp, dextents<int32_t,2>(int32_t(N), int32_t(M)));
+  constexpr auto desc = tensor_ops::matmul2d_descriptor(
+      64, 128, static_cast<int>(dynamic_extent), false, true, false);
+  tensor_ops::matmul2d<desc, execution_simdgroups<8>> op;
+  uint m0 = tgid.y * 64, n0 = tgid.x * 128;
+  auto mA = A.slice(0, m0);
+  auto mB = B.slice(0, n0);
+  auto mC = C.slice(n0, m0);
+  op.run(mA, mB, mC);
+}
 // ===== Port qmm_t_nax brique 1 : primitive cooperative_tensor à fragments registres.
 // Transcription de BaseNAXFrag (mlx steel/gemm/nax.h:27) : fragment 16x16, 8 élts/thread
 // (2 lignes x 4 cols, lignes espacées de 8), mapping lane->coord par bit-twiddling, MMA

@@ -43,7 +43,7 @@ fn templates_match_all_28_transformers_references() {
         )
         .expect("json");
         assert_eq!(
-            format!("{:x}", Sha256::digest(&bytes)),
+            crate::hex(Sha256::digest(&bytes)),
             header["payload_sha256"].as_str().expect("digest")
         );
         let fixture: Fixture = serde_json::from_slice(&bytes).expect("fixture JSON");

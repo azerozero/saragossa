@@ -50,6 +50,7 @@ const U6_QMM_BATCH_TILE: usize = 8;
 
 mod attention;
 mod attention_checks;
+mod micro;
 pub(crate) use attention_checks::check_threadgroup_size;
 mod barriers;
 mod buffers;
@@ -109,6 +110,7 @@ pub(crate) use self::matmul::with_concat_vram_fraction_override;
 pub(crate) use self::moe_na::moe_coop_tiled_trace_for_test;
 #[cfg(test)]
 pub(crate) use self::prefill::routed_coop_trace_for_test;
+pub(crate) use self::prefill::with_decision_segments;
 #[cfg(test)]
 pub(crate) use self::prefill::with_prefill_kv_layout_override;
 pub(crate) use self::prefill::with_prefill_kv_reserve;
@@ -405,6 +407,7 @@ pub struct MetalExecutor {
     prefill_kv_bf16_store_min_rows: Option<usize>,
     noncausal_attention_prefill_f32: ComputePipelineState,
     steel_attention_f32_bq32_bk32_bd64: Option<ComputePipelineState>,
+    decision_attention_nax: Option<attention::NaxCausalAttention>,
     add_rms_norm_row_f32: ComputePipelineState,
     topk_softmax_f32: ComputePipelineState,
     /// Top-k softmax 256 < experts ≤ 1024, un thread par logit.
@@ -448,6 +451,8 @@ pub struct MetalExecutor {
     /// GEMM tuilé à poids bf16 denses `[N,K]` et lhs f32 scindé hi + lo,
     /// pour le prefill des modèles BF16.
     na_gemm_bf16_nt_tiled_x2: Option<ComputePipelineState>,
+    /// matmul2d MPP A et B bf16, B `[N,K]` : réservé aux décisions THX-02.
+    na_gemm_bf16_nt_bn128: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_align64: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_gate_up_swiglu: Option<ComputePipelineState>,
     #[cfg(test)]
@@ -478,6 +483,7 @@ pub struct MetalExecutor {
     /// Bibliothèque `kernels.metal` compilée, gardée pour les pipelines créés à la
     /// demande (qmv-T du mode strict, une instance par largeur de lot).
     library: metal::Library,
+    micro_library: Mutex<Option<metal::Library>>,
     /// Pipelines qmv-T déjà créés, par nom de kernel.
     qmvt_pipelines: Mutex<HashMap<String, ComputePipelineState>>,
     /// Force la rétention des dérivés de poids avant de libérer leurs payloads CPU.
@@ -545,6 +551,7 @@ pub(crate) struct StackedAffineBuffers {
 
 #[derive(Clone, Debug)]
 pub(crate) enum MetalLinearWeightBuffers {
+    MicroScaled(micro::MicroWeightBuffers),
     DenseBf16 {
         rhs: Buffer,
         out_dim: usize,
@@ -574,6 +581,7 @@ pub(crate) enum MetalLinearWeightBuffers {
 
 #[derive(Clone, Debug)]
 pub(crate) enum MetalEmbeddingWeightBuffers {
+    MicroScaled(micro::MicroWeightBuffers),
     DenseBf16 {
         table: Buffer,
         vocab: usize,
@@ -1011,6 +1019,10 @@ struct MetalBufferKey {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum MetalBufferSource {
+    Micro {
+        weight_id: u64,
+        scales: bool,
+    },
     Pointer(usize),
     Affine {
         weight_id: u64,
@@ -1057,6 +1069,7 @@ impl ScratchBufferCache {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum MetalBufferElement {
+    U8,
     F32,
     U32,
     Bf16,

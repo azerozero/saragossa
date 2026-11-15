@@ -1275,7 +1275,11 @@ pub(super) fn causal_attention_suffix(
     let mut out = vec![0.0_f32; seq * expected_q_dim];
     for pos in 0..seq {
         let q_row = q.row_slice(pos)?;
-        let absolute_pos = position_offset + pos;
+        let absolute_pos = if crate::runtime_flags::decision_noncausal() {
+            k_seq - 1
+        } else {
+            position_offset + pos
+        };
         // Fenêtre sliding Gemma 3 : la position `pos` ne voit que les `window`
         // dernières positions causales ; `None` → masque causal plein.
         let window_start = layout

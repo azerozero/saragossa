@@ -1353,17 +1353,14 @@ impl CausalDecoder {
             .copied()
             .filter(|&v| v > 0)
             .ok_or_else(|| InferError::Config("vocabulaire KL vide".into()))?;
-        let config = format!(
-            "{:x}",
-            Sha256::digest(format!("{:?}", self.config).as_bytes())
-        );
+        let config = crate::hex(Sha256::digest(format!("{:?}", self.config).as_bytes()));
         let mut weights = Sha256::new();
         // Le gather existant fonctionne aussi après libération des poids CPU.
         let sample = self.embed_scaled(&[0, vocab / 2, vocab - 1])?;
         for value in sample.data().iter().chain(self.final_norm.data()) {
             weights.update(value.to_le_bytes());
         }
-        Ok((vocab, config, format!("{:x}", weights.finalize())))
+        Ok((vocab, config, crate::hex(weights.finalize())))
     }
 }
 
@@ -1943,7 +1940,17 @@ impl CausalDecoder {
             )?);
         }
         let final_norm = take_dense(&mut tensors, "norm.weight")?;
-        let lm_head = linear_from(&mut tensors, "lm_head")?;
+        let lm_head = if crate::runtime_flags::decision_headless() {
+            // NOTE: tête d'une ligne nulle, jamais exécutée par une décision ;
+            // une tête stockée a pu être lue (spec facultative) puis est jetée.
+            tensors.remove("lm_head.weight");
+            Linear::new(
+                Tensor::from_vec(vec![1, final_norm.len()], vec![0.0; final_norm.len()])?,
+                None,
+            )?
+        } else {
+            linear_from(&mut tensors, "lm_head")?
+        };
         // Contrat strict des modèles à sinks (flint) : un tenseur chargé mais
         // jamais assemblé (ex. `mlp.gate_proj.bias` sur une couche MoE) serait
         // ignoré en silence. Les autres familles gardent leur tolérance.
@@ -2030,6 +2037,117 @@ impl CausalDecoder {
         self.finalize_logits(&logits)
     }
 
+    /// Hidden normalisés des positions `rows` d'une décision texte jointe.
+    /// Les couches complètes voient toute la séquence, les gated-delta restent
+    /// causales. Aucun cache de préfixe ni tête de vocabulaire n'est utilisé.
+    ///
+    /// # Errors
+    /// Refuse les séquences hors contrat et les architectures non Qwen3.5.
+    pub fn decision_hidden(&self, token_ids: &[usize], rows: &[usize]) -> Result<Tensor> {
+        self.decision_hidden_packed(&[(token_ids, rows)])?
+            .pop()
+            .ok_or_else(|| InferError::Config("décision sans séquence".into()))
+    }
+
+    /// [`Self::decision_hidden`] pour plusieurs séquences indépendantes, lues
+    /// dans un seul prefill Metal : les couches ligne à ligne (normes, MLP)
+    /// lisent leurs poids une fois, chaque séquence garde ses positions, son
+    /// état gated-delta et son attention. Résultat identique, au bruit de
+    /// tuilage GEMM près, à des appels séparés ; le repli CPU les enchaîne.
+    ///
+    /// # Errors
+    /// Comme [`Self::decision_hidden`], pour chaque séquence.
+    pub fn decision_hidden_packed(
+        &self,
+        sequences: &[(&[usize], &[usize])],
+    ) -> Result<Vec<Tensor>> {
+        let hidden_dim = self.final_norm.len();
+        if sequences.is_empty()
+            || !self.config.is_qwen
+            || !self.config.attn_output_gate
+            || sequences.iter().any(|(tokens, rows)| {
+                tokens.is_empty()
+                    || tokens.len() > 2048
+                    || rows.iter().any(|&row| row >= tokens.len())
+            })
+        {
+            return Err(InferError::Config(
+                "décision Qwen3.5 : 1 à 2048 tokens requis".into(),
+            ));
+        }
+        // Seules les lignes lues par le readout passent par la norme finale.
+        let normed = |data: &[f32], first: usize, rows: &[usize]| -> Result<Tensor> {
+            let mut picked = Vec::with_capacity(rows.len() * hidden_dim);
+            for &row in rows {
+                let row = first + row;
+                let slice = data
+                    .get(row * hidden_dim..(row + 1) * hidden_dim)
+                    .ok_or_else(|| InferError::Config("ligne de décision hors séquence".into()))?;
+                picked.extend_from_slice(slice);
+            }
+            let picked = Tensor::from_vec(vec![rows.len(), hidden_dim], picked)?;
+            rms_norm(&picked, &self.final_norm, self.config.rms_eps)
+        };
+        crate::runtime_flags::with_decision_noncausal(|| {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            if self.resident_metal().is_some() {
+                let tokens: Vec<usize> = sequences
+                    .iter()
+                    .flat_map(|(tokens, _)| tokens.iter().copied())
+                    .collect();
+                let lengths: Vec<usize> =
+                    sequences.iter().map(|(tokens, _)| tokens.len()).collect();
+                // Une seule séquence : chemin habituel, sans découpage.
+                let prefill = || {
+                    self.prefill_resident_cache_hidden_and_captures(
+                        &tokens,
+                        &[],
+                        usize::MAX,
+                        false,
+                        0,
+                    )
+                };
+                let (_, hidden, _) = if lengths.len() == 1 {
+                    prefill()
+                } else {
+                    crate::metal_backend::with_decision_segments(&lengths, prefill)
+                }?
+                .ok_or_else(|| {
+                    InferError::Config("prefill décision résident indisponible".into())
+                })?;
+                let data = match &hidden {
+                    crate::metal_backend::PrefillKvRows::Owned(data) => data.as_slice(),
+                    crate::metal_backend::PrefillKvRows::Shared(rows) => rows.as_slice(),
+                    _ => {
+                        return Err(InferError::Config(
+                            "hidden de décision bf16 inattendu".into(),
+                        ))
+                    }
+                };
+                let mut first = 0;
+                return sequences
+                    .iter()
+                    .map(|(tokens, rows)| {
+                        let out = normed(data, first, rows);
+                        first += tokens.len();
+                        out
+                    })
+                    .collect();
+            }
+            let runtime = self.forward_runtime();
+            sequences
+                .iter()
+                .map(|(tokens, rows)| {
+                    let mut hidden = self.embed_scaled(tokens)?;
+                    for layer in &self.layers {
+                        hidden = layer.forward(&self.config, &hidden, runtime)?;
+                    }
+                    normed(hidden.data(), 0, rows)
+                })
+                .collect()
+        })
+    }
+
     /// Pré-remplit le cache depuis des embeddings déjà préparés.
     ///
     /// Qwen3-TTS prépare ses entrées comme un overlay texte+codec ; elles ne
@@ -2054,6 +2172,12 @@ impl CausalDecoder {
                 "embeddings préfixe attendus hidden={expected_hidden}, reçu {hidden_dim}"
             )));
         }
+        // NOTE: cette entrée ne sert qu'aux décodeurs TTS. La politique TTS doit
+        // donc suivre le prefill quel que soit l'appelant : un `QmmNaDequant`
+        // bf16 ici casserait l'identité avec l'extension mono-ligne (qmv f32).
+        let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+            crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+        );
         let runtime = self.forward_runtime();
         let mut cache = self.empty_cache();
         let mut hidden = input_embeds.clone();

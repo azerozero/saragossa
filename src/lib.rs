@@ -104,6 +104,7 @@ pub use norm::{layer_norm, rms_norm};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub use quantization::DenseBf16Tensor;
 pub use quantization::{dequantize_affine_u32, AffineQuantizedTensor};
+pub use quantization::{MicroMode, MicroQuantizedTensor};
 pub use qwen_loader::{
     load_causal_decoder, load_causal_decoder_from_shards, load_qwen_causal_decoder,
     load_qwen_causal_decoder_from_shards, load_qwen_causal_decoder_from_shards_with_memory_guard,
@@ -134,3 +135,16 @@ pub use tts::{
 pub use whisper::{
     log_mel_spectrogram, WhisperConfig, WhisperDecoder, WhisperEncoder, WhisperModel,
 };
+pub mod decision;
+
+/// Encode une empreinte en hexadécimal minuscule.
+///
+/// `sha2` 0.11 renvoie un `hybrid_array::Array` sans `LowerHex` : ce format
+/// explicite conserve l'encodage historique de `{:x}` octet par octet.
+pub(crate) fn hex(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}

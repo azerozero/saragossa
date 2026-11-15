@@ -31,6 +31,7 @@ pub(crate) fn take_concat_profile() -> (u64, u64) {
 fn linear_weight_id(weight: &LinearWeight) -> LinearWeightId {
     match weight {
         LinearWeight::Dense(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
+        LinearWeight::MicroScaled(tensor) => LinearWeightId::Affine(tensor.weight_id()),
         LinearWeight::DenseShared(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
         LinearWeight::DenseBf16(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
         LinearWeight::AffineQuantized(weight) => LinearWeightId::Affine(weight.weight_id()),
@@ -44,6 +45,11 @@ fn concat_copy_bytes(weights: &[&LinearWeight]) -> Option<u64> {
     weights.iter().try_fold(0_u64, |total, weight| {
         let bytes = match weight {
             LinearWeight::Dense(weight) => weight.len().checked_mul(4)?,
+            LinearWeight::MicroScaled(weight) => weight
+                .packed()
+                .len()
+                .checked_mul(4)?
+                .checked_add(weight.scales().len())?,
             LinearWeight::DenseShared(weight) => weight.data().len().checked_mul(4)?,
             LinearWeight::DenseBf16(weight) => weight.data().len().checked_mul(2)?,
             LinearWeight::AffineQuantized(weight) => {
@@ -326,6 +332,41 @@ impl MetalExecutor {
             return Err(InferError::Dimension(format!(
                 "matmul bf16 x=[{batch},{in_dim}] rhs=[{out_dim},{rhs_in_dim}]"
             )));
+        }
+        // NOTE: les modèles de décision tolèrent un GEMM bf16 classique (oracle
+        // f32 figé) ; les autres modèles gardent la correction hi + lo.
+        if let Some(pso) = self.na_gemm_bf16_nt_bn128.as_ref().filter(|_| {
+            crate::runtime_flags::decision_gemm_bf16_enabled()
+                && out_dim % 128 == 0
+                && can_use_dense_bf16_gemm(batch, in_dim, out_dim)
+        }) {
+            let len = checked_len(batch, in_dim, "décision GEMM A bf16")?;
+            let lhs_bf16 = self.private_bf16_buffer(len, "decision_gemm_lhs_bf16")?;
+            self.encode_f32_to_bf16(encoder, lhs, &lhs_bf16, len)?;
+            let mnk = [
+                checked_u32(batch, "bf16 gemm batch")?,
+                checked_u32(out_dim, "bf16 gemm out_dim")?,
+                checked_u32(in_dim, "bf16 gemm in_dim")?,
+                0,
+            ];
+            encoder.set_compute_pipeline_state(pso);
+            encoder.set_buffer(0, Some(&lhs_bf16), 0);
+            encoder.set_buffer(1, Some(rhs), 0);
+            encoder.set_buffer(2, Some(out), 0);
+            encoder.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
+            trace_dispatch_path("gemm_nax_bf16_nt_bn128", batch, out_dim, in_dim);
+            profile_dispatch();
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    checked_nsuint(out_dim / 128, "bf16 gemm out tiles")?,
+                    checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?,
+                    1,
+                ),
+                MTLSize::new(pso.thread_execution_width().max(1) * 8, 1, 1),
+            );
+            // Barrière complète : le scratch A est réécrit par le GEMM suivant.
+            post_dispatch_barrier(encoder);
+            return Ok(out_dim);
         }
         if let Some(pso) = self
             .na_gemm_bf16_nt_tiled_x2
@@ -908,6 +949,9 @@ impl MetalExecutor {
         label: &'static str,
     ) -> Result<MetalLinearWeightBuffers> {
         match weight {
+            LinearWeight::MicroScaled(weight) => Ok(MetalLinearWeightBuffers::MicroScaled(
+                self.resolve_micro(weight)?,
+            )),
             LinearWeight::DenseShared(weight) => Ok(MetalLinearWeightBuffers::Dense {
                 rhs: weight.buffer().clone(),
                 rhs_bf16: None,
@@ -1254,6 +1298,37 @@ impl MetalExecutor {
             )));
         };
         match first {
+            LinearWeight::MicroScaled(first_weight) => {
+                let mode = first_weight.mode();
+                let in_dim = first_weight.shape()[1];
+                let mut rows = 0usize;
+                let mut packed = Vec::new();
+                let mut scales = Vec::new();
+                for weight in weights {
+                    let LinearWeight::MicroScaled(weight) = weight else {
+                        return Err(InferError::Dimension(
+                            "concat micro avec stockage différent".into(),
+                        ));
+                    };
+                    if weight.mode() != mode || weight.shape()[1] != in_dim {
+                        return Err(InferError::Dimension("concat micro incompatible".into()));
+                    }
+                    rows = rows
+                        .checked_add(weight.shape()[0])
+                        .ok_or_else(|| InferError::Shape("concat micro trop grande".into()))?;
+                    packed.extend_from_slice(weight.packed());
+                    scales.extend_from_slice(weight.scales());
+                }
+                Ok(MetalLinearWeightBuffers::MicroScaled(
+                    micro::MicroWeightBuffers {
+                        packed: self.buffer_from_u32(&packed, label)?,
+                        scales: self.buffer_from_slice(&scales, label)?,
+                        out_dim: rows,
+                        in_dim,
+                        mode,
+                    },
+                ))
+            }
             LinearWeight::DenseBf16(first_weight) => {
                 // Certains sites exigent encore une concat : la copie reste bf16
                 // et le vecteur temporaire disparaît après l'upload partagé.

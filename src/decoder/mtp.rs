@@ -1539,7 +1539,7 @@ mod tests {
                 LinearWeight::DenseBf16(tensor) => tensor.row(0).ok()?.first().copied(),
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 LinearWeight::DenseShared(tensor) => tensor.data().first().copied(),
-                LinearWeight::AffineQuantized(_) => None,
+                LinearWeight::AffineQuantized(_) | LinearWeight::MicroScaled(_) => None,
             }
         }
 

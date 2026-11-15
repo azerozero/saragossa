@@ -128,7 +128,7 @@ impl CausalDecoder {
                         "embedding code predictor [{rows}, {dim}], attendu [{vocab}, {talker_hidden}]"
                     )));
                 }
-                // Les tables viennent de poids bf16 : le stockage bf16 est exact.
+                // L'appelant vérifie au chargement que les tables sont exactes en bf16.
                 Ok(MetalEmbeddingWeightBuffers::DenseBf16 {
                     table: metal.cached_buffer_from_f32_as_bf16(table.data(), "tts_cp_embedding")?,
                     vocab: rows,

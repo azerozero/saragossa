@@ -44,6 +44,10 @@ required-features = ["metal"]
 name = "dump_layers"
 required-features = ["devtools"]
 
+[[example]]
+name = "quant_micro"
+required-features = ["metal", "devtools"]
+
 [features]
 default = ["metal", "devtools"]
 metal = ["dep:metal"]
@@ -53,14 +57,15 @@ devtools = []
 thiserror = "2"
 safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+# preserve_order : ordre des questions de `decision` (déjà activé par llguidance).
+serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 rayon = "1"
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 rustfft = "6"
 hound = "3.5"
 md5 = "0.8"
-sha2 = "0.10"
+sha2 = "0.11"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
 fs2 = "0.4"
 

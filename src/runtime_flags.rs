@@ -28,6 +28,69 @@ pub(crate) fn force_resident_full_linear_decode() {}
 /// Préfixe canonique des variables d'environnement du moteur.
 const ENV_PREFIX: &str = "SARAGOSSA_";
 
+thread_local! {
+    static DECISION_NONCAUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DECISION_HEADLESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Chargement d'un modèle de décision : la tête de vocabulaire n'est ni
+/// chargée, ni liée aux embeddings ; le readout la remplace.
+pub(crate) fn decision_headless() -> bool {
+    DECISION_HEADLESS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn with_decision_headless<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DECISION_HEADLESS.with(|value| value.set(self.0));
+        }
+    }
+    let _restore = Restore(DECISION_HEADLESS.with(|value| value.replace(true)));
+    run()
+}
+
+/// Masque propre à un appel joint, sans modifier les autres threads de génération.
+pub(crate) fn decision_noncausal() -> bool {
+    DECISION_NONCAUSAL.with(std::cell::Cell::get)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn decision_nax_enabled() -> bool {
+    env_flag("SARAGOSSA_DECISION_NAX", true)
+}
+
+/// GEMM matmul2d bf16 (activation arrondie en bf16) pendant une décision ;
+/// `SARAGOSSA_DECISION_GEMM_BF16=0` rétablit le GEMM NAX hi + lo f32.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn decision_gemm_bf16_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    decision_noncausal() && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DECISION_GEMM_BF16", true))
+}
+
+/// Tokens au plus par prefill empaqueté des lectures TTA d'une décision
+/// (`SARAGOSSA_DECISION_PACK_TOKENS`, 0 : un prefill par lecture). Au-delà,
+/// le GEMM est déjà saturé et l'empaquetage ne gagne plus rien (mesuré).
+pub(crate) fn decision_pack_tokens() -> usize {
+    static TOKENS: OnceLock<usize> = OnceLock::new();
+    *TOKENS.get_or_init(|| {
+        env_var("SARAGOSSA_DECISION_PACK_TOKENS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(512)
+    })
+}
+
+pub(crate) fn with_decision_noncausal<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DECISION_NONCAUSAL.with(|value| value.set(self.0));
+        }
+    }
+    let _restore = Restore(DECISION_NONCAUSAL.with(|value| value.replace(true)));
+    run()
+}
+
 /// Préfixe historique, hérité de l'époque où le moteur vivait dans le binaire
 /// `reti`. Conservé en repli pour ne casser ni les scripts de bench, ni les
 /// presets machine, ni les canaries déjà déployés.
@@ -2424,7 +2487,7 @@ fn hash_environment(
             hash.update(bytes);
         }
     }
-    format!("{:x}", hash.finalize())
+    crate::hex(hash.finalize())
 }
 
 #[cfg(test)]

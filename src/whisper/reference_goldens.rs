@@ -26,7 +26,7 @@ fn check_audio(stem: &str) -> TestResult {
     let audio = std::fs::read(crate::golden::dir().join("whisper_samples16k.bin"))?;
     assert_eq!(
         header.source["audio"]["sha256"],
-        format!("{:x}", Sha256::digest(audio))
+        crate::hex(Sha256::digest(audio))
     );
     Ok(())
 }
@@ -38,7 +38,7 @@ fn external_whisper_audio_matches_attributed_voice() -> TestResult {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/voices/reti-fr.wav"),
     )?;
     assert_eq!(
-        format!("{:x}", Sha256::digest(&wav)),
+        crate::hex(Sha256::digest(&wav)),
         "266b428653f25d78dd5dc06d89afdaa26cb377ecd761c27b1e4e9da6639e46d5"
     );
     let mut reader = hound::WavReader::new(std::io::Cursor::new(wav))?;
@@ -57,7 +57,7 @@ fn external_whisper_audio_matches_attributed_voice() -> TestResult {
     let original = std::fs::read(crate::golden::dir().join("whisper_samples16k.bin"))?;
     assert_eq!(pcm.len(), 138_880 * 4);
     assert_eq!(
-        format!("{:x}", Sha256::digest(&original)),
+        crate::hex(Sha256::digest(&original)),
         "1722dd7a13d6814fcd919d628c567f440929590393c49333d1b30842a7e0566e"
     );
     assert_eq!(pcm, original, "le PCM doit provenir de la voix attribuée");

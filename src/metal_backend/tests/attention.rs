@@ -1,4 +1,26 @@
 #[test]
+fn decision_noncausal_gqa_d256_reads_suffix() -> Result<()> {
+    if test_executor()?.is_none() { return Ok(()); }
+    crate::runtime_flags::with_decision_noncausal(|| {
+        let executor = MetalExecutor::new()?;
+        let unsupported = Tensor::from_vec(vec![1, 512], vec![0.0; 512])?;
+        assert!(executor.noncausal_attention_prefill(&unsupported, &unsupported, &unsupported, 1, 1).is_err());
+        // Non-multiple des tuiles NAX, GQA 4:1 comme THX-02. Q=K=0 rend
+        // le softmax uniforme ; seule la dernière clé contient une valeur.
+        for seq in [128, 513] {
+            let q = Tensor::from_vec(vec![seq, 1024], vec![0.0;seq*1024])?;
+            let k = Tensor::from_vec(vec![seq, 256], vec![0.0;seq*256])?;
+            let mut values = vec![0.0;seq*256];
+            values[(seq-1)*256..].fill(2.0);
+            let v = Tensor::from_vec(vec![seq,256], values)?;
+            let got = executor.noncausal_attention_prefill(&q,&k,&v,4,1)?;
+            for &x in got.data() { assert!((x - 2.0/seq as f32).abs() < 1e-5); }
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn noncausal_attention_prefill_matches_cpu() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());

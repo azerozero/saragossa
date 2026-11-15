@@ -596,16 +596,9 @@ fn validate_affine_quantization(quant: &QuantConfig) -> Result<()> {
         }
         return Ok(());
     }
-    // MLX sérialise `mode` (affine, mxfp4, nvfp4...) ; seul affine a scales+biases.
-    if let Some(mode) = quant
-        .extra
-        .get("mode")
-        .and_then(|value| value.as_str())
-        .filter(|mode| !mode.eq_ignore_ascii_case("affine"))
-    {
-        return Err(InferError::Config(format!(
-            "quantification mode={mode} non supportée (attendu affine)"
-        )));
+    if let Some(mode) = micro_mode_for(quant, "")? {
+        validate_micro_params(quant, "", mode)?;
+        return Ok(());
     }
     let (group_size, bits) = quant_params(quant)?;
     if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) {
@@ -617,6 +610,36 @@ fn validate_affine_quantization(quant: &QuantConfig) -> Result<()> {
         return Err(InferError::Config(
             "quantification affine avec group_size nul".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn micro_mode_for(quant: &QuantConfig, source: &str) -> Result<Option<crate::MicroMode>> {
+    let base = source.strip_suffix(".weight").unwrap_or(source);
+    // Comme `to_quantized(**override)` dans MLX : un override par couche
+    // sans `mode` vaut affine, il n'hérite pas du mode global.
+    let value = match quant.extra.get(base) {
+        Some(entry) if entry.is_object() => entry.get("mode"),
+        _ => quant.extra.get("mode"),
+    };
+    let mode = match value {
+        None => "affine",
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| InferError::Config("quantification mode non textuel".into()))?,
+    };
+    crate::MicroMode::parse(mode)
+}
+
+fn validate_micro_params(quant: &QuantConfig, source: &str, mode: crate::MicroMode) -> Result<()> {
+    let (group, bits) = quant_params_for(quant, source)?;
+    if (group, bits) != (mode.group_size(), mode.bits()) {
+        return Err(InferError::Config(format!(
+            "{} exige group_size={} bits={}, reçu {group}/{bits}",
+            mode.name(),
+            mode.group_size(),
+            mode.bits()
+        )));
     }
     Ok(())
 }
@@ -900,7 +923,10 @@ fn bake_gemma_norm_offset(config: &ModelConfig, tensors: &mut HashMap<String, De
 /// borné aux modèles tied : les Qwen prod (27B/30B/35B) stockent leur `lm_head`
 /// et empruntent ce chemin sans aucune copie (byte-identité préservée).
 fn tie_lm_head_to_embeddings<T: Clone>(config: &ModelConfig, tensors: &mut HashMap<String, T>) {
-    if !config.tie_word_embeddings || tensors.contains_key(LM_HEAD_WEIGHT) {
+    if !config.tie_word_embeddings
+        || tensors.contains_key(LM_HEAD_WEIGHT)
+        || crate::runtime_flags::decision_headless()
+    {
         return;
     }
     if let Some(embed) = tensors.get(EMBED_TOKENS_WEIGHT).cloned() {
@@ -1061,7 +1087,7 @@ fn decoder_specs(
     specs.extend(specs_for(
         prefixes,
         [LM_HEAD_WEIGHT.to_string()],
-        !config.tie_word_embeddings,
+        !config.tie_word_embeddings && !crate::runtime_flags::decision_headless(),
     ));
     for layer in 0..config.num_hidden_layers {
         let plan = LoaderLayerPlan::build(config, layer);

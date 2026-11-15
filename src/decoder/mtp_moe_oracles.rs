@@ -49,6 +49,7 @@ fn dense_of(weight: &LinearWeight) -> Result<Tensor> {
         LinearWeight::DenseBf16(tensor) => tensor.to_tensor(),
         LinearWeight::DenseShared(tensor) => tensor.to_tensor(),
         LinearWeight::AffineQuantized(tensor) => tensor.dequantize(),
+        LinearWeight::MicroScaled(tensor) => tensor.dequantize(),
     }
 }
 

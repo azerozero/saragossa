@@ -259,6 +259,7 @@ impl TtsModel {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             let supported = crate::runtime_flags::tts_cp_fused_enabled()
+                && self.code_predictor_embeddings_bf16_exact
                 && sub.temperature.is_finite()
                 && sub.temperature > f32::EPSILON
                 && sub.top_k >= 1
