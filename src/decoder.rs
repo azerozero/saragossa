@@ -2111,6 +2111,12 @@ impl CausalDecoder {
                 "embeddings préfixe attendus hidden={expected_hidden}, reçu {hidden_dim}"
             )));
         }
+        // NOTE: cette entrée ne sert qu'aux décodeurs TTS. La politique TTS doit
+        // donc suivre le prefill quel que soit l'appelant : un `QmmNaDequant`
+        // bf16 ici casserait l'identité avec l'extension mono-ligne (qmv f32).
+        let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+            crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+        );
         let runtime = self.forward_runtime();
         let mut cache = self.empty_cache();
         let mut hidden = input_embeds.clone();
