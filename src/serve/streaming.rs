@@ -256,6 +256,9 @@ impl Drop for StreamingTextDetokenizer<'_> {
 #[derive(Default)]
 struct StreamingTextEmitter {
     emitted: usize,
+    // Le préfixe de contrôle n'existe qu'en debug ; aucune copie en release.
+    #[cfg(debug_assertions)]
+    emitted_prefix: String,
 }
 
 impl StreamingTextEmitter {
@@ -290,6 +293,11 @@ impl StreamingTextEmitter {
         final_snapshot: bool,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<()> {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            visible.starts_with(&self.emitted_prefix),
+            "le texte doit prolonger le préfixe déjà émis"
+        );
         let Some(delta) = visible.get(self.emitted..) else {
             return Err(ServeError::args(
                 "désynchronisation du detokenizer streaming",
@@ -302,6 +310,8 @@ impl StreamingTextEmitter {
             return Ok(());
         }
         on_event(CompletionStreamEvent::Delta(delta))?;
+        #[cfg(debug_assertions)]
+        self.emitted_prefix.push_str(delta);
         self.emitted = visible.len();
         Ok(())
     }
@@ -442,6 +452,35 @@ mod tests {
         let streamed = collect_visible_deltas(&snapshots, &final_content, &stop_texts);
 
         assert_eq!(streamed, final_content);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "le texte doit prolonger le préfixe déjà émis")]
+    fn emitter_rejects_rewritten_prefix_even_at_the_same_length() {
+        let mut emitter = StreamingTextEmitter::default();
+        emit_streaming_snapshot(&mut emitter, "abc", &mut Vec::new());
+        emit_streaming_snapshot(&mut emitter, "abd", &mut Vec::new());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "le texte doit prolonger le préfixe déjà émis")]
+    fn emitter_rejects_rewritten_final_prefix() {
+        let mut emitter = StreamingTextEmitter::default();
+        emit_streaming_snapshot(&mut emitter, "abc", &mut Vec::new());
+        emit_final_snapshot(&mut emitter, "abd suite", &mut Vec::new());
+    }
+
+    #[test]
+    fn emitter_does_not_record_a_failed_delta() {
+        let mut emitter = StreamingTextEmitter::default();
+        assert!(emitter
+            .emit_streaming("abc", &mut |_| Err(ServeError::args("échec du sink")))
+            .is_err());
+        let mut deltas = Vec::new();
+        emit_streaming_snapshot(&mut emitter, "xyz", &mut deltas);
+        assert_eq!(deltas, ["xyz"]);
     }
 
     #[test]
