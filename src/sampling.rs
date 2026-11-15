@@ -890,3 +890,7 @@ mod tests {
         assert_ne!(sample.token, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "sampling/mutation_tests.rs"]
+mod mutation_tests;
