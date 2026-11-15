@@ -59,7 +59,11 @@ pub(crate) fn synthetic() -> ModelAssets {
     vocab.insert(format!("STOP{}", alphabet[0xc3]), json!(258));
     let tokenizer: tokenizers::Tokenizer = serde_json::from_value(json!({
         "version":"1.0", "added_tokens":[{"id":256,"content":"<special>",
-        "single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],
+        "single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+        {"id":259,"content":"<think>","single_word":false,"lstrip":false,
+        "rstrip":false,"normalized":false,"special":false},
+        {"id":260,"content":"世界🌍","single_word":false,"lstrip":false,
+        "rstrip":false,"normalized":false,"special":false}],
         "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
         "model":{"type":"WordLevel","vocab":vocab,"unk_token":"<special>"}
     })).expect("invariant: tokenizer");
@@ -166,6 +170,24 @@ fn only_qualified_stream_degradation_enables_diagnostics() {
 }
 
 #[test]
+fn ordinary_added_tokens_match_full_decode_at_every_boundary() {
+    let assets = synthetic();
+    assert_eq!(assets.tokenizer.token_to_id("<think>"), Some(259));
+    assert_eq!(assets.tokenizer.token_to_id("世界🌍"), Some(260));
+    for ids in [
+        vec![259, 260, 259],
+        vec![0xc3, 259, 0xa9, 260],
+        vec![0xf0, 0x9f, 260, 0x8c, 0x8d, 259],
+        vec![257, 260, 256, 259, 261],
+    ] {
+        raw_oracle(&assets.tokenizer, &ids);
+        for cut in 0..=ids.len() {
+            assert_eq!(serve_oracle(&assets, &ids[..cut], &[]), 0);
+        }
+    }
+}
+
+#[test]
 fn bytelevel_utf8_specials_leading_spaces_and_all_finish_boundaries() {
     let assets = synthetic();
     for ids in [
@@ -194,7 +216,7 @@ fn bytelevel_utf8_specials_leading_spaces_and_all_finish_boundaries() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
     #[test]
-    fn arbitrary_bytes_match_full_decode(ids in prop::collection::vec(0u32..260, 0..100)) {
+    fn arbitrary_bytes_match_full_decode(ids in prop::collection::vec(0u32..262, 0..100)) {
         let assets = synthetic();
         raw_oracle(&assets.tokenizer, &ids);
         serve_oracle(&assets, &ids, &["STOP".into(), "é".into(), "�".into()]);

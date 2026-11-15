@@ -11,6 +11,9 @@ use tokenizers::{
 /// concaténation puis `from_utf8_lossy` est le décodage complet. Un delta ne
 /// finissant pas par U+FFFD ferme une frontière stable. Aucun cleanup ni règle
 /// d'espace de tête ne s'applique à cette famille de décodeurs.
+/// Les added tokens ordinaires passent aussi par ByteLevel : si un caractère
+/// sort de son alphabet, le token entier contribue ses octets UTF-8 bruts.
+/// Cette règle reste locale au token et conserve les mêmes frontières stables.
 pub struct ByteLevelDecodeStream<'a> {
     tokenizer: &'a RustTokenizer,
     stream: DecodeStream<
