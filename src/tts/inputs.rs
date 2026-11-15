@@ -2,7 +2,7 @@ use super::{add_into, gather_rows_i32, push_rows, PreparedVoiceDesign, TtsCloneC
 use crate::{InferError, Result, Tensor};
 
 impl TtsModel {
-    /// Choisit l'instruction de voix VoiceDesign ; sans effet sur le clonage ICL.
+    /// Fournit une instruction VoiceDesign ou CustomVoice explicite ; sans effet sur le clonage ICL.
     #[must_use]
     pub fn with_voice_design_instruction(mut self, instruction: impl Into<String>) -> Self {
         self.voice_design_instruction = instruction.into();
@@ -183,13 +183,14 @@ impl TtsModel {
             ));
         }
 
-        let instruct = &self.voice_design_instruction;
-        let instruct_chat = format!("<|im_start|>user\n{instruct}<|im_end|>\n");
-        let instruct_ids = self.encode_ids(&instruct_chat)?;
-        let instruct_embed = self.text_embed(&instruct_ids)?;
-
         let mut rows = Vec::new();
-        push_rows(&mut rows, &instruct_embed, 0, instruct_embed.shape()[0])?;
+        let instruct = &self.voice_design_instruction;
+        if !instruct.is_empty() {
+            let instruct_chat = format!("<|im_start|>user\n{instruct}<|im_end|>\n");
+            let instruct_ids = self.encode_ids(&instruct_chat)?;
+            let instruct_embed = self.text_embed(&instruct_ids)?;
+            push_rows(&mut rows, &instruct_embed, 0, instruct_embed.shape()[0])?;
+        }
         push_rows(&mut rows, &text_embed, 0, 3)?;
 
         for i in 0..(codec_len - 1) {

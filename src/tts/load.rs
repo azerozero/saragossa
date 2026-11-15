@@ -344,6 +344,10 @@ impl TtsModel {
             None
         };
         let speaker_id = assets.model_config.speaker_id(None)?;
+        let voice_design_instruction = match assets.model_kind() {
+            TtsModelKind::VoiceDesign => super::DEFAULT_INSTRUCT.to_owned(),
+            _ => String::new(),
+        };
         Ok(Self {
             speaker_id,
             generation_config,
@@ -362,7 +366,7 @@ impl TtsModel {
             codec,
             codec_payload,
             clone_ctx: None,
-            voice_design_instruction: super::DEFAULT_INSTRUCT.to_owned(),
+            voice_design_instruction,
             prefill_memo: Default::default(),
         })
     }

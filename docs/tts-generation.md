@@ -13,7 +13,10 @@ VoiceDesign et Base ignorent ce champ, car ils n'ont pas de locuteur nommé.
 
 Le préfixe CustomVoice français est : `think, think_bos, langue, think_eos,
 locuteur, pad, bos`. Le locuteur est un embedding codec du `spk_id`, pas un
-embedding texte. Le préfixe VoiceDesign reste identique.
+embedding texte. `DEFAULT_INSTRUCT` conditionne uniquement VoiceDesign.
+CustomVoice ne reçoit aucun préfixe d’instruction par défaut ; une instruction
+explicitement fournie à `with_voice_design_instruction` reste utilisable. Une
+instruction vide n’ajoute aucun message utilisateur, conformément à `mlx_audio`.
 Source vérifiée localement : `mlx_audio 0.4.3`,
 `tts/models/qwen3_tts/qwen3_tts.py`, `_prepare_inputs` (lignes 348–436) et
 `_sample_token` (lignes 750–780). Le locuteur utilise les embeddings codec et
