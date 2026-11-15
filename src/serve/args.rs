@@ -41,6 +41,8 @@ pub(super) struct ServeArgs {
     pub(super) read_timeout: Duration,
     /// Plafond dur du budget de génération par requête.
     pub(super) max_tokens_cap: usize,
+    /// Cache persistant opt-in.
+    pub(super) prefix_ssd: saragossa::runtime_flags::ServePrefixSsdOptions,
 }
 
 /// Modèle exposé par `saragossa serve`.
@@ -69,6 +71,7 @@ impl ServeArgs {
         let mut preload = false;
         let mut read_timeout = Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS);
         let mut max_tokens_cap = DEFAULT_MAX_TOKENS_CAP;
+        let mut prefix_ssd = saragossa::runtime_flags::ServePrefixSsdOptions::from_env()?;
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -122,6 +125,19 @@ impl ServeArgs {
                     backend = RuntimeKind::parse(&next_value(&mut iter, "--backend")?)
                         .map_err(|e| ServeError::args(e.to_string()))?;
                 }
+                "--prefix-cache-ssd-dir" => {
+                    prefix_ssd.directory =
+                        Some(next_value(&mut iter, "--prefix-cache-ssd-dir")?.into())
+                }
+                "--prefix-cache-ssd-gib" => {
+                    prefix_ssd.gib = parse_positive_u64("--prefix-cache-ssd-gib", &mut iter)?
+                }
+                "--prefix-cache-ssd-priority-tokens" => {
+                    prefix_ssd.priority_tokens =
+                        next_value(&mut iter, "--prefix-cache-ssd-priority-tokens")?
+                            .parse()
+                            .map_err(|_| ServeError::args("priorité SSD invalide"))?;
+                }
                 "--preload" => preload = true,
                 "--read-timeout-secs" => {
                     read_timeout =
@@ -134,6 +150,7 @@ impl ServeArgs {
                 other => return Err(ServeError::args(format!("argument serve inconnu: {other}"))),
             }
         }
+        prefix_ssd.bytes()?;
         validate_tcp_args(&host, port, api_key.as_deref())?;
         Ok(Self {
             host,
@@ -148,6 +165,7 @@ impl ServeArgs {
             preload,
             read_timeout,
             max_tokens_cap,
+            prefix_ssd,
         })
     }
 
@@ -170,6 +188,8 @@ pub(super) fn help_text() -> String {
          [--model-27b DIR] [--model-35b DIR] \\
          [--stt-model DIR] [--tts-model DIR] [--embed-model DIR] \\
          [--backend cpu|metal] [--preload]\n\
+         SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
+         --prefix-cache-ssd-priority-tokens 4096 (0 disables priority).\n\
          Models: repeat --model to expose any supported checkpoint. A bare path \\
          gets its directory name as alias; ORG/REPO is resolved through the local \\
          Hugging Face cache and downloaded when incomplete. Without --model, a TTY \\
@@ -470,5 +490,33 @@ mod tests {
         let cap = ServeArgs::parse(["--max-tokens-cap".to_string(), "0".to_string()])
             .expect_err("invariant: cap nul refusé");
         assert!(cap.to_string().contains("> 0"));
+    }
+}
+
+#[cfg(test)]
+mod ssd_tests {
+    use super::*;
+    #[test]
+    fn explicit_ssd_options_and_invalid_budgets() {
+        let args = ServeArgs::parse(
+            [
+                "--prefix-cache-ssd-dir",
+                "/cache",
+                "--prefix-cache-ssd-gib",
+                "8",
+                "--prefix-cache-ssd-priority-tokens",
+                "0",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(args.prefix_ssd.directory, Some(PathBuf::from("/cache")));
+        assert_eq!(args.prefix_ssd.bytes().unwrap(), 8 << 30);
+        assert_eq!(args.prefix_ssd.priority_tokens, 0);
+        for value in ["0", "18446744073709551615", "wrong"] {
+            assert!(
+                ServeArgs::parse(["--prefix-cache-ssd-gib", value].map(str::to_owned)).is_err()
+            );
+        }
     }
 }

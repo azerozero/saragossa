@@ -2335,17 +2335,44 @@ pub(crate) fn environment_sha256() -> &'static str {
     HASH.get_or_init(|| hash_environment(std::env::vars_os()))
 }
 
+/// Réglages serve purement opérationnels, sans effet sur le contenu des états.
+/// Liste fermée (suffixes communs à SARAGOSSA_ et RETI_) ; les flags inconnus,
+/// le batching et la géométrie des blocs restent dans l'empreinte par prudence.
+const SNAPSHOT_OPERATIONAL_SERVE_FLAGS: &[&str] = &[
+    "SERVE_LOG_PROMPT_FINGERPRINT",
+    "SERVE_LRU",
+    "SERVE_MAX_CONNECTIONS",
+    "SERVE_QUEUE",
+    "SERVE_MAX_INFLIGHT_BYTES",
+    "SERVE_OOM_GUARD",
+    "SERVE_PREFIX_CACHE_BYTES",
+    "SERVE_PREFIX_CACHE_BLOCKS",
+    "SERVE_PREFIX_BLOCKS_PER_SESSION",
+    "SERVE_MODEL_POOL",
+    "SERVE_MEMORY_CAP_BYTES",
+    "SERVE_MEMORY_HEADROOM_BYTES",
+];
+
+fn snapshot_environment_name(name: &[u8]) -> bool {
+    let Some(suffix) = name
+        .strip_prefix(ENV_PREFIX.as_bytes())
+        .or_else(|| name.strip_prefix(LEGACY_ENV_PREFIX.as_bytes()))
+    else {
+        return false;
+    };
+    !suffix.starts_with(b"SERVE_PREFIX_SSD_")
+        && !SNAPSHOT_OPERATIONAL_SERVE_FLAGS
+            .iter()
+            .any(|flag| suffix == flag.as_bytes())
+}
+
 fn hash_environment(
     variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut variables: Vec<_> = variables
         .into_iter()
-        .filter(|(name, _)| {
-            let name = name.as_encoded_bytes();
-            name.starts_with(ENV_PREFIX.as_bytes())
-                || name.starts_with(LEGACY_ENV_PREFIX.as_bytes())
-        })
+        .filter(|(name, _)| snapshot_environment_name(name.as_encoded_bytes()))
         .collect();
     variables.sort_unstable();
     let mut hash = Sha256::new();
@@ -2364,6 +2391,36 @@ fn hash_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_hash_excludes_only_documented_operational_flags() {
+        let base = vec![("SARAGOSSA_RUST_KV_BF16".into(), "1".into())];
+        let expected = hash_environment(base.clone());
+        for prefix in [ENV_PREFIX, LEGACY_ENV_PREFIX] {
+            for suffix in SNAPSHOT_OPERATIONAL_SERVE_FLAGS.iter().copied().chain([
+                "SERVE_PREFIX_SSD_DIR",
+                "SERVE_PREFIX_SSD_GIB",
+                "SERVE_PREFIX_SSD_PRIORITY_TOKENS",
+                "SERVE_PREFIX_SSD_STAGING_MIB",
+            ]) {
+                for value in ["first", "changed"] {
+                    let mut variables = base.clone();
+                    variables.push((format!("{prefix}{suffix}").into(), value.into()));
+                    assert_eq!(hash_environment(variables), expected, "{prefix}{suffix}");
+                }
+            }
+            for suffix in [
+                "RUST_KV_BF16",
+                "SERVE_BATCH",
+                "SERVE_PREFIX_BLOCK_TOKENS",
+                "SERVE_UNKNOWN",
+            ] {
+                let first = hash_environment([(format!("{prefix}{suffix}").into(), "1".into())]);
+                let second = hash_environment([(format!("{prefix}{suffix}").into(), "2".into())]);
+                assert_ne!(first, second, "{prefix}{suffix}");
+            }
+        }
+    }
 
     #[test]
     fn tts_qmm_na_dequant_scope_restores_policy_and_is_thread_local() {
@@ -2669,4 +2726,97 @@ mod tests {
         assert!(!claim_legacy_warning("RETI_TEST_UNIQUE"));
         assert!(claim_legacy_warning("RETI_TEST_AUTRE"));
     }
+}
+
+/// Options du second niveau SSD de `serve`, désactivé sans répertoire explicite.
+/// `SARAGOSSA_SERVE_PREFIX_SSD_DIR` désigne un répertoire privé dédié ;
+/// `SARAGOSSA_SERVE_PREFIX_SSD_GIB` borne les octets persistants (32 Gio par défaut).
+/// Le staging RAM a son propre plafond, voir [`serve_prefix_ssd_staging_bytes`]. Les préfixes courts, jusqu'à
+/// `SARAGOSSA_SERVE_PREFIX_SSD_PRIORITY_TOKENS` (4096), sont évincés après les
+/// autres ; chaque classe suit un LRU. Aucune priorité n'est reçue du réseau.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServePrefixSsdOptions {
+    /// Répertoire privé sous contrôle de l'opérateur.
+    pub directory: Option<std::path::PathBuf>,
+    /// Budget disque en Gio entiers, strictement positif.
+    pub gib: u64,
+    /// Longueur maximale des préfixes prioritaires ; zéro désactive la priorité.
+    pub priority_tokens: usize,
+}
+impl ServePrefixSsdOptions {
+    /// Lit les options ; une valeur mal formée est refusée, jamais ignorée.
+    ///
+    /// # Errors
+    /// Renvoie une erreur pour un entier invalide, nul ou trop grand.
+    pub fn from_env() -> crate::Result<Self> {
+        let number = |name: &str, default: u64| -> crate::Result<u64> {
+            env_var(name).map_or(Ok(default), |value| {
+                value
+                    .parse()
+                    .map_err(|_| crate::InferError::Config(format!("{name}: entier invalide")))
+            })
+        };
+        let options = Self {
+            directory: env_var_os("SARAGOSSA_SERVE_PREFIX_SSD_DIR")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from),
+            gib: number("SARAGOSSA_SERVE_PREFIX_SSD_GIB", 32)?,
+            priority_tokens: usize::try_from(number(
+                "SARAGOSSA_SERVE_PREFIX_SSD_PRIORITY_TOKENS",
+                4096,
+            )?)
+            .map_err(|_| crate::InferError::Config("priorité SSD trop grande".into()))?,
+        };
+        options.bytes()?;
+        Ok(options)
+    }
+    /// Convertit le budget en octets sans débordement.
+    ///
+    /// # Errors
+    /// Refuse zéro et les dépassements de capacité.
+    pub fn bytes(&self) -> crate::Result<u64> {
+        self.gib
+            .checked_mul(1024 * 1024 * 1024)
+            .filter(|&bytes| bytes > 0)
+            .ok_or_else(|| crate::InferError::Config("budget SSD invalide".into()))
+    }
+}
+
+/// Plafond RAM de préparation SSD, indépendant du disque : un quart du minimum
+/// entre RAM physique et budget mémoire explicite de `serve` (512 Mio si tous
+/// deux sont inconnus). `SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB` le remplace en Mio.
+/// La garde mémoire vérifie séparément l'empreinte courante avant toute copie.
+///
+/// # Errors
+/// Refuse une valeur nulle, mal formée ou dépassant la capacité en octets.
+pub fn serve_prefix_ssd_staging_bytes() -> crate::Result<u64> {
+    let value = env_var("SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB");
+    prefix_ssd_staging_bytes(
+        value.as_deref(),
+        crate::memory_guard::host_memory_bytes(),
+        serve_memory_static_cap_bytes(),
+    )
+}
+
+/// Résout le plafond sans accéder à l'environnement ni sonder la machine.
+pub(crate) fn prefix_ssd_staging_bytes(
+    explicit_mib: Option<&str>,
+    host_bytes: Option<u64>,
+    serve_cap_bytes: Option<u64>,
+) -> crate::Result<u64> {
+    let Some(value) = explicit_mib else {
+        // Une seule copie en vol : réserver au plus un quart du budget de base
+        // laisse la majorité aux poids, au cache actif et au décodage.
+        return Ok(host_bytes
+            .into_iter()
+            .chain(serve_cap_bytes)
+            .min()
+            .map_or(512 << 20, |bytes| (bytes / 4).max(1)));
+    };
+    let mib = value
+        .parse::<u64>()
+        .map_err(|_| crate::InferError::Config("staging SSD : entier invalide".into()))?;
+    mib.checked_mul(1 << 20)
+        .filter(|&bytes| bytes > 0)
+        .ok_or_else(|| crate::InferError::Config("staging SSD : plafond invalide".into()))
 }

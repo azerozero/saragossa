@@ -148,6 +148,20 @@ impl KvRows {
         }
     }
 
+    /// Taille sérialisée sans former de vue CPU sur les buffers Metal :
+    /// l'estimation peut précéder la barrière des calculs GPU en vol.
+    pub(super) fn snapshot_bytes(&self) -> u64 {
+        self.segments.iter().fold(0u64, |total, segment| {
+            let width = match segment.as_ref() {
+                Segment::OwnedBf16(_) => 2,
+                #[cfg(all(target_os = "macos", feature = "metal"))]
+                Segment::SharedBf16(_) => 2,
+                _ => 4,
+            };
+            total.saturating_add((segment.len() as u64).saturating_mul(width))
+        })
+    }
+
     /// Vues des seuls octets vivants ; préserver le dtype évite un second arrondi.
     pub(super) fn snapshot_segments(&self) -> Vec<(BlobDtype, &[u8])> {
         self.segments

@@ -4043,8 +4043,18 @@ impl CausalDecoder {
         mode: SnapshotMode,
     ) -> Result<(CausalDecoderCache, Tensor, usize)> {
         let snapshot = self.snapshot_request(prompt, mode)?;
+        if super::persistent_prefix_enabled() && prefix_cache_enabled() {
+            if let Some(((cache, final_state), reused)) = self.prefix_cache_get(prompt)? {
+                self.snapshot_save(&snapshot, &cache, &final_state, None, None);
+                return Ok((cache, final_state, reused));
+            }
+        }
         if let Some(state) = self.snapshot_load(&snapshot) {
-            return Ok((state.cache, state.final_state, prompt.len()));
+            let pair = (state.cache, state.final_state);
+            if super::persistent_prefix_enabled() && prefix_cache_enabled() {
+                self.prefix_cache_put(prompt, &pair, None, None)?;
+            }
+            return Ok((pair.0, pair.1, prompt.len()));
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _gpu_alloc_trace = self.trace_gpu_alloc_scope("prefill");
@@ -4109,12 +4119,24 @@ impl CausalDecoder {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
         let snapshot = self.snapshot_request(prompt, SnapshotMode::MtpCommitted)?;
+        if super::persistent_prefix_enabled() && prefix_cache_enabled() {
+            if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt, on_final_state)? {
+                if hit.2.len() == prompt.len().saturating_sub(1) {
+                    self.snapshot_save(&snapshot, &hit.0, &hit.1, Some(&hit.2), None);
+                }
+                return Ok(hit);
+            }
+        }
         if let Some(state) = self.snapshot_load(&snapshot) {
             if let Some(history) = state.history.filter(super::mtp_history::compatible) {
                 let keep = on_final_state(&state.final_state)?;
+                let pair = (state.cache, state.final_state);
+                if keep && super::persistent_prefix_enabled() && prefix_cache_enabled() {
+                    self.prefix_cache_put(prompt, &pair, Some(&history), None)?;
+                }
                 return Ok((
-                    state.cache,
-                    state.final_state,
+                    pair.0,
+                    pair.1,
                     if keep {
                         history
                     } else {
@@ -4144,6 +4166,7 @@ impl CausalDecoder {
             if prefix_cache_enabled() {
                 self.prefix_cache_put(prompt, &state, Some(&history), None)?;
             }
+            self.snapshot_save(&snapshot, &state.0, &state.1, Some(&history), None);
             return Ok((state.0, state.1, history, 0));
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -4686,7 +4709,9 @@ impl CausalDecoder {
         keep_rows: usize,
         drafter: Option<&DFlashDraft>,
     ) -> Result<(CausalDecoderCache, Tensor, Arc<Tensor>, usize)> {
-        let snapshot = if crate::runtime_flags::state_snapshot_dir().is_some() {
+        let snapshot = if crate::runtime_flags::state_snapshot_dir().is_some()
+            || super::persistent_prefix_enabled()
+        {
             self.snapshot_request_dflash(
                 prompt,
                 SnapshotMode::Dflash(format!("{layer_ids:?}:{keep_rows}")),
@@ -4695,6 +4720,28 @@ impl CausalDecoder {
         } else {
             None
         };
+        if super::persistent_prefix_enabled() && prefix_cache_enabled() {
+            if let Some(hit) = self.prefix_cache_get_with_captures(prompt, layer_ids, keep_rows)? {
+                let history = self.prefix_cache.lock().ok().and_then(|cache| {
+                    cache
+                        .entries
+                        .iter()
+                        .find(|entry| entry.tokens == prompt)
+                        .and_then(|entry| entry.mtp_history.clone())
+                });
+                if !self.dflash_switch_needs_history() || history.is_some() {
+                    let captures = PrefixCaptures::new(layer_ids, hit.3, Arc::clone(&hit.2));
+                    self.snapshot_save(
+                        &snapshot,
+                        &hit.0,
+                        &hit.1,
+                        history.as_ref(),
+                        Some(&captures),
+                    );
+                }
+                return Ok(hit);
+            }
+        }
         if let Some(state) = self.snapshot_load(&snapshot) {
             if let Some(captures) = state.captures {
                 if captures.layer_ids == layer_ids

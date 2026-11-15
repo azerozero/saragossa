@@ -60,6 +60,7 @@ hound = "3.5"
 md5 = "0.7"
 sha2 = "0.10"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
+fs2 = "0.4"
 
 # Last llguidance line compatible with Rust 1.85; keep toktrie aligned.
 [dependencies.llguidance]

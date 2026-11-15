@@ -366,6 +366,11 @@ default Unix socket, with no bearer, any caller allowed by the file permissions
 can claim any session id. For a real multi-tenant boundary, authenticate upstream
 (a front gateway) or use the TCP bearer of `saragossa serve`.
 
+An opt-in [persistent SSD prefix cache](docs/serve-prefix-ssd.md) survives RAM
+eviction and server restarts. Enable it with `--prefix-cache-ssd-dir DIR` and
+`--prefix-cache-ssd-gib 32`; the guide covers integrity, priority eviction and
+32k/128k restart measurements.
+
 ### OOM guard + LRU model pool
 
 - **Predictive OOM guard** — projects the process footprint (`phys_footprint`

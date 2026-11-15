@@ -38,6 +38,10 @@ mod kv_rows;
 pub(crate) mod layer_plan;
 use layer_plan::{FullPlan, LayerPlan, MixerPlan, ModelPlan};
 mod state_snapshot;
+pub(crate) use state_snapshot::persistent::enabled as persistent_prefix_enabled;
+pub use state_snapshot::persistent::{
+    configure_prefix_disk_cache, flush_prefix_disk_cache, PrefixDiskSession,
+};
 pub(crate) use state_snapshot::SnapshotSources;
 mod tts_prefill;
 #[cfg(test)]
@@ -2568,7 +2572,9 @@ impl CausalDecoder {
                 ForwardRuntime::metal(metal),
             )?,
         );
-        if crate::runtime_flags::state_snapshot_dir().is_some() {
+        if crate::runtime_flags::state_snapshot_dir().is_some()
+            || state_snapshot::persistent::enabled()
+        {
             if let Some(draft) = &self.dflash {
                 self.snapshot_sources.append(draft.snapshot_sources.clone());
             }
