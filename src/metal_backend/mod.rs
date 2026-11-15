@@ -50,6 +50,7 @@ const U6_QMM_BATCH_TILE: usize = 8;
 
 mod attention;
 mod attention_checks;
+mod micro;
 pub(crate) use attention_checks::check_threadgroup_size;
 mod barriers;
 mod buffers;
@@ -479,6 +480,7 @@ pub struct MetalExecutor {
     /// Bibliothèque `kernels.metal` compilée, gardée pour les pipelines créés à la
     /// demande (qmv-T du mode strict, une instance par largeur de lot).
     library: metal::Library,
+    micro_library: Mutex<Option<metal::Library>>,
     /// Pipelines qmv-T déjà créés, par nom de kernel.
     qmvt_pipelines: Mutex<HashMap<String, ComputePipelineState>>,
     /// Force la rétention des dérivés de poids avant de libérer leurs payloads CPU.
@@ -546,6 +548,7 @@ pub(crate) struct StackedAffineBuffers {
 
 #[derive(Clone, Debug)]
 pub(crate) enum MetalLinearWeightBuffers {
+    MicroScaled(micro::MicroWeightBuffers),
     DenseBf16 {
         rhs: Buffer,
         out_dim: usize,
@@ -575,6 +578,7 @@ pub(crate) enum MetalLinearWeightBuffers {
 
 #[derive(Clone, Debug)]
 pub(crate) enum MetalEmbeddingWeightBuffers {
+    MicroScaled(micro::MicroWeightBuffers),
     DenseBf16 {
         table: Buffer,
         vocab: usize,
@@ -1012,6 +1016,10 @@ struct MetalBufferKey {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum MetalBufferSource {
+    Micro {
+        weight_id: u64,
+        scales: bool,
+    },
     Pointer(usize),
     Affine {
         weight_id: u64,
@@ -1058,6 +1066,7 @@ impl ScratchBufferCache {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum MetalBufferElement {
+    U8,
     F32,
     U32,
     Bf16,

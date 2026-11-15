@@ -44,6 +44,10 @@ required-features = ["metal"]
 name = "dump_layers"
 required-features = ["devtools"]
 
+[[example]]
+name = "quant_micro"
+required-features = ["metal", "devtools"]
+
 [features]
 default = ["metal", "devtools"]
 metal = ["dep:metal"]

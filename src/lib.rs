@@ -104,6 +104,7 @@ pub use norm::{layer_norm, rms_norm};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub use quantization::DenseBf16Tensor;
 pub use quantization::{dequantize_affine_u32, AffineQuantizedTensor};
+pub use quantization::{MicroMode, MicroQuantizedTensor};
 pub use qwen_loader::{
     load_causal_decoder, load_causal_decoder_from_shards, load_qwen_causal_decoder,
     load_qwen_causal_decoder_from_shards, load_qwen_causal_decoder_from_shards_with_memory_guard,

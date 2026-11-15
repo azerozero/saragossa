@@ -21,6 +21,14 @@ impl MetalExecutor {
         prefer_fast_affine: bool,
     ) -> Result<usize> {
         match weight {
+            LinearWeight::MicroScaled(weight) => self.encode_micro(
+                encoder,
+                lhs_buffer,
+                output_buffer,
+                batch,
+                in_dim,
+                &self.resolve_micro(weight)?,
+            ),
             LinearWeight::DenseShared(weight) => self.encode_dense_f32_weight(
                 encoder,
                 lhs_buffer,

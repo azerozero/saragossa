@@ -531,7 +531,8 @@ impl MetalExecutor {
                     biases,
                     *biases_offset,
                 )),
-                MetalLinearWeightBuffers::Dense { .. }
+                MetalLinearWeightBuffers::MicroScaled(_)
+                | MetalLinearWeightBuffers::Dense { .. }
                 | MetalLinearWeightBuffers::DenseBf16 { .. } => Err(InferError::Config(format!(
                     "MLP fusionné : {name} n'est pas quantifié"
                 ))),
@@ -1275,6 +1276,19 @@ impl MetalExecutor {
             ));
         }
         match embedding {
+            MetalEmbeddingWeightBuffers::MicroScaled(weight) => {
+                return self.encode_micro_embedding(
+                    encoder,
+                    weight,
+                    index_buffer,
+                    index_offset,
+                    output_buffer,
+                    expected_dim,
+                    token_count,
+                    embedding_scale,
+                    recast_bf16,
+                );
+            }
             MetalEmbeddingWeightBuffers::Dense { table, vocab, dim }
             | MetalEmbeddingWeightBuffers::DenseBf16 { table, vocab, dim } => {
                 if *dim != expected_dim {

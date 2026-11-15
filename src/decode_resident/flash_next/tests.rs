@@ -5071,6 +5071,14 @@ fn distinct_weights(
                 LinearWeight::Dense(t) => {
                     LinearWeight::Dense(Tensor::from_vec(t.shape().to_vec(), t.data().to_vec())?)
                 }
+                LinearWeight::MicroScaled(w) => {
+                    LinearWeight::MicroScaled(crate::MicroQuantizedTensor::new(
+                        [w.shape()[0], w.shape()[1]],
+                        w.packed().to_vec(),
+                        w.scales().to_vec(),
+                        w.mode(),
+                    )?)
+                }
                 LinearWeight::DenseBf16(t) => LinearWeight::Dense(t.to_tensor()?),
                 LinearWeight::DenseShared(t) => LinearWeight::Dense(t.to_tensor()?),
                 LinearWeight::AffineQuantized(q) => {
@@ -5094,6 +5102,7 @@ fn distinct_weights(
         MetalLinearWeightBuffers::DenseBf16 { rhs, .. }
         | MetalLinearWeightBuffers::Dense { rhs, .. } => rhs.gpu_address(),
         MetalLinearWeightBuffers::AffineQuantized { packed, .. } => packed.gpu_address(),
+        MetalLinearWeightBuffers::MicroScaled(weight) => weight.packed.gpu_address(),
     };
     let distinct: std::collections::HashSet<u64> = weights.iter().map(address).collect();
     if distinct.len() != copies {

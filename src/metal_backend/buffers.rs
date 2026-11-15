@@ -20,6 +20,9 @@ impl MetalExecutor {
         embedding: &EmbeddingWeight,
     ) -> Result<MetalEmbeddingWeightBuffers> {
         match embedding {
+            EmbeddingWeight::MicroScaled(weight) => Ok(MetalEmbeddingWeightBuffers::MicroScaled(
+                self.resolve_micro(weight)?,
+            )),
             EmbeddingWeight::DenseBf16(table) => Ok(MetalEmbeddingWeightBuffers::DenseBf16 {
                 table: table.buffer().clone(),
                 vocab: table.shape()[0],
@@ -396,6 +399,7 @@ impl MetalExecutor {
 
     pub(crate) fn linear_weight_out_dim(&self, weight: &MetalLinearWeightBuffers) -> usize {
         match weight {
+            MetalLinearWeightBuffers::MicroScaled(weight) => weight.out_dim,
             MetalLinearWeightBuffers::DenseBf16 { out_dim, .. }
             | MetalLinearWeightBuffers::Dense { out_dim, .. }
             | MetalLinearWeightBuffers::AffineQuantized { out_dim, .. } => *out_dim,
@@ -404,6 +408,7 @@ impl MetalExecutor {
 
     pub(crate) fn linear_weight_in_dim(&self, weight: &MetalLinearWeightBuffers) -> usize {
         match weight {
+            MetalLinearWeightBuffers::MicroScaled(weight) => weight.in_dim,
             MetalLinearWeightBuffers::DenseBf16 { in_dim, .. }
             | MetalLinearWeightBuffers::Dense { in_dim, .. }
             | MetalLinearWeightBuffers::AffineQuantized { in_dim, .. } => *in_dim,
@@ -429,6 +434,21 @@ impl MetalExecutor {
     /// Alloue le stockage partagé définitif d'un payload de poids quantifié.
     pub(crate) fn weight_buffer_from_u32(&self, data: &[u32]) -> Result<metal::Buffer> {
         self.buffer_from_u32(data, "single_copy_weight_packed")
+    }
+
+    /// Alloue le stockage partagé définitif d'échelles U8 compactes.
+    pub(crate) fn weight_buffer_from_u8(&self, data: &[u8]) -> Result<metal::Buffer> {
+        self.buffer_from_slice(data, "single_copy_weight_scales")
+    }
+
+    /// Lit des octets bruts (échelles U8) dans leur stockage partagé définitif.
+    pub(crate) fn weight_buffer_from_u8_file(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len_bytes: usize,
+    ) -> Result<metal::Buffer> {
+        self.weight_buffer_from_file(path, offset, len_bytes)
     }
 
     /// Alloue le stockage partagé définitif d'un payload bf16 natif.
@@ -995,6 +1015,7 @@ impl MetalExecutor {
             return Ok(entry.buffer.clone());
         }
         let bytes = match element {
+            MetalBufferElement::U8 => byte_len::<u8>(len)?,
             MetalBufferElement::F32 => byte_len::<f32>(len)?,
             MetalBufferElement::U32 => byte_len::<u32>(len)?,
             MetalBufferElement::Bf16 => byte_len::<u16>(len)?,
@@ -1192,6 +1213,12 @@ fn describe_stacked_affine_buffers(weight: &StackedAffineBuffers) -> String {
 
 fn describe_linear_weight_buffers(weight: &MetalLinearWeightBuffers) -> String {
     match weight {
+        MetalLinearWeightBuffers::MicroScaled(weight) => format!(
+            "{} {}x{}",
+            weight.mode.name(),
+            weight.out_dim,
+            weight.in_dim
+        ),
         MetalLinearWeightBuffers::DenseBf16 {
             out_dim, in_dim, ..
         } => format!("dense bf16 out={out_dim} in={in_dim}"),
