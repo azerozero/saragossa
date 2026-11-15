@@ -5,6 +5,11 @@ use crate::{rms_norm, InferError, Result, Tensor};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+/// Trames par lot du décodage batch au préfixe GPU : borne la mémoire des
+/// scores d'attention sans changer le PCM (invariant au découpage).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const CODEC_GPU_PREFIX_LOT_FRAMES: usize = 64;
+
 #[derive(Debug)]
 pub(crate) struct TtsCodec {
     cfg: TtsDecoderConfig,
@@ -182,12 +187,12 @@ impl TtsCodec {
         if generated.is_empty() {
             return Ok(Vec::new());
         }
-        // Préfixe GPU : le batch est un unique lot streaming, PCM identique au
-        // streaming quel que soit son découpage.
+        // Préfixe GPU : le batch passe par des lots streaming fixes, PCM
+        // identique au bit quel que soit le découpage. Les lots bornent les
+        // scores d'attention à `lot × têtes × clés` au lieu de `T² × têtes`.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if gpu_prefix && self.gpu_prefix_active() {
-            let mut state = self.new_stream_state();
-            return self.decode_codes_streaming(&mut state, generated);
+            return self.decode_codes_in_lots(generated, CODEC_GPU_PREFIX_LOT_FRAMES);
         }
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let _ = gpu_prefix;
@@ -200,6 +205,25 @@ impl TtsCodec {
             return Ok(pcm.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect());
         }
         self.decode_tail_cpu(&hidden)
+    }
+
+    /// Décode `generated` en lots streaming de `lot` trames (préfixe GPU si
+    /// actif) et concatène le PCM.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn decode_codes_in_lots(
+        &self,
+        generated: &[Vec<i32>],
+        lot: usize,
+    ) -> Result<Vec<f32>> {
+        let lot = lot.max(1);
+        let mut state = self.new_stream_state();
+        let mut pcm = Vec::new();
+        let mut end = 0;
+        while end < generated.len() {
+            end = end.saturating_add(lot).min(generated.len());
+            pcm.extend(self.decode_codes_streaming(&mut state, &generated[..end])?);
+        }
+        Ok(pcm)
     }
 
     pub(crate) fn new_stream_state(&self) -> TtsCodecStreamState {

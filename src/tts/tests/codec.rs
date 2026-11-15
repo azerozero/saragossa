@@ -17,6 +17,29 @@ fn codec_at_server_frame_cap() -> Result<()> {
     Ok(())
 }
 
+/// Le batch au préfixe GPU découpe en lots fixes (mémoire bornée) : PCM
+/// identique au bit à un lot unique, sur une séquence longue.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "parité: lots du préfixe codec GPU, snapshot local et Metal requis"]
+fn codec_gpu_prefix_lots_match_single_lot() -> Result<()> {
+    let codec = load_voicedesign_codec()
+        .ok_or_else(|| InferError::Config("snapshot codec local requis".to_string()))?;
+    assert!(codec.gpu_active(), "le test exige le codec Metal");
+    let codes = synthetic_codes(300, 16);
+    let lots = codec.decode_codes(&codes)?;
+    let single = codec.decode_codes_in_lots(&codes, codes.len())?;
+    assert_eq!(lots.len(), codes.len() * 1920);
+    assert_eq!(lots.len(), single.len());
+    assert!(
+        lots.iter()
+            .zip(&single)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "préfixe GPU: lots de 64 != lot unique"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "inférence: snapshot VoiceDesign local et Metal requis"]
 fn synthesis_reports_frame_limit_with_audio() -> Result<()> {

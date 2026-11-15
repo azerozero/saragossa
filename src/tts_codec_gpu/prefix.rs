@@ -727,6 +727,17 @@ impl CodecGpu {
         pool.release(k);
         pool.release(v);
         let keys = past + rows;
+        // Les kernels indexent `(ligne·têtes + tête)·clés + clé` et
+        // `clé·kv_dim` en u32.
+        let fits = |a: usize, b: usize| a.checked_mul(b).is_some_and(|n| u32::try_from(n).is_ok());
+        rows.checked_mul(prefix.heads)
+            .filter(|n| fits(*n, keys) && fits(keys, kv_dim))
+            .ok_or_else(|| {
+                InferError::Dimension(format!(
+                    "attention codec {name}: scores {rows}×{}×{keys} hors index u32",
+                    prefix.heads
+                ))
+            })?;
         let scores = pool.acquire(rows * prefix.heads, keys)?;
         let scale = (prefix.head_dim as f32).powf(-0.5);
         let kv_repeat = prefix.heads / prefix.kv_heads;
