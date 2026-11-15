@@ -120,8 +120,8 @@ fn dense_bf16_prefill_matches_f32(expected_kernel: &str) -> Result<()> {
         executor.na_gemm_bf16_nt_tiled_x2.is_some(),
         "ce test exige le pipeline GEMM NA bf16"
     );
-    // 70 lignes : une tuile M pleine et une tuile masquée.
-    let (batch, out_dim, in_dim) = (70, 128, 192);
+    // 70 lignes : une tuile M pleine et une tuile masquée ; deux tuiles N.
+    let (batch, out_dim, in_dim) = (70, 256, 192);
     let values: Vec<f32> = (0..out_dim * in_dim)
         .map(|i| ((i % 23) as f32 - 11.0) / 16.0)
         .collect();

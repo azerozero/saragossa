@@ -71,7 +71,12 @@ impl DecisionModel {
     pub fn load(path: impl AsRef<Path>, metal: bool) -> Result<Self> {
         let path = path.as_ref();
         let decision = read_json(&path.join("decision_config.json"))?;
-        let d3 = decision["format_id"] == D3_FORMAT;
+        // Sans `format_id` : protocole joint THX ; tout autre format est refusé.
+        let d3 = match decision.get("format_id") {
+            None | Some(Value::Null) => false,
+            Some(id) if id == D3_FORMAT => true,
+            Some(id) => return Err(invalid(format!("format de décision inconnu : {id}"))),
+        };
         if d3 {
             if decision["format_version"] != 1
                 || decision["prompt"] != "d3"
