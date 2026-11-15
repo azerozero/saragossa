@@ -1021,3 +1021,154 @@ impl MetalExecutor {
         self.dispatch_qmv(encoder, &self.affine_matmul_rhs_t_u32_f32, out_dim, batch)
     }
 }
+
+/// Vue u6 gs64 alignée d'un poids : `(packed, scales, biases, offsets, dims)`
+/// si le qmv aligné u6 la traiterait, `None` sinon.
+#[allow(
+    clippy::type_complexity,
+    reason = "vue locale des bindings du qmv aligné u6"
+)]
+fn aligned_u6_view(
+    weight: &MetalLinearWeightBuffers,
+    in_dim: usize,
+) -> Result<Option<([(&BufferRef, NSUInteger); 3], [u32; 4], usize)>> {
+    let MetalLinearWeightBuffers::AffineQuantized {
+        packed,
+        packed_offset,
+        scales,
+        scales_offset,
+        biases,
+        biases_offset,
+        out_dim,
+        in_dim: weight_in,
+        packed_cols,
+        group_size,
+        bits,
+        groups,
+    } = weight
+    else {
+        return Ok(None);
+    };
+    if *bits != FAST_QMV_U6_BITS
+        || *group_size != FAST_QMV_GROUP_SIZE
+        || *weight_in != in_dim
+        || in_dim % 512 != 0
+        || *out_dim % 8 != 0
+        || *out_dim == 0
+    {
+        return Ok(None);
+    }
+    let dims = [
+        checked_u32(*out_dim, "qmv u6 fusionné out_dim")?,
+        checked_u32(in_dim, "qmv u6 fusionné in_dim")?,
+        checked_u32(*packed_cols, "qmv u6 fusionné packed_cols")?,
+        checked_u32(*groups, "qmv u6 fusionné groups")?,
+    ];
+    Ok(Some((
+        [
+            (packed.as_ref(), *packed_offset),
+            (scales.as_ref(), *scales_offset),
+            (biases.as_ref(), *biases_offset),
+        ],
+        dims,
+        *out_dim,
+    )))
+}
+
+impl MetalExecutor {
+    /// Indique si `weight` est u6 gs64 aligné en entrée `in_dim`, condition des
+    /// qmv u6 fusionnés ci-dessous.
+    pub(crate) fn is_aligned_u6_weight(weight: &MetalLinearWeightBuffers, in_dim: usize) -> bool {
+        matches!(aligned_u6_view(weight, in_dim), Ok(Some(_)))
+    }
+
+    /// gate + up + SwiGLU u6 en un dispatch (trame TTS du code predictor).
+    ///
+    /// Chaque sortie vaut au bit près `swiglu(qmv(gate), qmv(up))` des kernels
+    /// séparés. Renvoie `false` sans rien encoder si un poids n'est pas u6 gs64
+    /// aligné ou si les formes de gate et up diffèrent.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde `u32`.
+    pub(crate) fn encode_gate_up_swiglu_u6_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        gate: &MetalLinearWeightBuffers,
+        up: &MetalLinearWeightBuffers,
+        output_buffer: &BufferRef,
+        in_dim: usize,
+    ) -> Result<bool> {
+        let (Some((gate_bind, gate_dims, out_dim)), Some((up_bind, up_dims, _))) =
+            (aligned_u6_view(gate, in_dim)?, aligned_u6_view(up, in_dim)?)
+        else {
+            return Ok(false);
+        };
+        if gate_dims != up_dims {
+            return Ok(false);
+        }
+        encoder.set_compute_pipeline_state(&self.affine_gate_up_swiglu_aligned_u6_gs64_f32);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        for (slot, (buffer, offset)) in (1..).zip(gate_bind.into_iter().chain(up_bind)) {
+            encoder.set_buffer(slot, Some(buffer), offset);
+        }
+        encoder.set_buffer(7, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 8, &gate_dims, "gate_up_u6_dims")?;
+        trace_dispatch_path(
+            "affine_gate_up_swiglu_aligned_u6_gs64_f32",
+            1,
+            out_dim,
+            in_dim,
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(1, checked_nsuint(out_dim / 8, "gate_up u6 groups")?, 1),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(true)
+    }
+
+    /// qmv u6 suivi de `output = residual + qmv` en un dispatch, au bit près
+    /// le qmv aligné puis `weighted_sum_add_topk` à score 1. Renvoie `false`
+    /// sans rien encoder si le poids n'est pas u6 gs64 aligné.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde `u32`.
+    pub(crate) fn encode_qmv_u6_residual_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        weight: &MetalLinearWeightBuffers,
+        residual_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        in_dim: usize,
+    ) -> Result<bool> {
+        let Some((bind, dims, out_dim)) = aligned_u6_view(weight, in_dim)? else {
+            return Ok(false);
+        };
+        encoder.set_compute_pipeline_state(&self.affine_qmv_residual_aligned_u6_gs64_f32);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        for (slot, (buffer, offset)) in (1..).zip(bind) {
+            encoder.set_buffer(slot, Some(buffer), offset);
+        }
+        encoder.set_buffer(4, Some(residual_buffer), 0);
+        encoder.set_buffer(5, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 6, &dims, "qmv_u6_residual_dims")?;
+        trace_dispatch_path(
+            "affine_qmv_residual_aligned_u6_gs64_f32",
+            1,
+            out_dim,
+            in_dim,
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(1, checked_nsuint(out_dim / 8, "qmv u6 residual groups")?, 1),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(true)
+    }
+}

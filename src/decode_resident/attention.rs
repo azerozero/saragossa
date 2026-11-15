@@ -680,8 +680,9 @@ pub(crate) struct FullAttentionMetalState {
     copy_at_f32_to_bf16: ComputePipelineState,
     copy_at_bf16: ComputePipelineState,
     copy_at_bf16_to_f32: ComputePipelineState,
-    /// Rotation de K et append K/V fusionnés, KV f32 puis bf16.
-    rope_append_kv: [ComputePipelineState; 2],
+    /// Rotation de K et append K/V fusionnés, KV f32 puis bf16 ; puis la même
+    /// chose précédée de la rotation de Q (trame TTS).
+    rope_append_kv: [ComputePipelineState; 4],
     /// Sinks appris par tête (flint) et leurs kernels ; `None` = attention
     /// historique, kernels sans sink inchangés.
     sinks: Option<AttentionSinks>,
@@ -2086,14 +2087,81 @@ impl FullAttentionMetalState {
         rope: &FullAttnLayerDims,
         frequencies: &BufferRef,
     ) -> Result<bool> {
-        let pipeline = match self.format {
-            KvFormat::F32 => &self.rope_append_kv[0],
-            KvFormat::Bf16 => &self.rope_append_kv[1],
-            KvFormat::Q8 | KvFormat::K8V4 | KvFormat::Q4 => return Ok(false),
-        };
         if !crate::runtime_flags::decode_resident_rope_append_kv_enabled() {
             return Ok(false);
         }
+        self.encode_rope_append_kv_inner(
+            encoder,
+            k_raw,
+            k_offset,
+            k_norm,
+            v_buf,
+            v_offset,
+            rope,
+            frequencies,
+            None,
+        )
+    }
+
+    /// Variante de [`Self::encode_rope_append_kv`] qui normalise et tourne
+    /// aussi Q (`q_heads` têtes de `q_in` vers `q_out`) dans le même dispatch :
+    /// chaque tête suit le corps de `rms_norm_rope_heads_decode_f32`, au bit
+    /// près. Renvoie `Ok(false)` sans rien encoder si le KV est quantifié.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur (overflow) si la capacité KV est atteinte.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: sources Q/K/V + offsets + paramètres rms_norm+RoPE"
+    )]
+    pub(crate) fn encode_rope_qk_append_kv(
+        &mut self,
+        encoder: &ComputeCommandEncoderRef,
+        qkv: &BufferRef,
+        q_norm: &BufferRef,
+        q_out: &BufferRef,
+        k_offset: u64,
+        k_norm: &BufferRef,
+        v_offset: u64,
+        rope: &FullAttnLayerDims,
+        frequencies: &BufferRef,
+    ) -> Result<bool> {
+        self.encode_rope_append_kv_inner(
+            encoder,
+            qkv,
+            k_offset,
+            k_norm,
+            qkv,
+            v_offset,
+            rope,
+            frequencies,
+            Some((qkv, q_norm, q_out)),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: sources Q/K/V + offsets + paramètres rms_norm+RoPE"
+    )]
+    fn encode_rope_append_kv_inner(
+        &mut self,
+        encoder: &ComputeCommandEncoderRef,
+        k_raw: &BufferRef,
+        k_offset: u64,
+        k_norm: &BufferRef,
+        v_buf: &BufferRef,
+        v_offset: u64,
+        rope: &FullAttnLayerDims,
+        frequencies: &BufferRef,
+        query: Option<(&BufferRef, &BufferRef, &BufferRef)>,
+    ) -> Result<bool> {
+        let fused_q = usize::from(query.is_some()) * 2;
+        let pipeline = match self.format {
+            KvFormat::F32 => &self.rope_append_kv[fused_q],
+            KvFormat::Bf16 => &self.rope_append_kv[1 + fused_q],
+            KvFormat::Q8 | KvFormat::K8V4 | KvFormat::Q4 => return Ok(false),
+        };
         if self.len >= self.capacity {
             return Err(InferError::Dimension(format!(
                 "append KV résident: capacité {} atteinte (overflow)",
@@ -2120,13 +2188,24 @@ impl FullAttentionMetalState {
         encoder.set_buffer(5, Some(frequencies), 0);
         encoder.set_buffer(6, Some(v_buf), v_offset);
         encoder.set_buffer(7, Some(self.values.buffer()), offset);
+        let mut heads = to_u32(self.kv_heads, "rope append kv_heads")?;
+        if let Some((q_in, q_norm, q_out)) = query {
+            let q_heads = to_u32(self.q_heads, "rope append q_heads")?;
+            encoder.set_buffer(8, Some(q_in), 0);
+            encoder.set_buffer(9, Some(q_norm), 0);
+            encoder.set_buffer(10, Some(q_out), 0);
+            encoder.set_bytes(
+                11,
+                std::mem::size_of::<u32>() as u64,
+                std::ptr::from_ref(&q_heads).cast::<c_void>(),
+            );
+            heads = heads.checked_add(q_heads).ok_or_else(|| {
+                InferError::Dimension("rope append q+kv heads déborde".to_string())
+            })?;
+        }
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(
-            MTLSize::new(
-                u64::from(to_u32(self.kv_heads, "rope append kv_heads")?),
-                1,
-                1,
-            ),
+            MTLSize::new(u64::from(heads), 1, 1),
             MTLSize::new(256, 1, 1),
         );
         crate::metal_backend::post_dispatch_barrier(encoder);

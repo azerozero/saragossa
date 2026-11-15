@@ -233,6 +233,8 @@ pub struct MetalExecutor {
     affine_qmv_fast_aligned_u5_gs64_f32: ComputePipelineState,
     affine_qmv_fast_u6_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u6_gs64_f32: ComputePipelineState,
+    affine_gate_up_swiglu_aligned_u6_gs64_f32: ComputePipelineState,
+    affine_qmv_residual_aligned_u6_gs64_f32: ComputePipelineState,
     affine_qmm_batched_u6_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u4_gs64_f32: ComputePipelineState,
     affine_qmm8_fast_aligned_u4_gs64_f32: ComputePipelineState,

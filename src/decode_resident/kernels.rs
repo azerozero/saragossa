@@ -1300,6 +1300,74 @@ kernel void rms_norm_rope_append_kv_bf16(
     rope_append_kv(k_in, weight, keys, dims, params, inv_freq, v_in, values, tid, head, partial);
 }
 
+// Q et K du token en un dispatch : les `q_heads` premiers threadgroups normalisent
+// et tournent Q (comme `rms_norm_rope_heads_decode_f32`), les suivants font
+// l'append K/V de `rope_append_kv`. Mêmes calculs par tête que les deux chemins.
+template <typename T>
+inline void rope_qk_append_kv(
+    device const float* q_in,
+    device const float* q_weight,
+    device float* q_out,
+    device const float* k_in,
+    device const float* k_weight,
+    device T* keys,
+    uint4 dims,
+    float2 params,
+    device const float* inv_freq,
+    device const float* v_in,
+    device T* values,
+    uint q_heads,
+    uint tid,
+    uint head,
+    threadgroup float* partial
+) {
+    if (head < q_heads) {
+        rms_norm_rope_head(q_in, q_weight, q_out, dims, params, inv_freq, tid, head, partial);
+    } else if (head - q_heads < dims.x) {
+        rope_append_kv(k_in, k_weight, keys, dims, params, inv_freq, v_in, values, tid, head - q_heads, partial);
+    }
+}
+
+kernel void rms_norm_rope_qk_append_kv_f32(
+    device const float* k_in [[buffer(0)]],
+    device const float* k_weight [[buffer(1)]],
+    device float* keys [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]],
+    constant float2& params [[buffer(4)]],
+    device const float* inv_freq [[buffer(5)]],
+    device const float* v_in [[buffer(6)]],
+    device float* values [[buffer(7)]],
+    device const float* q_in [[buffer(8)]],
+    device const float* q_weight [[buffer(9)]],
+    device float* q_out [[buffer(10)]],
+    constant uint& q_heads [[buffer(11)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    threadgroup float partial[256];
+    rope_qk_append_kv(q_in, q_weight, q_out, k_in, k_weight, keys, dims, params, inv_freq, v_in, values, q_heads, tid, head, partial);
+}
+
+kernel void rms_norm_rope_qk_append_kv_bf16(
+    device const float* k_in [[buffer(0)]],
+    device const float* k_weight [[buffer(1)]],
+    device bfloat* keys [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]],
+    constant float2& params [[buffer(4)]],
+    device const float* inv_freq [[buffer(5)]],
+    device const float* v_in [[buffer(6)]],
+    device bfloat* values [[buffer(7)]],
+    device const float* q_in [[buffer(8)]],
+    device const float* q_weight [[buffer(9)]],
+    device float* q_out [[buffer(10)]],
+    constant uint& q_heads [[buffer(11)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]
+) {
+    threadgroup float partial[256];
+    rope_qk_append_kv(q_in, q_weight, q_out, k_in, k_weight, keys, dims, params, inv_freq, v_in, values, q_heads, tid, head, partial);
+}
+
 kernel void copy_at_f32(
     device const float* input [[buffer(0)]],
     device float* output [[buffer(1)]],
