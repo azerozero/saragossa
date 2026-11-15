@@ -287,12 +287,24 @@ impl Store {
                 .spawn(move || {
                     while let Ok(mut job) = rx.recv() {
                         let start = Instant::now();
-                        let result = job.payload.seal().and_then(|()| {
-                            worker_disk
-                                .lock()
-                                .map_err(|_| invalid("verrou SSD empoisonné"))
-                                .and_then(|mut disk| disk.write(&worker_root, budget, &job))
-                        });
+                        let result = job
+                            .payload
+                            .seal()
+                            .inspect_err(|error| {
+                                if let Ok(mut disk) = worker_disk.lock() {
+                                    disk.remember_refusal(
+                                        &worker_root.join(&job.name),
+                                        &error.to_string(),
+                                        Instant::now(),
+                                    );
+                                }
+                            })
+                            .and_then(|()| {
+                                worker_disk
+                                    .lock()
+                                    .map_err(|_| invalid("verrou SSD empoisonné"))
+                                    .and_then(|mut disk| disk.write(&worker_root, budget, &job))
+                            });
                         match result {
                             Ok(()) => eprintln!(
                                 "prefix_ssd written bytes={} write_ms={:.3}",

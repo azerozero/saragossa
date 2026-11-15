@@ -630,6 +630,38 @@ fn staging_limits_and_memory_guard_refuse_before_copy() {
 }
 
 #[test]
+fn sealing_failure_is_memoized_until_expiry() {
+    let root = private_dir();
+    let store = Store::open(root.path(), 1 << 20, 0).unwrap();
+    let (model, request, state) = fixture(&store, 1);
+    let mut data = payload(&model, &request, &state);
+    data.manifest = b"{invalid".to_vec();
+    publish(&store, &request, data);
+
+    assert!(!request.root.exists());
+    assert!(!store.root.join("pending").exists());
+    assert!(store.reserve().is_some());
+    for _ in 0..3 {
+        assert!(store.skip_save(&request));
+    }
+    {
+        let mut disk = store.disk.lock().unwrap();
+        assert!(!disk.write_failed);
+        assert_eq!(disk.refused.len(), 1);
+        assert!(disk
+            .refusal(&request.root, Instant::now())
+            .unwrap()
+            .contains("key must be a string"));
+        assert!(disk
+            .refusal(&request.root, Instant::now() + REFUSAL_TTL)
+            .is_none());
+    }
+    assert!(!store.skip_save(&request));
+    publish(&store, &request, payload(&model, &request, &state));
+    assert!(store.read(&model, &request).is_some());
+}
+
+#[test]
 fn negative_memo_is_bounded_expires_and_covers_worker_refusals() {
     let root = private_dir();
     let store = Store::open(root.path(), 1, 0).unwrap();
