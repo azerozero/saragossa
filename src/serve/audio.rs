@@ -330,10 +330,16 @@ fn handle_speech_with<S: Write>(
 
 fn send_speech<S: Write>(stream: &mut S, output: &TtsSynthesisOutput) -> ServeResult<()> {
     let wav = mono_f32_to_wav(&output.samples, output.sample_rate)?;
-    let headers = vec![(
-        "X-Saragossa-TTS-Frame-Limit-Reached",
-        output.frame_limit_reached.to_string(),
-    )];
+    let headers = vec![
+        (
+            "X-Saragossa-TTS-Frame-Limit-Reached",
+            output.frame_limit_reached.to_string(),
+        ),
+        (
+            "X-Saragossa-TTS-Stop-Reason",
+            output.stop_reason.as_str().into(),
+        ),
+    ];
     write_headers(stream, 200, "OK", "audio/wav", Some(wav.len()), headers)?;
     stream
         .write_all(&wav)
@@ -362,7 +368,10 @@ fn send_speech_stream<S: Write>(
             vec![
                 ("Transfer-Encoding", "chunked".into()),
                 ("X-Saragossa-Audio-Sample-Rate", sample_rate.to_string()),
-                ("Trailer", "X-Saragossa-TTS-Frame-Limit-Reached".into()),
+                (
+                    "Trailer",
+                    "X-Saragossa-TTS-Frame-Limit-Reached, X-Saragossa-TTS-Stop-Reason".into(),
+                ),
             ],
         )?;
         stream
@@ -377,8 +386,8 @@ fn send_speech_stream<S: Write>(
         // Le budget atteint n'est connu qu'après la génération : trailer HTTP.
         write!(
             stream,
-            "0\r\nX-Saragossa-TTS-Frame-Limit-Reached: {}\r\n\r\n",
-            output.frame_limit_reached
+            "0\r\nX-Saragossa-TTS-Frame-Limit-Reached: {}\r\nX-Saragossa-TTS-Stop-Reason: {}\r\n\r\n",
+            output.frame_limit_reached, output.stop_reason.as_str()
         )
         .and_then(|()| stream.flush())
         .map_err(|e| ServeError::io("fin réponse PCM", e))
@@ -776,6 +785,7 @@ mod tests {
                             samples: vec![0.0],
                             sample_rate: 24_000,
                             frame_limit_reached: false,
+                            stop_reason: saragossa::TtsStopReason::Eos,
                         },
                     )
                 },
@@ -794,6 +804,11 @@ mod tests {
                 samples: vec![0.0, 0.25, -0.25],
                 sample_rate: 24_000,
                 frame_limit_reached: reached,
+                stop_reason: if reached {
+                    saragossa::TtsStopReason::Cap
+                } else {
+                    saragossa::TtsStopReason::Eos
+                },
             };
             let mut response = Vec::new();
             send_speech(&mut response, &output)?;

@@ -125,7 +125,7 @@ pub use text_embedder::{TextEmbedError, TextEmbedder, DEFAULT_TEXT_EMBED_REPO, T
 pub use tokenizer::RustTokenizer;
 pub use tts::{
     TtsAssets, TtsCodecCatalog, TtsForwardOutput, TtsModel, TtsModelConfig, TtsModelKind,
-    TtsPayloadSummary, TtsSynthesisOutput, TtsTalkerCatalog,
+    TtsPayloadSummary, TtsStopReason, TtsSynthesisOutput, TtsTalkerCatalog,
 };
 pub use whisper::{
     log_mel_spectrogram, WhisperConfig, WhisperDecoder, WhisperEncoder, WhisperModel,

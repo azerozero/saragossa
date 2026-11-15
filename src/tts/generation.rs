@@ -1,13 +1,14 @@
+use super::model::{GeneratedCodes, TtsStopReason};
 use super::{
     greedy_talker_token, greedy_token, repeat_frame_stop_tripped, sample_talker_token,
-    tts_generation_trace_enabled, tts_repeat_frame_stop, TtsModel, TtsSampleParams,
-    CLONE_GENERATION_HARD_CAP,
+    tts_repeat_frame_stop, TtsModel, TtsSampleParams, CLONE_GENERATION_HARD_CAP,
 };
 use crate::sampling::DeterministicSampler;
 use crate::{CausalDecoderCache, InferError, Result, Tensor};
 use std::time::Instant;
 
 impl TtsModel {
+    #[cfg(test)]
     pub(super) fn generate_codes_greedy(
         &self,
         text: &str,
@@ -16,9 +17,10 @@ impl TtsModel {
         self.generate_codes_greedy_trace(
             text,
             max_frames,
-            tts_generation_trace_enabled(),
+            super::tts_generation_trace_enabled(),
             &mut |_| Ok(()),
         )
+        .map(|output| output.codes)
     }
 
     pub(super) fn generate_codes_clone_sampled_trace(
@@ -29,12 +31,15 @@ impl TtsModel {
         params: TtsSampleParams,
         trace: bool,
         on_frame: &mut dyn FnMut(&[Vec<i32>]) -> Result<()>,
-    ) -> Result<Vec<Vec<i32>>> {
+    ) -> Result<GeneratedCodes> {
         let cfg = &self.assets.model_config.talker_config;
-        let mode = self
-            .clone_ctx
-            .as_ref()
-            .map_or("clone-sampled", |ctx| ctx.mode.label());
+        let mode = self.clone_ctx.as_ref().map_or_else(
+            || match self.assets.model_kind() {
+                super::TtsModelKind::CustomVoice => "customvoice-sampled",
+                _ => "voicedesign-sampled",
+            },
+            |ctx| ctx.mode.label(),
+        );
         if trace {
             eprintln!(
                 "qwen3-tts rust diag: start mode={mode} requested_max_frames={requested_max_frames} effective_max_frames={effective_max_frames} hard_cap={CLONE_GENERATION_HARD_CAP} temp={} top_k={} top_p={} rep_penalty={} seed={}",
@@ -105,6 +110,7 @@ impl TtsModel {
             );
         }
 
+        let mut stop_reason = TtsStopReason::Cap;
         let mut generated = Vec::with_capacity(effective_max_frames);
         let mut trailing_idx = 0_usize;
         let repeat_stop = tts_repeat_frame_stop();
@@ -133,6 +139,7 @@ impl TtsModel {
                 eprintln!("qwen3-tts rust diag: frame={step} cb0={tok0}");
             }
             if tok0 == eos {
+                stop_reason = TtsStopReason::Eos;
                 if trace {
                     eprintln!(
                         "qwen3-tts rust diag: eos frame={step} generated_frames={}",
@@ -197,24 +204,27 @@ impl TtsModel {
                 );
             }
             if repeat_frame_stop_tripped(repeat_run, repeat_stop) {
-                if trace {
-                    eprintln!(
-                        "qwen3-tts rust diag: stop repeat_frame run={repeat_run} threshold={repeat_stop} generated_frames={}",
-                        generated.len()
-                    );
-                }
+                stop_reason = TtsStopReason::Repeat;
+                eprintln!(
+                    "qwen3-tts rust diag: stop repeat_frame run={repeat_run} threshold={repeat_stop} generated_frames={}",
+                    generated.len()
+                );
                 break;
             }
         }
         if trace {
             eprintln!(
-                "qwen3-tts rust diag: stop generated_frames={} reached_cap={} requested_max_frames={} effective_max_frames={effective_max_frames}",
+                "qwen3-tts rust diag: stop generated_frames={} reached_cap={} reason={} requested_max_frames={} effective_max_frames={effective_max_frames}",
                 generated.len(),
-                generated.len() == effective_max_frames,
+                stop_reason == TtsStopReason::Cap,
+                stop_reason.as_str(),
                 requested_max_frames
             );
         }
-        Ok(generated)
+        Ok(GeneratedCodes {
+            codes: generated,
+            stop_reason,
+        })
     }
 
     /// Sélectionne cb0 (token talker) depuis `final_state` : argmax greedy GPU
@@ -354,7 +364,7 @@ impl TtsModel {
         max_frames: usize,
         trace: bool,
         on_frame: &mut dyn FnMut(&[Vec<i32>]) -> Result<()>,
-    ) -> Result<Vec<Vec<i32>>> {
+    ) -> Result<GeneratedCodes> {
         let cfg = &self.assets.model_config.talker_config;
         let mode = self
             .clone_ctx
@@ -430,6 +440,7 @@ impl TtsModel {
                 cp_resident_cache.is_some()
             );
         }
+        let mut stop_reason = TtsStopReason::Cap;
         let mut generated = Vec::with_capacity(effective_max_frames);
         let mut trailing_idx = 0_usize;
         let repeat_stop = tts_repeat_frame_stop();
@@ -446,6 +457,7 @@ impl TtsModel {
                 eprintln!("qwen3-tts rust diag: frame={step} cb0={tok0}");
             }
             if tok0 == eos {
+                stop_reason = TtsStopReason::Eos;
                 if trace {
                     eprintln!(
                         "qwen3-tts rust diag: eos frame={step} generated_frames={}",
@@ -510,24 +522,27 @@ impl TtsModel {
                 );
             }
             if repeat_frame_stop_tripped(repeat_run, repeat_stop) {
-                if trace {
-                    eprintln!(
-                        "qwen3-tts rust diag: stop repeat_frame run={repeat_run} threshold={repeat_stop} generated_frames={}",
-                        generated.len()
-                    );
-                }
+                stop_reason = TtsStopReason::Repeat;
+                eprintln!(
+                    "qwen3-tts rust diag: stop repeat_frame run={repeat_run} threshold={repeat_stop} generated_frames={}",
+                    generated.len()
+                );
                 break;
             }
         }
         if trace {
             eprintln!(
-                "qwen3-tts rust diag: stop generated_frames={} reached_cap={} requested_max_frames={} effective_max_frames={effective_max_frames}",
+                "qwen3-tts rust diag: stop generated_frames={} reached_cap={} reason={} requested_max_frames={} effective_max_frames={effective_max_frames}",
                 generated.len(),
-                generated.len() == effective_max_frames,
+                stop_reason == TtsStopReason::Cap,
+                stop_reason.as_str(),
                 max_frames
             );
         }
-        Ok(generated)
+        Ok(GeneratedCodes {
+            codes: generated,
+            stop_reason,
+        })
     }
 
     #[cfg(test)]

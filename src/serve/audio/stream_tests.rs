@@ -41,6 +41,11 @@ fn output(samples: Vec<f32>, reached: bool) -> TtsSynthesisOutput {
         samples,
         sample_rate: 24_000,
         frame_limit_reached: reached,
+        stop_reason: if reached {
+            saragossa::TtsStopReason::Cap
+        } else {
+            saragossa::TtsStopReason::Eos
+        },
     }
 }
 
@@ -119,11 +124,13 @@ fn speech_route_selects_pcm_stream_or_complete_wav() -> ServeResult<()> {
             assert!(headers.contains("Content-Type: audio/pcm\r\n"));
             assert!(headers.contains("Transfer-Encoding: chunked\r\n"));
             assert!(headers.contains("X-Saragossa-Audio-Sample-Rate: 24000\r\n"));
-            assert!(headers.contains("Trailer: X-Saragossa-TTS-Frame-Limit-Reached\r\n"));
+            assert!(headers.contains(
+                "Trailer: X-Saragossa-TTS-Frame-Limit-Reached, X-Saragossa-TTS-Stop-Reason\r\n"
+            ));
             assert!(!headers.contains("Content-Length:"));
             assert_eq!(
                 body,
-                b"2\r\n\xff\x1f\r\n2\r\n\x01\xe0\r\n0\r\nX-Saragossa-TTS-Frame-Limit-Reached: true\r\n\r\n"
+                b"2\r\n\xff\x1f\r\n2\r\n\x01\xe0\r\n0\r\nX-Saragossa-TTS-Frame-Limit-Reached: true\r\nX-Saragossa-TTS-Stop-Reason: cap\r\n\r\n"
             );
             assert_eq!((synthesis.batch_calls, synthesis.stream_calls), (0, 1));
         } else {
@@ -169,7 +176,9 @@ fn speech_stream_is_flushed_during_synthesis_and_matches_batch_wav() -> ServeRes
             assert!(headers.contains("Content-Type: audio/pcm\r\n"));
             assert!(headers.contains("Transfer-Encoding: chunked\r\n"));
             assert!(headers.contains("X-Saragossa-Audio-Sample-Rate: 24000\r\n"));
-            assert!(headers.contains("Trailer: X-Saragossa-TTS-Frame-Limit-Reached\r\n"));
+            assert!(headers.contains(
+                "Trailer: X-Saragossa-TTS-Frame-Limit-Reached, X-Saragossa-TTS-Stop-Reason\r\n"
+            ));
             assert!(!headers.contains("Content-Length:"));
             let mut body = &writer.bytes[split..];
             let mut pcm = Vec::new();
@@ -191,7 +200,7 @@ fn speech_stream_is_flushed_during_synthesis_and_matches_batch_wav() -> ServeRes
             }
             assert_eq!(
                 body,
-                format!("X-Saragossa-TTS-Frame-Limit-Reached: {reached}\r\n\r\n").as_bytes()
+                format!("X-Saragossa-TTS-Frame-Limit-Reached: {reached}\r\nX-Saragossa-TTS-Stop-Reason: {}\r\n\r\n", if reached { "cap" } else { "eos" }).as_bytes()
             );
             let wav = mono_f32_to_wav(&samples, 24_000)?;
             let mut reader =
@@ -246,7 +255,7 @@ fn disconnect_and_timeout_stop_synthesis_without_second_response() -> ServeResul
         if !finished {
             assert!(!writer
                 .bytes
-                .ends_with(b"0\r\nX-Saragossa-TTS-Frame-Limit-Reached: false\r\n\r\n"));
+                .ends_with(b"0\r\nX-Saragossa-TTS-Frame-Limit-Reached: false\r\nX-Saragossa-TTS-Stop-Reason: eos\r\n\r\n"));
         }
     }
     Ok(())
@@ -287,4 +296,27 @@ fn closed_socket_does_not_start_synthesis() -> ServeResult<()> {
     send_speech_stream(&mut server, 24_000, |_| {
         unreachable!("invariant: socket fermée détectée avant synthèse")
     })
+}
+
+#[test]
+fn stop_reason_is_exposed_in_wav_headers_and_stream_trailers() -> ServeResult<()> {
+    for reason in [
+        saragossa::TtsStopReason::Eos,
+        saragossa::TtsStopReason::Repeat,
+        saragossa::TtsStopReason::Cap,
+    ] {
+        let make_output = || {
+            let mut out = output(vec![0.0], reason == saragossa::TtsStopReason::Cap);
+            out.stop_reason = reason;
+            out
+        };
+        let mut wav = Vec::new();
+        send_speech(&mut wav, &make_output())?;
+        let header = format!("X-Saragossa-TTS-Stop-Reason: {}\r\n", reason.as_str());
+        assert!(String::from_utf8_lossy(&wav).contains(&header));
+        let mut pcm = Vec::new();
+        send_speech_stream(&mut pcm, 24_000, |_| Ok(make_output()))?;
+        assert!(String::from_utf8_lossy(&pcm).ends_with(&format!("{header}\r\n")));
+    }
+    Ok(())
 }

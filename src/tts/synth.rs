@@ -1,3 +1,4 @@
+use super::model::{GeneratedCodes, TtsStopReason};
 use super::{
     clone_effective_frame_cap, clone_sample_seed, tts_generation_trace_enabled,
     tts_internal_profile_enabled, tts_stream_first_lot, usize_from_i32, TtsForwardOutput, TtsModel,
@@ -76,10 +77,17 @@ impl TtsModel {
     }
 
     pub fn synthesize_greedy(&self, text: &str, max_frames: usize) -> Result<TtsSynthesisOutput> {
-        let codes = self.generate_codes_greedy(text, max_frames)?;
+        let generated = self.generate_codes_greedy_trace(
+            text,
+            max_frames,
+            tts_generation_trace_enabled(),
+            &mut |_| Ok(()),
+        )?;
+        let codes = generated.codes;
         let samples = self.decode_codes_for_mode(&codes)?;
         Ok(TtsSynthesisOutput {
-            frame_limit_reached: codes.len() == self.greedy_frame_cap(max_frames),
+            frame_limit_reached: generated.stop_reason == TtsStopReason::Cap,
+            stop_reason: generated.stop_reason,
             codes,
             samples,
             sample_rate: self.codec.sample_rate(),
@@ -96,7 +104,7 @@ impl TtsModel {
             return self.synthesize_greedy(text, max_frames);
         }
         let effective_max_frames = self.default_frame_cap(text, max_frames)?;
-        let codes = if let Some(params) = self.default_sample_params() {
+        let generated = if let Some(params) = self.default_sample_params() {
             self.generate_codes_clone_sampled_trace(
                 text,
                 max_frames,
@@ -106,11 +114,18 @@ impl TtsModel {
                 &mut |_| Ok(()),
             )?
         } else {
-            self.generate_codes_greedy(text, effective_max_frames)?
+            self.generate_codes_greedy_trace(
+                text,
+                effective_max_frames,
+                tts_generation_trace_enabled(),
+                &mut |_| Ok(()),
+            )?
         };
+        let codes = generated.codes;
         let samples = self.decode_codes_for_mode(&codes)?;
         Ok(TtsSynthesisOutput {
-            frame_limit_reached: codes.len() == effective_max_frames,
+            frame_limit_reached: generated.stop_reason == TtsStopReason::Cap,
+            stop_reason: generated.stop_reason,
             codes,
             samples,
             sample_rate: self.codec.sample_rate(),
@@ -150,7 +165,6 @@ impl TtsModel {
                         on_frame,
                     )
                 },
-                effective_max_frames,
                 on_audio,
             );
         }
@@ -187,7 +201,6 @@ impl TtsModel {
                     on_frame,
                 )
             },
-            self.greedy_frame_cap(max_frames),
             on_audio,
         )
     }
@@ -203,18 +216,16 @@ impl TtsModel {
     fn synthesize_streaming_from_frames<F, G>(
         &self,
         generate_codes: G,
-        effective_max_frames: usize,
         on_audio: F,
     ) -> Result<TtsSynthesisOutput>
     where
         F: FnMut(&[f32]) -> Result<()>,
-        G: FnOnce(&mut dyn FnMut(&[Vec<i32>]) -> Result<()>) -> Result<Vec<Vec<i32>>>,
+        G: FnOnce(&mut dyn FnMut(&[Vec<i32>]) -> Result<()>) -> Result<GeneratedCodes>,
     {
         let mut decode_state = self.new_stream_decode_state();
         let fixed_lots = uses_fixed_lots(&decode_state);
         synthesize_streaming_from_frames(
             generate_codes,
-            effective_max_frames,
             on_audio,
             |codes| self.decode_codes_for_mode_streaming(&mut decode_state, codes),
             tts_stream_first_lot(),
@@ -294,7 +305,6 @@ fn uses_fixed_lots(state: &TtsStreamDecodeState) -> bool {
 // sans charger de modèle ; la production utilise exactement cette boucle.
 fn synthesize_streaming_from_frames<F, G, D>(
     generate_codes: G,
-    effective_max_frames: usize,
     mut on_audio: F,
     mut decode: D,
     first_lot: usize,
@@ -303,7 +313,7 @@ fn synthesize_streaming_from_frames<F, G, D>(
 ) -> Result<TtsSynthesisOutput>
 where
     F: FnMut(&[f32]) -> Result<()>,
-    G: FnOnce(&mut dyn FnMut(&[Vec<i32>]) -> Result<()>) -> Result<Vec<Vec<i32>>>,
+    G: FnOnce(&mut dyn FnMut(&[Vec<i32>]) -> Result<()>) -> Result<GeneratedCodes>,
     D: FnMut(&[Vec<i32>]) -> Result<Vec<f32>>,
 {
     let mut all_samples: Vec<f32> = Vec::new();
@@ -345,7 +355,8 @@ where
         };
         Ok(())
     };
-    let codes = generate_codes(&mut on_frame)?;
+    let generated = generate_codes(&mut on_frame)?;
+    let codes = generated.codes;
     // Flush final : décode le suffixe non couvert par le dernier lot.
     let final_flush_started = Instant::now();
     let pcm = decode(&codes)?;
@@ -379,7 +390,8 @@ where
         );
     }
     Ok(TtsSynthesisOutput {
-        frame_limit_reached: codes.len() == effective_max_frames,
+        frame_limit_reached: generated.stop_reason == TtsStopReason::Cap,
+        stop_reason: generated.stop_reason,
         codes,
         samples: all_samples,
         sample_rate,

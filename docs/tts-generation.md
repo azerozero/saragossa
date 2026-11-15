@@ -31,3 +31,9 @@ nommées `synthesize_greedy*` restent également des oracles.
 Les goldens audio VoiceDesign et clone appellent explicitement le chemin par
 défaut sous le flag glouton (override local au thread de test). Aucune tolérance
 ni fixture golden n’est modifiée.
+
+La réponse WAV porte `X-Saragossa-TTS-Stop-Reason: eos|repeat|cap`. En streaming,
+ce champ est annoncé dans `Trailer` puis envoyé après le chunk terminal, lorsque
+la cause est connue. L'arrêt `repeat` est toujours journalisé, même sans trace.
+`X-Saragossa-TTS-Frame-Limit-Reached` reste compatible et vaut vrai seulement
+pour `cap` ; un arrêt `repeat` sur la dernière trame reste identifié comme tel.

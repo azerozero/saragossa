@@ -334,7 +334,9 @@ fn live_clone_generation_diagnoses_frame_cap() -> Result<()> {
     let rust = TtsModel::load_clone_local(&model_dir, &wav_bytes, &ref_text)?;
     let prepared = rust.prepare_inputs(TEXT)?;
     let ref_frames = rust.clone_ctx.as_ref().map_or(0, |ctx| ctx.ref_codes.len());
-    let codes = rust.generate_codes_greedy_trace(TEXT, MAX_FRAMES, true, &mut |_| Ok(()))?;
+    let codes = rust
+        .generate_codes_greedy_trace(TEXT, MAX_FRAMES, true, &mut |_| Ok(()))?
+        .codes;
     let reached_eos = codes.len() < MAX_FRAMES;
     let metrics = format!(
         "text={TEXT:?}\nrequested_max_frames={MAX_FRAMES}\nhard_cap={CLONE_GENERATION_HARD_CAP}\neffective_max_frames={}\ninput_rows={}\ntrailing_rows={}\nref_frames={ref_frames}\ngenerated_frames={}\nreached_eos={reached_eos}\nfirst_frame={:?}\n",
