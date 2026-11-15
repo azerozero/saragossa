@@ -3,9 +3,10 @@
 `saragossa::decision` expose le Decider joint de THX-02 (HAL-X-AI/THX-02,
 Apache-2.0) et le format `d3-code-readout-v1` de d3-flash (vllm-sr/d3-flash,
 Apache-2.0), en texte seul. Le format est détecté par `decision_config.json`
-(`format_id`), sinon par `joint_config.json`. Vision, thinker (LoRA + tête MTP), TTA et le
-découpage de haut niveau du runtime Python ne sont pas pris en charge et sont
-refusés explicitement.
+(`format_id`), sinon par `joint_config.json`. Vision, thinker (LoRA + tête
+MTP) et le découpage en morceaux de questions du runtime Python ne sont pas
+pris en charge et sont refusés explicitement. La moyenne sur plusieurs ordres
+d'options (`tta`) est prise en charge pour THX-02 (voir plus bas).
 
 ## Calcul
 
@@ -64,6 +65,57 @@ cargo run --release --example decision_bench -- DOSSIER tests/fixtures/decision
 ```
 
 Les deux commandes lisent les poids réels : à lancer sous le verrou GPU.
+
+## Moyenne sur les ordres d'options (TTA, THX-02)
+
+Champ `tta` de la requête, défaut 1 comme `THX02.load(default_tta=1)` de la
+référence, ramené à 1..=8 (`runtime.plan`). Avec `tta` = 1, rien ne change :
+lecture jointe de toutes les questions. Au-delà, saragossa suit `runtime.plan` :
+
+- **lecture jointe de facettes** (`engine.facet_joint`) : au moins deux
+  questions, toutes à `instructions` textuelles, de même type et aux critères
+  identiques (à l'ordre des clés près) ; une seule lecture jointe, `tta`
+  ignoré ;
+- sinon **chaque question est lue seule** (requête `{state, {clé: question}}`),
+  `noul` et `score` une fois, une `choice` à au moins deux options dans les
+  `k` premiers ordres distincts parmi identité, inverse, puis décalages
+  circulaires `i ↦ (i + s) mod n` (`engine.orders`). À 4 ordres et 3 options :
+  `012`, `210`, `120`, `201` ; à 2 options, seuls 2 ordres existent. Les codes
+  `A`, `B`… restent dans l'ordre du prompt, seules les options bougent ;
+- chaque distribution est remise dans l'ordre d'origine par clé d'option, puis
+  `p_i ∝ exp(moyenne_j ln max(p_ji, 1e-9))`, renormalisée (`engine.geo_mean`).
+  Choix, confiance et score sont recalculés sur cette distribution.
+
+d3 refuse `tta` > 1 (son `permutation_average` n'est pas porté).
+
+Calcul partagé. Les 8 couches d'attention complète sont non causales : les
+lignes de l'état voient les options qui les suivent, donc aucun état de
+préfixe n'est réutilisable au-delà de la première de ces couches (couche 3).
+Les embeddings et les trois premières couches gated-delta du préfixe commun
+seraient exacts à partager, mais ne pèsent qu'environ 9 % du calcul d'une
+lecture ; ce n'est pas fait. Les lectures sont plutôt **empaquetées dans un
+même prefill** (`CausalDecoder::decision_hidden_packed`) : normes, résiduel
+et MLP (environ 63 % des poids) traitent toutes les lignes d'un coup, poids
+lus une fois ; projections, RoPE, récurrence gated-delta et attention restent
+séquence par séquence, chacune avec ses positions et son état neuf. Sur
+l'oracle, les probabilités empaquetées égalent celles des lectures séparées. Un
+paquet compte au plus 512 tokens (`SARAGOSSA_DECISION_PACK_TOKENS`, 0 :
+lectures séparées) : au-delà, le GEMM est déjà saturé. Mesures provisoires
+(machine utilisée, ABBA, 21 répétitions) : à 128 tokens, TTA=4 empaqueté
+175 ms contre 209 ms en quatre prefills (−16 %) ; deux lectures de 512
+empaquetées oscillent entre −8 % et +3 % selon le passage, d'où le seuil ;
+tout empaqueter (8 192 lignes) est 11 % plus lent à 2048.
+
+Oracle : `tests/fixtures/decision/tta/`, 7 requêtes (choice à 2, 3, 4 et 6
+options, requête mixte choice/noul/score, facettes jointes, état de 567
+tokens) passées par `runtime.plan` avec la référence f32 MPS. Tolérance figée
+0,0165 (deux fois le bruit bf16 mesuré sur les probabilités TTA=4, + 1e-6).
+
+```sh
+SARAGOSSA_DECISION_MODEL=DOSSIER cargo test --release --all-features \
+  decision_tta_real_weight_oracle -- --ignored
+cargo run --release --example decision_tta_bench -- DOSSIER
+```
 
 ## d3-flash
 

@@ -17,6 +17,8 @@ pub(crate) use self::resident::with_prefill_kv_reserve;
 #[cfg(test)]
 pub(crate) use self::resident::{with_router_capture, RouterCapture};
 mod scratch;
+mod segments;
+pub(crate) use self::segments::with_decision_segments;
 mod scratch_phases;
 #[cfg(test)]
 pub(super) use scratch_phases::test_support::allocate_phase_scratch_for_test;
@@ -134,6 +136,7 @@ struct PrefillResidentLayerScratch {
     tail: PrefillResidentTailScratch,
 }
 
+#[derive(Clone)]
 struct PrefillResidentFullAttentionScratch {
     q_norm: Buffer,
     k_norm: Buffer,
@@ -151,10 +154,12 @@ struct PrefillResidentFullAttentionScratch {
     sinks: Option<Buffer>,
 }
 
+#[derive(Clone)]
 struct PrefillResidentLinearAttentionScratch {
     output: Buffer,
 }
 
+#[derive(Clone)]
 enum PrefillResidentAttentionScratch {
     Full(PrefillResidentFullAttentionScratch),
     Linear(PrefillResidentLinearAttentionScratch),

@@ -2042,11 +2042,42 @@ impl CausalDecoder {
     /// # Errors
     /// Refuse les séquences hors contrat et les architectures non Qwen3.5.
     pub fn decision_hidden(&self, token_ids: &[usize], rows: &[usize]) -> Result<Tensor> {
+        self.decision_hidden_packed(&[(token_ids, rows)])?
+            .pop()
+            .ok_or_else(|| InferError::Config("décision sans séquence".into()))
+    }
+
+    /// [`Self::decision_hidden`] pour plusieurs séquences indépendantes, lues
+    /// dans un seul prefill Metal : les couches ligne à ligne (normes, MLP)
+    /// lisent leurs poids une fois, chaque séquence garde ses positions, son
+    /// état gated-delta et son attention. Résultat identique, au bruit de
+    /// tuilage GEMM près, à des appels séparés ; le repli CPU les enchaîne.
+    ///
+    /// # Errors
+    /// Comme [`Self::decision_hidden`], pour chaque séquence.
+    pub fn decision_hidden_packed(
+        &self,
+        sequences: &[(&[usize], &[usize])],
+    ) -> Result<Vec<Tensor>> {
         let hidden_dim = self.final_norm.len();
+        if sequences.is_empty()
+            || !self.config.is_qwen
+            || !self.config.attn_output_gate
+            || sequences.iter().any(|(tokens, rows)| {
+                tokens.is_empty()
+                    || tokens.len() > 2048
+                    || rows.iter().any(|&row| row >= tokens.len())
+            })
+        {
+            return Err(InferError::Config(
+                "décision Qwen3.5 : 1 à 2048 tokens requis".into(),
+            ));
+        }
         // Seules les lignes lues par le readout passent par la norme finale.
-        let normed = |data: &[f32]| -> Result<Tensor> {
+        let normed = |data: &[f32], first: usize, rows: &[usize]| -> Result<Tensor> {
             let mut picked = Vec::with_capacity(rows.len() * hidden_dim);
             for &row in rows {
+                let row = first + row;
                 let slice = data
                     .get(row * hidden_dim..(row + 1) * hidden_dim)
                     .ok_or_else(|| InferError::Config("ligne de décision hors séquence".into()))?;
@@ -2055,43 +2086,63 @@ impl CausalDecoder {
             let picked = Tensor::from_vec(vec![rows.len(), hidden_dim], picked)?;
             rms_norm(&picked, &self.final_norm, self.config.rms_eps)
         };
-        if token_ids.is_empty()
-            || token_ids.len() > 2048
-            || !self.config.is_qwen
-            || !self.config.attn_output_gate
-        {
-            return Err(InferError::Config(
-                "décision Qwen3.5 : 1 à 2048 tokens requis".into(),
-            ));
-        }
         crate::runtime_flags::with_decision_noncausal(|| {
             #[cfg(all(target_os = "macos", feature = "metal"))]
             if self.resident_metal().is_some() {
-                let (_, hidden, _) = self
-                    .prefill_resident_cache_hidden_and_captures(
-                        token_ids,
+                let tokens: Vec<usize> = sequences
+                    .iter()
+                    .flat_map(|(tokens, _)| tokens.iter().copied())
+                    .collect();
+                let lengths: Vec<usize> =
+                    sequences.iter().map(|(tokens, _)| tokens.len()).collect();
+                // Une seule séquence : chemin habituel, sans découpage.
+                let prefill = || {
+                    self.prefill_resident_cache_hidden_and_captures(
+                        &tokens,
                         &[],
                         usize::MAX,
                         false,
                         0,
-                    )?
-                    .ok_or_else(|| {
-                        InferError::Config("prefill décision résident indisponible".into())
-                    })?;
-                return match &hidden {
-                    crate::metal_backend::PrefillKvRows::Owned(data) => normed(data),
-                    crate::metal_backend::PrefillKvRows::Shared(rows) => normed(rows.as_slice()),
-                    _ => Err(InferError::Config(
-                        "hidden de décision bf16 inattendu".into(),
-                    )),
+                    )
                 };
+                let (_, hidden, _) = if lengths.len() == 1 {
+                    prefill()
+                } else {
+                    crate::metal_backend::with_decision_segments(&lengths, prefill)
+                }?
+                .ok_or_else(|| {
+                    InferError::Config("prefill décision résident indisponible".into())
+                })?;
+                let data = match &hidden {
+                    crate::metal_backend::PrefillKvRows::Owned(data) => data.as_slice(),
+                    crate::metal_backend::PrefillKvRows::Shared(rows) => rows.as_slice(),
+                    _ => {
+                        return Err(InferError::Config(
+                            "hidden de décision bf16 inattendu".into(),
+                        ))
+                    }
+                };
+                let mut first = 0;
+                return sequences
+                    .iter()
+                    .map(|(tokens, rows)| {
+                        let out = normed(data, first, rows);
+                        first += tokens.len();
+                        out
+                    })
+                    .collect();
             }
             let runtime = self.forward_runtime();
-            let mut hidden = self.embed_scaled(token_ids)?;
-            for layer in &self.layers {
-                hidden = layer.forward(&self.config, &hidden, runtime)?;
-            }
-            normed(hidden.data())
+            sequences
+                .iter()
+                .map(|(tokens, rows)| {
+                    let mut hidden = self.embed_scaled(tokens)?;
+                    for layer in &self.layers {
+                        hidden = layer.forward(&self.config, &hidden, runtime)?;
+                    }
+                    normed(hidden.data(), 0, rows)
+                })
+                .collect()
         })
     }
 

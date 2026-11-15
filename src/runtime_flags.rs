@@ -68,6 +68,18 @@ pub(crate) fn decision_gemm_bf16_enabled() -> bool {
     decision_noncausal() && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DECISION_GEMM_BF16", true))
 }
 
+/// Tokens au plus par prefill empaqueté des lectures TTA d'une décision
+/// (`SARAGOSSA_DECISION_PACK_TOKENS`, 0 : un prefill par lecture). Au-delà,
+/// le GEMM est déjà saturé et l'empaquetage ne gagne plus rien (mesuré).
+pub(crate) fn decision_pack_tokens() -> usize {
+    static TOKENS: OnceLock<usize> = OnceLock::new();
+    *TOKENS.get_or_init(|| {
+        env_var("SARAGOSSA_DECISION_PACK_TOKENS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(512)
+    })
+}
+
 pub(crate) fn with_decision_noncausal<T>(run: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {

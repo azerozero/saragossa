@@ -1,0 +1,5 @@
+{
+  "measured_bf16_max_abs": 0.008240973024627729,
+  "max_abs_probability": 0.01648294604925546,
+  "rule": "2 * measured bf16 max absolute error of TTA=4 probabilities + 1e-6; fixed before Rust comparison"
+}
