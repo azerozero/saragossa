@@ -22,7 +22,7 @@ fn prefill_kv_reserve_bounds_growth_without_trimming_hint() {
     }
 }
 
-fn test_executor() -> Result<Option<MetalExecutor>> {
+pub(super) fn test_executor() -> Result<Option<MetalExecutor>> {
     match MetalExecutor::new() {
         Ok(executor) => Ok(Some(executor)),
         Err(InferError::Metal(message)) if message.contains("aucun device") => Ok(None),
@@ -39,7 +39,12 @@ fn deterministic_value(seed: usize, index: usize, scale: f32) -> f32 {
     centered * scale / 128.0
 }
 
-fn deterministic_tensor(rows: usize, cols: usize, seed: usize, scale: f32) -> Result<Tensor> {
+pub(super) fn deterministic_tensor(
+    rows: usize,
+    cols: usize,
+    seed: usize,
+    scale: f32,
+) -> Result<Tensor> {
     Tensor::from_vec(
         vec![rows, cols],
         (0..rows * cols)
@@ -48,7 +53,7 @@ fn deterministic_tensor(rows: usize, cols: usize, seed: usize, scale: f32) -> Re
     )
 }
 
-fn deterministic_norm(dim: usize, seed: usize) -> Result<Tensor> {
+pub(super) fn deterministic_norm(dim: usize, seed: usize) -> Result<Tensor> {
     Tensor::from_vec(
         vec![dim],
         (0..dim)
@@ -197,7 +202,7 @@ fn full_cache(caches: &[PrefillResidentLayerCache]) -> Result<(Tensor, Tensor)> 
     }
 }
 
-fn assert_bit_exact(actual: &Tensor, expected: &Tensor, label: &str) {
+pub(super) fn assert_bit_exact(actual: &Tensor, expected: &Tensor, label: &str) {
     assert_eq!(
         actual.shape(),
         expected.shape(),

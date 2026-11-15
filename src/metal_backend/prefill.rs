@@ -18,6 +18,8 @@ pub(crate) use self::resident::with_prefill_kv_reserve;
 pub(crate) use self::resident::{with_router_capture, RouterCapture};
 mod scratch;
 mod segments;
+#[cfg(test)]
+mod segments_tests;
 pub(crate) use self::segments::with_decision_segments;
 mod scratch_phases;
 #[cfg(test)]
