@@ -263,7 +263,17 @@ pub(super) fn can_use_qmvt_buffers(
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
         && out_dim % 32 == 0
-        && super::verify_strict_active()
+        && (super::verify_strict_active()
+            || (qmvt_small_enabled() && batch < qmm_skinny_min_batch()))
+}
+
+/// qmv-T hors mode strict pour les largeurs sous le skinny (3-4 lignes : la
+/// vérification MTP à profondeur 2) : sans lui, ces lignes passent par le qmv
+/// répliqué, qui relit le poids une fois par ligne. Mêmes bits que le qmv mono,
+/// comme le qmv répliqué qu'il remplace. Kill-switch `SARAGOSSA_RUST_QMVT_SMALL=0`.
+pub(super) fn qmvt_small_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMVT_SMALL", true))
 }
 
 pub(super) fn can_use_qmvt(
