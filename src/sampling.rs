@@ -890,3 +890,6 @@ mod tests {
         assert_ne!(sample.token, 0);
     }
 }
+
+#[cfg(test)]
+mod mutation_tests;

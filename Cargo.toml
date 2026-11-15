@@ -1,12 +1,14 @@
 [package]
 name = "saragossa"
-version = "0.3.0"
+version = "0.3.1"
 description = "Pure-Rust Metal inference engine for Apple Silicon: Qwen dense/MoE LLMs, Whisper STT, Qwen3 TTS, OpenAI-compatible server — GPU-resident decode, 35B MoE at ~105 tok/s."
 repository = "https://github.com/azerozero/saragossa"
 keywords = ["llm", "inference", "metal", "apple-silicon", "transformer"]
 categories = ["science", "concurrency", "command-line-utilities"]
 license = "Apache-2.0"
-publish = false
+# release-plz ignore un paquet non publiable : la publication crates.io reste
+# coupée par `publish = false` dans release-plz.toml.
+publish = true
 edition = "2021"
 rust-version = "1.85"
 build = "build.rs"
@@ -52,7 +54,7 @@ thiserror = "2"
 safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-tokenizers = { version = "0.22.2", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 rayon = "1"
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 rustfft = "6"
@@ -71,7 +73,7 @@ default-features = false
 version = "=1.2.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-metal = { version = "0.29", optional = true }
+metal = { version = "0.33", optional = true }
 mach-sys = "0.5"
 
 [dev-dependencies]

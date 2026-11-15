@@ -4,6 +4,9 @@ use crate::{InferError, Result};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
+mod incremental;
+pub use incremental::ByteLevelDecodeStream;
+
 #[cfg(test)]
 pub(crate) mod golden_tests;
 
@@ -95,6 +98,15 @@ impl RustTokenizer {
                 path: self.path.clone(),
                 message: e.to_string(),
             })
+    }
+
+    /// Ouvre un flux uniquement pour le décodeur ByteLevel pur, sans cleanup.
+    /// Les autres décodeurs doivent conserver le décodage complet.
+    pub fn byte_level_decode_stream(
+        &self,
+        skip_special_tokens: bool,
+    ) -> Option<ByteLevelDecodeStream<'_>> {
+        incremental::new(self, skip_special_tokens)
     }
 
     /// Décode les bytes visibles d'un token isolé.
