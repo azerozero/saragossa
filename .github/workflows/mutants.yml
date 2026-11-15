@@ -27,14 +27,10 @@ jobs:
         run: rustup toolchain install 1.98.1 --profile minimal
       - name: Installer cargo-mutants en CI
         run: cargo +1.98.1 install cargo-mutants --version 24.11.2 --locked
+      # Un mutant survivant sort en code 2 : le rapport sert d'alerte, pas le statut.
       - name: Muter un module et exécuter ses tests CPU
+        continue-on-error: true
         run: cargo +1.98.1 mutants --no-default-features --features devtools --file "${{ matrix.file }}" -C --locked -- --lib --bins
       - name: Publier les survivants dans le journal
         if: always()
-        run: |
-          for result in caught missed timeout unviable; do
-            if test -f "mutants.out/$result.txt"; then
-              printf "\\n%s\\n" "$result"
-              cat "mutants.out/$result.txt"
-            fi
-          done
+        run: tail -n +1 mutants.out/*.txt

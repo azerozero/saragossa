@@ -4,7 +4,6 @@ set -euo pipefail
 
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
-export GPU_LOCK="${GPU_LOCK:-${TMPDIR:-/tmp}/saragossa-gpu.lock}"
 export SARAGOSSA_REQUIRE_REAL_MODELS=1
 export SARAGOSSA_REQUIRE_METAL=1
 export HF_HUB_OFFLINE=1

@@ -892,5 +892,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "sampling/mutation_tests.rs"]
 mod mutation_tests;

@@ -396,10 +396,11 @@ class Matrix:
         for option in ("dimensions_override", "encoding_base64", "usage"):
             self.add(EMBED, option, unsupported="src/serve/embeddings.rs: dimension fixe 384, float seulement, usage absent.")
         self.add(SPEECH, "wav", self.speech, "" if self.family in {"tts", "audio"} else "Profil sans Qwen3-TTS.")
-        for option, action in (("wav_long", lambda: self.speech(text=LONG_AUDIO_TEXT)),
-                               ("voice_custom", self.custom_voice)):
-            self.add(SPEECH, option, action,
-                     "" if self.family in {"tts", "audio"} else "Profil sans Qwen3-TTS.")
+        self.add(SPEECH, "wav_long", lambda: self.speech(text=LONG_AUDIO_TEXT),
+                 "" if self.family in {"tts", "audio"} else "Profil sans Qwen3-TTS.")
+        self.add(SPEECH, "voice_custom", self.custom_voice,
+                 "Profil sans Qwen3-TTS." if self.family not in {"tts", "audio"}
+                 else "" if os.environ.get("E2E_CUSTOM_VOICE", "").strip() else "E2E_CUSTOM_VOICE absent.")
         for fmt in ("mp3", "opus", "aac", "flac", "pcm"):
             self.add(SPEECH, "format_" + fmt, unsupported=(
                 "src/serve/audio.rs SpeechRequest: response_format ignoré, WAV; PCM via extension stream seulement."))
