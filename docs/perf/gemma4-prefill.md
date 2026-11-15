@@ -169,7 +169,6 @@ n'a été ajusté. L'ancien plafond 4096 limitait les allocations ; il ne prouva
 pas la qualité numérique de cette plage. Les mesures supplémentaires et la
 réduction du plafond sont détaillées ci-dessous.
 
-
 Les tests `gemma4_prefill_reference_kld_per_op` et
 `gemma4_prefill_reference_kld_resident` partagent le calcul et les seuils de
 `golden::kld::external_kld_gemma4` : KL moyen et p99 Δp au plus 1,5 fois le
