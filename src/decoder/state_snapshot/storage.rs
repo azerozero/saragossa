@@ -18,13 +18,24 @@ pub(super) fn invalid(message: impl Into<String>) -> InferError {
     InferError::Config(format!("instantané post-prefill : {}", message.into()))
 }
 pub(super) fn digest(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
+    crate::hex(Sha256::digest(data))
 }
 pub(super) fn hash_file(path: &Path) -> Result<String> {
     let mut file = io(path, File::open(path))?;
     let mut hash = Sha256::new();
-    io(path, std::io::copy(&mut file, &mut hash))?;
-    Ok(format!("{:x}", hash.finalize()))
+    // NOTE: sha2 0.11 n'implémente plus `std::io::Write`, d'où la lecture par blocs.
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = match file.read(&mut buffer) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => io(path, result)?,
+        };
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(crate::hex(hash.finalize()))
 }
 
 pub(super) fn binary_sha256() -> Result<&'static str> {

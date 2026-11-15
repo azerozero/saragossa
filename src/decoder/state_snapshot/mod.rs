@@ -449,7 +449,7 @@ impl CausalDecoder {
             .map(|metal| metal.snapshot_kernel_profile());
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let kernel_profile: Option<String> = None;
-        let prompt_sha256 = format!("{:x}", hash.finalize());
+        let prompt_sha256 = crate::hex(hash.finalize());
         // Une bascule DFlash vers MTP préremplit un autre prompt : son écriture
         // ne doit pas remplacer l'instantané du prompt initial à accélérer.
         let entry = storage::digest(format!("{prompt_sha256}:{mode}").as_bytes());

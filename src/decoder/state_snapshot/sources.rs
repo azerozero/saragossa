@@ -155,7 +155,7 @@ fn hash_blocks(path: &Path, stamp: &Stamp, workers: usize) -> Result<String> {
     for block in hashes {
         hash.update(block);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(crate::hex(hash.finalize()))
 }
 
 #[cfg(test)]
@@ -181,7 +181,7 @@ mod tests {
             expected.update(Sha256::digest(vec![byte; BLOCK_BYTES]));
         }
         expected.update(Sha256::digest(b"partial block"));
-        let expected = format!("{:x}", expected.finalize());
+        let expected = crate::hex(expected.finalize());
         for workers in [1, 2, 3, 8] {
             assert_eq!(hash_blocks(&path, &stamp, workers)?, expected);
         }

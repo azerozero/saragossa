@@ -1351,17 +1351,14 @@ impl CausalDecoder {
             .copied()
             .filter(|&v| v > 0)
             .ok_or_else(|| InferError::Config("vocabulaire KL vide".into()))?;
-        let config = format!(
-            "{:x}",
-            Sha256::digest(format!("{:?}", self.config).as_bytes())
-        );
+        let config = crate::hex(Sha256::digest(format!("{:?}", self.config).as_bytes()));
         let mut weights = Sha256::new();
         // Le gather existant fonctionne aussi après libération des poids CPU.
         let sample = self.embed_scaled(&[0, vocab / 2, vocab - 1])?;
         for value in sample.data().iter().chain(self.final_norm.data()) {
             weights.update(value.to_le_bytes());
         }
-        Ok((vocab, config, format!("{:x}", weights.finalize())))
+        Ok((vocab, config, crate::hex(weights.finalize())))
     }
 }
 
