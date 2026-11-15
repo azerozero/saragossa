@@ -203,6 +203,8 @@ impl CausalDecoder {
                 || !MetalExecutor::is_aligned_u6_weight(&up, hidden)
                 || !MetalExecutor::is_aligned_u6_weight(&down, inter)
                 || metal.linear_weight_out_dim(&up) != inter
+                || metal.linear_weight_out_dim(&down) != hidden
+                || metal.linear_weight_out_dim(&o_proj) != hidden
             {
                 return Ok(None);
             }
@@ -317,7 +319,7 @@ impl CausalDecoder {
                 let dims = self.plan.layers[index]
                     .resident
                     .resident_windowed_full_attn_layer_dims(hidden, position, eps, theta)?;
-                match &weights.fused_qkv {
+                let fused = match &weights.fused_qkv {
                     Some(fused_qkv) => self.encode_tts_cp_fused_layer(
                         metal,
                         arena,
@@ -330,7 +332,10 @@ impl CausalDecoder {
                         current.buffer(),
                         other.buffer(),
                     )?,
-                    None => self.encode_resident_full_layer(
+                    None => false,
+                };
+                if !fused {
+                    self.encode_resident_full_layer(
                         metal,
                         arena,
                         &mut layers[index],
@@ -341,7 +346,7 @@ impl CausalDecoder {
                         dims,
                         current.buffer(),
                         other.buffer(),
-                    )?,
+                    )?;
                 }
                 std::mem::swap(&mut current, &mut other);
             }
@@ -445,7 +450,7 @@ impl CausalDecoder {
         dims: FullAttnLayerDims,
         layer_in: &metal::BufferRef,
         layer_out: &metal::BufferRef,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(ResidentLayerBuffers::FullDense(resolved)) = arena.layers.get(index) else {
             return Err(InferError::Config(format!(
                 "poids full-attn dense résidents absents couche {index} (trame TTS)"
@@ -456,9 +461,8 @@ impl CausalDecoder {
             || resolved.sigmoid_moe.is_some()
             || resolved.value_norm
         {
-            return Err(InferError::Config(format!(
-                "couche {index} hors du périmètre de la trame TTS fusionnée"
-            )));
+            // Hors périmètre : le chemin général encode la couche.
+            return Ok(false);
         }
         let kv = layer_cache.full.as_mut().ok_or_else(|| {
             InferError::Metal("KV full-attn résident absent (trame TTS)".to_string())

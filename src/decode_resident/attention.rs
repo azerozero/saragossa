@@ -752,6 +752,12 @@ impl FullAttentionMetalState {
         self.sinks.is_some()
     }
 
+    /// Indique si norm+RoPE+append K/V fusionnés acceptent ce cache (f32 ou
+    /// bf16) : sinon [`Self::encode_rope_qk_append_kv`] renvoie `false`.
+    pub(super) fn supports_fused_rope_append(&self) -> bool {
+        !self.format.is_quantized()
+    }
+
     /// Renvoie la dimension d'une ligne KV (`kv_heads * head_dim`).
     pub(crate) fn kv_dim(&self) -> usize {
         self.kv_heads * self.head_dim

@@ -12,7 +12,7 @@
 //!
 //! Chaque kernel fusionné reprend la boucle et les associations du kernel
 //! qu'il remplace : la sortie de couche est identique au bit à celle du chemin
-//! général (`tts_cp_layer_matches_general_layer`). Seule la trame fusionnée
+//! général (`tts_cp_fused_kernels_match_general_layers`). Seule la trame fusionnée
 //! du code predictor l'emprunte ; le glouton et le decode LLM n'y passent pas.
 
 use super::utils::byte_offset_f32;
@@ -37,13 +37,14 @@ pub(crate) struct TtsCpLayerWeights<'a> {
 impl DecodeResidentState {
     /// Encode une couche du code predictor : `layer_in [hidden]` → `layer_out`.
     ///
-    /// Couche Qwen3 sans gate de sortie, sans norme de V et sans sinks, poids
-    /// u6 gs64 alignés : l'appelant le vérifie à la résolution des poids.
+    /// Couche Qwen3 sans gate de sortie, sans norme de V et sans sinks, KV f32
+    /// ou bf16, poids u6 gs64 alignés. Renvoie `false` sans rien encoder si la
+    /// couche sort de ce périmètre : l'appelant prend alors le chemin général.
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si un kernel fusionné refuse les poids (vérification
-    /// manquée en amont), si le KV déborde ou si un encodage échoue.
+    /// Renvoie une erreur si un kernel fusionné refuse les poids après la
+    /// vérification préalable, si le KV déborde ou si un encodage échoue.
     #[expect(
         clippy::too_many_arguments,
         reason = "data flow d'une couche : exécuteur + KV + poids + dims + ping-pong"
@@ -58,17 +59,26 @@ impl DecodeResidentState {
         dims: FullAttnLayerDims,
         layer_in: &BufferRef,
         layer_out: &BufferRef,
-    ) -> Result<()> {
-        if dims.attn_output_gate || kv.has_sinks() {
-            return Err(InferError::Config(
-                "couche TTS fusionnée: gate de sortie ou sinks non supportés".to_string(),
-            ));
-        }
+    ) -> Result<bool> {
         let hidden = dims.hidden;
         let q_dim = dims.q_heads * dims.head_dim;
         let kv_dim = dims.kv_heads * dims.head_dim;
         let qkv_dim = q_dim + 2 * kv_dim;
         let inter = executor.linear_weight_out_dim(weights.gate_proj);
+        // Tout le périmètre est vérifié avant le premier dispatch : un refus
+        // après l'append K/V ne pourrait plus se replier sur le chemin général.
+        let eligible = !dims.attn_output_gate
+            && !kv.has_sinks()
+            && kv.supports_fused_rope_append()
+            && executor.linear_weight_out_dim(weights.qkv_proj) == qkv_dim
+            && MetalExecutor::is_aligned_u6_weight(weights.gate_proj, hidden)
+            && MetalExecutor::is_aligned_u6_weight(weights.up_proj, hidden)
+            && executor.linear_weight_out_dim(weights.up_proj) == inter
+            && MetalExecutor::is_aligned_u6_weight(weights.down_proj, inter)
+            && executor.linear_weight_out_dim(weights.down_proj) == hidden;
+        if !eligible {
+            return Ok(false);
+        }
         let score_cells = dims.q_heads * kv.capacity();
 
         let normed = self.scratch().lease(hidden, GpuElement::F32)?;
@@ -116,7 +126,7 @@ impl DecodeResidentState {
             weights.rope_frequencies,
         )? {
             return Err(InferError::Config(
-                "couche TTS fusionnée: KV quantifié non supporté".to_string(),
+                "couche TTS fusionnée: append K/V refusé après vérification".to_string(),
             ));
         }
         Self::encode_query_attention_scale(
@@ -162,6 +172,7 @@ impl DecodeResidentState {
             weights.up_proj,
             swiglu.tensor().buffer(),
             hidden,
+            inter,
         )? && executor.encode_qmv_u6_residual_buffers(
             encoder,
             swiglu.tensor().buffer(),
@@ -169,12 +180,13 @@ impl DecodeResidentState {
             summed.tensor().buffer(),
             layer_out,
             inter,
+            hidden,
         )?;
         if !fused_mlp {
             return Err(InferError::Config(
-                "couche TTS fusionnée: MLP non u6 gs64 aligné".to_string(),
+                "couche TTS fusionnée: MLP refusé après vérification".to_string(),
             ));
         }
-        Ok(())
+        Ok(true)
     }
 }

@@ -1025,6 +1025,13 @@ impl MetalExecutor {
     }
 }
 
+/// Indique si `buffer` contient au moins `n` f32.
+fn f32_buffer_fits(buffer: &BufferRef, n: usize) -> bool {
+    (n as u64)
+        .checked_mul(4)
+        .is_some_and(|bytes| buffer.length() >= bytes)
+}
+
 /// Vue u6 gs64 alignée d'un poids : `(packed, scales, biases, offsets, dims)`
 /// si le qmv aligné u6 la traiterait, `None` sinon.
 #[allow(
@@ -1058,6 +1065,11 @@ fn aligned_u6_view(
         || in_dim % 512 != 0
         || *out_dim % 8 != 0
         || *out_dim == 0
+        || !AffineMatmulKernel::FastQmvU6.supports_offsets(
+            *packed_offset,
+            *scales_offset,
+            *biases_offset,
+        )
     {
         return Ok(None);
     }
@@ -1089,11 +1101,16 @@ impl MetalExecutor {
     ///
     /// Chaque sortie vaut au bit près `swiglu(qmv(gate), qmv(up))` des kernels
     /// séparés. Renvoie `false` sans rien encoder si un poids n'est pas u6 gs64
-    /// aligné ou si les formes de gate et up diffèrent.
+    /// aligné, si les formes de gate et up diffèrent ou ne sortent pas
+    /// `out_dim`, ou si un buffer est trop court.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si une dimension déborde `u32`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodeur Metal: buffers liés et dimensions vérifiées"
+    )]
     pub(crate) fn encode_gate_up_swiglu_u6_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1102,13 +1119,18 @@ impl MetalExecutor {
         up: &MetalLinearWeightBuffers,
         output_buffer: &BufferRef,
         in_dim: usize,
+        out_dim: usize,
     ) -> Result<bool> {
-        let (Some((gate_bind, gate_dims, out_dim)), Some((up_bind, up_dims, _))) =
+        let (Some((gate_bind, gate_dims, weight_out)), Some((up_bind, up_dims, _))) =
             (aligned_u6_view(gate, in_dim)?, aligned_u6_view(up, in_dim)?)
         else {
             return Ok(false);
         };
-        if gate_dims != up_dims {
+        if gate_dims != up_dims
+            || weight_out != out_dim
+            || !f32_buffer_fits(lhs_buffer, in_dim)
+            || !f32_buffer_fits(output_buffer, out_dim)
+        {
             return Ok(false);
         }
         encoder.set_compute_pipeline_state(&self.affine_gate_up_swiglu_aligned_u6_gs64_f32);
@@ -1135,11 +1157,16 @@ impl MetalExecutor {
 
     /// qmv u6 suivi de `output = residual + qmv` en un dispatch, au bit près
     /// le qmv aligné puis `weighted_sum_add_topk` à score 1. Renvoie `false`
-    /// sans rien encoder si le poids n'est pas u6 gs64 aligné.
+    /// sans rien encoder si le poids n'est pas u6 gs64 aligné, ne sort pas
+    /// `out_dim`, ou si un buffer est trop court.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si une dimension déborde `u32`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodeur Metal: buffers liés et dimensions vérifiées"
+    )]
     pub(crate) fn encode_qmv_u6_residual_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1148,10 +1175,18 @@ impl MetalExecutor {
         residual_buffer: &BufferRef,
         output_buffer: &BufferRef,
         in_dim: usize,
+        out_dim: usize,
     ) -> Result<bool> {
-        let Some((bind, dims, out_dim)) = aligned_u6_view(weight, in_dim)? else {
+        let Some((bind, dims, weight_out)) = aligned_u6_view(weight, in_dim)? else {
             return Ok(false);
         };
+        if weight_out != out_dim
+            || !f32_buffer_fits(lhs_buffer, in_dim)
+            || !f32_buffer_fits(residual_buffer, out_dim)
+            || !f32_buffer_fits(output_buffer, out_dim)
+        {
+            return Ok(false);
+        }
         encoder.set_compute_pipeline_state(&self.affine_qmv_residual_aligned_u6_gs64_f32);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
         for (slot, (buffer, offset)) in (1..).zip(bind) {
