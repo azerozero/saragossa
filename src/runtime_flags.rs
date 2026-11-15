@@ -2918,3 +2918,32 @@ pub(crate) fn prefix_ssd_staging_bytes(
         .filter(|&bytes| bytes > 0)
         .ok_or_else(|| crate::InferError::Config("staging SSD : plafond invalide".into()))
 }
+
+/// Force le décodage glouton TTS historique pour les oracles.
+#[must_use]
+pub fn tts_greedy_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TTS_GREEDY_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    env_flag("SARAGOSSA_TTS_GREEDY", false)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TTS_GREEDY_OVERRIDE: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_tts_greedy_for_test<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TTS_GREEDY_OVERRIDE.with(|flag| flag.set(self.0));
+        }
+    }
+    let _reset = Reset(TTS_GREEDY_OVERRIDE.with(|flag| flag.replace(Some(enabled))));
+    run()
+}

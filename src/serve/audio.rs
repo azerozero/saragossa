@@ -60,6 +60,14 @@ struct TtsSlot {
 // Seule la synthèse est substituable : les tests conservent le choix WAV/PCM
 // du gestionnaire de production, sans charger de poids ni initialiser Metal.
 pub(super) trait SpeechSynthesis {
+    fn configure_voice(
+        &mut self,
+        _voice: Option<&str>,
+        _seed: Option<u64>,
+    ) -> ServeResult<Option<String>> {
+        Ok(None)
+    }
+
     fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput>;
     fn stream_sample_rate(&mut self) -> ServeResult<u32>;
     fn synthesize_streaming(
@@ -161,6 +169,33 @@ impl AudioState {
 }
 
 impl SpeechSynthesis for AudioState {
+    fn configure_voice(
+        &mut self,
+        voice: Option<&str>,
+        seed: Option<u64>,
+    ) -> ServeResult<Option<String>> {
+        self.ensure_tts_loaded()?;
+        let model = self
+            .tts
+            .model
+            .as_mut()
+            .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
+        model.set_seed(seed);
+        match model.set_voice(voice) {
+            Ok(()) => Ok(None),
+            Err(cause) => {
+                let Some(requested) = voice else {
+                    return Err(cause.into());
+                };
+                // Le défaut est résolu à nouveau pour ne pas conserver la voix
+                // d'une requête précédente. Un défaut invalide reste une erreur.
+                model.set_voice(None)?;
+                eprintln!("saragossa serve TTS: {cause} ; repli sur serena");
+                Ok(Some(requested.to_owned()))
+            }
+        }
+    }
+
     fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput> {
         self.ensure_tts_loaded()?;
         let model = self
@@ -264,13 +299,18 @@ pub(super) fn handle_speech<S: Write>(
         body,
         // Nom canonique depuis l'origine : pas d'alias `RETI_` à honorer ici.
         saragossa::runtime_flags::env_var_exact(TTS_MAX_FRAMES_ENV).as_deref(),
-        |stream, text, max_frames, streaming| {
+        |stream, text, max_frames, streaming, voice, seed| {
+            let fallback = audio.configure_voice(voice, seed)?;
             if !streaming {
-                return send_speech(stream, &audio.synthesize(text, max_frames)?);
+                return send_speech(
+                    stream,
+                    &audio.synthesize(text, max_frames)?,
+                    fallback.as_deref(),
+                );
             }
             // Le chargement peut encore produire une erreur HTTP avant les en-têtes.
             let sample_rate = audio.stream_sample_rate()?;
-            send_speech_stream(stream, sample_rate, |on_audio| {
+            send_speech_stream(stream, sample_rate, fallback.as_deref(), |on_audio| {
                 audio.synthesize_streaming(text, max_frames, on_audio)
             })
         },
@@ -283,7 +323,7 @@ fn handle_speech_with<S: Write>(
     stream: &mut S,
     body: &[u8],
     override_value: Option<&str>,
-    synthesize: impl FnOnce(&mut S, &str, usize, bool) -> ServeResult<()>,
+    synthesize: impl FnOnce(&mut S, &str, usize, bool, Option<&str>, Option<u64>) -> ServeResult<()>,
 ) -> ServeResult<()> {
     let request: SpeechRequest = serde_json::from_slice(body)
         .map_err(|e| ServeError::json("désérialisation audio/speech", e))?;
@@ -298,15 +338,46 @@ fn handle_speech_with<S: Write>(
         input,
         tts_max_frames(input, override_value),
         request.stream,
+        request.voice.as_deref(),
+        request.seed,
     )
 }
 
-fn send_speech<S: Write>(stream: &mut S, output: &TtsSynthesisOutput) -> ServeResult<()> {
+// Valeur fournie par le client : échapper les contrôles et l'UTF-8 pour ne
+// jamais injecter une ligne HTTP. Les noms usuels (alloy, nova…) restent tels quels.
+fn voice_fallback_header(voice: Option<&str>) -> Option<(&'static str, String)> {
+    voice.map(|voice| {
+        let value = voice
+            .bytes()
+            .map(|byte| {
+                if (b' '..=b'~').contains(&byte) && byte != b'%' {
+                    char::from(byte).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect();
+        ("X-Saragossa-TTS-Voice-Fallback", value)
+    })
+}
+
+fn send_speech<S: Write>(
+    stream: &mut S,
+    output: &TtsSynthesisOutput,
+    fallback: Option<&str>,
+) -> ServeResult<()> {
     let wav = mono_f32_to_wav(&output.samples, output.sample_rate)?;
-    let headers = vec![(
-        "X-Saragossa-TTS-Frame-Limit-Reached",
-        output.frame_limit_reached.to_string(),
-    )];
+    let mut headers = vec![
+        (
+            "X-Saragossa-TTS-Frame-Limit-Reached",
+            output.frame_limit_reached.to_string(),
+        ),
+        (
+            "X-Saragossa-TTS-Stop-Reason",
+            output.stop_reason.as_str().into(),
+        ),
+    ];
+    headers.extend(voice_fallback_header(fallback));
     write_headers(stream, 200, "OK", "audio/wav", Some(wav.len()), headers)?;
     stream
         .write_all(&wav)
@@ -321,6 +392,7 @@ fn send_speech<S: Write>(stream: &mut S, output: &TtsSynthesisOutput) -> ServeRe
 fn send_speech_stream<S: Write>(
     stream: &mut S,
     sample_rate: u32,
+    fallback: Option<&str>,
     synthesize: impl FnOnce(
         &mut dyn FnMut(&[f32]) -> saragossa::Result<()>,
     ) -> ServeResult<TtsSynthesisOutput>,
@@ -332,11 +404,17 @@ fn send_speech_stream<S: Write>(
             "OK",
             "audio/pcm",
             None,
-            vec![
+            [
                 ("Transfer-Encoding", "chunked".into()),
                 ("X-Saragossa-Audio-Sample-Rate", sample_rate.to_string()),
-                ("Trailer", "X-Saragossa-TTS-Frame-Limit-Reached".into()),
-            ],
+                (
+                    "Trailer",
+                    "X-Saragossa-TTS-Frame-Limit-Reached, X-Saragossa-TTS-Stop-Reason".into(),
+                ),
+            ]
+            .into_iter()
+            .chain(voice_fallback_header(fallback))
+            .collect(),
         )?;
         stream
             .flush()
@@ -350,8 +428,8 @@ fn send_speech_stream<S: Write>(
         // Le budget atteint n'est connu qu'après la génération : trailer HTTP.
         write!(
             stream,
-            "0\r\nX-Saragossa-TTS-Frame-Limit-Reached: {}\r\n\r\n",
-            output.frame_limit_reached
+            "0\r\nX-Saragossa-TTS-Frame-Limit-Reached: {}\r\nX-Saragossa-TTS-Stop-Reason: {}\r\n\r\n",
+            output.frame_limit_reached, output.stop_reason.as_str()
         )
         .and_then(|()| stream.flush())
         .map_err(|e| ServeError::io("fin réponse PCM", e))
@@ -382,12 +460,15 @@ fn pcm_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
 }
 
-/// Requête `/v1/audio/speech`. Le backend expose une voix VoiceDesign unique,
-/// donc `model`/`voice` (ignorés) sont acceptés sans effet.
+/// Requête `/v1/audio/speech` : `voice` sélectionne un locuteur CustomVoice.
 #[derive(Debug, Deserialize)]
 struct SpeechRequest {
     /// Texte à synthétiser.
     input: String,
+    #[serde(default)]
+    voice: Option<String>,
+    #[serde(default)]
+    seed: Option<u64>,
     /// Extension explicite : PCM s16le mono chunked au lieu du WAV complet.
     #[serde(default)]
     stream: bool,
@@ -521,14 +602,17 @@ mod tests {
             ("é".repeat(200), Some("2000"), 800),
             ("é".repeat(200), Some("0"), 400),
         ] {
-            let body = json!({ "input": format!("  {text}\n") }).to_string();
+            let body = json!({ "input": format!("  {text}\n"), "voice": "vivian", "seed": 123 })
+                .to_string();
             let mut response = Vec::new();
             let mut called = false;
             handle_speech_with(
                 &mut response,
                 body.as_bytes(),
                 override_value,
-                |stream, input, max_frames, streaming| {
+                |stream, input, max_frames, streaming, voice, seed| {
+                    assert_eq!(voice, Some("vivian"));
+                    assert_eq!(seed, Some(123));
                     called = true;
                     assert!(!streaming);
                     assert_eq!(input, text);
@@ -540,7 +624,9 @@ mod tests {
                             samples: vec![0.0],
                             sample_rate: 24_000,
                             frame_limit_reached: false,
+                            stop_reason: saragossa::TtsStopReason::Eos,
                         },
+                        None,
                     )
                 },
             )?;
@@ -558,9 +644,14 @@ mod tests {
                 samples: vec![0.0, 0.25, -0.25],
                 sample_rate: 24_000,
                 frame_limit_reached: reached,
+                stop_reason: if reached {
+                    saragossa::TtsStopReason::Cap
+                } else {
+                    saragossa::TtsStopReason::Eos
+                },
             };
             let mut response = Vec::new();
-            send_speech(&mut response, &output)?;
+            send_speech(&mut response, &output, None)?;
             let split = response
                 .windows(4)
                 .position(|w| w == b"\r\n\r\n")

@@ -11,13 +11,18 @@ y compris sous le plancher de 160, puis reste bornée à 800. Une valeur absente
 nulle, invalide ou hors plage `usize` revient au calcul proportionnel.
 `SARAGOSSA_TTS_MAX_FRAMES=160` restaure le budget précédent.
 
-Le WAV est toujours renvoyé en HTTP 200. L'en-tête
+Une synthèse réussie renvoie le WAV en HTTP 200, même si elle est tronquée.
+L’en-tête
 `X-Saragossa-TTS-Frame-Limit-Reached: true` indique que le budget effectif a été
-consommé sans EOS observé : l'audio peut être incomplet. Il vaut `false` sinon.
+atteint comme cause d’arrêt : l’audio peut être incomplet. Il vaut `false`
+pour EOS et pour le garde-fou anti-répétition, même sur la dernière trame.
 Le même indicateur est disponible dans `TtsSynthesisOutput::frame_limit_reached`,
 en batch et en streaming, avec prise en compte des plafonds internes du clone.
 Les garde-fous anti-répétition restent inchangés ; `false` ne certifie donc pas
-une fin par EOS. L'ajout du champ exige d'adapter les constructions littérales
+une fin par EOS. `X-Saragossa-TTS-Stop-Reason` et
+`TtsSynthesisOutput::stop_reason` distinguent `eos`, `repeat` et `cap`
+(voir [la politique de génération](tts-generation.md)).
+L’ajout des champs exige d’adapter les constructions littérales
 de cette structure dans les clients Rust.
 
 Les budgets explicites de la bibliothèque, le cap adaptatif du clone, les

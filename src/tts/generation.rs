@@ -1,15 +1,14 @@
+use super::model::{GeneratedCodes, TtsStopReason};
 use super::{
-    clone_effective_frame_cap, clone_sample_seed, greedy_talker_token, greedy_token,
-    repeat_frame_stop_tripped, sample_talker_token, tts_generation_trace_enabled,
+    greedy_talker_token, greedy_token, repeat_frame_stop_tripped, sample_talker_token,
     tts_repeat_frame_stop, TtsModel, TtsSampleParams, CLONE_GENERATION_HARD_CAP,
-    CLONE_SAMPLE_REPETITION_PENALTY, CLONE_SAMPLE_TEMPERATURE, CLONE_SAMPLE_TOP_K,
-    CLONE_SAMPLE_TOP_P,
 };
 use crate::sampling::DeterministicSampler;
 use crate::{CausalDecoderCache, InferError, Result, Tensor};
 use std::time::Instant;
 
 impl TtsModel {
+    #[cfg(test)]
     pub(super) fn generate_codes_greedy(
         &self,
         text: &str,
@@ -18,33 +17,10 @@ impl TtsModel {
         self.generate_codes_greedy_trace(
             text,
             max_frames,
-            tts_generation_trace_enabled(),
+            super::tts_generation_trace_enabled(),
             &mut |_| Ok(()),
         )
-    }
-
-    pub(super) fn generate_codes_clone_sampled(
-        &self,
-        text: &str,
-        max_frames: usize,
-    ) -> Result<Vec<Vec<i32>>> {
-        let target_tokens = self.encode_ids(text)?.len();
-        let effective_max_frames = clone_effective_frame_cap(max_frames, target_tokens);
-        let params = TtsSampleParams {
-            temperature: CLONE_SAMPLE_TEMPERATURE,
-            top_k: CLONE_SAMPLE_TOP_K,
-            top_p: CLONE_SAMPLE_TOP_P,
-            repetition_penalty: CLONE_SAMPLE_REPETITION_PENALTY,
-            seed: clone_sample_seed(),
-        };
-        self.generate_codes_clone_sampled_trace(
-            text,
-            max_frames,
-            effective_max_frames,
-            params,
-            tts_generation_trace_enabled(),
-            &mut |_| Ok(()),
-        )
+        .map(|output| output.codes)
     }
 
     pub(super) fn generate_codes_clone_sampled_trace(
@@ -55,12 +31,15 @@ impl TtsModel {
         params: TtsSampleParams,
         trace: bool,
         on_frame: &mut dyn FnMut(&[Vec<i32>]) -> Result<()>,
-    ) -> Result<Vec<Vec<i32>>> {
+    ) -> Result<GeneratedCodes> {
         let cfg = &self.assets.model_config.talker_config;
-        let mode = self
-            .clone_ctx
-            .as_ref()
-            .map_or("clone-sampled", |ctx| ctx.mode.label());
+        let mode = self.clone_ctx.as_ref().map_or_else(
+            || match self.assets.model_kind() {
+                super::TtsModelKind::CustomVoice => "customvoice-sampled",
+                _ => "voicedesign-sampled",
+            },
+            |ctx| ctx.mode.label(),
+        );
         if trace {
             eprintln!(
                 "qwen3-tts rust diag: start mode={mode} requested_max_frames={requested_max_frames} effective_max_frames={effective_max_frames} hard_cap={CLONE_GENERATION_HARD_CAP} temp={} top_k={} top_p={} rep_penalty={} seed={}",
@@ -131,18 +110,28 @@ impl TtsModel {
             );
         }
 
+        let mut stop_reason = TtsStopReason::Cap;
         let mut generated = Vec::with_capacity(effective_max_frames);
         let mut trailing_idx = 0_usize;
         let repeat_stop = tts_repeat_frame_stop();
         let mut repeat_run = 1_usize;
         let mut cb0_history = Vec::with_capacity(effective_max_frames);
         let mut sampler = DeterministicSampler::new(params.seed);
+        let subtalker = self
+            .generation_config
+            .as_ref()
+            .map(|config| config.subtalker_params(params.seed));
 
+        let mut logits = {
+            let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+                crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+            );
+            self.talker.logits_from_final_state(&final_state)?
+        };
         for step in 0..effective_max_frames {
             let qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
                 crate::runtime_flags::tts_qmm_na_dequant_enabled(),
             );
-            let logits = self.talker.logits_from_final_state(&final_state)?;
             let tok0 = sample_talker_token(
                 logits.as_row()?,
                 &params,
@@ -155,6 +144,7 @@ impl TtsModel {
                 eprintln!("qwen3-tts rust diag: frame={step} cb0={tok0}");
             }
             if tok0 == eos {
+                stop_reason = TtsStopReason::Eos;
                 if trace {
                     eprintln!(
                         "qwen3-tts rust diag: eos frame={step} generated_frames={}",
@@ -164,8 +154,13 @@ impl TtsModel {
                 break;
             }
 
-            let codes_frame =
-                self.predict_codebooks(tok0, &final_state, n_groups, cp_resident_cache.as_mut())?;
+            let codes_frame = self.predict_codebooks(
+                tok0,
+                &final_state,
+                n_groups,
+                cp_resident_cache.as_mut(),
+                subtalker.as_ref().map(|p| (p, &mut sampler)),
+            )?;
 
             let text_embed = if trailing_idx < prepared.trailing.shape()[0] {
                 let row = Tensor::row(prepared.trailing.row_slice(trailing_idx)?.to_vec())?;
@@ -179,17 +174,20 @@ impl TtsModel {
                 codec_embed = codec_embed.add(&self.code_predictor_embed(codebook, &[code])?)?;
             }
             let next_input = text_embed.add(&codec_embed)?;
-            final_state = if talker_resident {
+            (final_state, logits) = if talker_resident {
                 self.talker
-                    .decode_step_resident_from_embedding(&mut talker_cache, &next_input)?
+                    .decode_state_logits_resident_from_embedding(&mut talker_cache, &next_input)?
                     .ok_or_else(|| {
                         InferError::Metal(
                             "decode résident talker indisponible en cours de frame".to_string(),
                         )
                     })?
             } else {
-                self.talker
-                    .next_state_from_embedding(&mut talker_cache, &next_input)?
+                let state = self
+                    .talker
+                    .next_state_from_embedding(&mut talker_cache, &next_input)?;
+                let logits = self.talker.logits_from_final_state(&state)?;
+                (state, logits)
             };
 
             let repeated_frame = generated.last().is_some_and(|prev| prev == &codes_frame);
@@ -214,24 +212,27 @@ impl TtsModel {
                 );
             }
             if repeat_frame_stop_tripped(repeat_run, repeat_stop) {
-                if trace {
-                    eprintln!(
-                        "qwen3-tts rust diag: stop repeat_frame run={repeat_run} threshold={repeat_stop} generated_frames={}",
-                        generated.len()
-                    );
-                }
+                stop_reason = TtsStopReason::Repeat;
+                eprintln!(
+                    "qwen3-tts rust diag: stop repeat_frame run={repeat_run} threshold={repeat_stop} generated_frames={}",
+                    generated.len()
+                );
                 break;
             }
         }
         if trace {
             eprintln!(
-                "qwen3-tts rust diag: stop generated_frames={} reached_cap={} requested_max_frames={} effective_max_frames={effective_max_frames}",
+                "qwen3-tts rust diag: stop generated_frames={} reached_cap={} reason={} requested_max_frames={} effective_max_frames={effective_max_frames}",
                 generated.len(),
-                generated.len() == effective_max_frames,
+                stop_reason == TtsStopReason::Cap,
+                stop_reason.as_str(),
                 requested_max_frames
             );
         }
-        Ok(generated)
+        Ok(GeneratedCodes {
+            codes: generated,
+            stop_reason,
+        })
     }
 
     /// Sélectionne cb0 (token talker) depuis `final_state` : argmax greedy GPU
@@ -275,6 +276,7 @@ impl TtsModel {
         final_state: &Tensor,
         n_groups: usize,
         cp_resident: Option<&mut CausalDecoderCache>,
+        mut sampling: Option<(&TtsSampleParams, &mut DeterministicSampler)>,
     ) -> Result<Vec<i32>> {
         let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
             crate::runtime_flags::tts_qmm_na_dequant_enabled(),
@@ -287,9 +289,9 @@ impl TtsModel {
         match cp_resident {
             Some(cp_cache) => {
                 // position 0 : final_state (seed KV, pas de code). Puis un pas par
-                // codebook avec la tête FUSIONNÉE on-device (matmul tête + argmax
-                // greedy dans le command buffer du pas → readback d'1 u32, plus de
-                // cp_state relu ni de matmul de tête CPU). KV remis à zéro par frame.
+                // codebook avec la tête dans le command buffer du pas. En greedy,
+                // on relit un u32 ; en sampling, uniquement les logits. Aucun état
+                // cp relu pour projeter la tête sur CPU. KV remis à zéro par frame.
                 self.code_predictor.reset_resident_decode_cache(cp_cache)?;
                 let fs_proj = self.code_predictor_projection.forward(final_state)?;
                 self.code_predictor
@@ -302,14 +304,26 @@ impl TtsModel {
                     let head = self.code_predictor_heads.get(code_idx).ok_or_else(|| {
                         InferError::MissingWeight(format!("code_predictor.lm_head.{code_idx}"))
                     })?;
-                    let token = self
-                        .code_predictor
-                        .decode_token_resident_from_embedding_head(cp_cache, &next_input, head)?
-                        .ok_or_else(|| {
-                            InferError::Metal("cp résident: token absent".to_string())
-                        })?;
-                    let code = i32::try_from(token)
-                        .map_err(|_| InferError::Config(format!("code cp hors i32: {token}")))?;
+                    let code = if let Some((params, sampler)) = sampling.as_mut() {
+                        let logits = self
+                            .code_predictor
+                            .decode_logits_resident_from_embedding_head(
+                                cp_cache,
+                                &next_input,
+                                head,
+                            )?
+                            .ok_or_else(|| {
+                                InferError::Metal("cp résident: logits absents".into())
+                            })?;
+                        sample_talker_token(logits.as_row()?, params, &[], &[], None, sampler)?
+                    } else {
+                        let token = self
+                            .code_predictor
+                            .decode_token_resident_from_embedding_head(cp_cache, &next_input, head)?
+                            .ok_or_else(|| InferError::Metal("cp résident: token absent".into()))?;
+                        i32::try_from(token)
+                            .map_err(|_| InferError::Config(format!("code cp hors i32: {token}")))?
+                    };
                     codes_frame.push(code);
                     if code_idx + 1 < n_groups - 1 {
                         let embed = self.code_predictor_embed(code_idx, &[code])?;
@@ -331,7 +345,12 @@ impl TtsModel {
                     let head = self.code_predictor_heads.get(code_idx).ok_or_else(|| {
                         InferError::MissingWeight(format!("code_predictor.lm_head.{code_idx}"))
                     })?;
-                    let code = greedy_token(head.forward(&cp_state)?.as_row()?, &[])?;
+                    let logits = head.forward(&cp_state)?;
+                    let code = if let Some((params, sampler)) = sampling.as_mut() {
+                        sample_talker_token(logits.as_row()?, params, &[], &[], None, sampler)?
+                    } else {
+                        greedy_token(logits.as_row()?, &[])?
+                    };
                     codes_frame.push(code);
                     if code_idx + 1 < n_groups - 1 {
                         let embed = self.code_predictor_embed(code_idx, &[code])?;
@@ -352,7 +371,7 @@ impl TtsModel {
         max_frames: usize,
         trace: bool,
         on_frame: &mut dyn FnMut(&[Vec<i32>]) -> Result<()>,
-    ) -> Result<Vec<Vec<i32>>> {
+    ) -> Result<GeneratedCodes> {
         let cfg = &self.assets.model_config.talker_config;
         let mode = self
             .clone_ctx
@@ -428,6 +447,7 @@ impl TtsModel {
                 cp_resident_cache.is_some()
             );
         }
+        let mut stop_reason = TtsStopReason::Cap;
         let mut generated = Vec::with_capacity(effective_max_frames);
         let mut trailing_idx = 0_usize;
         let repeat_stop = tts_repeat_frame_stop();
@@ -444,6 +464,7 @@ impl TtsModel {
                 eprintln!("qwen3-tts rust diag: frame={step} cb0={tok0}");
             }
             if tok0 == eos {
+                stop_reason = TtsStopReason::Eos;
                 if trace {
                     eprintln!(
                         "qwen3-tts rust diag: eos frame={step} generated_frames={}",
@@ -453,8 +474,13 @@ impl TtsModel {
                 break;
             }
 
-            let codes_frame =
-                self.predict_codebooks(tok0, &final_state, n_groups, cp_resident_cache.as_mut())?;
+            let codes_frame = self.predict_codebooks(
+                tok0,
+                &final_state,
+                n_groups,
+                cp_resident_cache.as_mut(),
+                None,
+            )?;
 
             let text_embed = if trailing_idx < prepared.trailing.shape()[0] {
                 let row = Tensor::row(prepared.trailing.row_slice(trailing_idx)?.to_vec())?;
@@ -503,24 +529,27 @@ impl TtsModel {
                 );
             }
             if repeat_frame_stop_tripped(repeat_run, repeat_stop) {
-                if trace {
-                    eprintln!(
-                        "qwen3-tts rust diag: stop repeat_frame run={repeat_run} threshold={repeat_stop} generated_frames={}",
-                        generated.len()
-                    );
-                }
+                stop_reason = TtsStopReason::Repeat;
+                eprintln!(
+                    "qwen3-tts rust diag: stop repeat_frame run={repeat_run} threshold={repeat_stop} generated_frames={}",
+                    generated.len()
+                );
                 break;
             }
         }
         if trace {
             eprintln!(
-                "qwen3-tts rust diag: stop generated_frames={} reached_cap={} requested_max_frames={} effective_max_frames={effective_max_frames}",
+                "qwen3-tts rust diag: stop generated_frames={} reached_cap={} reason={} requested_max_frames={} effective_max_frames={effective_max_frames}",
                 generated.len(),
-                generated.len() == effective_max_frames,
+                stop_reason == TtsStopReason::Cap,
+                stop_reason.as_str(),
                 max_frames
             );
         }
-        Ok(generated)
+        Ok(GeneratedCodes {
+            codes: generated,
+            stop_reason,
+        })
     }
 
     #[cfg(test)]
