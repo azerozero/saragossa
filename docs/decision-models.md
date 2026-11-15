@@ -1,7 +1,9 @@
-# Modèles de décision Qwen3.5 (THX-02)
+# Modèles de décision Qwen3.5 (THX-02, d3-flash)
 
 `saragossa::decision` expose le Decider joint de THX-02 (HAL-X-AI/THX-02,
-Apache-2.0) en texte seul. Vision, thinker (LoRA + tête MTP), TTA et le
+Apache-2.0) et le format `d3-code-readout-v1` de d3-flash (vllm-sr/d3-flash,
+Apache-2.0), en texte seul. Le format est détecté par `decision_config.json`
+(`format_id`), sinon par `joint_config.json`. Vision, thinker (LoRA + tête MTP), TTA et le
 découpage de haut niveau du runtime Python ne sont pas pris en charge et sont
 refusés explicitement.
 
@@ -58,17 +60,42 @@ cargo run --release --example decision_bench -- DOSSIER tests/fixtures/decision
 
 Les deux commandes lisent les poids réels : à lancer sous le verrou GPU.
 
-## Modèles suivants
+## d3-flash
 
-d3-flash (9B) et openjev (27B) peuvent partager backbone et prefill si leurs
-configurations, ordre des codes, template, readout et température sont
-vérifiés. Le chargeur attend aujourd'hui `model.safetensors` et le wrapper
-`backbone_config` de THX ; ajouter la résolution de shards et un adaptateur de
-métadonnées si besoin, puis produire leurs propres oracles.
+Backbone Qwen3.5-9B (hidden 4096, MLP 12288), mêmes couches et même masque
+non causal que THX-02. Poids en shards (`model.safetensors.index.json`),
+tenseurs `visual.*` ignorés, pas de tête de vocabulaire. Différences :
 
-Écart assumé avec la référence Python : saragossa neutralise tous les
+- **une séquence par question**, l'état répété dans chacune ; prompt
+  `d3_format.user_prompt` : `State:`, `Question:`, `Options:` puis
+  `Reply with only the code of the best option.`, système propre à d3 ;
+  état `null` ou vide rendu `(empty)` ;
+- lecture au **dernier token** ; `n` premières lignes du readout f32
+  `[255, 4096]`, température 1,0 ; les `token_ids` valident seulement le
+  tokenizer ;
+- `score` limité à 2 à 10 niveaux distincts, légende en JSON compact trié ;
+  confiance `choice`/`score` = 1 − entropie normalisée ;
+- une question invalide ou trop longue reçoit `{type, error, message}`
+  (`invalid_question`, `max_length_exceeded`) sans bloquer les autres.
+  `permutation_average` n'est pas pris en charge.
+
+Oracle : `tests/fixtures/decision/d3/`, 39 questions et prompts de 128, 512
+et 2048 tokens, tolérance figée 0,0184 (deux fois le bruit bf16 mesuré
++ 1e-6).
+
+```sh
+SARAGOSSA_DECISION_D3_MODEL=DOSSIER cargo test --release --all-features \
+  decision_d3_real_weight_oracle -- --ignored
+cargo run --release --example decision_bench -- DOSSIER tests/fixtures/decision/d3
+```
+
+openjev (27B) devra fournir ses propres oracles ; sa configuration et son
+protocole restent à vérifier avant tout support.
+
+Écart assumé avec les références Python : saragossa neutralise tous les
 `added_tokens` marqués `special` du tokenizer (21 pour THX-02), alors que
 `all_special_tokens` de Transformers n'en liste que 9. Un texte utilisateur
 qui contient par exemple `<|im_start|>` littéral ne peut donc pas injecter
 de tour de conversation ; les prompts sans token spécial littéral sont
-identiques.
+identiques. Le runtime d3 n'échappe rien ; saragossa applique la même
+neutralisation aux 14 tokens spéciaux de d3, et sa référence aussi.
