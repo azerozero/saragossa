@@ -106,7 +106,7 @@ def main(argv=None):
     parser.add_argument("--report-dir", type=Path, default=Path("tools/e2e/reports/latest"))
     parser.add_argument("--startup-timeout", type=float, default=60)
     parser.add_argument("--request-timeout", type=float, default=600)
-    parser.add_argument("--word-similarity", type=float, default=0.6)
+    parser.add_argument("--word-similarity", type=float, default=0.8)
     parser.add_argument("--list", action="store_true", help="inventaire statique; aucun SDK, poids ou serveur")
     args = parser.parse_args(argv)
     modes = args.modes.split(",")

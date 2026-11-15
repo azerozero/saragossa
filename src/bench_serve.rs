@@ -578,7 +578,10 @@ fn consume_sse_events(
     first_content: &mut Option<Instant>,
     generated: &mut String,
 ) -> BenchResult<()> {
-    for event in parser.push(bytes)? {
+    for event in parser
+        .push(bytes)
+        .map_err(|e| BenchServeError::new(e.to_string()))?
+    {
         if first_sse.is_none() {
             *first_sse = Some(observed_at);
         }

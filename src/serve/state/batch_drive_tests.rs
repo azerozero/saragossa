@@ -207,3 +207,62 @@ fn batched_session_request_alone_would_be_served_by_mtp() {
         assert_eq!(loaded.routes_mtp(&chat, &prepared), admitted, "stop {stop}");
     }
 }
+
+#[test]
+fn bytelevel_batch_preserves_content_stop_position_and_usage() {
+    struct ExactSink {
+        expected: &'static str,
+        tokens: usize,
+        emitted: String,
+    }
+    impl CompletionSink for ExactSink {
+        fn event(&mut self, event: CompletionStreamEvent<'_>) -> ServeResult<()> {
+            if let CompletionStreamEvent::Delta(delta) = event {
+                self.emitted.push_str(delta);
+            }
+            Ok(())
+        }
+        fn finish(&mut self, result: ServeResult<ServedCompletion>) -> ServeResult<()> {
+            let completion = result?;
+            assert_eq!(completion.content, self.expected);
+            assert_eq!(self.emitted, self.expected);
+            assert_eq!(completion.finish_reason, "stop");
+            let usage = serde_json::to_value(completion.usage).expect("usage");
+            assert_eq!(usage["completion_tokens"], self.tokens);
+            Ok(())
+        }
+    }
+    let mut loaded = tiny_loaded_model();
+    let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model":"tiny", "messages":[{"role":"user","content":"x"}],
+        "temperature":0, "stream":true, "stop":"STOP", "max_tokens":16
+    }))
+    .expect("requête");
+    let prepared = loaded.prepare(&request, 16).expect("préparation");
+    loaded.assets = super::super::streaming::incremental_tests::synthetic();
+    let mut boxes: Vec<Box<dyn CompletionSink>> = vec![
+        Box::new(ExactSink {
+            expected: "",
+            tokens: 1,
+            emitted: String::new(),
+        }),
+        Box::new(ExactSink {
+            expected: "é",
+            tokens: 6,
+            emitted: String::new(),
+        }),
+    ];
+    let mut sinks: Vec<&mut Box<dyn CompletionSink>> = boxes.iter_mut().collect();
+    let (outcomes, _) = loaded.drive_batch(&[&prepared, &prepared], &mut sinks, &[], |on_token| {
+        assert!(on_token(1, 0xc3));
+        // STOP suivi d'un fragment UTF-8 dans le même token : usage = 1.
+        assert!(!on_token(0, 258));
+        assert!(!on_token(0, 65), "aucun token consommé après le stop");
+        for byte in "éSTOP".bytes().skip(1).take(4) {
+            assert!(on_token(1, usize::from(byte)));
+        }
+        assert!(!on_token(1, usize::from(b'P')));
+        Ok(6)
+    });
+    assert!(outcomes.iter().all(Result::is_ok));
+}

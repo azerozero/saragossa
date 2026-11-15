@@ -13,7 +13,9 @@
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
 
-use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+#[cfg(test)]
+use hound::WavReader;
+use hound::{SampleFormat, WavSpec, WavWriter};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -27,12 +29,6 @@ use super::error::{ServeError, ServeResult};
 use super::http::{send_json, write_headers};
 use crate::RuntimeKind;
 
-/// Fréquence d'échantillonnage attendue par l'encodeur Whisper.
-const WHISPER_SAMPLE_RATE: u32 = 16_000;
-/// De la téléphonie à la prise de son haute résolution ; borne l'amplification à ×2.
-const WAV_SAMPLE_RATE_RANGE: std::ops::RangeInclusive<u32> = 8_000..=192_000;
-/// Valeurs entrelacées, tous canaux confondus : au plus 32 Mo décodés en f32.
-const MAX_WAV_SAMPLES: u64 = 8_000_000;
 /// Budget minimal conservé pour les clauses courtes.
 const MIN_TTS_MAX_FRAMES: usize = 160;
 /// Surcharge du cap de frames TTS pour les entrées longues.
@@ -496,195 +492,23 @@ fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
         .map_err(|e| ServeError::io("flush réponse texte", e))
 }
 
-/// Un champ de formulaire `multipart/form-data`.
-#[derive(Debug)]
-struct MultipartField {
-    name: String,
-    #[allow(
-        dead_code,
-        reason = "conservé pour le diagnostic des parties multipart"
-    )]
-    filename: Option<String>,
-    data: Vec<u8>,
+// Les cibles fuzz et le serveur exécutent le même décodeur, sans copie.
+#[cfg(test)]
+use saragossa::wire_audio::MAX_WAV_SAMPLES;
+use saragossa::wire_audio::{extract_boundary, text_field, MultipartField};
+
+#[cfg(test)]
+fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult<Vec<f32>> {
+    saragossa::wire_audio::downsample(samples, input_rate, target_rate)
+        .map_err(|e| ServeError::Http(e.0))
 }
 
-fn text_field(fields: &[MultipartField], name: &str) -> Option<String> {
-    let value = fields
-        .iter()
-        .find(|field| field.name == name)
-        .map(|field| String::from_utf8_lossy(&field.data).trim().to_string())?;
-    (!value.is_empty()).then_some(value)
-}
-
-/// Extrait la valeur `boundary` d'un Content-Type multipart.
-fn extract_boundary(content_type: &str) -> Option<String> {
-    for part in content_type.split(';') {
-        let Some((name, value)) = part.trim().split_once('=') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("boundary") {
-            let value = value.trim().trim_matches('"');
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Parse un corps `multipart/form-data` à la main (le serveur n'a pas de crate HTTP).
 fn parse_multipart(body: &[u8], boundary: &str) -> ServeResult<Vec<MultipartField>> {
-    let delimiter = format!("--{boundary}");
-    let delimiter = delimiter.as_bytes();
-    let closing = format!("\r\n--{boundary}");
-    let closing = closing.as_bytes();
-    let mut index = find_sub(body, delimiter)
-        .ok_or_else(|| ServeError::Http("délimiteur multipart absent".to_string()))?;
-    let mut fields = Vec::new();
-    loop {
-        let after_delim = index + delimiter.len();
-        // `--` après le délimiteur marque la frontière de clôture.
-        if body[after_delim..].starts_with(b"--") {
-            break;
-        }
-        let part_start = if body[after_delim..].starts_with(b"\r\n") {
-            after_delim + 2
-        } else {
-            return Err(ServeError::Http(
-                "délimiteur multipart sans fin de ligne".to_string(),
-            ));
-        };
-        let next = find_sub(&body[part_start..], closing).ok_or_else(|| {
-            ServeError::Http("partie multipart sans délimiteur suivant".to_string())
-        })?;
-        fields.push(parse_part(&body[part_start..part_start + next])?);
-        // Repositionne sur le délimiteur suivant (saute le `\r\n` de tête).
-        index = part_start + next + 2;
-    }
-    Ok(fields)
+    saragossa::wire_audio::parse_multipart(body, boundary).map_err(|e| ServeError::Http(e.0))
 }
 
-fn parse_part(part: &[u8]) -> ServeResult<MultipartField> {
-    let split = find_sub(part, b"\r\n\r\n")
-        .ok_or_else(|| ServeError::Http("partie multipart sans en-têtes".to_string()))?;
-    let headers = std::str::from_utf8(&part[..split])
-        .map_err(|e| ServeError::Http(format!("en-têtes multipart non UTF-8: {e}")))?;
-    let data = part[split + 4..].to_vec();
-    let mut name = None;
-    let mut filename = None;
-    for line in headers.split("\r\n") {
-        let Some((header, value)) = line.split_once(':') else {
-            continue;
-        };
-        if header.trim().eq_ignore_ascii_case("content-disposition") {
-            (name, filename) = parse_content_disposition(value);
-        }
-    }
-    let name = name.ok_or_else(|| ServeError::Http("Content-Disposition sans name".to_string()))?;
-    Ok(MultipartField {
-        name,
-        filename,
-        data,
-    })
-}
-
-fn parse_content_disposition(value: &str) -> (Option<String>, Option<String>) {
-    let mut name = None;
-    let mut filename = None;
-    for part in value.split(';') {
-        let Some((key, raw)) = part.trim().split_once('=') else {
-            continue;
-        };
-        let raw = raw.trim().trim_matches('"').to_string();
-        match key.trim().to_ascii_lowercase().as_str() {
-            "name" => name = Some(raw),
-            "filename" => filename = Some(raw),
-            _ => {}
-        }
-    }
-    (name, filename)
-}
-
-fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-/// Décode un WAV en échantillons mono f32 @ 16 kHz (format Whisper).
 fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
-    let invalid_wav = |e| ServeError::Http(format!("WAV invalide: {e}"));
-    let mut cursor = Cursor::new(bytes);
-    let file_len = hound::read_wave_header(&mut cursor).map_err(invalid_wav)?;
-    if file_len > bytes.len() as u64 {
-        return Err(ServeError::Http(
-            "WAV tronqué: taille RIFF supérieure au corps".into(),
-        ));
-    }
-    let reader = WavReader::new(Cursor::new(bytes)).map_err(invalid_wav)?;
-    let spec = reader.spec();
-    let samples_len = u64::from(reader.len());
-    let data_start = reader.into_inner().position() as usize;
-    // Le curseur de Hound suit immédiatement la taille du bloc data.
-    let size_bytes = bytes
-        .get(data_start.saturating_sub(4)..data_start)
-        .and_then(|raw| raw.try_into().ok())
-        .ok_or_else(|| ServeError::Http("WAV sans taille data".into()))?;
-    let data_len = u32::from_le_bytes(size_bytes);
-    // Hound déduit la longueur de l'itérateur de l'en-tête, sans vérifier le corps.
-    // Vérifier les octets stockés (y compris le padding des samples) avant collect.
-    if data_start as u64 + u64::from(data_len) > file_len {
-        return Err(ServeError::Http(
-            "WAV tronqué: bloc data supérieur au corps RIFF".into(),
-        ));
-    }
-    validate_wav_limits(spec.sample_rate, spec.channels, samples_len)?;
-    let mut reader = WavReader::new(Cursor::new(bytes)).map_err(invalid_wav)?;
-    let samples: Vec<f32> = match spec.sample_format {
-        SampleFormat::Int => match spec.bits_per_sample {
-            16 => reader
-                .samples::<i16>()
-                .map(|sample| sample.map(|value| f32::from(value) / f32::from(i16::MAX)))
-                .collect::<Result<Vec<_>, _>>(),
-            bits @ (24 | 32) => {
-                // hound rend la valeur 24 bits telle quelle dans un i32, sans la décaler.
-                let full_scale = ((1_u64 << (bits - 1)) - 1) as f32;
-                reader
-                    .samples::<i32>()
-                    .map(|sample| sample.map(|value| value as f32 / full_scale))
-                    .collect()
-            }
-            other => {
-                return Err(ServeError::Http(format!(
-                    "profondeur WAV non supportée: {other} bits"
-                )))
-            }
-        },
-        SampleFormat::Float => reader.samples::<f32>().collect(),
-    }
-    .map_err(invalid_wav)?;
-    let mono = to_mono(&samples, spec.channels as usize);
-    downsample(&mono, spec.sample_rate, WHISPER_SAMPLE_RATE)
-}
-
-fn validate_wav_limits(sample_rate: u32, channels: u16, samples: u64) -> ServeResult<()> {
-    if !WAV_SAMPLE_RATE_RANGE.contains(&sample_rate) {
-        return Err(ServeError::Http(format!(
-            "taux WAV hors plage 8000–192000 Hz: {sample_rate}"
-        )));
-    }
-    if channels == 0 {
-        return Err(ServeError::Http("WAV sans canal".into()));
-    }
-    if samples > MAX_WAV_SAMPLES {
-        return Err(ServeError::Http(format!(
-            "WAV dépasse {MAX_WAV_SAMPLES} échantillons"
-        )));
-    }
-    Ok(())
+    saragossa::wire_audio::wav_to_mono_16k(bytes).map_err(|e| ServeError::Http(e.0))
 }
 
 /// Encode des échantillons mono f32 en WAV PCM i16 en mémoire.
@@ -712,45 +536,14 @@ fn mono_f32_to_wav(samples: &[f32], sample_rate: u32) -> ServeResult<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
-/// Replie des canaux entrelacés en mono par moyenne.
-fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
-    if channels <= 1 {
-        return samples.to_vec();
+#[cfg(test)]
+fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
     }
-    samples
-        .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect()
-}
-
-/// Rééchantillonne linéairement vers `target_rate` (sur/sous-échantillonnage).
-fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult<Vec<f32>> {
-    validate_wav_limits(input_rate, 1, samples.len() as u64)?;
-    validate_wav_limits(target_rate, 1, 0)?;
-    if input_rate == target_rate || samples.is_empty() {
-        return Ok(samples.to_vec());
-    }
-    if input_rate < target_rate {
-        let ratio = f64::from(target_rate) / f64::from(input_rate);
-        let out_len = (samples.len() as f64 * ratio) as usize;
-        validate_wav_limits(target_rate, 1, out_len as u64)?;
-        return Ok((0..out_len)
-            .map(|i| samples[((i as f64 / ratio) as usize).min(samples.len() - 1)])
-            .collect());
-    }
-    let ratio = f64::from(input_rate) / f64::from(target_rate);
-    let out_len = (samples.len() as f64 / ratio) as usize;
-    validate_wav_limits(target_rate, 1, out_len as u64)?;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let start = (i as f64 * ratio) as usize;
-        let end = (((i + 1) as f64) * ratio) as usize;
-        let slice = &samples[start..end.min(samples.len())];
-        if !slice.is_empty() {
-            out.push(slice.iter().sum::<f32>() / slice.len() as f32);
-        }
-    }
-    Ok(out)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -1174,3 +967,6 @@ mod tests {
 
 #[cfg(test)]
 mod stream_tests;
+
+#[cfg(test)]
+mod mutation_tests;

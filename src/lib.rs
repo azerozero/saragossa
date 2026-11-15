@@ -41,6 +41,8 @@ pub mod runtime_flags;
 pub mod runtime_preset;
 pub mod safetensor;
 pub mod sampling;
+#[doc(hidden)]
+pub mod sse;
 pub mod tensor;
 pub mod text_embedder;
 pub mod tokenizer;
@@ -52,6 +54,8 @@ pub(crate) mod tts_codec_gpu;
 pub mod tts_mimi;
 pub mod tts_speaker;
 pub mod whisper;
+#[doc(hidden)]
+pub mod wire_audio;
 
 #[cfg(test)]
 pub(crate) mod test_support;

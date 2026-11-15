@@ -36,7 +36,12 @@ pub(super) fn load_qwen3_tts_tokenizer(dir: &Path) -> Result<Tokenizer> {
         .iter()
         .map(|(content, special)| AddedToken::from(*content, *special))
         .collect::<Vec<_>>();
-    tokenizer.add_special_tokens(&added);
+    tokenizer
+        .add_special_tokens(added)
+        .map_err(|err| InferError::Tokenizer {
+            path: dir.to_path_buf(),
+            message: format!("ajout des tokens spéciaux Qwen3-TTS: {err}"),
+        })?;
     Ok(tokenizer)
 }
 
