@@ -1,4 +1,4 @@
-# Modèles de décision Qwen3.5 (THX-02, d3-flash)
+# Modèles de décision Qwen3.5 (THX-02, d3-flash, d3-mini, H2O-Lightning)
 
 `saragossa::decision` expose le Decider joint de THX-02 (HAL-X-AI/THX-02,
 Apache-2.0) et le format `d3-code-readout-v1` de d3-flash (vllm-sr/d3-flash,
@@ -153,6 +153,25 @@ et 2048 tokens, tolérance figée 0,0184 (deux fois le bruit bf16 mesuré
 SARAGOSSA_DECISION_D3_MODEL=DOSSIER cargo test --release --all-features \
   decision_d3_real_weight_oracle -- --ignored
 cargo run --release --example decision_bench -- DOSSIER tests/fixtures/decision/d3
+```
+
+### d3-mini
+
+d3-mini (vllm-sr/d3-mini, Apache-2.0) publie le même format
+`d3-code-readout-v1` sur Qwen3.5-4B (hidden 2560, MLP 9216, deux shards,
+`tie_word_embeddings=true`, tête ignorée) : aucun code propre. Les 31 SHA-256
+de `MODEL_MANIFEST.json` sont vérifiés et ses fichiers Python identiques à
+ceux de d3-flash. Oracle : `tests/fixtures/decision/d3-mini/`, même corpus de
+39 questions et prompts de 128, 512 et 2048 tokens que d3-flash, tolérance
+figée 0,0133 (deux fois le bruit bf16 mesuré + 1e-6) ; écart mesuré 0,0041.
+Mesure provisoire (machine utilisée, ABBA, 21 répétitions, p50) contre Torch
+MPS bf16 sur le même graphe : 52 contre 86 ms à 128 tokens, 125 contre 205 ms
+à 512, 543 contre 966 ms à 2048.
+
+```sh
+SARAGOSSA_DECISION_D3_MINI_MODEL=DOSSIER cargo test --release --all-features \
+  decision_d3_mini_real_weight_oracle -- --ignored
+cargo run --release --example decision_bench -- DOSSIER tests/fixtures/decision/d3-mini
 ```
 
 openjev (27B) devra fournir ses propres oracles ; sa configuration et son
