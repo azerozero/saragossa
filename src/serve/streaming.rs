@@ -133,6 +133,7 @@ pub(crate) struct StreamingTextDetokenizer<'a> {
     stable_len: usize,
     max_stop_len: usize,
     fallback_decodes: usize,
+    degraded: bool,
     controls: Vec<(u32, &'static str)>,
     emitter: StreamingTextEmitter,
     stopped: bool,
@@ -155,6 +156,7 @@ impl<'a> StreamingTextDetokenizer<'a> {
             stable_len: 0,
             max_stop_len: stop_texts.iter().map(String::len).max().unwrap_or(0),
             fallback_decodes: 0,
+            degraded: false,
             controls: completion_controls(assets),
             emitter: StreamingTextEmitter::default(),
             stopped: false,
@@ -186,7 +188,10 @@ impl<'a> StreamingTextDetokenizer<'a> {
                 }
                 // Une fenêtre pathologique (U+FFFD répété) ou une divergence
                 // ne doit ni croître sans borne ni compromettre l'oracle.
-                _ => self.stream = None,
+                _ => {
+                    self.degraded = true;
+                    self.stream = None;
+                }
             }
         }
         if self.stream.is_none() {
@@ -238,7 +243,7 @@ impl<'a> StreamingTextDetokenizer<'a> {
 
 impl Drop for StreamingTextDetokenizer<'_> {
     fn drop(&mut self) {
-        if self.fallback_decodes != 0 {
+        if self.degraded {
             eprintln!(
                 "saragossa serve detokenizer fallback_decodes={} generated_tokens={}",
                 self.fallback_decodes,

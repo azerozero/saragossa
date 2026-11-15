@@ -147,6 +147,25 @@ fn serve_oracle(assets: &ModelAssets, ids: &[u32], stops: &[String]) -> usize {
 }
 
 #[test]
+fn only_qualified_stream_degradation_enables_diagnostics() {
+    let qualified = synthetic();
+    let gemma = assets(synthetic().tokenizer, "gemma4");
+    for (assets, expected_degraded) in [(&qualified, true), (&gemma, false)] {
+        let mut stream = StreamingTextDetokenizer::new(assets, &[], 65);
+        for _ in 0..64 {
+            stream.push_token(257, &mut |_| Ok(())).expect("step");
+            assert!(!stream.degraded);
+        }
+        stream.push_token(257, &mut |_| Ok(())).expect("step");
+        assert_eq!(stream.degraded, expected_degraded);
+        assert_eq!(
+            stream.fallback_decodes,
+            if expected_degraded { 1 } else { 65 }
+        );
+    }
+}
+
+#[test]
 fn bytelevel_utf8_specials_leading_spaces_and_all_finish_boundaries() {
     let assets = synthetic();
     for ids in [
