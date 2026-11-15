@@ -40,6 +40,21 @@ template<uint B, uint G> inline float micro_value(device const uint* w, device c
     return micro_scaled<B, G>(q, scales[i / G]);
 }
 
+// Le store NAX partagé ne masque que M : avec N non multiple de 64, les
+// colonnes du dernier bloc déborderaient sur la ligne suivante.
+inline void micro_store_c(const thread metal::vec<float, 8>& src, device float* dst,
+                          uint m_base, uint n_base, uint N, uint M) {
+    short2 sc = NaxFrag::get_coord();
+    for (short i = 0; i < 2; i++) {
+        uint row = m_base + uint(sc.y) + uint(i) * 8u;
+        if (row >= M) continue;
+        for (short j = 0; j < 4; j++) {
+            uint col = n_base + uint(sc.x) + uint(j);
+            if (col < N) dst[size_t(row) * N + col] = src[i * 4 + j];
+        }
+    }
+}
+
 // Chaque thread charge une demi-ligne (32 poids) et écrit quatre vecteurs
 // bf16 alignés. K est multiple de 64 ; le masque N traite les dernières lignes.
 template<uint B, uint G>
@@ -133,10 +148,10 @@ kernel void micro_gemm_mxfp4(device const bfloat* A [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  NaxFrag::store_c_masked(c0a, C, m0, n0 + ns, N, M);
-  NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
-  NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
-  NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+  micro_store_c(c0a, C, m0, n0 + ns, N, M);
+  micro_store_c(c0b, C, m0, n0 + ns + 16u, N, M);
+  micro_store_c(c1a, C, m0 + 16u, n0 + ns, N, M);
+  micro_store_c(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
 }
 
 kernel void micro_qmv_nvfp4(device const float* x [[buffer(0)]], device const uint* w [[buffer(1)]], device const uchar* scales [[buffer(2)]], device float* y [[buffer(4)]], constant uint3& dims [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
@@ -201,10 +216,10 @@ kernel void micro_gemm_nvfp4(device const bfloat* A [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  NaxFrag::store_c_masked(c0a, C, m0, n0 + ns, N, M);
-  NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
-  NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
-  NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+  micro_store_c(c0a, C, m0, n0 + ns, N, M);
+  micro_store_c(c0b, C, m0, n0 + ns + 16u, N, M);
+  micro_store_c(c1a, C, m0 + 16u, n0 + ns, N, M);
+  micro_store_c(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
 }
 
 kernel void micro_qmv_mxfp8(device const float* x [[buffer(0)]], device const uint* w [[buffer(1)]], device const uchar* scales [[buffer(2)]], device float* y [[buffer(4)]], constant uint3& dims [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
@@ -269,8 +284,8 @@ kernel void micro_gemm_mxfp8(device const bfloat* A [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  NaxFrag::store_c_masked(c0a, C, m0, n0 + ns, N, M);
-  NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
-  NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
-  NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+  micro_store_c(c0a, C, m0, n0 + ns, N, M);
+  micro_store_c(c0b, C, m0, n0 + ns + 16u, N, M);
+  micro_store_c(c1a, C, m0 + 16u, n0 + ns, N, M);
+  micro_store_c(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
 }
