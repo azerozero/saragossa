@@ -56,6 +56,35 @@ fn events(bytes: Vec<u8>) -> Vec<Value> {
 }
 
 #[test]
+fn tools_keep_main_sorted_bytes_and_argument_strings_keep_source_order() {
+    let expected_tool = r#"{"function":{"description":"D","name":"f","parameters":{"properties":{"a":{"type":"string"},"z":{"type":"integer"}},"type":"object"},"strict":false},"type":"function"}"#;
+    let arguments = r#"{"z":2,"a":"é"}"#;
+    for parameters in [
+        r#"{"type":"object","properties":{"z":{"type":"integer"},"a":{"type":"string"}}}"#,
+        r#"{"properties":{"a":{"type":"string"},"z":{"type":"integer"}},"type":"object"}"#,
+    ] {
+        let parameters: Value = serde_json::from_str(parameters).expect("invariant: JSON valide");
+        let req = request(json!({
+            "tools":[{"type":"function","name":"f","description":"D","parameters":parameters}],
+            "input":[
+                {"type":"function_call","call_id":"c","name":"f","arguments":arguments},
+                {"type":"function_call_output","call_id":"c","output":"ok"}
+            ]
+        }));
+        assert_eq!(
+            req.chat.active_tools().expect("invariant: outils actifs")[0]
+                .json
+                .as_bytes(),
+            expected_tool.as_bytes()
+        );
+        assert_eq!(
+            req.chat.template_messages()[0].tool_calls[0],
+            r#"{"function":{"arguments":"{\"z\":2,\"a\":\"é\"}","name":"f"},"id":"c","type":"function"}"#
+        );
+    }
+}
+
+#[test]
 fn converts_roles_instructions_and_text_parts() {
     let req = request(json!({"instructions":"règle", "input":[
         {"role":"developer","content":"contrainte"},

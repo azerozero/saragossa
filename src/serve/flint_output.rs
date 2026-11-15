@@ -454,7 +454,13 @@ fn expect(text: &str, done: bool, markers: &[&str]) -> Expect {
 fn arguments_json(arguments: &[(String, Value)]) -> String {
     let members: Vec<String> = arguments
         .iter()
-        .map(|(key, value)| format!("{}:{value}", Value::String(key.clone())))
+        .map(|(key, value)| {
+            format!(
+                "{}:{}",
+                Value::String(key.clone()),
+                saragossa::chat_template::canonical_json::to_string(value)
+            )
+        })
         .collect();
     format!("{{{}}}", members.join(","))
 }
@@ -486,6 +492,16 @@ fn typed_argument(tools: &[Value], name: &str, key: &str, raw: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replayed_arguments_keep_source_order_and_sort_nested_objects() {
+        let nested: Value =
+            serde_json::from_str(r#"[{"z":2,"a":1}]"#).expect("invariant: JSON valide");
+        assert_eq!(
+            arguments_json(&[("z".into(), nested), ("a".into(), Value::Null)]),
+            r#"{"z":[{"a":1,"z":2}],"a":null}"#
+        );
+    }
 
     fn tools() -> Vec<Value> {
         serde_json::from_str(

@@ -12,7 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from matrix import ANTHROPIC_TOOL, OPENAI_TOOL, Matrix, sdk_body
-from test_contracts import events, message
+from test_contracts import chat, events, message
 from transport import Clients
 
 
@@ -50,7 +50,8 @@ class SDK(unittest.TestCase):
             response_format={"type": "json_object"}, stream_options={"include_usage": True},
             tools=[OPENAI_TOOL], tool_choice="auto", stream=True)
         anthropic = sdk_body(self.matrix.chat_body(system="Bonjour", stop_sequences=["Bonjour"],
-            tools=[ANTHROPIC_TOOL], tool_choice={"type": "auto"}, stream=True), True)
+            tools=[ANTHROPIC_TOOL], tool_choice={"type": "auto"}, stream=True,
+            output_config={"format":{"type":"json_schema", "schema":{"type":"object"}}}), True)
         embedding = dict(model="test", input=["Bonjour"], encoding_format="float")
         speech = dict(model="test", input="Bonjour", voice="alloy", response_format="wav")
         transcription = dict(model="whisper", file=("probe.wav", b"fixture", "audio/wav"),
@@ -102,6 +103,26 @@ class SDK(unittest.TestCase):
             self.matrix.stream(anthropic=True)
         self.assertEqual(wire.call_args.args[1]["temperature"], 0)
         self.assert_temperature_on_wire()
+
+    def test_json_schema_content_and_wire_on_both_apis(self):
+        for anthropic in (False, True):
+            self.response = message() if anthropic else chat()
+            content = '{"city":"Paris","greeting":"Bonjour"}'
+            if anthropic:
+                self.response["content"][0]["text"] = content
+            else:
+                self.response["choices"][0]["message"]["content"] = content
+            self.matrix.json_schema(0.8, anthropic)
+            body = json.loads(self.requests[-1].content)
+            self.assertEqual(body["temperature"], 0.8)
+            schema = body["output_config"]["format"]["schema"] if anthropic else body["response_format"]["json_schema"]["schema"]
+            self.assertEqual(schema["required"], ["city", "greeting"])
+            if anthropic:
+                self.response["content"][0]["text"] = "{}"
+            else:
+                self.response["choices"][0]["message"]["content"] = "{}"
+            with self.assertRaisesRegex(AssertionError, "required"):
+                self.matrix.json_schema(0, anthropic)
 
     def test_anthropic_unknown_model_reaches_http_error(self):
         self.status = 404

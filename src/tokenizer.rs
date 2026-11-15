@@ -114,6 +114,28 @@ impl RustTokenizer {
         self.decode(&[id], true).map(String::into_bytes)
     }
 
+    /// Raw HF surfaces preserve split UTF-8 bytes and SentencePiece spaces.
+    pub(crate) fn schema_token_bytes(&self) -> Result<Vec<Vec<u8>>> {
+        let serialized = self
+            .inner
+            .to_string(false)
+            .map_err(|error| InferError::Config(format!("json_schema tokenizer: {error}")))?;
+        let value: serde_json::Value = serde_json::from_str(&serialized)
+            .map_err(|error| InferError::Config(format!("json_schema tokenizer: {error}")))?;
+        // WordLevel is used by the small, single-token integration fixtures.
+        if value["model"]["type"].as_str() == Some("WordLevel") && value["decoder"].is_null() {
+            return (0..self.vocab_size())
+                .map(|id| {
+                    let id = u32::try_from(id)
+                        .map_err(|_| InferError::Config("token id hors u32".into()))?;
+                    self.decode_token_bytes(id)
+                })
+                .collect();
+        }
+        llguidance::token_bytes_from_tokenizer_json(&value)
+            .map_err(|error| InferError::Config(format!("json_schema tokenizer: {error}")))
+    }
+
     #[must_use]
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
         self.inner.token_to_id(token)

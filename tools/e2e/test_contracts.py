@@ -189,14 +189,14 @@ class Runner(unittest.TestCase):
         action.assert_not_called()
 
     def test_expected_rejection_failure_is_not_hidden(self):
-        case = Case(CHAT, "json_schema", Mock(side_effect=AssertionError("accepted")), "expected 501",
+        case = Case(CHAT, "unsupported_fixture", Mock(side_effect=AssertionError("accepted")), "expected 501",
                     verify_rejection=True)
         row = execute_case(case, "test", "ar")
         self.assertEqual(row["status"], FAIL)
         self.assertTrue(row["executed"])
 
     def test_successful_rejection_remains_unsupported(self):
-        case = Case(CHAT, "json_schema", lambda: None, "expected 501", verify_rejection=True)
+        case = Case(CHAT, "unsupported_fixture", lambda: None, "expected 501", verify_rejection=True)
         self.assertEqual(execute_case(case, "test", "ar")["status"], UNSUPPORTED)
 
     def test_report_counts_and_redaction(self):
