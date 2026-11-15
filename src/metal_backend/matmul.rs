@@ -1271,12 +1271,12 @@ impl MetalExecutor {
                 let mut scales = Vec::new();
                 for weight in weights {
                     let LinearWeight::MicroScaled(weight) = weight else {
-                        return Err(InferError::Config(
+                        return Err(InferError::Dimension(
                             "concat micro avec stockage différent".into(),
                         ));
                     };
                     if weight.mode() != mode || weight.shape()[1] != in_dim {
-                        return Err(InferError::Config("concat micro incompatible".into()));
+                        return Err(InferError::Dimension("concat micro incompatible".into()));
                     }
                     rows = rows
                         .checked_add(weight.shape()[0])

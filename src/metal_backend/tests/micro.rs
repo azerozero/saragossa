@@ -34,6 +34,27 @@ fn micro_dequant_and_matmul_bit_exact() -> Result<()> {
     let metal = MetalExecutor::new()?;
     for mode in [MicroMode::Mxfp4, MicroMode::Nvfp4, MicroMode::Mxfp8] {
         let w = weight(mode, 67, 256)?;
+        // Le setup résident replie les concats incompatibles uniquement sur
+        // Dimension ; des overrides MLX par projection doivent rester valides.
+        let source = LinearWeight::MicroScaled(w.clone());
+        let other_mode = if mode == MicroMode::Mxfp4 {
+            MicroMode::Nvfp4
+        } else {
+            MicroMode::Mxfp4
+        };
+        let different_mode = LinearWeight::MicroScaled(weight(other_mode, 3, 256)?);
+        let dense = LinearWeight::Dense(Tensor::from_vec(vec![3, 256], vec![0.0; 3 * 256])?);
+        for other in [&different_mode, &dense] {
+            for _ in 0..2 {
+                assert!(matches!(
+                    metal.resolve_concat_linear_weight_buffers(
+                        &[&source, other],
+                        "micro_mixed_concat"
+                    ),
+                    Err(InferError::Dimension(_))
+                ));
+            }
+        }
         let buffers = metal.resolve_micro(&w)?;
         let expected = w.dequantize()?;
         let out = metal.new_f32_buffer(expected.len(), "micro_dequant_test")?;
@@ -98,47 +119,56 @@ fn micro_all_scale_bytes_bit_exact() -> Result<()> {
     let metal = MetalExecutor::new()?;
     for mode in [MicroMode::Mxfp4, MicroMode::Nvfp4, MicroMode::Mxfp8] {
         let k = mode.group_size();
-        let word = if mode.bits() == 4 {
-            0x2222_2222
+        // Valeur 1, plus petit/grand code non nul et leurs opposés : couvre
+        // sous-normaux, signes et débordements, sans comparer des payloads NaN.
+        let codes = if mode.bits() == 4 {
+            [2, 1, 7, 9, 15]
         } else {
-            0x3838_3838
+            [56, 1, 127, 129, 255]
         };
-        let w = MicroQuantizedTensor::new(
-            [256, k],
-            vec![word; 256 * k * mode.bits() / 32],
-            (0..=255).collect(),
-            mode,
-        )?;
-        let buffers = metal.resolve_micro(&w)?;
-        let expected = w.dequantize()?;
-        let out = metal.new_f32_buffer(expected.len(), "micro_all_scales")?;
-        let pipeline = metal.micro_pipeline(&format!("micro_dequant_{}", mode.name()))?;
-        let cb = metal.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&pipeline);
-        enc.set_buffer(0, Some(&buffers.packed), 0);
-        enc.set_buffer(1, Some(&buffers.scales), 0);
-        enc.set_buffer(2, Some(&out), 0);
-        set_u32_bytes(enc, 3, &[expected.len() as u32], "micro_count")?;
-        enc.dispatch_threads(
-            MTLSize::new(expected.len() as u64, 1, 1),
-            MTLSize::new(128, 1, 1),
-        );
-        enc.end_encoding();
-        commit_and_wait(cb)?;
-        for (i, (gpu, cpu)) in read_f32_buffer(&out, expected.len())?
-            .iter()
-            .zip(expected.data())
-            .enumerate()
-        {
-            assert_eq!(
-                gpu.to_bits(),
-                cpu.to_bits(),
-                "{} scale={} column={}",
-                mode.name(),
-                i / k,
-                i % k
+        for code in codes {
+            let word = if mode.bits() == 4 {
+                0x1111_1111 * code
+            } else {
+                0x0101_0101 * code
+            };
+            let w = MicroQuantizedTensor::new(
+                [256, k],
+                vec![word; 256 * k * mode.bits() / 32],
+                (0..=255).collect(),
+                mode,
+            )?;
+            let buffers = metal.resolve_micro(&w)?;
+            let expected = w.dequantize()?;
+            let out = metal.new_f32_buffer(expected.len(), "micro_all_scales")?;
+            let pipeline = metal.micro_pipeline(&format!("micro_dequant_{}", mode.name()))?;
+            let cb = metal.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&buffers.packed), 0);
+            enc.set_buffer(1, Some(&buffers.scales), 0);
+            enc.set_buffer(2, Some(&out), 0);
+            set_u32_bytes(enc, 3, &[expected.len() as u32], "micro_count")?;
+            enc.dispatch_threads(
+                MTLSize::new(expected.len() as u64, 1, 1),
+                MTLSize::new(128, 1, 1),
             );
+            enc.end_encoding();
+            commit_and_wait(cb)?;
+            for (i, (gpu, cpu)) in read_f32_buffer(&out, expected.len())?
+                .iter()
+                .zip(expected.data())
+                .enumerate()
+            {
+                assert_eq!(
+                    gpu.to_bits(),
+                    cpu.to_bits(),
+                    "{} code={code} scale={} column={}",
+                    mode.name(),
+                    i / k,
+                    i % k
+                );
+            }
         }
     }
     Ok(())
