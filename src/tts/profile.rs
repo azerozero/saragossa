@@ -51,6 +51,24 @@ pub(super) struct FrameProfile {
     enabled: bool,
     totals: [Totals; PHASES.len()],
     started: Option<Instant>,
+    /// Dispatches par site source et par phase, sous
+    /// `SARAGOSSA_RUST_DECODE_PROFILE_SITES=1`.
+    sites: Option<Vec<SiteCounts>>,
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+type SiteCounts = std::collections::HashMap<crate::metal_backend::DispatchProfileSite, u64>;
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+type SiteCounts = ();
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn sites_snapshot(enabled: bool) -> Option<SiteCounts> {
+    enabled.then(crate::metal_backend::decode_profile_dispatch_sites_snapshot)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+fn sites_snapshot(_enabled: bool) -> Option<SiteCounts> {
+    None
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -72,10 +90,13 @@ fn gpu_counters() -> [u64; 4] {
 impl FrameProfile {
     pub(super) fn new() -> Self {
         let enabled = super::tts_internal_profile_enabled();
+        let sites =
+            enabled && crate::runtime_flags::env_flag("SARAGOSSA_RUST_DECODE_PROFILE_SITES", false);
         Self {
             enabled,
             totals: [Totals::default(); PHASES.len()],
             started: enabled.then(Instant::now),
+            sites: sites.then(|| vec![SiteCounts::default(); PHASES.len()]),
         }
     }
 
@@ -84,11 +105,24 @@ impl FrameProfile {
         if !self.enabled {
             return work();
         }
+        let sites_before = sites_snapshot(self.sites.is_some());
         let before = gpu_counters();
         let started = Instant::now();
         let out = work();
         let wall = started.elapsed();
         let after = gpu_counters();
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let (Some(before), Some(sites)) = (sites_before, self.sites.as_mut()) {
+            let counts = &mut sites[phase as usize];
+            for (site, count) in crate::metal_backend::decode_profile_dispatch_sites_snapshot() {
+                let delta = count.saturating_sub(before.get(&site).copied().unwrap_or(0));
+                if delta > 0 {
+                    *counts.entry(site).or_insert(0) += delta;
+                }
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = sites_before;
         let delta = |index: usize| after[index].saturating_sub(before[index]);
         let totals = &mut self.totals[phase as usize];
         totals.wall += wall;
@@ -121,5 +155,20 @@ impl FrameProfile {
             ));
         }
         eprintln!("{line}");
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(sites) = &self.sites {
+            for ((name, _), counts) in PHASES.iter().zip(sites) {
+                let mut rows = counts.iter().collect::<Vec<_>>();
+                rows.sort_by(|left, right| right.1.cmp(left.1));
+                for (site, count) in rows {
+                    eprintln!(
+                        "perf tts.frame.site phase={name} per_frame={:.1} at {}:{}",
+                        per(*count as f64),
+                        site.file,
+                        site.line
+                    );
+                }
+            }
+        }
     }
 }
