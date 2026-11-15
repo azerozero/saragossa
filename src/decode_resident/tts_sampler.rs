@@ -33,6 +33,7 @@ using namespace metal;
 constant uint SORT_N = 2048u;
 constant uint THREADS = 1024u;
 constant uint TRACE_K = 64u;
+constant uint PARTIAL_K = 64u;
 
 static inline float tts_splitmix_unit_f32(ulong state) {
     state += 0x9E3779B97F4A7C15ul;
@@ -49,7 +50,8 @@ static inline bool tts_ranks_before(float pa, uint ia, float pb, uint ib) {
     return pa > pb || (pa == pb && ia < ib);
 }
 
-// dims = (count, top_k, slot, trace), params = (temperature, top_p).
+// dims = (count, top_k, slot, drapeaux : bit 0 trace, bit 1 sélection
+// partielle), params = (temperature, top_p).
 // `rng_state` est l'état AVANT le tirage (DeterministicSampler::state()).
 kernel void tts_sample_codebook_f32(
     device const float* logits [[buffer(0)]],
@@ -107,6 +109,69 @@ kernel void tts_sample_codebook_f32(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    if ((dims.w & 2u) != 0u && dims.y <= PARTIAL_K) {
+        // Sélection partielle exacte des PARTIAL_K premiers rangs : chaque
+        // simdgroup trie son bloc de 64, puis cinq niveaux fusionnent deux blocs
+        // en gardant les 64 meilleurs. L'ordre (probabilité, indice) est strict :
+        // ces rangs sont ceux du tri complet, au bit près.
+        const uint lane = tid % 32u;
+        const uint simd = tid / 32u;
+        for (uint k = 2u; k <= PARTIAL_K; k <<= 1u) {
+            for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+                const uint a = (tid / j) * 2u * j + (tid % j);
+                const uint b = a + j;
+                const float pa = probs[a];
+                const float pb = probs[b];
+                const uint ia = ids[a];
+                const uint ib = ids[b];
+                const bool descending = k == PARTIAL_K || (a & k) == 0u;
+                if (descending != tts_ranks_before(pa, ia, pb, ib)) {
+                    probs[a] = pb;
+                    probs[b] = pa;
+                    ids[a] = ib;
+                    ids[b] = ia;
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+        for (uint span = 1u; span < SORT_N / PARTIAL_K; span <<= 1u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint block = simd * 2u * span;
+            if (block < SORT_N / PARTIAL_K) {
+                const uint base_a = block * PARTIAL_K;
+                const uint base_b = (block + span) * PARTIAL_K;
+                // Bloc A décroissant contre B renversé : le meilleur de chaque
+                // couple forme une suite bitonique des 64 premiers de A ∪ B.
+                for (uint r = lane; r < PARTIAL_K; r += 32u) {
+                    const float pa = probs[base_a + r];
+                    const uint ia = ids[base_a + r];
+                    const float pb = probs[base_b + PARTIAL_K - 1u - r];
+                    const uint ib = ids[base_b + PARTIAL_K - 1u - r];
+                    if (!tts_ranks_before(pa, ia, pb, ib)) {
+                        probs[base_a + r] = pb;
+                        ids[base_a + r] = ib;
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint j = PARTIAL_K >> 1u; j > 0u; j >>= 1u) {
+                    const uint a = base_a + (lane / j) * 2u * j + (lane % j);
+                    const uint b = a + j;
+                    const float pa = probs[a];
+                    const float pb = probs[b];
+                    const uint ia = ids[a];
+                    const uint ib = ids[b];
+                    if (!tts_ranks_before(pa, ia, pb, ib)) {
+                        probs[a] = pb;
+                        probs[b] = pa;
+                        ids[a] = ib;
+                        ids[b] = ia;
+                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
     // Tri bitonique complet, décroissant par rang ; le bourrage (-1) finit en queue.
     for (uint k = 2u; k <= SORT_N; k <<= 1u) {
         for (uint j = k >> 1u; j > 0u; j >>= 1u) {
@@ -125,6 +190,7 @@ kernel void tts_sample_codebook_f32(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+    }
     }
 
     if (tid != 0u) {
@@ -176,7 +242,7 @@ kernel void tts_sample_codebook_f32(
     }
     const uint slot = dims.z;
     codes[slot] = chosen;
-    if (dims.w != 0u) {
+    if ((dims.w & 1u) != 0u) {
         device float* row = trace + slot * 2u * TRACE_K;
         for (uint r = 0u; r < TRACE_K; ++r) {
             const bool live = r < kept;
@@ -265,7 +331,8 @@ impl DecodeResidentState {
             to_u32(count, "tirage TTS vocab")?,
             to_u32(sample.top_k, "tirage TTS top_k")?,
             to_u32(slot, "tirage TTS slot")?,
-            u32::from(trace.is_some()),
+            u32::from(trace.is_some())
+                | (u32::from(crate::runtime_flags::tts_sampler_partial_topk_enabled()) << 1),
         ];
         let params = [sample.temperature, sample.top_p];
         let kernel = self.tts_sampler_kernel()?;
@@ -290,4 +357,77 @@ fn set_bytes<T: Copy>(encoder: &ComputeCommandEncoderRef, index: u64, values: &[
         std::mem::size_of_val(values) as u64,
         values.as_ptr().cast::<c_void>(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sélection partielle contre tri complet : mêmes codes et mêmes traces au
+    /// bit près, logits aléatoires avec ex aequo et vocabulaires partiels.
+    #[test]
+    fn partial_topk_matches_full_sort() -> Result<()> {
+        let Some(state) = super::super::tests::try_state()? else {
+            return Ok(());
+        };
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..48_usize {
+            let count = [2048, 2048, 1931, 777][case % 4];
+            let top_k = [50, 64, 1, 17][case / 4 % 4];
+            // Valeurs entières répétées : nombreux ex aequo exacts.
+            let logits = (0..count)
+                .map(|_| {
+                    let raw = next();
+                    if case % 3 == 0 {
+                        (raw % 7) as f32
+                    } else {
+                        (raw % 20_000) as f32 / 1000.0 - 10.0
+                    }
+                })
+                .collect::<Vec<_>>();
+            let sample = TtsCodebookSample {
+                temperature: [0.9, 1.0, 0.3][case % 3],
+                top_k,
+                top_p: [1.0, 0.8, 0.95][case / 3 % 3],
+            };
+            let rng = next();
+            let run = |partial: bool| -> Result<(Vec<u32>, Vec<u32>)> {
+                crate::runtime_flags::with_tts_sampler_partial_topk(partial, || {
+                    let input = super::super::tests::lease_with(&state, &logits)?;
+                    let codes = state.scratch().lease(1, GpuElement::U32)?;
+                    let trace = state
+                        .scratch()
+                        .lease(2 * TTS_SAMPLER_TRACE_K, GpuElement::F32)?;
+                    let command_buffer = state.queue().new_command_buffer();
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    state.encode_tts_codebook_sample(
+                        encoder,
+                        input.tensor().buffer(),
+                        count,
+                        codes.tensor().buffer(),
+                        0,
+                        Some(trace.tensor().buffer()),
+                        sample,
+                        rng,
+                    )?;
+                    encoder.end_encoding();
+                    crate::metal_backend::commit_and_wait(command_buffer)?;
+                    let codes = crate::metal_backend::read_u32_buffer(codes.tensor().buffer(), 1)?;
+                    let trace = crate::metal_backend::read_f32_buffer(
+                        trace.tensor().buffer(),
+                        2 * TTS_SAMPLER_TRACE_K,
+                    )?;
+                    Ok((codes, trace.iter().map(|value| value.to_bits()).collect()))
+                })
+            };
+            assert_eq!(run(true)?, run(false)?, "cas {case}");
+        }
+        Ok(())
+    }
 }

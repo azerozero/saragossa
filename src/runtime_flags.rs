@@ -2956,6 +2956,33 @@ pub(crate) fn tts_codec_gpu_prefix_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CODEC_GPU_PREFIX", true))
 }
 
+/// Tirage TTS GPU : sélection partielle exacte des 64 premiers rangs (tri
+/// par blocs de 64 puis fusions) au lieu du tri bitonique complet, quand
+/// `top_k <= 64`. Mêmes rangs au bit près. Défaut ON ;
+/// `SARAGOSSA_TTS_SAMPLER_TOPK=0` rétablit le tri complet.
+pub(crate) fn tts_sampler_partial_topk_enabled() -> bool {
+    if let Some(enabled) = TTS_SAMPLER_TOPK_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_SAMPLER_TOPK", true))
+}
+
+thread_local! {
+    static TTS_SAMPLER_TOPK_OVERRIDE: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Force la sélection partielle du tirage TTS pendant `work` (oracles).
+#[cfg(test)]
+pub(crate) fn with_tts_sampler_partial_topk<T>(enabled: bool, work: impl FnOnce() -> T) -> T {
+    let previous = TTS_SAMPLER_TOPK_OVERRIDE.with(|flag| flag.replace(Some(enabled)));
+    let out = work();
+    TTS_SAMPLER_TOPK_OVERRIDE.with(|flag| flag.set(previous));
+    out
+}
+
 /// Force le décodage glouton TTS historique pour les oracles.
 #[must_use]
 pub fn tts_greedy_enabled() -> bool {
