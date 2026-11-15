@@ -116,9 +116,19 @@ inline void micro_load_b(threadgroup bfloat* tile, device const uint* w,
         uint word1 = B == 8 ? w[offset / P + block * 2 + 1] : word0;
         uchar scale = block < 2 ? s0 : s1;
         metal::vec<bfloat, 8> out;
-        for (uint j = 0; j < 8; ++j) {
-            uint word = j < P ? word0 : word1;
-            out[j] = bfloat(micro_scaled<B, G>((word >> ((j % P) * B)) & ((1u << B) - 1u), scale));
+        // Même produit f32 que `micro_scaled` dans la plage normale, avec
+        // l'échelle décodée une fois par bloc de huit poids.
+        if (G == 16 || (scale >= 10 && scale <= 246)) {
+            float s = micro_scale<G>(scale);
+            for (uint j = 0; j < 8; ++j) {
+                uint word = j < P ? word0 : word1;
+                out[j] = bfloat(micro_code<B>((word >> ((j % P) * B)) & ((1u << B) - 1u)) * s);
+            }
+        } else {
+            for (uint j = 0; j < 8; ++j) {
+                uint word = j < P ? word0 : word1;
+                out[j] = bfloat(micro_scaled<B, G>((word >> ((j % P) * B)) & ((1u << B) - 1u), scale));
+            }
         }
         dst[block] = out;
     }
