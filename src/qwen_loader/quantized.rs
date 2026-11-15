@@ -348,6 +348,38 @@ pub(super) fn quantized_tensor_from_entry(
         let scale_shard = headers
             .get(scale_entry.shard_index)
             .ok_or_else(|| InferError::Shape("index shard invalide".into()))?;
+        // Single-copy : codes et échelles sont lus directement dans les
+        // MTLBuffer partagés que lisent les kernels, sans vecteur CPU.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if crate::runtime_flags::single_copy_weights_enabled() {
+            if let Some(metal) = context.metal {
+                let file_offset = |header: &ShardHeader, entry: &ShardTensorEntry| {
+                    header
+                        .data_start
+                        .checked_add(entry.data_offsets[0] as u64)
+                        .ok_or_else(|| InferError::Shape("offset safetensors trop grand".into()))
+                };
+                let packed = metal.weight_buffer_from_u32_file(
+                    &shard.path,
+                    file_offset(shard, entry)?,
+                    entry.payload_len(&spec.source)?,
+                )?;
+                let scales = metal.weight_buffer_from_u8_file(
+                    &scale_shard.path,
+                    file_offset(scale_shard, &scale_entry.entry)?,
+                    scale_entry.entry.payload_len(&scale_name)?,
+                )?;
+                let weight = crate::MicroQuantizedTensor::new_metal_shared(
+                    [shape[0], shape[1]],
+                    packed,
+                    scales,
+                    mode,
+                )?;
+                return Ok(DecoderTensor::LinearWeight(LinearWeight::MicroScaled(
+                    weight,
+                )));
+            }
+        }
         let scales = read_entry_bytes(scale_shard, &scale_entry.entry)?;
         let bytes = read_entry_bytes(shard, entry)?;
         let packed = bytes

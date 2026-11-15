@@ -99,6 +99,24 @@ fn micro_dequant_and_matmul_bit_exact() -> Result<()> {
                 mode.name()
             );
         }
+        // Stockage partagé : même contenu CPU, buffers Metal réutilisés tels quels.
+        let mut shared = w.clone();
+        shared.move_to_metal_shared(&metal)?;
+        assert_eq!(shared, w);
+        let views = shared.metal_views().expect("invariant: poids déplacé");
+        let resolved = metal.resolve_micro(&shared)?;
+        assert_eq!(resolved.packed.gpu_address(), views.0.gpu_address());
+        assert_eq!(resolved.scales.gpu_address(), views.1.gpu_address());
+        let input = Tensor::from_vec(
+            vec![16, 256],
+            (0..16 * 256)
+                .map(|i| ((i % 3) as f32 - 1.0) * 0.5)
+                .collect(),
+        )?;
+        assert_eq!(
+            metal.matmul_rhs_t_micro(&input, &shared)?.data(),
+            w.matmul_rhs_t(&input)?.data()
+        );
         // K court non multiple de 64 : repli QMV sûr, même pour un lot long.
         let w = weight(mode, 5, mode.group_size())?;
         let x = Tensor::from_vec(

@@ -137,8 +137,10 @@ impl LinearWeight {
         &mut self,
         metal: &crate::MetalExecutor,
     ) -> Result<()> {
-        if let Self::AffineQuantized(weight) = self {
-            weight.move_packed_to_metal_shared(metal)?;
+        match self {
+            Self::AffineQuantized(weight) => weight.move_packed_to_metal_shared(metal)?,
+            Self::MicroScaled(weight) => weight.move_to_metal_shared(metal)?,
+            _ => {}
         }
         Ok(())
     }

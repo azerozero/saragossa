@@ -110,17 +110,59 @@ pub struct MicroQuantizedTensor {
     #[cfg_attr(not(all(target_os = "macos", feature = "metal")), allow(dead_code))]
     weight_id: u64,
     shape: [usize; 2],
-    packed: Vec<u32>,
-    scales: Vec<u8>,
+    storage: MicroStorage,
     mode: MicroMode,
+}
+
+/// Codes et échelles possédés, ou adossés aux MTLBuffer partagés que lisent
+/// les kernels : la mémoire unifiée évite alors toute seconde copie.
+#[derive(Clone, Debug)]
+enum MicroStorage {
+    Owned {
+        packed: Vec<u32>,
+        scales: Vec<u8>,
+    },
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    MetalShared {
+        packed: metal::Buffer,
+        scales: metal::Buffer,
+    },
+}
+
+/// Nombre de mots U32 et d'échelles d'une matrice micro valide.
+fn micro_lengths(shape: [usize; 2], mode: MicroMode) -> Result<(usize, usize)> {
+    let [rows, cols] = shape;
+    let count = rows
+        .checked_mul(cols)
+        .ok_or_else(|| InferError::Shape("poids micro trop grand".into()))?;
+    if rows == 0 || cols == 0 || cols % mode.group_size() != 0 {
+        return Err(InferError::Shape(format!(
+            "poids {} de forme {shape:?} invalide",
+            mode.name()
+        )));
+    }
+    Ok((count / (32 / mode.bits()), count / mode.group_size()))
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[expect(
+    unsafe_code,
+    reason = "vue CPU en lecture seule des échelles d'un MTLBuffer de poids partagé"
+)]
+fn metal_shared_u8_slice(buffer: &metal::Buffer, len: usize) -> &[u8] {
+    // SAFETY: `new_metal_shared` vérifie `len <= buffer.length()` et un pointeur
+    // non nul. StorageModeShared rend `contents` visible côté hôte ; `buffer`
+    // est retenu par le stockage pendant la vue, et les MTLBuffer de poids ne
+    // sont jamais écrits après chargement.
+    unsafe { std::slice::from_raw_parts(buffer.contents().cast::<u8>(), len) }
 }
 
 impl PartialEq for MicroQuantizedTensor {
     fn eq(&self, other: &Self) -> bool {
         self.shape == other.shape
             && self.mode == other.mode
-            && self.packed == other.packed
-            && self.scales == other.scales
+            && self.packed() == other.packed()
+            && self.scales() == other.scales()
     }
 }
 
@@ -140,16 +182,8 @@ impl MicroQuantizedTensor {
         scales: Vec<u8>,
         mode: MicroMode,
     ) -> Result<Self> {
-        let [rows, cols] = shape;
-        let count = rows
-            .checked_mul(cols)
-            .ok_or_else(|| InferError::Shape("poids micro trop grand".into()))?;
-        if rows == 0
-            || cols == 0
-            || cols % mode.group_size() != 0
-            || packed.len() != count / (32 / mode.bits())
-            || scales.len() != count / mode.group_size()
-        {
+        let (words, groups) = micro_lengths(shape, mode)?;
+        if packed.len() != words || scales.len() != groups {
             return Err(InferError::Shape(format!(
                 "poids {} {shape:?}: {} mots, {} échelles",
                 mode.name(),
@@ -160,10 +194,60 @@ impl MicroQuantizedTensor {
         Ok(Self {
             weight_id: super::next_weight_id()?,
             shape,
-            packed,
-            scales,
+            storage: MicroStorage::Owned { packed, scales },
             mode,
         })
+    }
+
+    /// Adosse le poids aux MTLBuffer partagés lus par Metal, sans copie CPU.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn new_metal_shared(
+        shape: [usize; 2],
+        packed: metal::Buffer,
+        scales: metal::Buffer,
+        mode: MicroMode,
+    ) -> Result<Self> {
+        let (words, groups) = micro_lengths(shape, mode)?;
+        let fits = |buffer: &metal::Buffer, bytes: usize| {
+            usize::try_from(buffer.length()).is_ok_and(|len| len >= bytes)
+                && !buffer.contents().is_null()
+        };
+        let packed_bytes = words
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| InferError::Shape("poids micro trop grand".into()))?;
+        if !fits(&packed, packed_bytes) || !fits(&scales, groups) {
+            return Err(InferError::Shape(format!(
+                "buffers {} trop courts pour {shape:?}",
+                mode.name()
+            )));
+        }
+        Ok(Self {
+            weight_id: super::next_weight_id()?,
+            shape,
+            storage: MicroStorage::MetalShared { packed, scales },
+            mode,
+        })
+    }
+
+    /// Déplace codes et échelles dans des MTLBuffer partagés, puis libère
+    /// les vecteurs CPU : la vue CPU et les kernels lisent la même mémoire.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn move_to_metal_shared(&mut self, metal: &crate::MetalExecutor) -> Result<()> {
+        if let MicroStorage::Owned { packed, scales } = &self.storage {
+            let packed = metal.weight_buffer_from_u32(packed)?;
+            let scales = metal.weight_buffer_from_u8(scales)?;
+            self.storage = MicroStorage::MetalShared { packed, scales };
+        }
+        Ok(())
+    }
+
+    /// Buffers partagés `(codes, échelles)` quand le poids y est adossé.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn metal_views(&self) -> Option<(&metal::Buffer, &metal::Buffer)> {
+        match &self.storage {
+            MicroStorage::Owned { .. } => None,
+            MicroStorage::MetalShared { packed, scales } => Some((packed, scales)),
+        }
     }
 
     /// Forme logique dense.
@@ -179,25 +263,42 @@ impl MicroQuantizedTensor {
     /// Codes empaquetés, colonnes de poids faible en premier.
     #[must_use]
     pub fn packed(&self) -> &[u32] {
-        &self.packed
+        match &self.storage {
+            MicroStorage::Owned { packed, .. } => packed,
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            MicroStorage::MetalShared { packed, .. } => {
+                let words = self.shape[0] * self.shape[1] / (32 / self.mode.bits());
+                super::metal_shared_u32_slice(packed, 0, words)
+            }
+        }
     }
     /// Octets d'échelle sans conversion ni biais.
     #[must_use]
     pub fn scales(&self) -> &[u8] {
-        &self.scales
+        match &self.storage {
+            MicroStorage::Owned { scales, .. } => scales,
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            MicroStorage::MetalShared { scales, .. } => metal_shared_u8_slice(
+                scales,
+                self.shape[0] * self.shape[1] / self.mode.group_size(),
+            ),
+        }
     }
 
     fn value(&self, index: usize) -> f32 {
         let bits = self.mode.bits();
         let lanes = 32 / bits;
         let code =
-            ((self.packed[index / lanes] >> ((index % lanes) * bits)) & ((1 << bits) - 1)) as u8;
+            ((self.packed()[index / lanes] >> ((index % lanes) * bits)) & ((1 << bits) - 1)) as u8;
         let value = if bits == 4 {
             decode_e2m1(code)
         } else {
             decode_e4m3(code)
         };
-        value * self.mode.scale(self.scales[index / self.mode.group_size()])
+        value
+            * self
+                .mode
+                .scale(self.scales()[index / self.mode.group_size()])
     }
 
     /// Déquantifie une ligne sans matérialiser la matrice entière.

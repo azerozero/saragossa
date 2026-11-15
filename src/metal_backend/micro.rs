@@ -52,6 +52,17 @@ impl MetalExecutor {
         &self,
         weight: &MicroQuantizedTensor,
     ) -> Result<MicroWeightBuffers> {
+        if let Some((packed, scales)) = weight.metal_views() {
+            // Poids adossé à la mémoire unifiée : les kernels lisent les mêmes
+            // buffers que la vue CPU, sans copie ni entrée de cache.
+            return Ok(MicroWeightBuffers {
+                packed: packed.clone(),
+                scales: scales.clone(),
+                out_dim: weight.shape()[0],
+                in_dim: weight.shape()[1],
+                mode: weight.mode(),
+            });
+        }
         // Les échelles U8 restent compactes ; le cache réutilise le stockage
         // immuable des poids entre les tokens.
         let scales = self.cached_buffer(

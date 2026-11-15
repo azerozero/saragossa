@@ -436,6 +436,21 @@ impl MetalExecutor {
         self.buffer_from_u32(data, "single_copy_weight_packed")
     }
 
+    /// Alloue le stockage partagé définitif d'échelles U8 compactes.
+    pub(crate) fn weight_buffer_from_u8(&self, data: &[u8]) -> Result<metal::Buffer> {
+        self.buffer_from_slice(data, "single_copy_weight_scales")
+    }
+
+    /// Lit des octets bruts (échelles U8) dans leur stockage partagé définitif.
+    pub(crate) fn weight_buffer_from_u8_file(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len_bytes: usize,
+    ) -> Result<metal::Buffer> {
+        self.weight_buffer_from_file(path, offset, len_bytes)
+    }
+
     /// Alloue le stockage partagé définitif d'un payload bf16 natif.
     #[cfg(test)]
     pub(crate) fn weight_buffer_from_bf16_bytes(&self, data: &[u8]) -> Result<metal::Buffer> {
