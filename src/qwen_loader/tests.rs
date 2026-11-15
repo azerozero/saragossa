@@ -1082,6 +1082,12 @@ fn accepts_micro_modes_and_checks_overrides() -> Result<()> {
             micro_mode_for(&quant, "model.proj.weight"),
             Err(InferError::UnsupportedQuantization(_))
         ));
+        // Override MLX sans `mode` : affine, sans hériter du mode global.
+        quant.extra.insert(
+            "model.proj".into(),
+            serde_json::json!({"bits":8,"group_size":64}),
+        );
+        assert_eq!(micro_mode_for(&quant, "model.proj.weight")?, None);
     }
     Ok(())
 }

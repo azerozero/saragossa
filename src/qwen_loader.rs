@@ -616,11 +616,12 @@ fn validate_affine_quantization(quant: &QuantConfig) -> Result<()> {
 
 fn micro_mode_for(quant: &QuantConfig, source: &str) -> Result<Option<crate::MicroMode>> {
     let base = source.strip_suffix(".weight").unwrap_or(source);
-    let value = quant
-        .extra
-        .get(base)
-        .and_then(|entry| entry.get("mode"))
-        .or_else(|| quant.extra.get("mode"));
+    // Comme `to_quantized(**override)` dans MLX : un override par couche
+    // sans `mode` vaut affine, il n'hérite pas du mode global.
+    let value = match quant.extra.get(base) {
+        Some(entry) if entry.is_object() => entry.get("mode"),
+        _ => quant.extra.get("mode"),
+    };
     let mode = match value {
         None => "affine",
         Some(value) => value
