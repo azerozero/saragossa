@@ -790,6 +790,29 @@ impl MetalExecutor {
             };
         let noncausal_attention_prefill_f32 =
             pipeline(&library, &device, "noncausal_attention_prefill_f32")?;
+        let decision_attention_nax = if crate::runtime_flags::decision_noncausal()
+            && crate::runtime_flags::decision_nax_enabled()
+        {
+            let shape = attention::NaxCausalAttnShape::from_flags();
+            compile_nax_function(
+                &device,
+                sources.steel_attention_nax.as_ref(),
+                shape.host_name,
+                &[
+                    (200, false),
+                    (201, false),
+                    (300, false),
+                    (301, false),
+                    (302, false),
+                    (303, false),
+                    (304, shape.head_major),
+                    (305, false),
+                ],
+            )
+            .map(|pipeline| attention::NaxCausalAttention { pipeline, shape })
+        } else {
+            None
+        };
         let steel_attention_f32_bq32_bk32_bd64 =
             compile_steel_attention(&device, sources.steel_attention.as_ref());
         let add_rms_norm_row_f32 = pipeline(&library, &device, "add_rms_norm_row_f32")?;
@@ -856,6 +879,7 @@ impl MetalExecutor {
         let na_gemm_coop_qb_tiled_u4 = compile_na("gemm_nax_coop_qb_tiled_u4");
         let na_gemm_coop_qb_tiled_u4_x3 = compile_na("gemm_nax_coop_qb_tiled_u4_x3");
         let na_gemm_bf16_nt_tiled_x2 = compile_na("gemm_nax_bf16_nt_tiled_x2");
+        let na_gemm_bf16_nt_bn128 = compile_na("gemm_nax_bf16_nt_bn128");
         let na_gemm_coop_qb_tiled_u4_align64 = compile_na("gemm_nax_coop_qb_tiled_u4_align64");
         let na_gemm_coop_qb_tiled_u4_gate_up_swiglu =
             compile_na("gemm_nax_coop_qb_tiled_u4_gate_up_swiglu");
@@ -1043,6 +1067,7 @@ impl MetalExecutor {
                 && crate::decode_resident::kv_bf16_dense_by_default())
             .then(crate::runtime_flags::kv_bf16_greedy_min_tokens),
             noncausal_attention_prefill_f32,
+            decision_attention_nax,
             steel_attention_f32_bq32_bk32_bd64,
             add_rms_norm_row_f32,
             topk_softmax_f32,
@@ -1076,6 +1101,7 @@ impl MetalExecutor {
             na_gemm_coop_qb_tiled_u4,
             na_gemm_coop_qb_tiled_u4_x3,
             na_gemm_bf16_nt_tiled_x2,
+            na_gemm_bf16_nt_bn128,
             na_gemm_skinny_u4,
             na_gemm_skinny_u4_x3,
             na_gemm_skinny_u4_x2,

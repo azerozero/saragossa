@@ -76,6 +76,14 @@ fn dense_bf16_prefill_gemm_matches_f32() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requiert Metal avec GEMM NA ; poids synthétiques"]
+fn decision_dense_bf16_gemm_rounds_activation_once() -> Result<()> {
+    crate::runtime_flags::with_decision_noncausal(|| {
+        dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_bn128")
+    })
+}
+
+#[test]
 #[ignore = "requiert Metal avec GEMM NA ; kill-switch isolé en sous-processus ; poids synthétiques"]
 fn dense_bf16_prefill_kill_switch_selects_qmv(
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -134,7 +142,18 @@ fn dense_bf16_prefill_matches_f32(expected_kernel: &str) -> Result<()> {
             .map(|i| ((i % 19) as f32 - 9.0) / 7.0 + (i % 5) as f32 * 1e-3)
             .collect(),
     )?;
-    let expected = input.matmul_rhs_t(&Tensor::from_vec(vec![out_dim, in_dim], values)?)?;
+    let decision = expected_kernel == "gemm_nax_bf16_nt_bn128";
+    // Le GEMM de décision arrondit l'activation en bf16 (au plus proche, pair).
+    let reference = if decision {
+        let rounded = input.data().iter().map(|&v| {
+            let bits = v.to_bits();
+            f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
+        });
+        Tensor::from_vec(vec![batch, in_dim], rounded.collect())?
+    } else {
+        input.clone()
+    };
+    let expected = reference.matmul_rhs_t(&Tensor::from_vec(vec![out_dim, in_dim], values)?)?;
     let lhs = executor.buffer_from_f32(input.data(), "test_bf16_gemm_lhs")?;
     let out = executor.uncached_f32_buffer(batch * out_dim, "test_bf16_gemm_out")?;
     let cb = executor.queue.new_command_buffer();
@@ -150,11 +169,15 @@ fn dense_bf16_prefill_matches_f32(expected_kernel: &str) -> Result<()> {
     enc.end_encoding();
     encoded?;
     commit_and_wait(cb)?;
+    let mut expected_trace = Vec::new();
+    if decision {
+        expected_trace.push(format!("f32_to_bf16 M={} N=1 K=0", batch * in_dim));
+    }
+    expected_trace.push(format!(
+        "{expected_kernel} M={batch} N={out_dim} K={in_dim}"
+    ));
     assert_eq!(
-        trace,
-        [format!(
-            "{expected_kernel} M={batch} N={out_dim} K={in_dim}"
-        )],
+        trace, expected_trace,
         "le kernel attendu doit être réellement dispatché"
     );
     let actual = read_f32_buffer(&out, batch * out_dim)?;
