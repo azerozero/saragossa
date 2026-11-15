@@ -94,10 +94,12 @@ def validate_shapes(shard, base, shape, bits):
 
 
 def convert(src, template, dst, imatrix=None, imatrix_blend=False,
-            block_rows=256, min_free_gib=30):
+            block_rows=256, min_free_gib=30, workers=1):
     sources, shards = validate(src, template, dst)
     if imatrix_blend and imatrix is None:
         raise ValueError("--imatrix-blend exige --imatrix")
+    if workers <= 0:
+        raise ValueError("nombre de processus positif requis")
     if block_rows <= 0 or not math.isfinite(min_free_gib) or min_free_gib < 0:
         raise ValueError("bloc positif et réserve disque finie positive ou nulle requis")
     config = json.loads((template / "config.json").read_text())
@@ -141,35 +143,36 @@ def convert(src, template, dst, imatrix=None, imatrix_blend=False,
         tensor_stream.copy_shard(path, outputs[path], min_free_gib)
     count, err0, err1 = 0, 0.0, 0.0
     total = sum(tensor.nbytes for tensor in merged.values())
-    for base in bases:
-        source = bf16_tensor(tensor_stream, weights, base)
-        bits = quantization_spec(config, base)
-        weight = importance_for(matrix, base, source.shape[-1])
-        blend = imatrix_blend and weight is not None
-        rows = math.prod(source.shape[:-1])
-        # Aucun groupe de 64 ni aucune ligne du blend n'est coupé. Le fit et
-        # ses réductions par groupe restent inchangés ; seul le diagnostic
-        # RMSE global est cumulé par bloc, avec un ordre de somme différent.
-        for start in range(0, rows, block_rows):
-            tensor_stream.check_space(dst, min_free_gib)
-            x = source.read_rows(mx, start, min(start + block_rows, rows))
-            packed, scale, bias, rmse0, rmse1 = opt_quant.fit(
-                x, bits=bits, weight=weight, imatrix_blend=blend)
-            mx.eval(packed, scale, bias, rmse0, rmse1)
-            for suffix, value in zip((".weight", ".scales", ".biases"), (packed, scale, bias)):
-                target = merged[base + suffix]
-                tensor_stream.write_rows(mx, target, outputs[target.path], start, value)
-            mass = opt_quant.error_mass(x, weight, blend)
-            if matrix is not None and weight is None and base.endswith(".embed_tokens"):
-                mass /= rows
-            err0 += rmse0.item() ** 2 * mass
-            err1 += rmse1.item() ** 2 * mass
-            del x, packed, scale, bias, rmse0, rmse1, value
-            mx.clear_cache()
-        gc.collect()
-        count += 1
-        print("ajusté", count, "/", len(bases), base, bits, "bits",
-              f"MSE ls/minmax {err1 / err0 if err0 else 0:.4f}", flush=True)
+    with tensor_stream.cpu_pool(workers) as pool:
+        for base in bases:
+            source = bf16_tensor(tensor_stream, weights, base)
+            bits = quantization_spec(config, base)
+            weight = importance_for(matrix, base, source.shape[-1])
+            blend = imatrix_blend and weight is not None
+            if weight is not None:
+                weight = weight.tolist()
+            rows = math.prod(source.shape[:-1])
+            targets = [(merged[base + suffix], outputs[owner[base + suffix]])
+                       for suffix in (".weight", ".scales", ".biases")]
+            # Aucun groupe ni aucune ligne du blend n'est coupé. La file ne
+            # contient que workers blocs du tenseur courant, jamais le modèle.
+            jobs = ((source, start, min(start + block_rows, rows), bits,
+                     weight, blend, targets, min_free_gib)
+                    for start in range(0, rows, block_rows))
+            print("ajustement", count + 1, "/", len(bases), base, bits, "bits", flush=True)
+            for block, (error0, error1) in enumerate(
+                    tensor_stream.fit_blocks(pool, jobs, workers), 1):
+                if matrix is not None and weight is None and base.endswith(".embed_tokens"):
+                    error0 /= rows
+                    error1 /= rows
+                err0 += error0
+                err1 += error1
+                if block % 128 == 0:
+                    print("  lignes", min(block * block_rows, rows), "/", rows, flush=True)
+            gc.collect()
+            count += 1
+            print("ajusté", count, "/", len(bases), base, bits, "bits",
+                  f"MSE ls/minmax {err1 / err0 if err0 else 0:.4f}", flush=True)
     for path in shards:
         tensor_stream.check_space(dst, min_free_gib)
         outputs[path].rename(dst / path.name)
@@ -313,6 +316,7 @@ def main():
     parser.add_argument("--template", type=pathlib.Path, required=True, help="checkpoint MLX affine gs64 (3/4/5/6/8 bits)")
     parser.add_argument("--dst", type=pathlib.Path, required=True, help="destination inexistante")
     parser.add_argument("--imatrix", type=pathlib.Path, help="importance E[x²] par colonne ; linéaires manquants refusés")
+    parser.add_argument("--workers", type=int, default=1, help="processus CPU ; mémoire proportionnelle (défaut : 1)")
     parser.add_argument("--block-rows", type=int, default=256, help="lignes par bloc CPU (défaut : 256)")
     parser.add_argument("--min-free-gib", type=float, default=30, help="réserve disque minimale en Gio")
     parser.add_argument("--imatrix-blend", action="store_true",
@@ -321,7 +325,7 @@ def main():
     if args.imatrix_blend and args.imatrix is None:
         parser.error("--imatrix-blend exige --imatrix")
     convert(args.src, args.template, args.dst, args.imatrix, args.imatrix_blend,
-            args.block_rows, args.min_free_gib)
+            args.block_rows, args.min_free_gib, args.workers)
 
 
 if __name__ == "__main__":

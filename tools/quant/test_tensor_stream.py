@@ -20,6 +20,30 @@ def payload_hash(tensor):
 
 
 def stdlib_checks():
+    # Une longue entrée ne doit pas créer une longue file de blocs en mémoire.
+    class Future:
+        def __init__(self, pool, value):
+            self.pool, self.value = pool, value
+
+        def result(self):
+            self.pool.outstanding -= 1
+            return self.value
+
+        def cancel(self):
+            self.pool.outstanding -= 1
+
+    class Pool:
+        outstanding = 0
+        peak = 0
+
+        def submit(self, function, value):
+            self.outstanding += 1
+            self.peak = max(self.peak, self.outstanding)
+            return Future(self, value)
+
+    pool = Pool()
+    assert list(tensor_stream.fit_blocks(pool, iter(range(1000)), 4)) == list(range(1000))
+    assert pool.peak == 4 and pool.outstanding == 0
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         path = root / "model.safetensors"
@@ -88,7 +112,8 @@ def mlx_checks():
                 mx.save_safetensors(str(oracle), expected)
                 destination = root / f"out-{bits}-{blend}"
                 convert_ls.convert(source, template, destination, matrix_path, blend,
-                                   block_rows=3, min_free_gib=0)
+                                   block_rows=3, min_free_gib=0,
+                                   workers=2 if bits in (3, 8) else 1)
                 actual = tensor_stream.catalog(sorted(destination.glob("model*.safetensors")))
                 reference = tensor_stream.catalog([oracle])
                 assert actual.keys() == reference.keys()

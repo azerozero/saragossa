@@ -139,6 +139,10 @@ La conversion refuse une destination existante et s'arrête sous 30 Gio libres
 (`--min-free-gib`). Une interruption laisse des shards `.partial` à supprimer
 avant de recommencer ; ils ne constituent pas un checkpoint utilisable. Aucun
 chargement du modèle entier ni accumulation des sorties n'est nécessaire.
+`--workers N` permet d'ajuster jusqu'à N blocs indépendants du même tenseur
+en parallèle sur CPU. La file est bornée à N blocs ; la mémoire augmente
+proportionnellement à N. Chaque processus écrit une plage distincte et le
+diagnostic est cumulé dans l'ordre des lignes. Le défaut reste un processus.
 Tests du flux, des experts fusionnés et des payloads SHA-256 sur CPU :
 
 ```bash

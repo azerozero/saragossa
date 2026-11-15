@@ -1,7 +1,11 @@
 """Accès borné aux payloads safetensors, sans charger les shards dans MLX."""
 from dataclasses import dataclass, replace
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 import json
 import math
+import multiprocessing
 import shutil
 import struct
 
@@ -116,3 +120,58 @@ def write_rows(mx, tensor, destination, start, value):
     with destination.open("r+b") as handle:
         handle.seek(offset)
         handle.write(block)
+
+
+def _init_cpu():
+    import mlx.core as mx
+    mx.set_default_device(mx.cpu)
+
+
+def fit_block(job):
+    """Un bloc indépendant, écrit sur des plages disjointes des autres blocs."""
+    import mlx.core as mx
+    import opt_quant
+
+    source, start, stop, bits, weight, blend, targets, minimum = job
+    check_space(targets[0][1].parent, minimum)
+    x = source.read_rows(mx, start, stop)
+    packed, scale, bias, rmse0, rmse1 = opt_quant.fit(
+        x, bits=bits, weight=weight, imatrix_blend=blend)
+    mx.eval(packed, scale, bias, rmse0, rmse1)
+    for (target, destination), value in zip(targets, (packed, scale, bias)):
+        write_rows(mx, target, destination, start, value)
+    mass = opt_quant.error_mass(x, weight, blend)
+    result = rmse0.item() ** 2 * mass, rmse1.item() ** 2 * mass
+    del x, packed, scale, bias, rmse0, rmse1, value
+    mx.clear_cache()
+    return result
+
+
+@contextmanager
+def cpu_pool(workers):
+    if workers == 1:
+        yield None
+        return
+    # Spawn évite d'hériter d'un runtime MLX déjà initialisé par fork.
+    with ProcessPoolExecutor(max_workers=workers, initializer=_init_cpu,
+                             mp_context=multiprocessing.get_context("spawn")) as pool:
+        yield pool
+
+
+def fit_blocks(pool, jobs, workers):
+    if pool is None:
+        yield from map(fit_block, jobs)
+        return
+    pending = deque()
+    try:
+        for job in jobs:
+            pending.append(pool.submit(fit_block, job))
+            if len(pending) == workers:
+                # Consommer dans l'ordre garde le diagnostic reproductible.
+                # Le map d'Executor soumettrait tout le modèle sans cette borne.
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
+    finally:
+        for future in pending:
+            future.cancel()
