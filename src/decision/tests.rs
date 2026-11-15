@@ -251,7 +251,7 @@ fn decision_tta_real_weight_oracle() -> Result<()> {
     // Seuil figé sur la référence avant la première comparaison Rust.
     assert!((tolerance - 0.016_482_946_049_255_46).abs() < 1e-12);
     let reference = read_json(&root.join("reference-f32.json"))?;
-    let (mut maximum, mut packing) = (0.0_f64, 0.0_f64);
+    let (mut maximum, mut packing) = (0.0_f64, 0_usize);
     for record in reference["records"].as_array().unwrap() {
         let mut request = record["request"].clone();
         request["tta"] = json!(4);
@@ -295,8 +295,10 @@ fn decision_tta_real_weight_oracle() -> Result<()> {
             )?;
             for (read, p) in reads.iter().zip(&packed) {
                 let alone = model.probabilities(&read.2.tokens, &read.2.markers, &read.2.counts)?;
+                // Empaquetage exact : mêmes bits que la lecture seule.
                 for (a, b) in alone[0].iter().zip(&p[0]) {
-                    packing = packing.max(f64::from((a - b).abs()));
+                    assert_eq!(a.to_bits(), b.to_bits(), "empaquetage {a} != {b}");
+                    packing += 1;
                 }
             }
         }
@@ -328,11 +330,11 @@ fn decision_tta_real_weight_oracle() -> Result<()> {
             }
         }
     }
-    eprintln!("decision tta oracle max_abs={maximum:.9} packed_vs_alone={packing:e} tolerance={tolerance:.9}");
+    eprintln!("decision tta oracle max_abs={maximum:.9} packed_bit_equal={packing} tolerance={tolerance:.9}");
     assert!(
         maximum <= tolerance,
         "écart {maximum} > bruit bf16 admis {tolerance}"
     );
-    assert!(packing <= tolerance, "empaquetage {packing} > {tolerance}");
+    assert!(packing > 0, "aucune lecture empaquetée comparée");
     Ok(())
 }
