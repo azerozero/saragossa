@@ -170,6 +170,52 @@ fn only_qualified_stream_degradation_enables_diagnostics() {
 }
 
 #[test]
+fn degraded_stream_resumes_at_stable_utf8_boundaries() {
+    let assets = synthetic();
+    let mut stream = StreamingTextDetokenizer::new(&assets, &[], 256);
+    for cycle in 1..=2 {
+        for _ in 0..80 {
+            stream.push_token(257, &mut |_| Ok(())).expect("U+FFFD");
+        }
+        assert!(stream.stream.is_none());
+        assert!(stream.degraded);
+        for id in [0xc3, 256] {
+            stream.push_token(id, &mut |_| Ok(())).expect("queue");
+            assert!(stream.stream.is_none());
+        }
+        stream
+            .push_token(0xa9, &mut |_| Ok(()))
+            .expect("frontière é");
+        assert!(stream.stream.is_some());
+        assert_eq!(stream.stable_len, stream.decoded.len());
+        assert_eq!(stream.fallback_decodes, cycle * 19);
+
+        // Les tokens suivants utilisent uniquement le flux neuf, y compris
+        // un nouveau caractère multioctet, les added tokens et un id absent.
+        for id in bytes(" suite 🌍").into_iter().chain([259, 260, 261]) {
+            stream
+                .push_token(id as usize, &mut |_| Ok(()))
+                .expect("suite");
+            assert_eq!(stream.fallback_decodes, cycle * 19);
+            assert_eq!(
+                stream.decoded,
+                decode_completion_tokens(&assets, &stream.generated).expect("oracle")
+            );
+        }
+    }
+    assert_eq!(serve_oracle(&assets, &stream.generated, &[]), 38);
+    // Le stop commence dans la queue dégradée et se ferme au pas de reprise.
+    serve_oracle(&assets, &stream.generated, &["��é".into()]);
+    serve_oracle(&assets, &stream.generated, &["é suite 🌍".into()]);
+
+    let gemma = self::assets(synthetic().tokenizer, "gemma4");
+    assert_eq!(
+        serve_oracle(&gemma, &stream.generated, &[]),
+        stream.generated.len()
+    );
+}
+
+#[test]
 fn ordinary_added_tokens_match_full_decode_at_every_boundary() {
     let assets = synthetic();
     assert_eq!(assets.tokenizer.token_to_id("<think>"), Some(259));
@@ -221,6 +267,20 @@ proptest! {
         raw_oracle(&assets.tokenizer, &ids);
         serve_oracle(&assets, &ids, &["STOP".into(), "é".into(), "�".into()]);
         serve_oracle(&assets, &ids, &[]);
+    }
+    #[test]
+    fn recovered_stream_matches_full_decode(
+        pending in 65usize..90,
+        suffix in prop::collection::vec(0u32..262, 0..60),
+    ) {
+        let assets = synthetic();
+        let mut ids = bytes("début ");
+        ids.extend(std::iter::repeat_n(257, pending));
+        ids.push(u32::from(b'A'));
+        ids.extend(suffix);
+        // La queue aléatoire fait moins de 64 tokens : aucune rechute possible.
+        prop_assert_eq!(serve_oracle(&assets, &ids, &[]), pending - 64 + 1);
+        serve_oracle(&assets, &ids, &["��A".into(), "STOP".into()]);
     }
     #[test]
     fn stops_cross_every_byte_boundary(prefix in "[a-z ]{0,30}", stop in "[A-Zé🌍]{1,8}") {

@@ -23,8 +23,8 @@ incomplet. U+FFFD littéral est retenu aussi prudemment qu'un fragment UTF-8.
 Le snapshot final, déjà décodé intégralement par `finish_completion`, libère la
 queue et vérifie une fois le préfixe émis.
 
-Le flux conserve le texte décodé dans un buffer et une longueur émise, sans
-recopie ni comparaison du préfixe à chaque token qualifié. Un stop nouveau
+En release, le flux conserve le texte décodé dans un buffer et une longueur
+émise, sans recopie ni comparaison du préfixe à chaque token qualifié. Un stop nouveau
 commence dans les nouveaux octets ou dans les `L-1` derniers octets du snapshot
 précédent, où `L` est la longueur maximale des stops. La recherche conserve
 `L+3` octets, arrondis vers la frontière UTF-8 précédente : la marge couvre le
@@ -33,11 +33,14 @@ les stops. La rétention d'un préfixe de stop examine uniquement des suffixes.
 
 Une configuration non qualifiée, une erreur de `DecodeStream` ou une queue de
 plus de 64 tokens utilise le décodage complet. Ce dernier compare le préfixe
-émis et reste volontairement quadratique. Le compteur `fallback_decodes` est
-journalisé à la destruction du flux lorsqu'il est non nul, y compris pour
-`TextStop` et les flux de lot. Une suite pathologique de U+FFFD peut donc
-revenir sur ce chemin ; une suite de spéciaux ignorés ne fait pas grossir la
-fenêtre. Aucun gain de performance Gemma n'est revendiqué.
+émis. Un flux ByteLevel dégradé reprend avec un `DecodeStream` neuf dès que le
+snapshot complet ne finit plus par U+FFFD : cette frontière ne contient plus
+d'octet UTF-8 incomplet. Le pas de reprise recherche encore les stops dans
+tout le snapshot. Le repli reste quadratique tant que cette frontière manque,
+ainsi que pour les décodeurs non qualifiés. Le compteur `fallback_decodes` est
+journalisé à la destruction uniquement si un flux qualifié s'est dégradé, y
+compris pour `TextStop` et les flux de lot. Une suite de spéciaux ignorés ne
+fait pas grossir la fenêtre. Aucun gain de performance Gemma n'est revendiqué.
 
 ## Oracles CPU
 

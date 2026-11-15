@@ -194,7 +194,8 @@ impl<'a> StreamingTextDetokenizer<'a> {
                 }
             }
         }
-        if self.stream.is_none() {
+        let incremental = self.stream.is_some();
+        if !incremental {
             self.fallback_decodes += 1;
             let decoded = decode_with_controls(self.assets, &self.generated, &self.controls)?;
             self.emitter.check_prefix(
@@ -202,15 +203,22 @@ impl<'a> StreamingTextDetokenizer<'a> {
                 strip_empty_think_streaming(&decoded),
             )?;
             self.decoded = decoded;
+            // Le décodage complet ferme une frontière ByteLevel dès qu'il ne
+            // finit plus par U+FFFD. Repartir sans historique est alors exact :
+            // aucun octet incomplet ne peut modifier ce préfixe par la suite.
+            if self.degraded && !self.decoded.ends_with('\u{FFFD}') {
+                self.stream = self.assets.tokenizer.byte_level_decode_stream(true);
+                self.stable_len = self.decoded.len();
+            }
         }
         let text = strip_empty_think_streaming(&self.decoded);
         // Un nouvel appariement commence au plus L-1 octets avant le delta.
         // Trois octets supplémentaires couvrent U+FFFD remplacé par un UTF-8
         // complété ; reculer à une frontière char coûte au plus trois octets.
-        let mut start = if self.stream.is_some() {
+        let mut start = if incremental {
             previous_len.saturating_sub(self.max_stop_len.saturating_add(3))
         } else {
-            0 // Aucun invariant de stabilité pour les décodeurs non qualifiés.
+            0 // Scanner tout le snapshot de repli, même au pas de reprise.
         };
         start = start.min(text.len());
         while !text.is_char_boundary(start) {
