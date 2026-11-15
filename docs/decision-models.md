@@ -24,6 +24,11 @@ refusés explicitement.
 
 Limite : 2048 tokens, sans troncature.
 
+Le chargement d'un modèle de décision ne lit ni ne lie de tête de vocabulaire :
+le readout la remplace. Une tête stockée dans les poids est jetée après
+lecture. Footprint mesuré inchangé par rapport à la tête liée, qui partageait
+déjà le buffer des embeddings (d3-flash 15,3 Gio, THX-02 8,1 Gio).
+
 ## Interfaces
 
 ```sh

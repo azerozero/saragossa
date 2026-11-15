@@ -143,11 +143,7 @@ impl DecisionModel {
         }
         let raw: crate::config::RawModelConfig =
             serde_json::from_value(backbone.clone()).map_err(|e| invalid(e.to_string()))?;
-        let mut config = raw.resolve()?;
-        // NOTE: Qwen3_5Model n'a pas de tête de vocabulaire (d3) ; le readout la
-        // remplace et elle n'est jamais exécutée. La lier aux embeddings évite
-        // d'exiger un `lm_head` absent.
-        config.tie_word_embeddings = true;
+        let config = raw.resolve()?;
         let readout =
             crate::safetensor::load_float_tensor(path.join("readout.safetensors"), "weight")?;
         if readout.shape() != [codes.len(), config.hidden_size]
@@ -164,21 +160,25 @@ impl DecisionModel {
             shards,
             mtp: Default::default(),
         };
-        let decoder = if metal {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
-            {
-                let executor =
-                    crate::runtime_flags::with_decision_noncausal(crate::MetalExecutor::new)?;
-                crate::qwen_loader::load_causal_decoder_for_metal(&assets, &executor)?
-                    .with_metal_executor(executor)?
-            }
-            #[cfg(not(all(target_os = "macos", feature = "metal")))]
-            {
-                return Err(invalid("Metal indisponible sur cette plateforme"));
-            }
-        } else {
-            crate::load_causal_decoder(&assets)?
-        };
+        // Sans tête de vocabulaire : le readout la remplace (Qwen3_5Model n'en
+        // a pas, THX la lierait aux embeddings).
+        let decoder = crate::runtime_flags::with_decision_headless(|| -> Result<CausalDecoder> {
+            Ok(if metal {
+                #[cfg(all(target_os = "macos", feature = "metal"))]
+                {
+                    let executor =
+                        crate::runtime_flags::with_decision_noncausal(crate::MetalExecutor::new)?;
+                    crate::qwen_loader::load_causal_decoder_for_metal(&assets, &executor)?
+                        .with_metal_executor(executor)?
+                }
+                #[cfg(not(all(target_os = "macos", feature = "metal")))]
+                {
+                    return Err(invalid("Metal indisponible sur cette plateforme"));
+                }
+            } else {
+                crate::load_causal_decoder(&assets)?
+            })
+        })?;
         Ok(Self {
             decoder,
             tokenizer,

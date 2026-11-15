@@ -41,6 +41,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let fixtures = Path::new(&args[2]);
     let model = DecisionModel::load(&args[1], true)?;
+    let footprint_mib = || saragossa::memory_guard::process_footprint_bytes().map(|b| b >> 20);
+    let footprint_load_mib = footprint_mib();
     let corpus = read(&fixtures.join("reference-f32.json"))?;
     let (mut corpus_max, mut corpus_kl) = (0.0_f64, 0.0_f64);
     for record in corpus["records"].as_array().ok_or("records absents")? {
@@ -68,7 +70,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!(
         "{}",
-        json!({"corpus_max_abs": corpus_max, "corpus_max_kl": corpus_kl})
+        json!({"corpus_max_abs": corpus_max, "corpus_max_kl": corpus_kl,
+               "footprint_load_mib": footprint_load_mib, "footprint_corpus_mib": footprint_mib()})
     );
     for case in read(&fixtures.join("reference-long.json"))?
         .as_array()
@@ -97,7 +100,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!(
             "{}",
             json!({"length": tokens.len(), "p50_ms": sorted[sorted.len() / 2], "p95_ms": p95,
-                   "max_abs": abs, "max_kl": kl, "ms": ms})
+                   "max_abs": abs, "max_kl": kl, "footprint_mib": footprint_mib(), "ms": ms})
         );
     }
     Ok(())
