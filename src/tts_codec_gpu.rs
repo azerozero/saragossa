@@ -30,6 +30,8 @@ use metal::{
 use std::collections::HashMap;
 use std::ffi::c_void;
 
+mod prefix;
+
 const CODEC_KERNELS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -190,6 +192,14 @@ struct GpuConv {
     out_dim: usize,
     inner: usize,
     kernel: usize,
+    /// Groupes de la convolution (1, ou `out_dim` en depthwise).
+    groups: usize,
+}
+
+impl GpuConv {
+    fn in_channels(&self) -> usize {
+        self.inner * self.groups
+    }
 }
 
 /// Buffers GPU d'une activation Snake-β (`exp(alpha)`/`exp(beta)` par canal).
@@ -215,12 +225,16 @@ pub(crate) struct CodecGpu {
     transposes: HashMap<String, GpuConv>,
     snakes: HashMap<String, GpuSnake>,
     upsample_rates: Vec<usize>,
+    /// Préfixe GPU (RVQ → upsampling), `None` : préfixe CPU.
+    prefix: Option<prefix::GpuPrefix>,
 }
 
 /// État streaming du codec GPU : contextes causaux par couche conv/transpose.
 #[derive(Debug, Default)]
 pub(crate) struct CodecGpuStream {
     contexts: HashMap<String, GpuContext>,
+    /// Cache K/V résident du `pre_transformer`, par couche (préfixe GPU).
+    kv: Vec<Option<prefix::GpuKv>>,
 }
 
 #[derive(Debug)]
@@ -351,8 +365,12 @@ impl CodecGpu {
             transposes: HashMap::new(),
             snakes: HashMap::new(),
             upsample_rates,
+            prefix: None,
         };
         gpu.register_weights(weights)?;
+        if crate::runtime_flags::tts_codec_gpu_prefix_enabled() {
+            gpu.register_prefix(weights, cfg)?;
+        }
         Ok(gpu)
     }
 
@@ -398,6 +416,7 @@ impl CodecGpu {
             out_dim,
             inner,
             kernel,
+            groups: 1,
         };
         self.convs.insert(prefix.to_string(), conv);
         Ok(())
@@ -428,6 +447,7 @@ impl CodecGpu {
             out_dim,
             inner: in_dim,
             kernel,
+            groups: 1,
         };
         self.transposes.insert(prefix.to_string(), conv);
         Ok(())
@@ -814,11 +834,55 @@ impl CodecGpu {
             time: hidden_time,
             channels: hidden_channels,
         };
+        let wav = self.encode_tail_stream(state, encoder, &mut pool, input)?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        read_f32_buffer(&wav.buffer, wav.len())
+    }
 
+    /// Décode `time` trames depuis leurs sommes RVQ (`first` : premier
+    /// quantificateur, `rest` : les suivants, `[time, codebook_dim]`) : préfixe
+    /// et section `decoder.decoder` dans un command buffer. PCM non clampé.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le préfixe GPU est inactif, si une forme est
+    /// incohérente ou si Metal échoue.
+    pub(crate) fn decode_rvq_streaming(
+        &self,
+        state: &mut CodecGpuStream,
+        time: usize,
+        first: &[f32],
+        rest: &[f32],
+    ) -> Result<Vec<f32>> {
+        if time == 0 {
+            return Ok(Vec::new());
+        }
+        let options = MTLResourceOptions::StorageModeShared;
+        let mut pool = BufPool::new(self.device.clone(), options);
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let _barrier_scope = install_dispatch_barrier_scope();
+        let hidden = self.encode_prefix_stream(state, encoder, &mut pool, time, first, rest)?;
+        let wav = self.encode_tail_stream(state, encoder, &mut pool, hidden)?;
+        encoder.end_encoding();
+        commit_and_wait(command_buffer)?;
+        read_f32_buffer(&wav.buffer, wav.len())
+    }
+
+    /// Encode la section `decoder.decoder` streaming depuis `input` et renvoie
+    /// le PCM mono résident.
+    fn encode_tail_stream(
+        &self,
+        state: &mut CodecGpuStream,
+        encoder: &ComputeCommandEncoderRef,
+        pool: &mut BufPool,
+        input: GpuNlc,
+    ) -> Result<GpuNlc> {
         let mut cur = self.conv_stream(
             state,
             encoder,
-            &mut pool,
+            pool,
             &input,
             "decoder.decoder.0.conv",
             1,
@@ -831,7 +895,7 @@ impl CodecGpu {
             let stride = self.upsample_rates[block - 1];
             let snaked = self.snake(
                 encoder,
-                &mut pool,
+                pool,
                 &cur,
                 &format!("decoder.decoder.{block}.block.0"),
             )?;
@@ -839,7 +903,7 @@ impl CodecGpu {
             cur = self.transpose_stream(
                 state,
                 encoder,
-                &mut pool,
+                pool,
                 &snaked,
                 &format!("decoder.decoder.{block}.block.1.conv"),
                 stride,
@@ -847,8 +911,7 @@ impl CodecGpu {
             pool.release(snaked);
             for (slot, dilation) in [(2_usize, 1_usize), (3, 3), (4, 9)] {
                 let prefix = format!("decoder.decoder.{block}.block.{slot}");
-                cur =
-                    self.residual_unit_stream(state, encoder, &mut pool, cur, &prefix, dilation)?;
+                cur = self.residual_unit_stream(state, encoder, pool, cur, &prefix, dilation)?;
             }
         }
 
@@ -856,7 +919,7 @@ impl CodecGpu {
         let tail_conv = blocks + 2;
         let snaked = self.snake(
             encoder,
-            &mut pool,
+            pool,
             &cur,
             &format!("decoder.decoder.{tail_snake}"),
         )?;
@@ -864,7 +927,7 @@ impl CodecGpu {
         let wav = self.conv_stream(
             state,
             encoder,
-            &mut pool,
+            pool,
             &snaked,
             &format!("decoder.decoder.{tail_conv}.conv"),
             1,
@@ -878,9 +941,7 @@ impl CodecGpu {
                 wav.channels
             )));
         }
-        encoder.end_encoding();
-        commit_and_wait(command_buffer)?;
-        read_f32_buffer(&wav.buffer, wav.len())
+        Ok(wav)
     }
 
     fn residual_unit_stream(
@@ -939,10 +1000,11 @@ impl CodecGpu {
             .convs
             .get(prefix)
             .ok_or_else(|| InferError::MissingWeight(format!("conv GPU {prefix}")))?;
-        if x.channels != conv.inner {
+        if x.channels != conv.in_channels() {
             return Err(InferError::Dimension(format!(
                 "conv GPU streaming {prefix} attendu in={}, reçu {}",
-                conv.inner, x.channels
+                conv.in_channels(),
+                x.channels
             )));
         }
         if nopad {
@@ -952,7 +1014,7 @@ impl CodecGpu {
                     conv.kernel
                 )));
             }
-            return self.conv(encoder, pool, x, prefix, dilation, true);
+            return self.conv_with_start(encoder, pool, x, prefix, dilation, true, 0);
         }
 
         let keep_rows = (conv.kernel - 1).checked_mul(dilation).ok_or_else(|| {
@@ -988,10 +1050,11 @@ impl CodecGpu {
             .convs
             .get(prefix)
             .ok_or_else(|| InferError::MissingWeight(format!("conv GPU {prefix}")))?;
-        if x.channels != conv.inner {
+        if x.channels != conv.in_channels() {
             return Err(InferError::Dimension(format!(
                 "conv GPU {prefix} attendu in={}, reçu {}",
-                conv.inner, x.channels
+                conv.in_channels(),
+                x.channels
             )));
         }
         let (pad, out_time) = if nopad {
@@ -1013,7 +1076,7 @@ impl CodecGpu {
             u32_of(conv.kernel)?,
             u32_of(dilation)?,
             u32_of(pad)?,
-            u32_of(conv.out_dim)?,
+            u32_of(conv.out_dim / conv.groups)?,
             u32_of(x.channels)?,
             u32_of(x.time)?,
             u32::from(conv.bias.is_some()),

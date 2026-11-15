@@ -555,3 +555,66 @@ fn payload_summary_checksum_hashes_raw_tensor_bytes_fnv1a64() -> Result<()> {
     assert_eq!(summary.checksum, 0x4b72477f9c5c2f98);
     Ok(())
 }
+
+/// Préfixe codec GPU (`SARAGOSSA_TTS_CODEC_GPU_PREFIX`) contre le préfixe CPU,
+/// tous deux suivis de la section GPU, sur codes réels décodés par lots de 4.
+///
+/// Seuils fixés avant la première mesure, jamais élargis : `max_abs <= 1e-3`
+/// et `rms <= 1e-4` (PCM dans [-1, 1]). Le streaming GPU est en outre
+/// identique au bit au batch, et à lui-même pour un autre découpage.
+#[test]
+#[ignore = "parité: préfixe codec GPU vs CPU (cache HF + Metal requis)"]
+fn codec_gpu_prefix_matches_cpu_prefix() -> Result<()> {
+    let model_dir = local_tts_snapshot(
+        "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
+        "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
+    )
+    .ok_or_else(|| InferError::Config("snapshot VoiceDesign local requis".to_string()))?;
+    let rust = TtsModel::load_local(model_dir)?;
+    assert!(rust.codec.gpu_active(), "le test exige le codec Metal");
+    let text = "D'accord, je vérifie l'état du projet et je te donne le point utile. La priorité est de garder la réponse courte pour lancer l'audio plus vite.";
+    let codes = rust.generate_codes_greedy(text, 160)?;
+    let stream = |lot: usize, cpu_prefix: bool| -> Result<Vec<f32>> {
+        let mut state = rust.codec.new_stream_state();
+        let mut pcm = Vec::new();
+        let mut end = 0;
+        while end < codes.len() {
+            end = (end + lot).min(codes.len());
+            pcm.extend(if cpu_prefix {
+                rust.codec
+                    .decode_codes_streaming_cpu_prefix(&mut state, &codes[..end])?
+            } else {
+                rust.codec
+                    .decode_codes_streaming(&mut state, &codes[..end])?
+            });
+        }
+        Ok(pcm)
+    };
+    let gpu = stream(4, false)?;
+    let cpu = stream(4, true)?;
+    assert_eq!(gpu.len(), cpu.len(), "longueur préfixe GPU != CPU");
+    let (max_abs, rms, mean_abs, signal_max) = drift_stats(&cpu, &gpu);
+    eprintln!(
+        "préfixe codec GPU vs CPU: frames={} samples={} signal_max={signal_max:.4} max_abs={max_abs:.3e} rms={rms:.3e} mean_abs={mean_abs:.3e}",
+        codes.len(),
+        gpu.len(),
+    );
+    assert!(max_abs <= 1e-3, "max_abs préfixe GPU {max_abs:e}");
+    assert!(rms <= 1e-4, "rms préfixe GPU {rms:e}");
+    let identical = |left: &[f32], right: &[f32]| {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    };
+    assert!(
+        identical(&gpu, &rust.codec.decode_codes(&codes)?),
+        "préfixe GPU: streaming != batch"
+    );
+    assert!(
+        identical(&gpu, &stream(7, false)?),
+        "préfixe GPU: lots 4 != 7"
+    );
+    Ok(())
+}

@@ -170,6 +170,13 @@ impl TtsCodec {
         if generated.is_empty() {
             return Ok(Vec::new());
         }
+        // Préfixe GPU : le batch est un unique lot streaming, PCM identique au
+        // streaming quel que soit son découpage.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if self.gpu_prefix_active() {
+            let mut state = self.new_stream_state();
+            return self.decode_codes_streaming(&mut state, generated);
+        }
         let hidden = self.decode_prefix(generated)?;
         // Section chaude (`decoder.decoder.*`, ~94 % du coût) : forward GPU résident
         // si disponible, sinon repli CPU octet-identique (l'oracle de parité).
@@ -202,6 +209,40 @@ impl TtsCodec {
         state: &mut TtsCodecStreamState,
         generated: &[Vec<i32>],
     ) -> Result<Vec<f32>> {
+        self.decode_codes_streaming_with(state, generated, self.gpu_prefix_active())
+    }
+
+    /// Préfixe GPU actif : forward GPU présent avec son préfixe, RVQ en deux
+    /// groupes (sémantique puis acoustique).
+    fn gpu_prefix_active(&self) -> bool {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            self.gpu.as_ref().is_some_and(|gpu| gpu.has_prefix())
+                && self.cfg.num_quantizers > self.cfg.num_semantic_quantizers
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            false
+        }
+    }
+
+    /// Streaming avec le préfixe CPU et la section GPU, quel que soit le flag
+    /// (oracle du préfixe GPU).
+    #[cfg(test)]
+    pub(crate) fn decode_codes_streaming_cpu_prefix(
+        &self,
+        state: &mut TtsCodecStreamState,
+        generated: &[Vec<i32>],
+    ) -> Result<Vec<f32>> {
+        self.decode_codes_streaming_with(state, generated, false)
+    }
+
+    fn decode_codes_streaming_with(
+        &self,
+        state: &mut TtsCodecStreamState,
+        generated: &[Vec<i32>],
+        gpu_prefix: bool,
+    ) -> Result<Vec<f32>> {
         if generated.len() < state.generated_frames {
             return Err(InferError::Dimension(format!(
                 "codec streaming préfixe régressif: {} < {}",
@@ -213,6 +254,28 @@ impl TtsCodec {
             return Ok(Vec::new());
         }
 
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let (true, Some(gpu), Some(gpu_state)) =
+            (gpu_prefix, self.gpu.as_ref(), state.gpu.as_mut())
+        {
+            let new_codes = &generated[state.generated_frames..];
+            let semantic =
+                usize_from_i32(self.cfg.num_semantic_quantizers, "num_semantic_quantizers")?;
+            let total = usize_from_i32(self.cfg.num_quantizers, "num_quantizers")?;
+            let first = self.rvq_sum(new_codes, 0, semantic, "decoder.quantizer.rvq_first")?;
+            let rest = self.rvq_sum(
+                new_codes,
+                semantic,
+                total - semantic,
+                "decoder.quantizer.rvq_rest",
+            )?;
+            let pcm = gpu.decode_rvq_streaming(gpu_state, first.time, &first.data, &rest.data)?;
+            state.generated_frames = generated.len();
+            state.emitted_samples = state.emitted_samples.saturating_add(pcm.len());
+            return Ok(pcm.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect());
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = gpu_prefix;
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if let Some(gpu_state) = state.gpu.as_mut() {
             let hidden = self
@@ -403,6 +466,18 @@ impl TtsCodec {
         n_q: usize,
         prefix: &str,
     ) -> Result<Nlc> {
+        let acc = self.rvq_sum(generated, group_offset, n_q, prefix)?;
+        self.conv1x1(&acc, &format!("{prefix}.output_proj.weight"))
+    }
+
+    /// Somme des embeddings des `n_q` codebooks d'un groupe RVQ, `[time, dim]`.
+    fn rvq_sum(
+        &self,
+        generated: &[Vec<i32>],
+        group_offset: usize,
+        n_q: usize,
+        prefix: &str,
+    ) -> Result<Nlc> {
         let emb0 = self.weight(&format!("{prefix}.vq.layers.0.codebook.embed.weight"))?;
         let inner = matrix_shape(emb0)?.1;
         let mut acc = Nlc::zeros(generated.len(), inner);
@@ -416,7 +491,7 @@ impl TtsCodec {
                 acc.add_row_in_place(time, row)?;
             }
         }
-        self.conv1x1(&acc, &format!("{prefix}.output_proj.weight"))
+        Ok(acc)
     }
 
     fn pre_transformer(&self, x: &Nlc) -> Result<Nlc> {
