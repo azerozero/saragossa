@@ -224,10 +224,22 @@ impl TtsModel {
     {
         let mut decode_state = self.new_stream_decode_state();
         let fixed_lots = uses_fixed_lots(&decode_state);
+        let decode =
+            |codes: &[Vec<i32>]| self.decode_codes_for_mode_streaming(&mut decode_state, codes);
+        if crate::runtime_flags::tts_codec_overlap_enabled() {
+            return synthesize_streaming_overlapped(
+                generate_codes,
+                on_audio,
+                decode,
+                tts_stream_first_lot(),
+                fixed_lots,
+                self.codec.sample_rate(),
+            );
+        }
         synthesize_streaming_from_frames(
             generate_codes,
             on_audio,
-            |codes| self.decode_codes_for_mode_streaming(&mut decode_state, codes),
+            decode,
             tts_stream_first_lot(),
             fixed_lots,
             self.codec.sample_rate(),
@@ -345,14 +357,7 @@ where
             on_audio(&pcm)?;
             all_samples.extend_from_slice(&pcm);
         }
-        // Seul le codec à contextes causaux évite de redécoder le passé.
-        threshold = if fixed_lots {
-            generated.len().saturating_add(first_lot)
-        } else {
-            threshold
-                .saturating_mul(2)
-                .max(generated.len().saturating_add(1))
-        };
+        threshold = next_lot_threshold(generated.len(), threshold, first_lot, fixed_lots);
         Ok(())
     };
     let generated = generate_codes(&mut on_frame)?;
@@ -396,6 +401,150 @@ where
         samples: all_samples,
         sample_rate,
     })
+}
+
+/// Seuil du lot suivant, partagé par les variantes synchrone et recouverte.
+fn next_lot_threshold(generated: usize, threshold: usize, first_lot: usize, fixed: bool) -> usize {
+    // Seul le codec à contextes causaux évite de redécoder le passé.
+    if fixed {
+        generated.saturating_add(first_lot)
+    } else {
+        threshold.saturating_mul(2).max(generated.saturating_add(1))
+    }
+}
+
+/// Variante de [`synthesize_streaming_from_frames`] où le codec tourne sur un
+/// thread dédié : la trame suivante du talker se calcule pendant le décodage
+/// du lot courant (double tampon). Les lots arrivés pendant un décodage sont
+/// fusionnés en un seul appel ; le codec étant causal, le PCM ne dépend pas du
+/// découpage. `on_audio` reste appelé sur le thread appelant, dans l'ordre,
+/// au fil des trames puis à la fin.
+fn synthesize_streaming_overlapped<F, G, D>(
+    generate_codes: G,
+    mut on_audio: F,
+    decode: D,
+    first_lot: usize,
+    fixed_lots: bool,
+    sample_rate: u32,
+) -> Result<TtsSynthesisOutput>
+where
+    F: FnMut(&[f32]) -> Result<()>,
+    G: FnOnce(&mut dyn FnMut(&[Vec<i32>]) -> Result<()>) -> Result<GeneratedCodes>,
+    D: FnMut(&[Vec<i32>]) -> Result<Vec<f32>> + Send,
+{
+    use std::sync::mpsc;
+    let profile = tts_internal_profile_enabled();
+    let profile_started = Instant::now();
+    std::thread::scope(|scope| {
+        let (job_tx, job_rx) = mpsc::channel::<Vec<Vec<i32>>>();
+        let (pcm_tx, pcm_rx) = mpsc::channel::<Result<Vec<f32>>>();
+        let worker = scope.spawn(move || codec_worker(job_rx, pcm_tx, decode));
+        let mut all_samples: Vec<f32> = Vec::new();
+        let mut first_emit = None;
+        let mut emit = |pcm: Result<Vec<f32>>, all: &mut Vec<f32>| -> Result<()> {
+            let pcm = pcm?;
+            if !pcm.is_empty() {
+                first_emit.get_or_insert_with(|| profile_started.elapsed());
+                on_audio(&pcm)?;
+                all.extend_from_slice(&pcm);
+            }
+            Ok(())
+        };
+        let worker_gone = || InferError::Metal("thread codec TTS arrêté".to_string());
+        let outcome = (|| {
+            let job_tx = job_tx;
+            let mut sent = 0_usize;
+            let mut threshold = first_lot;
+            let generated = generate_codes(&mut |generated: &[Vec<i32>]| -> Result<()> {
+                while let Ok(pcm) = pcm_rx.try_recv() {
+                    emit(pcm, &mut all_samples)?;
+                }
+                if generated.len() < threshold {
+                    return Ok(());
+                }
+                job_tx
+                    .send(generated[sent..].to_vec())
+                    .map_err(|_| worker_gone())?;
+                sent = generated.len();
+                threshold = next_lot_threshold(generated.len(), threshold, first_lot, fixed_lots);
+                Ok(())
+            })?;
+            // Flush final : le suffixe non couvert par le dernier lot.
+            if generated.codes.len() > sent {
+                job_tx
+                    .send(generated.codes[sent..].to_vec())
+                    .map_err(|_| worker_gone())?;
+            }
+            drop(job_tx);
+            for pcm in pcm_rx.iter() {
+                emit(pcm, &mut all_samples)?;
+            }
+            Ok(generated)
+        })();
+        // Canal de travaux fermé dans tous les cas : le thread codec se termine.
+        let stats = worker
+            .join()
+            .map_err(|_| InferError::Metal("thread codec TTS en panique".to_string()))?;
+        let generated = outcome?;
+        if profile {
+            eprintln!(
+                "perf tts.internal.stream_codec overlap=1 first_lot={} frames={} samples={} codec_calls={} codec_ms={:.3} first_codec_ms={:.3} first_emit_ms={:.3} total_ms={:.3}",
+                first_lot,
+                generated.codes.len(),
+                all_samples.len(),
+                stats.calls,
+                stats.total.as_secs_f64() * 1e3,
+                stats.first.unwrap_or_default().as_secs_f64() * 1e3,
+                first_emit.unwrap_or_default().as_secs_f64() * 1e3,
+                profile_started.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        Ok(TtsSynthesisOutput {
+            frame_limit_reached: generated.stop_reason == TtsStopReason::Cap,
+            stop_reason: generated.stop_reason,
+            codes: generated.codes,
+            samples: all_samples,
+            sample_rate,
+        })
+    })
+}
+
+#[derive(Default)]
+struct CodecWorkerStats {
+    calls: usize,
+    total: Duration,
+    first: Option<Duration>,
+}
+
+/// Décode les lots reçus dans l'ordre ; s'arrête au premier échec ou quand
+/// l'un des canaux est fermé.
+fn codec_worker<D>(
+    jobs: std::sync::mpsc::Receiver<Vec<Vec<i32>>>,
+    results: std::sync::mpsc::Sender<Result<Vec<f32>>>,
+    mut decode: D,
+) -> CodecWorkerStats
+where
+    D: FnMut(&[Vec<i32>]) -> Result<Vec<f32>>,
+{
+    let mut stats = CodecWorkerStats::default();
+    let mut prefix = Vec::new();
+    while let Ok(job) = jobs.recv() {
+        prefix.extend(job);
+        while let Ok(more) = jobs.try_recv() {
+            prefix.extend(more);
+        }
+        let started = Instant::now();
+        let pcm = decode(&prefix);
+        let elapsed = started.elapsed();
+        stats.calls += 1;
+        stats.total += elapsed;
+        stats.first.get_or_insert(elapsed);
+        let failed = pcm.is_err();
+        if results.send(pcm).is_err() || failed {
+            break;
+        }
+    }
+    stats
 }
 
 #[cfg(test)]
