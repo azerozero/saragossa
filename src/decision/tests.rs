@@ -212,9 +212,14 @@ fn tta_plan_matches_reference_engine() -> Result<()> {
     let keys: Vec<&String> = p["criteria"].as_object().unwrap().keys().collect();
     assert_eq!(keys, ["c", "a", "b"]);
     assert_eq!(p["criteria"]["b"], Value::Null);
-    let g = geo_mean(&[vec![0.5, 0.5], vec![0.8, 0.2]]);
+    let g = geo_mean(&[vec![0.5, 0.5], vec![0.8, 0.2]])?;
     assert!((g[0] - 0.4_f64.sqrt() / (0.4_f64.sqrt() + 0.1_f64.sqrt())).abs() < 1e-12);
-    assert!((geo_mean(&[vec![0.0, 1.0]])[0] - 1e-9 / (1.0 + 1e-9)).abs() < 1e-18);
+    assert!((geo_mean(&[vec![0.0, 1.0]])?[0] - 1e-9 / (1.0 + 1e-9)).abs() < 1e-18);
+    assert!(geo_mean(&[]).is_err() && geo_mean(&[vec![1.0], vec![0.5, 0.5]]).is_err());
+    let many: Map<String, Value> = (0..65)
+        .map(|i| (i.to_string(), json!({"type":"noul"})))
+        .collect();
+    assert!(validate_request(&json!({"state":"","questions":many})).is_err());
     for (request, k) in [
         (json!({"state":"","questions":{}}), 1),
         (json!({"tta":4}), 4),
