@@ -75,18 +75,9 @@ mod macos {
                 &serde_json::json!({"vocab":tokenizer_json["model"]["vocab"],"added_tokens":tokenizer_json["added_tokens"]})
             )?)
         );
-        // Le corpus est re-tokenisé par le tokenizer du modèle, sans toucher aux
-        // captures externes ; les conversions issues du même BF16 gardent ces IDs.
-        let tokenizer = saragossa::RustTokenizer::from_file(path.join("tokenizer.json"))?;
-        let corpus = tokenizer.encode(include_str!("../tests/fixtures/goldens/kld/corpus.txt"))?;
-        let mut protocol = protocol;
-        if corpus.len() < 4096 {
-            return Err("corpus trop court".into());
-        }
-        protocol.chunks = corpus[..4096]
-            .chunks_exact(512)
-            .map(|c| c.iter().map(|&v| v as usize).collect())
-            .collect();
+        // Les IDs du protocole sont ceux du banc MLX. Les conversions mlx_lm
+        // réécrivent le pré-tokenizer : on compare donc le vocabulaire, sans
+        // re-tokeniser le corpus avec le tokenizer du candidat.
         let reference: Option<Reference> = if args[0] == "score" {
             Some(serde_json::from_slice(&fs::read(output)?)?)
         } else {
