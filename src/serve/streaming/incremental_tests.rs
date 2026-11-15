@@ -359,10 +359,10 @@ fn local_fixture(family: &str) -> Option<(ModelAssets, Vec<Vec<u32>>)> {
         return None;
     };
     assert_eq!(
-        format!(
-            "{:x}",
-            Sha256::digest(std::fs::read(&path).expect("fixture locale"))
-        ),
+        Sha256::digest(std::fs::read(&path).expect("fixture locale"))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
         header["tokenizer_sha256"].as_str().expect("SHA")
     );
     let ids = rows

@@ -1,0 +1,3 @@
+# Graines de tests/sampling_properties.rs, rejouées avant les nouveaux cas.
+# Aucune régression observée à l’initialisation ; ajouter les graines produites
+# par proptest, jamais un résultat de référence recalculé pour masquer un échec.

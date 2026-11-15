@@ -76,12 +76,22 @@ pub(in crate::decoder) struct ResidentPipelineOutput {
     pub(in crate::decoder) drained: bool,
 }
 
-/// Sortie d'un pas résident piloté par embedding : soit le `final_state` post-norm
-/// relu (pas de tête), soit l'argmax greedy on-device d'une tête fournie (TTS cp).
+/// Sortie d'un pas résident piloté par embedding : état, token glouton ou
+/// logits échantillonnables. Le talker a aussi besoin de l'état pour le cp.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(in crate::decoder) enum ResidentEmbeddingOut {
     State(Tensor),
     Token(usize),
+    Logits(Tensor),
+    StateLogits(Tensor, Tensor),
+}
+
+/// Projection terminale encodée avec le pas, avant toute synchronisation CPU.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(in crate::decoder) enum ResidentEmbeddingHead<'a> {
+    Greedy(&'a crate::metal_backend::MetalLinearWeightBuffers),
+    Logits(&'a crate::metal_backend::MetalLinearWeightBuffers),
+    StateLogits(&'a crate::metal_backend::MetalLinearWeightBuffers),
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

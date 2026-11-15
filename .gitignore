@@ -5,3 +5,7 @@
 # Recette d'environnement du sandbox agent (chemins machine locaux).
 /orca.yaml
 __pycache__/
+
+# Sorties locales de campagne et temporaires de compilation.
+/mutants.out*/
+/.tmp/

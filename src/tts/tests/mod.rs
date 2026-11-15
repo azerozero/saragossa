@@ -11,6 +11,8 @@ mod assets;
 mod codec;
 mod golden;
 mod guards;
+mod inputs;
+mod policy;
 
 /// Charge le codec TTS réel depuis le snapshot VoiceDesign en cache HF.
 fn load_voicedesign_codec() -> Option<TtsCodec> {

@@ -539,7 +539,7 @@ fn snapshot_key_uses_effective_chunk_after_environment_change() {
                     hash.update(field);
                 }
             }
-            let environment = format!("{:x}", hash.finalize());
+            let environment = crate::hex(hash.finalize());
             assert_eq!(crate::runtime_flags::prefill_resident_chunk_tokens(), 4096);
             // Aucune demande de clé avant la mutation : c'est le premier flag
             // qui doit avoir capturé l'environnement initial entier.

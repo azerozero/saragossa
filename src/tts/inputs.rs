@@ -2,11 +2,17 @@ use super::{add_into, gather_rows_i32, push_rows, PreparedVoiceDesign, TtsCloneC
 use crate::{InferError, Result, Tensor};
 
 impl TtsModel {
-    /// Choisit l'instruction de voix VoiceDesign ; sans effet sur le clonage ICL.
+    /// Fournit une instruction VoiceDesign ou CustomVoice explicite ; sans effet sur le clonage ICL.
     #[must_use]
     pub fn with_voice_design_instruction(mut self, instruction: impl Into<String>) -> Self {
         self.voice_design_instruction = instruction.into();
         self
+    }
+
+    /// Sélectionne un locuteur CustomVoice ; `None` rétablit Serena.
+    pub fn set_voice(&mut self, voice: Option<&str>) -> Result<()> {
+        self.speaker_id = self.assets.model_config.speaker_id(voice)?;
+        Ok(())
     }
 
     pub(super) fn prepare_inputs(&self, text: &str) -> Result<PreparedVoiceDesign> {
@@ -167,23 +173,7 @@ impl TtsModel {
         let tts_bos = tts_embeds.row_slice(0)?.to_vec();
         let tts_pad = tts_embeds.row_slice(2)?.to_vec();
 
-        let lang_id = cfg.codec_language_id.get("french").copied();
-        let codec_prefill: Vec<i32> = match lang_id {
-            Some(lid) => vec![
-                cfg.codec_think_id,
-                cfg.codec_think_bos_id,
-                lid,
-                cfg.codec_think_eos_id,
-            ],
-            None => vec![
-                cfg.codec_nothink_id,
-                cfg.codec_think_bos_id,
-                cfg.codec_think_eos_id,
-            ],
-        };
-        let mut codec_ids = codec_prefill;
-        codec_ids.push(cfg.codec_pad_id);
-        codec_ids.push(cfg.codec_bos_id);
+        let codec_ids = cfg.codec_prompt_ids(self.speaker_id);
         let codec_embed = self.codec_embed(&codec_ids)?;
         let codec_len = codec_embed.shape()[0];
         let hidden = self.hidden_dim()?;
@@ -193,13 +183,14 @@ impl TtsModel {
             ));
         }
 
-        let instruct = &self.voice_design_instruction;
-        let instruct_chat = format!("<|im_start|>user\n{instruct}<|im_end|>\n");
-        let instruct_ids = self.encode_ids(&instruct_chat)?;
-        let instruct_embed = self.text_embed(&instruct_ids)?;
-
         let mut rows = Vec::new();
-        push_rows(&mut rows, &instruct_embed, 0, instruct_embed.shape()[0])?;
+        let instruct = &self.voice_design_instruction;
+        if !instruct.is_empty() {
+            let instruct_chat = format!("<|im_start|>user\n{instruct}<|im_end|>\n");
+            let instruct_ids = self.encode_ids(&instruct_chat)?;
+            let instruct_embed = self.text_embed(&instruct_ids)?;
+            push_rows(&mut rows, &instruct_embed, 0, instruct_embed.shape()[0])?;
+        }
         push_rows(&mut rows, &text_embed, 0, 3)?;
 
         for i in 0..(codec_len - 1) {
