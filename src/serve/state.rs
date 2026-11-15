@@ -692,6 +692,7 @@ impl LoadedModel {
         session_key: Option<&str>,
         memory_guard: &MemoryGuard,
     ) -> ServeResult<ServedCompletion> {
+        let _disk_session = saragossa::decoder::PrefixDiskSession::enter(session_key);
         let prepared = self.prepare(&request, max_tokens)?;
         let PreparedRequest {
             tokens: prompt_tokens_ids,
@@ -778,6 +779,7 @@ impl LoadedModel {
         memory_guard: &MemoryGuard,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<ServedCompletion> {
+        let _disk_session = saragossa::decoder::PrefixDiskSession::enter(session_key);
         let prepared = self.prepare(&request, max_tokens)?;
         let PreparedRequest {
             tokens: prompt_tokens_ids,
@@ -1293,7 +1295,23 @@ impl LoadedModel {
             .prefix_cache
             .match_prefix(root, tokens)
             .filter(|hit| cheap_extend || hit.tokens.saturating_mul(2) >= full_block_tokens);
-        let reused_prefix_tokens = hit.as_ref().map_or(0, |hit| hit.tokens);
+        let minimum = hit
+            .as_ref()
+            .map_or(0, |hit| hit.tokens)
+            .max(if cheap_extend {
+                0
+            } else {
+                full_block_tokens.div_ceil(2).saturating_sub(1)
+            });
+        let persistent = self.decoder.load_persistent_prefix(
+            &tokens[..full_block_tokens],
+            block_tokens,
+            minimum,
+        )?;
+        let reused_prefix_tokens = persistent.as_ref().map_or_else(
+            || hit.as_ref().map_or(0, |hit| hit.tokens),
+            CausalDecoderPromptState::position,
+        );
 
         // NOTE: une seule frontière mémorisée par prompt, la dernière complète.
         // Un snapshot par bloc partageait l'Arc du KV avec l'état vivant : chaque
@@ -1301,7 +1319,9 @@ impl LoadedModel {
         // ponytail: un préfixe commun plus court que le prompt servi (prompt
         // système partagé) n'est réutilisé que s'il a été servi seul ; ajouter
         // une frontière déclarée (fin du message système) si ce cas compte.
-        let mut state = if let Some(hit) = hit {
+        let mut state = if let Some(state) = persistent {
+            self.extend_persistent_prefix(root, &tokens[..full_block_tokens], state, memory_guard)?
+        } else if let Some(hit) = hit {
             let hit_kv = kv_allocations(&hit.state);
             let mut state = hit.state;
             let metal = self.decoder.copy_prompt_state_metal_snapshot(&hit.metal)?;
@@ -1329,12 +1349,36 @@ impl LoadedModel {
             let hash = tokens[..full_block_tokens]
                 .chunks_exact(block_tokens)
                 .fold(root, BlockHash::chain);
+            self.decoder
+                .persist_prompt(&tokens[..full_block_tokens], &state)?;
             self.remember_prefix_block(root, hash, full_block_tokens, &state, memory_guard)?;
         }
         self.decoder
             .extend_prompt_state(&mut state, &tokens[full_block_tokens..])?;
 
         Ok((state, reused_prefix_tokens, started.elapsed()))
+    }
+
+    /// La relecture possède déjà sa récurrence Metal indépendante. La garder
+    /// vivante évite snapshot + restauration ; seule l'entrée RAM est copiée.
+    fn extend_persistent_prefix(
+        &mut self,
+        root: BlockHash,
+        tokens: &[usize],
+        mut state: CausalDecoderPromptState,
+        memory_guard: &MemoryGuard,
+    ) -> ServeResult<CausalDecoderPromptState> {
+        let boundary = state.position();
+        if boundary == tokens.len() {
+            let hash = tokens
+                .chunks_exact(self.prefix_cache.block_tokens())
+                .fold(root, BlockHash::chain);
+            self.remember_prefix_block(root, hash, boundary, &state, memory_guard)?;
+        }
+        // Une frontière prolongée sera mémorisée une seule fois par l'appelant.
+        self.decoder
+            .extend_prompt_state(&mut state, &tokens[boundary..])?;
+        Ok(state)
     }
 
     fn remember_prefix_block(
@@ -1888,6 +1932,50 @@ mod tests {
         assert_eq!(
             fitting_streams(&MemoryGuard::disabled(), &rest, |bytes| *bytes),
             4
+        );
+    }
+
+    #[test]
+    fn persistent_prefix_keeps_one_reusable_frontier() {
+        let mut loaded = super::json_tests::tiny_loaded_model();
+        loaded.prefix_cache = BlockAwarePrefixCache::new(1, 8);
+        let root = BlockHash::for_session(Some("ssd"));
+        let guard = MemoryGuard::disabled();
+        let make_state = |loaded: &LoadedModel| {
+            loaded
+                .decoder
+                .prefill_prompt_state_uncached(&[0, 1])
+                .unwrap()
+        };
+        let state = make_state(&loaded);
+        let state = loaded
+            .extend_persistent_prefix(root, &[0, 1], state, &guard)
+            .unwrap();
+        let hit = loaded.prefix_cache.match_prefix(root, &[0, 1]).unwrap();
+        assert_eq!(hit.tokens, 2);
+        let generate = |state| {
+            loaded
+                .decoder
+                .generate_greedy_timed_from_prompt_state_with_options(
+                    state,
+                    Duration::ZERO,
+                    4,
+                    &GenerationOptions::default(),
+                )
+                .unwrap()
+                .tokens
+        };
+        assert_eq!(generate(state), generate(hit.state));
+
+        loaded.prefix_cache = BlockAwarePrefixCache::new(1, 8);
+        let state = make_state(&loaded);
+        let state = loaded
+            .extend_persistent_prefix(root, &[0, 1, 2], state, &guard)
+            .unwrap();
+        assert_eq!(state.position(), 3);
+        assert!(
+            loaded.prefix_cache.match_prefix(root, &[0, 1, 2]).is_none(),
+            "la frontière intermédiaire ne doit pas déclencher de snapshot"
         );
     }
 

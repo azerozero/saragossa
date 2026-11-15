@@ -9372,6 +9372,121 @@ kernel void causal_attention_prefill_long_f32(
     }
 }
 
+// Extension d512 isolée : préserver le kernel historique pour d <= 256.
+// Deux colonnes par thread, scores arrondis comme dans le kernel mid.
+kernel void causal_attention_prefill_long_d512_f32(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint4& dims [[buffer(4)]],
+    constant float2& scale_params [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint seq = dims.x;
+    const uint q_heads = dims.y;
+    const uint kv_heads = dims.z;
+    const uint head_dim = dims.w;
+    const uint q_head = tile.x;
+    const uint pos = tile.y;
+    if (q_head >= q_heads || pos >= seq || head_dim > 512u) {
+        return;
+    }
+
+    threadgroup float partial[256];
+    const uint kv_group = q_heads / kv_heads;
+    const uint kv_head = q_head / kv_group;
+    const uint q_dim = q_heads * head_dim;
+    const uint kv_dim = kv_heads * head_dim;
+    const uint q_start = pos * q_dim + q_head * head_dim;
+    const uint kv_head_start = kv_head * head_dim;
+    const float scale = scale_params.y > 0.0f ? scale_params.x : rsqrt(float(head_dim));
+
+    // Passe 1 : maximum des scores (ordre 0..=pos), score recalculé en arbre.
+    float max_score = -INFINITY;
+    for (uint row = 0u; row <= pos; ++row) {
+        const uint k_start = row * kv_dim + kv_head_start;
+        float dot = 0.0f;
+        for (uint col = tid; col < head_dim; col += 256u) {
+            dot += q[q_start + col] * k[k_start + col];
+        }
+        partial[tid] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        max_score = max(max_score, partial[0] * scale);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Passe 2 : somme des exponentielles (même ordre), score recalculé.
+    float sum = 0.0f;
+    for (uint row = 0u; row <= pos; ++row) {
+        const uint k_start = row * kv_dim + kv_head_start;
+        float dot = 0.0f;
+        for (uint col = tid; col < head_dim; col += 256u) {
+            dot += q[q_start + col] * k[k_start + col];
+        }
+        partial[tid] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        // Le mid stocke le score avant la soustraction : ne pas contracter
+        // score - max_score en FMA.
+        volatile float score = partial[0] * scale;
+        sum += exp(score - max_score);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+
+    // Passe 3 : deux colonnes indépendantes par thread pour les têtes d512.
+    const uint out_start = pos * q_dim + q_head * head_dim;
+    const uint my_col = tid;
+    float acc = 0.0f;
+    float acc_hi = 0.0f;
+    for (uint row = 0u; row <= pos; ++row) {
+        const uint k_start = row * kv_dim + kv_head_start;
+        float dot = 0.0f;
+        for (uint col = tid; col < head_dim; col += 256u) {
+            dot += q[q_start + col] * k[k_start + col];
+        }
+        partial[tid] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        volatile float score = partial[0] * scale;
+        // Même frontière d’arrondi que le poids normalisé stocké par mid.
+        volatile float weight = exp(score - max_score) * inv_sum;
+        if (my_col < head_dim) {
+            const uint v_start = row * kv_dim + kv_head_start;
+            acc += weight * v[v_start + my_col];
+        }
+        if (my_col + 256u < head_dim) {
+            const uint v_start = row * kv_dim + kv_head_start;
+            acc_hi += weight * v[v_start + my_col + 256u];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (my_col < head_dim) {
+        out[out_start + my_col] = acc;
+    }
+    if (my_col + 256u < head_dim) {
+        out[out_start + my_col + 256u] = acc_hi;
+    }
+}
+
 // Variantes sliding-window du prefill causal. Elles restent séparées des
 // kernels historiques afin que les chemins Qwen et Gemma globaux conservent
 // strictement leur code et leur ordre arithmétique.

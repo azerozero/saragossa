@@ -3690,8 +3690,9 @@ impl CausalDecoder {
 
     /// Capture le prefill Gemma 4 MoE dans un répertoire neuf (feature `devtools`).
     ///
-    /// Utilise le runtime attaché : CPU f32 ou Metal per-op par défaut, sans
-    /// cache de préfixe ni snapshot disque. Aucun poids ni token n'est téléchargé.
+    /// Utilise le runtime attaché : CPU f32, ou Metal per-op avec
+    /// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0`, sans cache de préfixe ni
+    /// snapshot disque. Aucun poids ni token n'est téléchargé.
     ///
     /// # Errors
     ///
@@ -4043,8 +4044,18 @@ impl CausalDecoder {
         mode: SnapshotMode,
     ) -> Result<(CausalDecoderCache, Tensor, usize)> {
         let snapshot = self.snapshot_request(prompt, mode)?;
+        if super::persistent_prefix_enabled() && prefix_cache_enabled() {
+            if let Some(((cache, final_state), reused)) = self.prefix_cache_get(prompt)? {
+                self.snapshot_save(&snapshot, &cache, &final_state, None, None);
+                return Ok((cache, final_state, reused));
+            }
+        }
         if let Some(state) = self.snapshot_load(&snapshot) {
-            return Ok((state.cache, state.final_state, prompt.len()));
+            let pair = (state.cache, state.final_state);
+            if super::persistent_prefix_enabled() && prefix_cache_enabled() {
+                self.prefix_cache_put(prompt, &pair, None, None)?;
+            }
+            return Ok((pair.0, pair.1, prompt.len()));
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _gpu_alloc_trace = self.trace_gpu_alloc_scope("prefill");
@@ -4109,12 +4120,24 @@ impl CausalDecoder {
             return Err(InferError::Dimension("prompt token vide".to_string()));
         }
         let snapshot = self.snapshot_request(prompt, SnapshotMode::MtpCommitted)?;
+        if super::persistent_prefix_enabled() && prefix_cache_enabled() {
+            if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt, on_final_state)? {
+                if hit.2.len() == prompt.len().saturating_sub(1) {
+                    self.snapshot_save(&snapshot, &hit.0, &hit.1, Some(&hit.2), None);
+                }
+                return Ok(hit);
+            }
+        }
         if let Some(state) = self.snapshot_load(&snapshot) {
             if let Some(history) = state.history.filter(super::mtp_history::compatible) {
                 let keep = on_final_state(&state.final_state)?;
+                let pair = (state.cache, state.final_state);
+                if keep && super::persistent_prefix_enabled() && prefix_cache_enabled() {
+                    self.prefix_cache_put(prompt, &pair, Some(&history), None)?;
+                }
                 return Ok((
-                    state.cache,
-                    state.final_state,
+                    pair.0,
+                    pair.1,
                     if keep {
                         history
                     } else {
@@ -4144,6 +4167,7 @@ impl CausalDecoder {
             if prefix_cache_enabled() {
                 self.prefix_cache_put(prompt, &state, Some(&history), None)?;
             }
+            self.snapshot_save(&snapshot, &state.0, &state.1, Some(&history), None);
             return Ok((state.0, state.1, history, 0));
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -4686,7 +4710,9 @@ impl CausalDecoder {
         keep_rows: usize,
         drafter: Option<&DFlashDraft>,
     ) -> Result<(CausalDecoderCache, Tensor, Arc<Tensor>, usize)> {
-        let snapshot = if crate::runtime_flags::state_snapshot_dir().is_some() {
+        let snapshot = if crate::runtime_flags::state_snapshot_dir().is_some()
+            || super::persistent_prefix_enabled()
+        {
             self.snapshot_request_dflash(
                 prompt,
                 SnapshotMode::Dflash(format!("{layer_ids:?}:{keep_rows}")),
@@ -4695,6 +4721,28 @@ impl CausalDecoder {
         } else {
             None
         };
+        if super::persistent_prefix_enabled() && prefix_cache_enabled() {
+            if let Some(hit) = self.prefix_cache_get_with_captures(prompt, layer_ids, keep_rows)? {
+                let history = self.prefix_cache.lock().ok().and_then(|cache| {
+                    cache
+                        .entries
+                        .iter()
+                        .find(|entry| entry.tokens == prompt)
+                        .and_then(|entry| entry.mtp_history.clone())
+                });
+                if !self.dflash_switch_needs_history() || history.is_some() {
+                    let captures = PrefixCaptures::new(layer_ids, hit.3, Arc::clone(&hit.2));
+                    self.snapshot_save(
+                        &snapshot,
+                        &hit.0,
+                        &hit.1,
+                        history.as_ref(),
+                        Some(&captures),
+                    );
+                }
+                return Ok(hit);
+            }
+        }
         if let Some(state) = self.snapshot_load(&snapshot) {
             if let Some(captures) = state.captures {
                 if captures.layer_ids == layer_ids
@@ -5673,7 +5721,17 @@ impl CausalDecoder {
         if !prefill_resident_enabled() {
             return self.resident_prefill_ineligible("SARAGOSSA_RUST_PREFILL_RESIDENT=0");
         }
-        if self.config.is_gemma4 && !prefill_resident_gemma4_enabled() {
+        if self.config.is_gemma4
+            && !crate::runtime_flags::prefill_resident_gemma4_eligible(prompt.len())
+        {
+            let max_tokens = crate::runtime_flags::prefill_resident_gemma4_max_tokens();
+            if prefill_resident_gemma4_enabled() && trace_prefill_enabled() {
+                eprintln!(
+                    "prefill résident Gemma 4 inéligible: tokens={} > \
+                         SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS={max_tokens}; per-op",
+                    prompt.len()
+                );
+            }
             return Ok(None);
         }
         self.ensure_prompt_within_prefill_cap(prompt.len())?;
@@ -5746,9 +5804,9 @@ impl CausalDecoder {
                 cache.position = prompt.len();
                 Ok(Some((cache, final_hidden, captures)))
             }
-            // Erreur d'exécution flint : la propager plutôt que masquer un
-            // kernel cassé derrière un prefill CPU ~500× plus lent.
-            Err(error) if resident_only => Err(error),
+            // Une erreur résidente Gemma 4 ou flint ne doit pas masquer un
+            // kernel cassé derrière un prefill CPU beaucoup plus lent.
+            Err(error) if resident_only || self.config.is_gemma4 => Err(error),
             Err(error) => {
                 if trace_prefill_enabled() {
                     eprintln!("prefill résident fallback: {error}");
@@ -5884,6 +5942,75 @@ impl CausalDecoder {
         prompt: &[usize],
     ) -> Result<Option<(CausalDecoderCache, Tensor)>> {
         self.prefill_cache_state_metal_resident(prompt)
+    }
+
+    /// Ablation de diagnostic : seules les couches globales d512 passent en
+    /// per-op. Le contrôle garde toutes les couches résidentes, une par soumission.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn prefill_gemma4_global_ablation_for_test(
+        &self,
+        prompt: &[usize],
+        global_per_op: bool,
+    ) -> Result<(CausalDecoderCache, Tensor)> {
+        let metal = self
+            .resident_metal()
+            .ok_or_else(|| InferError::Config("ablation Gemma 4: Metal requis".into()))?;
+        let spec = self
+            .resident_prefill_spec(prompt.len(), self.final_norm.data().len())
+            .ok_or_else(|| InferError::Config("ablation Gemma 4: spec refusée".into()))?;
+        let mut hidden = self.embed_scaled(prompt)?;
+        let mut cache = self.empty_cache();
+        let mut per_op_layers = 0;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let prefill_layer = layer
+                .prefill_moe_layer(&self.config, spec)
+                .ok_or_else(|| InferError::Config("ablation Gemma 4: couche refusée".into()))?;
+            let layer_spec = prefill_layer.attention_spec;
+            if global_per_op && layer_spec.head_dim == 512 && layer_spec.window.is_none() {
+                hidden = layer.forward_prefill(
+                    &self.config,
+                    &hidden,
+                    &mut cache.layers[index],
+                    0,
+                    self.forward_runtime(),
+                )?;
+                per_op_layers += 1;
+            } else {
+                let (output, states) =
+                    metal.qwen_moe_prefill_resident(&hidden, &[prefill_layer], layer_spec)?;
+                assert_eq!(states.len(), 1);
+                for state in states {
+                    let crate::metal_backend::PrefillResidentLayerCache::Full {
+                        key,
+                        value,
+                        kv_dim,
+                        base,
+                        ..
+                    } = state
+                    else {
+                        return Err(InferError::Config(
+                            "ablation Gemma 4: cache full attendu".into(),
+                        ));
+                    };
+                    let layout = AttentionLayout {
+                        num_attention_heads: layer_spec.q_heads,
+                        num_key_value_heads: layer_spec.kv_heads,
+                        head_dim: layer_spec.head_dim,
+                        rope_dims: layer_spec.rope_dims,
+                        attn_scalar: layer_spec.attn_scalar,
+                        sliding_window: layer_spec.window,
+                    };
+                    cache.layers[index].append_prefill(key, value, kv_dim, base, &layout)?;
+                }
+                hidden = output;
+            }
+        }
+        eprintln!("Gemma4 ablation global_per_op={global_per_op} per_op_layers={per_op_layers}");
+        assert_eq!(per_op_layers > 0, global_per_op);
+        cache.position = prompt.len();
+        let final_hidden = Tensor::row(hidden.last_row()?.to_vec())?;
+        let state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
+        Ok((cache, state))
     }
 
     fn can_prefill_batched(&self) -> bool {

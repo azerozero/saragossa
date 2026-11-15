@@ -1651,6 +1651,59 @@ fn rows_exact_qmvt_engaged_in_strict_mode() -> Result<()> {
     Ok(())
 }
 
+/// Hors mode strict, les lots de 3 et 4 lignes (sous le skinny) prennent le
+/// qmv-T au lieu du qmv répliqué et rendent en bits les lignes du qmv mono ;
+/// à 5 lignes le skinny reprend la main.
+#[test]
+#[ignore = "oracle GPU en bits : lancer avec --ignored"]
+fn rows_exact_qmvt_engaged_below_skinny() -> Result<()> {
+    let executor = rows_exact_executor()?;
+    let (out_dim, in_dim) = (5120usize, 17408usize);
+    let buffers = executor.resolve_linear_weight_buffers(
+        &LinearWeight::AffineQuantized(test_affine_random_u4(out_dim, in_dim, 23)?),
+        "rexact_qmvt_small",
+    )?;
+    let x = rows_exact_lhs(5, in_dim, 5, 1.0);
+    let lhs = executor.buffer_from_slice(&x, "rexact_qmvt_small_lhs")?;
+    let out = executor.uncached_f32_buffer(5 * out_dim, "rexact_qmvt_small_out")?;
+    let mut mono = Vec::with_capacity(5 * out_dim);
+    for r in 0..5 {
+        let xr = executor.buffer_from_slice(&x[r * in_dim..(r + 1) * in_dim], "rexact_qmvt_small_x1")?;
+        let o = executor.uncached_f32_buffer(out_dim, "rexact_qmvt_small_o1")?;
+        rows_exact_cb(&executor, |enc| {
+            executor
+                .encode_matmul_weight_buffers(enc, &xr, 1, in_dim, &buffers, &o, false)
+                .map(|_| ())
+        })?;
+        mono.extend(read_f32_buffer(&o, out_dim)?);
+    }
+    let fast = super::flags::fast_affine_qmv_enabled(out_dim)
+        && super::eligibility::qmvt_small_enabled();
+    for rows in 3..=5 {
+        let count = || super::matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get);
+        let before = count();
+        rows_exact_cb(&executor, |enc| {
+            executor
+                .encode_matmul_weight_buffers(enc, &lhs, rows, in_dim, &buffers, &out, false)
+                .map(|_| ())
+        })?;
+        let engaged = count() > before;
+        assert_eq!(engaged, fast && rows < 5, "qmv-T R={rows} : engagé = {engaged}");
+        if engaged {
+            assert_eq!(
+                rows_exact_ndiff(
+                    &mono[..rows * out_dim],
+                    &read_f32_buffer(&out, rows * out_dim)?,
+                    "qmv-T"
+                ),
+                0,
+                "R={rows} : lot ≠ mono"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Mode strict, matmuls enchaînés dans un même encodeur : deux projections
 /// 5120×5120 (même scratch device `xt`/`sum`, réécrit par le second prep après
 /// lecture par le premier qmv-T), puis up et down 5120×17408 en threadgroup ;

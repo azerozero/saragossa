@@ -1,6 +1,6 @@
 [package]
 name = "saragossa"
-version = "0.3.0"
+version = "0.3.1"
 description = "Pure-Rust Metal inference engine for Apple Silicon: Qwen dense/MoE LLMs, Whisper STT, Qwen3 TTS, OpenAI-compatible server — GPU-resident decode, 35B MoE at ~105 tok/s."
 repository = "https://github.com/azerozero/saragossa"
 keywords = ["llm", "inference", "metal", "apple-silicon", "transformer"]
@@ -57,9 +57,10 @@ rayon = "1"
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 rustfft = "6"
 hound = "3.5"
-md5 = "0.7"
+md5 = "0.8"
 sha2 = "0.10"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
+fs2 = "0.4"
 
 # Last llguidance line compatible with Rust 1.85; keep toktrie aligned.
 [dependencies.llguidance]

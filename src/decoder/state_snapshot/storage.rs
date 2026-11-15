@@ -115,11 +115,18 @@ pub(super) fn bf16_values(bytes: &[u8]) -> Result<Vec<u16>> {
     Ok(bytemuck::pod_collect_to_vec(bytes))
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static BUFFERED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) struct Writer {
     root: PathBuf,
     generation: String,
     next: usize,
     published: bool,
+    buffered: Option<Vec<(PathBuf, Vec<u8>)>>,
+    remaining: u64,
 }
 impl Writer {
     pub(super) fn new(root: &Path) -> Result<Self> {
@@ -141,11 +148,45 @@ impl Writer {
             generation,
             next: 0,
             published: false,
+            buffered: None,
+            remaining: u64::MAX,
         })
+    }
+    /// Prépare les octets sur le thread moteur sans aucune E/S disque.
+    pub(super) fn buffered(root: &Path, budget: u64) -> Self {
+        Self {
+            root: root.to_owned(),
+            generation: "state-buffered".into(),
+            next: 0,
+            published: false,
+            buffered: Some(Vec::new()),
+            remaining: budget,
+        }
     }
     pub(super) fn blob(&mut self, dtype: BlobDtype, bytes: &[u8]) -> Result<Blob> {
         let relative = PathBuf::from(&self.generation).join(format!("{}.bin", self.next));
         self.next += 1;
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len() as u64)
+            .ok_or_else(|| invalid("budget d'écriture dépassé"))?;
+        if let Some(buffered) = &mut self.buffered {
+            let mut owned = Vec::new();
+            owned
+                .try_reserve_exact(bytes.len())
+                .map_err(|_| invalid("mémoire de staging SSD insuffisante"))?;
+            owned.extend_from_slice(bytes);
+            #[cfg(test)]
+            BUFFERED_BYTES.set(BUFFERED_BYTES.get().saturating_add(bytes.len()));
+            buffered.push((relative.clone(), owned));
+            return Ok(Blob {
+                file: relative,
+                dtype,
+                bytes: bytes.len(),
+                // Taille réservée ; le worker calcule le SHA-256 hors moteur.
+                sha256: "0".repeat(64),
+            });
+        }
         let path = self.root.join(&relative);
         let temp = path.with_extension("tmp");
         let mut file = io(
@@ -183,6 +224,25 @@ impl Writer {
         self.published = true;
         io(&self.root, sync_dir(&self.root))
     }
+    pub(super) fn finish_buffered(
+        mut self,
+        manifest: &impl Serialize,
+    ) -> Result<super::persistent::Payload> {
+        let manifest = serde_json::to_vec(manifest).map_err(|error| invalid(error.to_string()))?;
+        if manifest.len() as u64 > super::MAX_MANIFEST_BYTES
+            || manifest.len() as u64 + 64 > self.remaining
+        {
+            return Err(invalid("manifeste hors budget"));
+        }
+        self.published = true;
+        Ok(super::persistent::Payload {
+            blobs: self
+                .buffered
+                .take()
+                .ok_or_else(|| invalid("writer non bufferisé"))?,
+            manifest,
+        })
+    }
 }
 
 /// Windows ne fournit pas de `fsync` de dossier via la bibliothèque standard :
@@ -199,7 +259,7 @@ fn sync_dir(_dir: &Path) -> std::io::Result<()> {
 }
 impl Drop for Writer {
     fn drop(&mut self) {
-        if !self.published {
+        if !self.published && self.buffered.is_none() {
             let _ = fs::remove_dir_all(self.root.join(&self.generation));
             let _ = fs::remove_file(self.root.join(format!("{}.json.tmp", self.generation)));
         }

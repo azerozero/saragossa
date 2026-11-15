@@ -5,8 +5,6 @@ pub(crate) mod pairwise;
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::cell::Cell;
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
-use std::sync::atomic::AtomicU8;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -1543,18 +1541,22 @@ pub(crate) fn with_prefill_resident_override<R>(enabled: bool, run: impl FnOnce(
 }
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
-static PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+thread_local! {
+    static PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
 
 /// Restaure la bascule Gemma 4 précédente à la fin d'un test.
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 pub(crate) struct PrefillResidentGemma4TestOverride {
-    previous: u8,
+    previous: Option<bool>,
+    // Une garde locale ne doit pas être restaurée par un autre thread.
+    _thread: std::marker::PhantomData<*const ()>,
 }
 
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 impl Drop for PrefillResidentGemma4TestOverride {
     fn drop(&mut self) {
-        PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.store(self.previous, Ordering::Relaxed);
+        PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.with(|cell| cell.set(self.previous));
     }
 }
 
@@ -1563,26 +1565,63 @@ impl Drop for PrefillResidentGemma4TestOverride {
 pub(crate) fn override_prefill_resident_gemma4_for_test(
     enabled: bool,
 ) -> PrefillResidentGemma4TestOverride {
-    let value = if enabled { 2 } else { 1 };
-    let previous = PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.swap(value, Ordering::Relaxed);
-    PrefillResidentGemma4TestOverride { previous }
+    let previous = PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+    PrefillResidentGemma4TestOverride {
+        previous,
+        _thread: std::marker::PhantomData,
+    }
 }
 
 /// Active le prefill résident Gemma 4.
 ///
-/// Défaut OFF : `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=1` ouvre le gate après
-/// qualification des couches fenêtrées, du tail parallèle et de la continuité
-/// KV prefill vers decode.
+/// Défaut ON jusqu'à 4100 tokens : mêmes verdicts que le per-op à 1024,
+/// 2048 et 4100 tokens. L'échec top-1 à 4100 est préexistant et commun aux
+/// deux chemins ; il reste à traiter séparément, sans relâcher les seuils
+/// ni régénérer les goldens (voir docs/perf/gemma4-prefill.md).
+/// Kill-switch : `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0` rétablit le per-op.
+/// Une erreur d'exécution résidente est propagée, sans repli silencieux.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(super) fn prefill_resident_gemma4_enabled() -> bool {
     #[cfg(test)]
-    match PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.load(Ordering::Relaxed) {
-        1 => return false,
-        2 => return true,
-        _ => {}
+    if let Some(forced) = PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.with(Cell::get) {
+        return forced;
     }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", true))
+}
+
+/// Admission Gemma 4 avant embedding/allocation, sans initialiser Metal.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_resident_gemma4_eligible(tokens: usize) -> bool {
+    prefill_resident_gemma4_enabled() && tokens <= prefill_resident_gemma4_max_tokens()
+}
+
+/// Longueur maximale du prefill résident Gemma 4, enveloppe chat comprise.
+/// `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS` vaut 4100 par défaut.
+/// Ce plafond borne les allocations à la longueur mesurée, sans garantir
+/// la qualification numérique de tous les prompts de cette plage : voir
+/// `docs/perf/gemma4-prefill.md`. Zéro, valeur invalide ou absente gardent
+/// cette borne ; une valeur positive la remplace explicitement.
+/// Au-delà, le résident est inéligible AVANT embedding/allocation : `Ok(None)`
+/// laisse l'appelant choisir le per-op. Les erreurs après admission remontent.
+/// Le découpage résident ne couvre pas d512 :
+/// `SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK` ne borne pas ces allocations.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn prefill_resident_gemma4_max_tokens() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        parse_gemma4_prefill_max_tokens(
+            env_var("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS").as_deref(),
+        )
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn parse_gemma4_prefill_max_tokens(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&max| max > 0)
+        .unwrap_or(4100)
 }
 
 /// Active le tail MLP dense du prefill résident (27B hybride `qwen3_5`).
@@ -2335,17 +2374,44 @@ pub(crate) fn environment_sha256() -> &'static str {
     HASH.get_or_init(|| hash_environment(std::env::vars_os()))
 }
 
+/// Réglages serve purement opérationnels, sans effet sur le contenu des états.
+/// Liste fermée (suffixes communs à SARAGOSSA_ et RETI_) ; les flags inconnus,
+/// le batching et la géométrie des blocs restent dans l'empreinte par prudence.
+const SNAPSHOT_OPERATIONAL_SERVE_FLAGS: &[&str] = &[
+    "SERVE_LOG_PROMPT_FINGERPRINT",
+    "SERVE_LRU",
+    "SERVE_MAX_CONNECTIONS",
+    "SERVE_QUEUE",
+    "SERVE_MAX_INFLIGHT_BYTES",
+    "SERVE_OOM_GUARD",
+    "SERVE_PREFIX_CACHE_BYTES",
+    "SERVE_PREFIX_CACHE_BLOCKS",
+    "SERVE_PREFIX_BLOCKS_PER_SESSION",
+    "SERVE_MODEL_POOL",
+    "SERVE_MEMORY_CAP_BYTES",
+    "SERVE_MEMORY_HEADROOM_BYTES",
+];
+
+fn snapshot_environment_name(name: &[u8]) -> bool {
+    let Some(suffix) = name
+        .strip_prefix(ENV_PREFIX.as_bytes())
+        .or_else(|| name.strip_prefix(LEGACY_ENV_PREFIX.as_bytes()))
+    else {
+        return false;
+    };
+    !suffix.starts_with(b"SERVE_PREFIX_SSD_")
+        && !SNAPSHOT_OPERATIONAL_SERVE_FLAGS
+            .iter()
+            .any(|flag| suffix == flag.as_bytes())
+}
+
 fn hash_environment(
     variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut variables: Vec<_> = variables
         .into_iter()
-        .filter(|(name, _)| {
-            let name = name.as_encoded_bytes();
-            name.starts_with(ENV_PREFIX.as_bytes())
-                || name.starts_with(LEGACY_ENV_PREFIX.as_bytes())
-        })
+        .filter(|(name, _)| snapshot_environment_name(name.as_encoded_bytes()))
         .collect();
     variables.sort_unstable();
     let mut hash = Sha256::new();
@@ -2363,7 +2429,96 @@ fn hash_environment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn gemma4_prefill_default_dispatch_and_kill_switch() {
+        const CHILD: &str = "GEMMA4_PREFILL_DISPATCH_CHILD";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let enabled = expected == "true";
+            assert_eq!(super::prefill_resident_gemma4_enabled(), enabled);
+            assert_eq!(super::prefill_resident_gemma4_max_tokens(), 4100);
+            for tokens in [1, 1024, 2048, 4099, 4100] {
+                assert_eq!(super::prefill_resident_gemma4_eligible(tokens), enabled);
+            }
+            for tokens in [4101, 8192, usize::MAX] {
+                assert!(!super::prefill_resident_gemma4_eligible(tokens));
+            }
+            return;
+        }
+        // Chaque processus isole les OnceLock et l'environnement, sans GPU.
+        for (value, enabled) in [(None, true), (Some("1"), true), (Some("0"), false)] {
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("invariant: binaire de test"),
+            );
+            command
+                .args([
+                    "--exact",
+                    "runtime_flags::tests::gemma4_prefill_default_dispatch_and_kill_switch",
+                ])
+                .env(CHILD, enabled.to_string());
+            for flag in [
+                "SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4",
+                "SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS",
+            ] {
+                command
+                    .env_remove(flag)
+                    .env_remove(flag.replacen("SARAGOSSA_", "RETI_", 1));
+            }
+            if let Some(value) = value {
+                command.env("SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4", value);
+            }
+            let output = command.output().expect("invariant: sous-processus de test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Un filtre --exact périmé lancerait 0 test avec un code de sortie nul.
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn gemma4_prefill_max_tokens_defaults_and_override() {
+        for value in [None, Some(""), Some("0"), Some("-1"), Some("invalid")] {
+            assert_eq!(super::parse_gemma4_prefill_max_tokens(value), 4100);
+        }
+        assert_eq!(super::parse_gemma4_prefill_max_tokens(Some(" 4109 ")), 4109);
+        assert_eq!(super::parse_gemma4_prefill_max_tokens(Some("256")), 256);
+    }
+
     use super::*;
+
+    #[test]
+    fn snapshot_hash_excludes_only_documented_operational_flags() {
+        let base = vec![("SARAGOSSA_RUST_KV_BF16".into(), "1".into())];
+        let expected = hash_environment(base.clone());
+        for prefix in [ENV_PREFIX, LEGACY_ENV_PREFIX] {
+            for suffix in SNAPSHOT_OPERATIONAL_SERVE_FLAGS.iter().copied().chain([
+                "SERVE_PREFIX_SSD_DIR",
+                "SERVE_PREFIX_SSD_GIB",
+                "SERVE_PREFIX_SSD_PRIORITY_TOKENS",
+                "SERVE_PREFIX_SSD_STAGING_MIB",
+            ]) {
+                for value in ["first", "changed"] {
+                    let mut variables = base.clone();
+                    variables.push((format!("{prefix}{suffix}").into(), value.into()));
+                    assert_eq!(hash_environment(variables), expected, "{prefix}{suffix}");
+                }
+            }
+            for suffix in [
+                "RUST_KV_BF16",
+                "SERVE_BATCH",
+                "SERVE_PREFIX_BLOCK_TOKENS",
+                "SERVE_UNKNOWN",
+            ] {
+                let first = hash_environment([(format!("{prefix}{suffix}").into(), "1".into())]);
+                let second = hash_environment([(format!("{prefix}{suffix}").into(), "2".into())]);
+                assert_ne!(first, second, "{prefix}{suffix}");
+            }
+        }
+    }
 
     #[test]
     fn tts_qmm_na_dequant_scope_restores_policy_and_is_thread_local() {
@@ -2669,4 +2824,97 @@ mod tests {
         assert!(!claim_legacy_warning("RETI_TEST_UNIQUE"));
         assert!(claim_legacy_warning("RETI_TEST_AUTRE"));
     }
+}
+
+/// Options du second niveau SSD de `serve`, désactivé sans répertoire explicite.
+/// `SARAGOSSA_SERVE_PREFIX_SSD_DIR` désigne un répertoire privé dédié ;
+/// `SARAGOSSA_SERVE_PREFIX_SSD_GIB` borne les octets persistants (32 Gio par défaut).
+/// Le staging RAM a son propre plafond, voir [`serve_prefix_ssd_staging_bytes`]. Les préfixes courts, jusqu'à
+/// `SARAGOSSA_SERVE_PREFIX_SSD_PRIORITY_TOKENS` (4096), sont évincés après les
+/// autres ; chaque classe suit un LRU. Aucune priorité n'est reçue du réseau.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServePrefixSsdOptions {
+    /// Répertoire privé sous contrôle de l'opérateur.
+    pub directory: Option<std::path::PathBuf>,
+    /// Budget disque en Gio entiers, strictement positif.
+    pub gib: u64,
+    /// Longueur maximale des préfixes prioritaires ; zéro désactive la priorité.
+    pub priority_tokens: usize,
+}
+impl ServePrefixSsdOptions {
+    /// Lit les options ; une valeur mal formée est refusée, jamais ignorée.
+    ///
+    /// # Errors
+    /// Renvoie une erreur pour un entier invalide, nul ou trop grand.
+    pub fn from_env() -> crate::Result<Self> {
+        let number = |name: &str, default: u64| -> crate::Result<u64> {
+            env_var(name).map_or(Ok(default), |value| {
+                value
+                    .parse()
+                    .map_err(|_| crate::InferError::Config(format!("{name}: entier invalide")))
+            })
+        };
+        let options = Self {
+            directory: env_var_os("SARAGOSSA_SERVE_PREFIX_SSD_DIR")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from),
+            gib: number("SARAGOSSA_SERVE_PREFIX_SSD_GIB", 32)?,
+            priority_tokens: usize::try_from(number(
+                "SARAGOSSA_SERVE_PREFIX_SSD_PRIORITY_TOKENS",
+                4096,
+            )?)
+            .map_err(|_| crate::InferError::Config("priorité SSD trop grande".into()))?,
+        };
+        options.bytes()?;
+        Ok(options)
+    }
+    /// Convertit le budget en octets sans débordement.
+    ///
+    /// # Errors
+    /// Refuse zéro et les dépassements de capacité.
+    pub fn bytes(&self) -> crate::Result<u64> {
+        self.gib
+            .checked_mul(1024 * 1024 * 1024)
+            .filter(|&bytes| bytes > 0)
+            .ok_or_else(|| crate::InferError::Config("budget SSD invalide".into()))
+    }
+}
+
+/// Plafond RAM de préparation SSD, indépendant du disque : un quart du minimum
+/// entre RAM physique et budget mémoire explicite de `serve` (512 Mio si tous
+/// deux sont inconnus). `SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB` le remplace en Mio.
+/// La garde mémoire vérifie séparément l'empreinte courante avant toute copie.
+///
+/// # Errors
+/// Refuse une valeur nulle, mal formée ou dépassant la capacité en octets.
+pub fn serve_prefix_ssd_staging_bytes() -> crate::Result<u64> {
+    let value = env_var("SARAGOSSA_SERVE_PREFIX_SSD_STAGING_MIB");
+    prefix_ssd_staging_bytes(
+        value.as_deref(),
+        crate::memory_guard::host_memory_bytes(),
+        serve_memory_static_cap_bytes(),
+    )
+}
+
+/// Résout le plafond sans accéder à l'environnement ni sonder la machine.
+pub(crate) fn prefix_ssd_staging_bytes(
+    explicit_mib: Option<&str>,
+    host_bytes: Option<u64>,
+    serve_cap_bytes: Option<u64>,
+) -> crate::Result<u64> {
+    let Some(value) = explicit_mib else {
+        // Une seule copie en vol : réserver au plus un quart du budget de base
+        // laisse la majorité aux poids, au cache actif et au décodage.
+        return Ok(host_bytes
+            .into_iter()
+            .chain(serve_cap_bytes)
+            .min()
+            .map_or(512 << 20, |bytes| (bytes / 4).max(1)));
+    };
+    let mib = value
+        .parse::<u64>()
+        .map_err(|_| crate::InferError::Config("staging SSD : entier invalide".into()))?;
+    mib.checked_mul(1 << 20)
+        .filter(|&bytes| bytes > 0)
+        .ok_or_else(|| crate::InferError::Config("staging SSD : plafond invalide".into()))
 }

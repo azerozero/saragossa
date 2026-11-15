@@ -4,6 +4,9 @@ use super::attention_ops::{
     rms_norm_heads, rms_norm_rope_heads_at, AttentionLayout, RopeParams,
 };
 use super::*;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[path = "gemma4_oracles.rs"]
+mod gemma4_oracles;
 use crate::oracle::assert_close_abs as assert_close;
 use safetensors::{serialize, Dtype, View};
 use std::borrow::Cow;

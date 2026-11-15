@@ -942,7 +942,9 @@ pub(crate) fn load_dflash_draft_weights_with_runtime(
     quant: Option<DFlashQuant>,
     runtime: ForwardRuntime<'_>,
 ) -> Result<DFlashDraft> {
-    let sources = if crate::runtime_flags::state_snapshot_dir().is_some() {
+    let sources = if crate::runtime_flags::state_snapshot_dir().is_some()
+        || crate::decoder::persistent_prefix_enabled()
+    {
         crate::decoder::SnapshotSources::capture([draft_dir
             .as_ref()
             .join("model.safetensors")
