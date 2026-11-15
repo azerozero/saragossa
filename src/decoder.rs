@@ -59,6 +59,8 @@ mod mtp_adaptive;
 mod mtp_history;
 mod multi;
 mod resident;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) use resident::tts_codebooks::TtsCodebookWeights;
 
 use self::flags::*;
 pub(in crate::decoder) use self::loading::*;

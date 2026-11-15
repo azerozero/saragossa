@@ -15,6 +15,7 @@ mod load;
 mod model;
 mod payload;
 mod prefill;
+mod profile;
 mod sampling;
 mod synth;
 #[cfg(test)]

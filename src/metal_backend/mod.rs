@@ -162,7 +162,7 @@ use self::pipelines::KernelSources;
 #[doc(hidden)]
 pub use self::profiling::{
     decode_profile_dispatch_shapes_snapshot, decode_profile_dispatch_sites_snapshot,
-    decode_profile_snapshot, DispatchProfileShape, DispatchProfileSite,
+    decode_profile_gpu_ns, decode_profile_snapshot, DispatchProfileShape, DispatchProfileSite,
 };
 pub(crate) use self::profiling::{profile_dispatch, profile_dispatch_shape, trace_dispatch_path};
 pub(crate) use self::scratch::install_scratch_namespace;

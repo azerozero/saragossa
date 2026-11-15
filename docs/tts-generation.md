@@ -42,6 +42,12 @@ partagent la même politique. `SARAGOSSA_TTS_GREEDY=1` force l'oracle historique
 sur les deux niveaux, sans sampling ni pénalité. Les méthodes explicitement
 nommées `synthesize_greedy*` restent également des oracles.
 
+En mode échantillonné, les 15 pas du code predictor et leur tirage tiennent
+dans un seul command buffer (`SARAGOSSA_TTS_CP_FUSED=0` rétablit le pas à pas
+avec tirage CPU), et le codec streaming tourne sur un thread dédié en
+recouvrement des trames (`SARAGOSSA_TTS_CODEC_OVERLAP=0` le rend synchrone).
+Le chemin glouton n'emprunte ni l'un ni l'autre.
+
 Les goldens audio VoiceDesign et clone appellent explicitement le chemin par
 défaut sous le flag glouton (override local au thread de test). Aucune tolérance
 ni fixture golden n’est modifiée.
