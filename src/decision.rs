@@ -2,8 +2,8 @@
 //! `d3-code-readout-v1` (d3-flash, une séquence par question).
 //!
 //! L'ordre JSON des questions et des critères fait partie du prompt. THX-02
-//! accepte `tta` (moyenne sur plusieurs ordres d'options, `runtime.plan`) ;
-//! ni vision ni thinker.
+//! suit les règles de lecture de `runtime.plan` (facettes jointes, sinon une
+//! lecture par question, `tta` ordres d'options) ; ni vision ni thinker.
 
 use crate::{CausalDecoder, InferError, ModelAssets, Result, RustTokenizer, Tensor, WeightCatalog};
 use serde_json::{json, Map, Value};
@@ -449,19 +449,29 @@ impl DecisionModel {
     /// reçoit `{type, error, message}` sans bloquer les autres, comme le
     /// runtime d3. THX-02 rejette la requête entière.
     ///
-    /// `tta` (défaut 1, ramené à 1..=8) suit `runtime.plan` de THX-02 : au-delà
-    /// de 1, hors lecture jointe de facettes, chaque question est lue seule et
-    /// une `choice` l'est dans plusieurs ordres d'options, moyennés
-    /// géométriquement. d3 refuse `tta` > 1.
+    /// THX-02 suit `runtime.plan`, sur lequel ses scores publiés ont été
+    /// mesurés : des facettes sont lues ensemble ; sinon chaque question est
+    /// lue seule, une `choice` dans `tta` ordres d'options (défaut 1, ramené à
+    /// 1..=8) moyennés géométriquement. `"joint": true` force la lecture
+    /// jointe de toutes les questions (`Decider.decide`), sans `tta`. d3
+    /// refuse `tta` > 1 et `joint`.
     pub fn decide(&self, request: &Value) -> Result<Value> {
         let d3 = self.marker_id.is_none();
         let tta = tta(request)?;
-        if d3 && tta > 1 {
+        let joint = match request.get("joint") {
+            None => false,
+            Some(Value::Bool(joint)) => *joint,
+            Some(_) => return Err(invalid("joint : booléen attendu")),
+        };
+        if d3 && (tta > 1 || joint) {
             return Err(invalid(
-                "tta non pris en charge par d3 (permutation_average)",
+                "tta et joint non pris en charge par d3 (permutation_average)",
             ));
         }
-        if !d3 && tta > 1 {
+        if joint && tta > 1 {
+            return Err(invalid("joint exclut tta > 1"));
+        }
+        if !d3 && !joint {
             let questions = validate_request(request)?;
             if !facet_joint(questions) {
                 return self.decide_tta(request, questions, tta);
@@ -538,10 +548,10 @@ fn envelope(request: &Value) -> Result<&Map<String, Value>> {
     if !object.contains_key("state")
         || object
             .keys()
-            .any(|k| k != "state" && k != "questions" && k != "tta")
+            .any(|k| !["state", "questions", "tta", "joint"].contains(&k.as_str()))
     {
         return Err(invalid(
-            "seuls state, questions et tta sont supportés (texte, sans thinking ni images)",
+            "seuls state, questions, tta et joint sont supportés (texte, sans thinking ni images)",
         ));
     }
     let questions = request["questions"]

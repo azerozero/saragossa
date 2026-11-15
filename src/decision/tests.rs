@@ -138,7 +138,12 @@ fn real_weight_oracle(env: &str, fixtures: &str, frozen: f64) -> Result<f64> {
         }
         compare(&actual, &record["probabilities"]);
         if let Some(answers) = record["answers"].as_object() {
-            let ours = model.decide(&record["request"])?;
+            // Référence THX : `Decider.decide`, lecture jointe forcée.
+            let mut request = record["request"].clone();
+            if model.marker_id.is_some() {
+                request["joint"] = json!(true);
+            }
+            let ours = model.decide(&request)?;
             for (key, reference) in answers {
                 for (field, value) in reference.as_object().unwrap() {
                     if !value.is_number() && field != "probabilities" {
@@ -258,6 +263,25 @@ fn decision_tta_real_weight_oracle() -> Result<()> {
             model.tta_reads(&request, questions, 4)?
         };
         let expected = record["reads"].as_array().unwrap();
+        if joint {
+            assert_eq!(json!([model.encode(&request)?[0].tokens]), json!(expected));
+        } else {
+            // tta=1 : les seules lectures dans l'ordre d'origine.
+            let identity: Vec<&Vec<usize>> = reads
+                .iter()
+                .filter(|r| {
+                    r.1.as_ref()
+                        .is_none_or(|o| o.iter().enumerate().all(|(i, &j)| i == j))
+                })
+                .map(|r| &r.2.tokens)
+                .collect();
+            let single: Vec<Vec<usize>> = model
+                .tta_reads(&request, questions, 1)?
+                .into_iter()
+                .map(|r| r.2.tokens)
+                .collect();
+            assert_eq!(identity, single.iter().collect::<Vec<_>>());
+        }
         if !joint {
             assert_eq!(reads.len(), expected.len());
             for (read, tokens) in reads.iter().zip(expected) {

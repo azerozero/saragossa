@@ -5,8 +5,9 @@ Apache-2.0) et le format `d3-code-readout-v1` de d3-flash (vllm-sr/d3-flash,
 Apache-2.0), en texte seul. Le format est détecté par `decision_config.json`
 (`format_id`), sinon par `joint_config.json`. Vision, thinker (LoRA + tête
 MTP) et le découpage en morceaux de questions du runtime Python ne sont pas
-pris en charge et sont refusés explicitement. La moyenne sur plusieurs ordres
-d'options (`tta`) est prise en charge pour THX-02 (voir plus bas).
+pris en charge et sont refusés explicitement. THX-02 suit par défaut les
+règles de lecture de `runtime.plan` (facettes jointes, sinon une lecture par
+question) et sa moyenne sur plusieurs ordres d'options (`tta`, voir plus bas).
 
 ## Calcul
 
@@ -36,7 +37,8 @@ déjà le buffer des embeddings (d3-flash 15,3 Gio, THX-02 8,1 Gio).
 saragossa decide --model-dir DOSSIER < requetes.jsonl
 ```
 
-Une requête JSON par document (`{"state": ..., "questions": {...}}`), une
+Une requête JSON par document (`{"state": ..., "questions": {...}}`, plus
+`tta` et `joint` pour THX-02), une
 réponse JSON par ligne. `--cpu` force le chemin de référence CPU.
 `SARAGOSSA_DECISION_NAX=0` désactive l'attention NAX non causale.
 `SARAGOSSA_DECISION_GEMM_BF16=0` remplace le GEMM matmul2d bf16 des
@@ -68,9 +70,9 @@ Les deux commandes lisent les poids réels : à lancer sous le verrou GPU.
 
 ## Moyenne sur les ordres d'options (TTA, THX-02)
 
-Champ `tta` de la requête, défaut 1 comme `THX02.load(default_tta=1)` de la
-référence, ramené à 1..=8 (`runtime.plan`). Avec `tta` = 1, rien ne change :
-lecture jointe de toutes les questions. Au-delà, saragossa suit `runtime.plan` :
+THX-02 suit les règles de lecture de `runtime.plan`, celles des scores
+publiés. Champ `tta` de la requête, défaut 1 comme
+`THX02.load(default_tta=1)` de la référence, ramené à 1..=8 :
 
 - **lecture jointe de facettes** (`engine.facet_joint`) : au moins deux
   questions, toutes à `instructions` textuelles, de même type et aux critères
@@ -86,7 +88,9 @@ lecture jointe de toutes les questions. Au-delà, saragossa suit `runtime.plan` 
   `p_i ∝ exp(moyenne_j ln max(p_ji, 1e-9))`, renormalisée (`engine.geo_mean`).
   Choix, confiance et score sont recalculés sur cette distribution.
 
-d3 refuse `tta` > 1 (son `permutation_average` n'est pas porté).
+`"joint": true` force la lecture jointe de toutes les questions en une
+séquence (`Decider.decide`, l'ancien comportement), sans `tta`. d3 refuse
+`tta` > 1 et `joint` (son `permutation_average` n'est pas porté).
 
 Calcul partagé. Les 8 couches d'attention complète sont non causales : les
 lignes de l'état voient les options qui les suivent, donc aucun état de
@@ -106,10 +110,15 @@ lectures séparées) : au-delà, le GEMM est déjà saturé. Mesures provisoires
 empaquetées oscillent entre −8 % et +3 % selon le passage, d'où le seuil ;
 tout empaqueter (8 192 lignes) est 11 % plus lent à 2048.
 
-Oracle : `tests/fixtures/decision/tta/`, 7 requêtes (choice à 2, 3, 4 et 6
-options, requête mixte choice/noul/score, facettes jointes, état de 567
-tokens) passées par `runtime.plan` avec la référence f32 MPS. Tolérance figée
-0,0165 (deux fois le bruit bf16 mesuré sur les probabilités TTA=4, + 1e-6).
+Oracle : `tests/fixtures/decision/tta/`, 12 requêtes TTA=4 passées par
+`runtime.plan` avec la référence f32 MPS : choice à 2, 3, 4 et 6 options,
+état de 567 tokens, requêtes mixtes non-facettes (choice/noul/score,
+instructions absentes, critères différents) et facettes (noul, choice, score).
+Tolérance figée 0,0165 (deux fois le bruit bf16 mesuré sur les probabilités
+TTA=4, + 1e-6), inchangée à l'ajout des requêtes. Les lectures à `tta` = 1
+sont vérifiées par leurs tokens (sous-ensemble à l'ordre d'origine), pas par
+leurs probabilités : une lecture isolée a un bruit bf16 de 0,0088 sur ce
+corpus, que ce seuil ne couvre pas et qui n'est pas élargi pour elle.
 
 ```sh
 SARAGOSSA_DECISION_MODEL=DOSSIER cargo test --release --all-features \

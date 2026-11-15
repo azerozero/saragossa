@@ -6,7 +6,7 @@ use std::io::Write;
 pub(crate) fn run(args: impl Iterator<Item = String>) -> CliResult<()> {
     let mut args = args.peekable();
     if args.peek().is_some_and(|a| a == "--help" || a == "-h") {
-        println!("saragossa decide --model-dir DOSSIER [--cpu]\nRequêtes JSON {{state,questions[,tta]}} sur stdin (multiligne ou JSON Lines) ; une réponse par ligne.\nFormats THX-02 (joint) et d3-code-readout-v1 détectés via decision_config.json ; texte seul, 2048 tokens par séquence, sans thinker.\ntta (THX-02, défaut 1, 1 à 8) : chaque choice lue dans plusieurs ordres d'options, moyenne géométrique.");
+        println!("saragossa decide --model-dir DOSSIER [--cpu]\nRequêtes JSON {{state,questions[,tta][,joint]}} sur stdin (multiligne ou JSON Lines) ; une réponse par ligne.\nFormats THX-02 et d3-code-readout-v1 détectés via decision_config.json ; texte seul, 2048 tokens par séquence, sans thinker.\nTHX-02 suit runtime.plan : facettes lues ensemble, sinon une lecture par question ; tta (défaut 1, 1 à 8) lit chaque choice dans plusieurs ordres d'options (moyenne géométrique) ; joint=true force une lecture jointe de toutes les questions, sans tta.");
         return Ok(());
     }
     let mut path = None;
