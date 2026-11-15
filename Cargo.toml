@@ -6,7 +6,9 @@ repository = "https://github.com/azerozero/saragossa"
 keywords = ["llm", "inference", "metal", "apple-silicon", "transformer"]
 categories = ["science", "concurrency", "command-line-utilities"]
 license = "Apache-2.0"
-publish = false
+# release-plz ignore un paquet non publiable : la publication crates.io reste
+# coupée par `publish = false` dans release-plz.toml.
+publish = true
 edition = "2021"
 rust-version = "1.85"
 build = "build.rs"
