@@ -239,8 +239,9 @@ pub(super) fn can_use_qmm_skinny_buffers(
 /// exclut le skinny et les GEMM NA et garde le qmv répliqué, exact aussi.
 pub(super) const QMVT_MAX_BATCH: usize = 16;
 
-/// qmv-T u4 gs64 exact (`affine_qmvt_*`) : en vérification greedy stricte
-/// seulement, de 3 à [`QMVT_MAX_BATCH`] lignes. Il prend la place du skinny,
+/// qmv-T u4 gs64 exact (`affine_qmvt_*`) : en vérification greedy stricte de 3
+/// à [`QMVT_MAX_BATCH`] lignes, et hors strict sous le seuil du skinny
+/// ([`qmvt_small_enabled`]). Il prend la place du skinny,
 /// du qmm8 et du qmv répliqué ; chaque ligne rend les bits du qmv mono.
 /// Mesuré le 2026-11-05 (M5 Max, formes 27B, R = 9) : gate 0,251 ms, down
 /// 0,284 ms, lm_head 3,9 ms, contre 0,19 / 0,21 / 2,1 en skinny et 0,36 /
@@ -263,7 +264,17 @@ pub(super) fn can_use_qmvt_buffers(
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
         && out_dim % 32 == 0
-        && super::verify_strict_active()
+        && (super::verify_strict_active()
+            || (qmvt_small_enabled() && batch < qmm_skinny_min_batch()))
+}
+
+/// qmv-T hors mode strict pour les largeurs sous le skinny (3-4 lignes : la
+/// vérification MTP à profondeur 2) : sans lui, ces lignes passent par le qmv
+/// répliqué, qui relit le poids une fois par ligne. Mêmes bits que le qmv mono,
+/// comme le qmv répliqué qu'il remplace. Kill-switch `SARAGOSSA_RUST_QMVT_SMALL=0`.
+pub(super) fn qmvt_small_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMVT_SMALL", true))
 }
 
 pub(super) fn can_use_qmvt(
