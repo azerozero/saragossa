@@ -310,8 +310,6 @@ impl TtsCodec {
             state.emitted_samples = state.emitted_samples.saturating_add(pcm.len());
             return Ok(pcm.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect());
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
-        let _ = gpu_prefix;
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if let Some(gpu_state) = state.gpu.as_mut() {
             let hidden = self
@@ -329,7 +327,8 @@ impl TtsCodec {
             return Ok(pcm.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect());
         }
 
-        let pcm = self.decode_codes(generated)?;
+        // Même préfixe que l'état : un état exact ne retombe jamais sur le GPU.
+        let pcm = self.decode_codes_with(generated, gpu_prefix)?;
         if pcm.len() < state.emitted_samples {
             return Err(InferError::Dimension(format!(
                 "codec streaming PCM régressif: {} < {}",
