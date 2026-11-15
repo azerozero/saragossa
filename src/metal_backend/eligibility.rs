@@ -239,8 +239,9 @@ pub(super) fn can_use_qmm_skinny_buffers(
 /// exclut le skinny et les GEMM NA et garde le qmv répliqué, exact aussi.
 pub(super) const QMVT_MAX_BATCH: usize = 16;
 
-/// qmv-T u4 gs64 exact (`affine_qmvt_*`) : en vérification greedy stricte
-/// seulement, de 3 à [`QMVT_MAX_BATCH`] lignes. Il prend la place du skinny,
+/// qmv-T u4 gs64 exact (`affine_qmvt_*`) : en vérification greedy stricte de 3
+/// à [`QMVT_MAX_BATCH`] lignes, et hors strict sous le seuil du skinny
+/// ([`qmvt_small_enabled`]). Il prend la place du skinny,
 /// du qmm8 et du qmv répliqué ; chaque ligne rend les bits du qmv mono.
 /// Mesuré le 2026-11-05 (M5 Max, formes 27B, R = 9) : gate 0,251 ms, down
 /// 0,284 ms, lm_head 3,9 ms, contre 0,19 / 0,21 / 2,1 en skinny et 0,36 /
