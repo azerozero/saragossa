@@ -69,12 +69,11 @@ mod macos {
         let tokenizer_sha256 = hash(&path.join("tokenizer.json"))?;
         let tokenizer_json: serde_json::Value =
             serde_json::from_slice(&fs::read(path.join("tokenizer.json"))?)?;
-        let vocab_sha256 = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(
-                &serde_json::json!({"vocab":tokenizer_json["model"]["vocab"],"added_tokens":tokenizer_json["added_tokens"]})
-            )?)
-        );
+        // Clés triées : mlx_lm réordonne les champs des added_tokens sans
+        // changer leur contenu.
+        let mut vocab = serde_json::json!({"vocab":tokenizer_json["model"]["vocab"],"added_tokens":tokenizer_json["added_tokens"]});
+        vocab.sort_all_objects();
+        let vocab_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&vocab)?));
         // Les IDs du protocole sont ceux du banc MLX. Les conversions mlx_lm
         // réécrivent le pré-tokenizer : on compare donc le vocabulaire, sans
         // re-tokeniser le corpus avec le tokenizer du candidat.
