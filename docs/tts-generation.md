@@ -2,8 +2,13 @@
 
 Sur `/v1/audio/speech`, `voice` sélectionne une clé de `talker_config.spk_id`
 pour CustomVoice (insensible à la casse). Sans ce champ, le locuteur est
-`serena`. Une voix inconnue produit HTTP 400, paramètre `voice`. Chaque requête
-sans voix rétablit le défaut ; une voix précédente ne persiste pas.
+`serena`. Une voix inconnue (y compris `alloy`, `nova` et les autres noms
+OpenAI) se replie sur Serena, avec HTTP 200 et l’en-tête
+`X-Saragossa-TTS-Voice-Fallback: <voix demandée>` en WAV comme en streaming.
+La cause d’origine est conservée dans le diagnostic stderr. Les octets de
+contrôle, non ASCII et `%` du nom sont encodés `%HH` dans cet en-tête. Une
+requête valide n’a pas cet en-tête. Chaque requête sans voix rétablit le défaut ;
+une voix précédente ne persiste pas.
 VoiceDesign et Base ignorent ce champ, car ils n'ont pas de locuteur nommé.
 
 Le préfixe CustomVoice français est : `think, think_bos, langue, think_eos,

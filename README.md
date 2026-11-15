@@ -84,8 +84,10 @@ the **single-user latency × Apple Silicon** quadrant:
 
 ### Streaming audio HTTP
 
-CustomVoice accepte `voice` (défaut : `serena`) et refuse les voix inconnues avec
-HTTP 400. VoiceDesign et CustomVoice utilisent le sampling du snapshot avec
+CustomVoice accepte `voice` (défaut : `serena`). Une voix inconnue (`alloy`,
+`nova`…) utilise Serena et renvoie `X-Saragossa-TTS-Voice-Fallback` avec le nom
+demandé, en WAV comme en streaming. La cause est journalisée sur stderr.
+VoiceDesign et CustomVoice utilisent le sampling du snapshot avec
 une graine déterministe ; `seed` permet de la choisir par requête.
 Voir [la politique de génération TTS](docs/tts-generation.md) pour les
 paramètres, le flag glouton des oracles et les raisons d'arrêt.

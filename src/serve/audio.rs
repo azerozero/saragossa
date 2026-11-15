@@ -64,8 +64,12 @@ struct TtsSlot {
 // Seule la synthèse est substituable : les tests conservent le choix WAV/PCM
 // du gestionnaire de production, sans charger de poids ni initialiser Metal.
 pub(super) trait SpeechSynthesis {
-    fn configure_voice(&mut self, _voice: Option<&str>, _seed: Option<u64>) -> ServeResult<()> {
-        Ok(())
+    fn configure_voice(
+        &mut self,
+        _voice: Option<&str>,
+        _seed: Option<u64>,
+    ) -> ServeResult<Option<String>> {
+        Ok(None)
     }
 
     fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput>;
@@ -169,7 +173,11 @@ impl AudioState {
 }
 
 impl SpeechSynthesis for AudioState {
-    fn configure_voice(&mut self, voice: Option<&str>, seed: Option<u64>) -> ServeResult<()> {
+    fn configure_voice(
+        &mut self,
+        voice: Option<&str>,
+        seed: Option<u64>,
+    ) -> ServeResult<Option<String>> {
         self.ensure_tts_loaded()?;
         let model = self
             .tts
@@ -177,12 +185,19 @@ impl SpeechSynthesis for AudioState {
             .as_mut()
             .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
         model.set_seed(seed);
-        model
-            .set_voice(voice)
-            .map_err(|_| ServeError::InvalidParameter {
-                param: "voice",
-                message: "voix CustomVoice inconnue (défaut : serena)",
-            })
+        match model.set_voice(voice) {
+            Ok(()) => Ok(None),
+            Err(cause) => {
+                let Some(requested) = voice else {
+                    return Err(cause.into());
+                };
+                // Le défaut est résolu à nouveau pour ne pas conserver la voix
+                // d'une requête précédente. Un défaut invalide reste une erreur.
+                model.set_voice(None)?;
+                eprintln!("saragossa serve TTS: {cause} ; repli sur serena");
+                Ok(Some(requested.to_owned()))
+            }
+        }
     }
 
     fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput> {
@@ -289,13 +304,17 @@ pub(super) fn handle_speech<S: Write>(
         // Nom canonique depuis l'origine : pas d'alias `RETI_` à honorer ici.
         saragossa::runtime_flags::env_var_exact(TTS_MAX_FRAMES_ENV).as_deref(),
         |stream, text, max_frames, streaming, voice, seed| {
-            audio.configure_voice(voice, seed)?;
+            let fallback = audio.configure_voice(voice, seed)?;
             if !streaming {
-                return send_speech(stream, &audio.synthesize(text, max_frames)?);
+                return send_speech(
+                    stream,
+                    &audio.synthesize(text, max_frames)?,
+                    fallback.as_deref(),
+                );
             }
             // Le chargement peut encore produire une erreur HTTP avant les en-têtes.
             let sample_rate = audio.stream_sample_rate()?;
-            send_speech_stream(stream, sample_rate, |on_audio| {
+            send_speech_stream(stream, sample_rate, fallback.as_deref(), |on_audio| {
                 audio.synthesize_streaming(text, max_frames, on_audio)
             })
         },
@@ -328,9 +347,31 @@ fn handle_speech_with<S: Write>(
     )
 }
 
-fn send_speech<S: Write>(stream: &mut S, output: &TtsSynthesisOutput) -> ServeResult<()> {
+// Valeur fournie par le client : échapper les contrôles et l'UTF-8 pour ne
+// jamais injecter une ligne HTTP. Les noms usuels (alloy, nova…) restent tels quels.
+fn voice_fallback_header(voice: Option<&str>) -> Option<(&'static str, String)> {
+    voice.map(|voice| {
+        let value = voice
+            .bytes()
+            .map(|byte| {
+                if (b' '..=b'~').contains(&byte) && byte != b'%' {
+                    char::from(byte).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect();
+        ("X-Saragossa-TTS-Voice-Fallback", value)
+    })
+}
+
+fn send_speech<S: Write>(
+    stream: &mut S,
+    output: &TtsSynthesisOutput,
+    fallback: Option<&str>,
+) -> ServeResult<()> {
     let wav = mono_f32_to_wav(&output.samples, output.sample_rate)?;
-    let headers = vec![
+    let mut headers = vec![
         (
             "X-Saragossa-TTS-Frame-Limit-Reached",
             output.frame_limit_reached.to_string(),
@@ -340,6 +381,7 @@ fn send_speech<S: Write>(stream: &mut S, output: &TtsSynthesisOutput) -> ServeRe
             output.stop_reason.as_str().into(),
         ),
     ];
+    headers.extend(voice_fallback_header(fallback));
     write_headers(stream, 200, "OK", "audio/wav", Some(wav.len()), headers)?;
     stream
         .write_all(&wav)
@@ -354,6 +396,7 @@ fn send_speech<S: Write>(stream: &mut S, output: &TtsSynthesisOutput) -> ServeRe
 fn send_speech_stream<S: Write>(
     stream: &mut S,
     sample_rate: u32,
+    fallback: Option<&str>,
     synthesize: impl FnOnce(
         &mut dyn FnMut(&[f32]) -> saragossa::Result<()>,
     ) -> ServeResult<TtsSynthesisOutput>,
@@ -365,14 +408,17 @@ fn send_speech_stream<S: Write>(
             "OK",
             "audio/pcm",
             None,
-            vec![
+            [
                 ("Transfer-Encoding", "chunked".into()),
                 ("X-Saragossa-Audio-Sample-Rate", sample_rate.to_string()),
                 (
                     "Trailer",
                     "X-Saragossa-TTS-Frame-Limit-Reached, X-Saragossa-TTS-Stop-Reason".into(),
                 ),
-            ],
+            ]
+            .into_iter()
+            .chain(voice_fallback_header(fallback))
+            .collect(),
         )?;
         stream
             .flush()
@@ -787,6 +833,7 @@ mod tests {
                             frame_limit_reached: false,
                             stop_reason: saragossa::TtsStopReason::Eos,
                         },
+                        None,
                     )
                 },
             )?;
@@ -811,7 +858,7 @@ mod tests {
                 },
             };
             let mut response = Vec::new();
-            send_speech(&mut response, &output)?;
+            send_speech(&mut response, &output, None)?;
             let split = response
                 .windows(4)
                 .position(|w| w == b"\r\n\r\n")

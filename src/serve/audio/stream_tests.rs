@@ -73,6 +73,14 @@ fn speech_route_selects_pcm_stream_or_complete_wav() -> ServeResult<()> {
     }
 
     impl SpeechSynthesis for Synthesis {
+        fn configure_voice(
+            &mut self,
+            voice: Option<&str>,
+            _: Option<u64>,
+        ) -> ServeResult<Option<String>> {
+            Ok(voice.filter(|voice| *voice == "alloy").map(str::to_owned))
+        }
+
         fn synthesize(&mut self, text: &str, _: usize) -> ServeResult<TtsSynthesisOutput> {
             assert_eq!(text, "Bonjour.");
             assert_eq!(self.flushes.get(), 0);
@@ -104,14 +112,17 @@ fn speech_route_selects_pcm_stream_or_complete_wav() -> ServeResult<()> {
         }
     }
 
-    for mode in [None, Some(false), Some(true)] {
+    for (mode, voice) in [None, Some(false), Some(true)]
+        .into_iter()
+        .flat_map(|mode| [None, Some("serena"), Some("alloy")].map(|voice| (mode, voice)))
+    {
         let mut writer = Writer::default();
         let mut synthesis = Synthesis {
             flushes: Rc::clone(&writer.flushes),
             batch_calls: 0,
             stream_calls: 0,
         };
-        let mut request = json!({"input": " Bonjour. "});
+        let mut request = json!({"input": " Bonjour. ", "voice": voice});
         if let Some(streaming) = mode {
             request["stream"] = json!(streaming);
         }
@@ -120,6 +131,10 @@ fn speech_route_selects_pcm_stream_or_complete_wav() -> ServeResult<()> {
         let headers = String::from_utf8_lossy(&writer.bytes[..split]);
         let body = &writer.bytes[split..];
         assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(
+            headers.contains("X-Saragossa-TTS-Voice-Fallback: alloy\r\n"),
+            voice == Some("alloy")
+        );
         if mode == Some(true) {
             assert!(headers.contains("Content-Type: audio/pcm\r\n"));
             assert!(headers.contains("Transfer-Encoding: chunked\r\n"));
@@ -159,7 +174,7 @@ fn speech_stream_is_flushed_during_synthesis_and_matches_batch_wav() -> ServeRes
                     assert_eq!(text, "Bonjour.");
                     assert_eq!(max_frames, 12);
                     assert!(streaming);
-                    send_speech_stream(stream, 24_000, |on_audio| {
+                    send_speech_stream(stream, 24_000, None, |on_audio| {
                         assert_eq!(flushes.get(), 1);
                         on_audio(&[])?;
                         for (index, chunk) in samples.chunks(2).enumerate() {
@@ -218,7 +233,9 @@ fn speech_stream_is_flushed_during_synthesis_and_matches_batch_wav() -> ServeRes
 #[test]
 fn disconnect_and_timeout_stop_synthesis_without_second_response() -> ServeResult<()> {
     let mut reference = Vec::new();
-    send_speech_stream(&mut reference, 24_000, |_| Ok(output(Vec::new(), false)))?;
+    send_speech_stream(&mut reference, 24_000, None, |_| {
+        Ok(output(Vec::new(), false))
+    })?;
     let header_len = find_sub(&reference, b"\r\n\r\n").expect("invariant: en-têtes écrits") + 4;
     for (fail_after, fail_flush, expected_callbacks) in [
         (Some(8), None, 0),
@@ -236,7 +253,7 @@ fn disconnect_and_timeout_stop_synthesis_without_second_response() -> ServeResul
         };
         let mut callbacks = 0;
         let mut finished = false;
-        let result = send_speech_stream(&mut writer, 24_000, |on_audio| {
+        let result = send_speech_stream(&mut writer, 24_000, None, |on_audio| {
             for _ in 0..2 {
                 callbacks += 1;
                 on_audio(&[0.25, -0.25])?;
@@ -264,7 +281,7 @@ fn disconnect_and_timeout_stop_synthesis_without_second_response() -> ServeResul
 #[test]
 fn inference_failure_leaves_an_incomplete_chunked_body() -> ServeResult<()> {
     let mut bytes = Vec::new();
-    let result = send_speech_stream(&mut bytes, 24_000, |on_audio| {
+    let result = send_speech_stream(&mut bytes, 24_000, None, |on_audio| {
         on_audio(&[0.25])?;
         Err(ServeError::args("codec factice interrompu"))
     });
@@ -293,7 +310,7 @@ fn closed_socket_does_not_start_synthesis() -> ServeResult<()> {
     let (mut server, client) =
         std::os::unix::net::UnixStream::pair().map_err(|e| ServeError::io("socket de test", e))?;
     drop(client);
-    send_speech_stream(&mut server, 24_000, |_| {
+    send_speech_stream(&mut server, 24_000, None, |_| {
         unreachable!("invariant: socket fermée détectée avant synthèse")
     })
 }
@@ -311,12 +328,45 @@ fn stop_reason_is_exposed_in_wav_headers_and_stream_trailers() -> ServeResult<()
             out
         };
         let mut wav = Vec::new();
-        send_speech(&mut wav, &make_output())?;
+        send_speech(&mut wav, &make_output(), None)?;
         let header = format!("X-Saragossa-TTS-Stop-Reason: {}\r\n", reason.as_str());
         assert!(String::from_utf8_lossy(&wav).contains(&header));
         let mut pcm = Vec::new();
-        send_speech_stream(&mut pcm, 24_000, |_| Ok(make_output()))?;
+        send_speech_stream(&mut pcm, 24_000, None, |_| Ok(make_output()))?;
         assert!(String::from_utf8_lossy(&pcm).ends_with(&format!("{header}\r\n")));
+    }
+    Ok(())
+}
+
+#[test]
+fn fallback_header_survives_wav_and_pcm_and_escapes_controls() -> ServeResult<()> {
+    for (requested, expected) in [
+        (None, None),
+        (Some("alloy"), Some("alloy")),
+        (Some("nova"), Some("nova")),
+        (
+            Some("voix\r\nInjected: yes%"),
+            Some("voix%0D%0AInjected: yes%25"),
+        ),
+    ] {
+        let mut wav = Vec::new();
+        send_speech(&mut wav, &output(vec![0.0], false), requested)?;
+        let mut pcm = Vec::new();
+        send_speech_stream(&mut pcm, 24_000, requested, |_| {
+            Ok(output(Vec::new(), false))
+        })?;
+        for response in [wav, pcm] {
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            let response = String::from_utf8_lossy(&response);
+            match expected {
+                Some(value) => {
+                    assert!(response
+                        .contains(&format!("\r\nX-Saragossa-TTS-Voice-Fallback: {value}\r\n")))
+                }
+                None => assert!(!response.contains("X-Saragossa-TTS-Voice-Fallback")),
+            }
+            assert!(!response.contains("\r\nInjected:"));
+        }
     }
     Ok(())
 }
