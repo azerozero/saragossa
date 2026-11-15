@@ -64,7 +64,7 @@ the **single-user latency × Apple Silicon** quadrant:
 
 | Domain | Details |
 |---|---|
-| LLM | Qwen3.5 / 3.6 / 3.8 dense and MoE (27B / 30B / 35B-A3B; MLX `affine` quants only, not `mxfp4`/`nvfp4`), Gemma 4 dense (`gemma4_unified`) and MoE (`gemma4`), plus a generic Llama / Mistral / Gemma 3 loader; u2–u8 (incl. mixed 3/4-bit) quantization at group sizes 32–128, bf16 scales/biases |
+| LLM | Qwen3.5 / 3.6 / 3.8 dense and MoE (27B / 30B / 35B-A3B; MLX `affine` quants; `mxfp4`/`nvfp4`/`mxfp8` for rank-2 dense weights), Gemma 4 dense (`gemma4_unified`) and MoE (`gemma4`), plus a generic Llama / Mistral / Gemma 3 loader; u2–u8 (incl. mixed 3/4-bit) quantization at group sizes 32–128, bf16 scales/biases |
 | STT | Whisper large-v3-turbo (resident encoder + decoder, bf16 Neural-Accelerator GEMM) |
 | TTS | Qwen3-TTS: resident talker + GPU codec + intra-sentence streaming |
 | Embeddings | e5-small, pure Rust (CPU) — for semantic memory / RAG |
@@ -135,6 +135,11 @@ These numbers hold for their context (hardware, model, length) — measure on yo
 own machine before committing to a choice.
 
 ## Quantization formats: footprint, throughput & quality
+
+MLX micro-scaled `mxfp4`, `nvfp4` and `mxfp8` weights are supported for
+rank-2 projections and embeddings, with compact QMV and NAX prefill kernels.
+See [micro-scale formats and validation](docs/quantization/micro-scales.md)
+for layouts, hardware requirements and current limitations.
 
 saragossa loads **MLX affine** integer weights `u2`/`u3`/`u4`/`u6`/`u8`
 (group-size 64) and **fp8** (`e4m3`). Trade-offs on a **27B dense** model
