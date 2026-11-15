@@ -39,7 +39,7 @@ fn token_md5(tokens: &[usize]) -> String {
     for token in tokens {
         context.consume(token.to_le_bytes());
     }
-    format!("{:x}", context.compute())
+    format!("{:x}", context.finalize())
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
