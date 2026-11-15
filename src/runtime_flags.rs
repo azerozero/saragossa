@@ -30,6 +30,24 @@ const ENV_PREFIX: &str = "SARAGOSSA_";
 
 thread_local! {
     static DECISION_NONCAUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DECISION_HEADLESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Chargement d'un modèle de décision : la tête de vocabulaire n'est ni
+/// chargée, ni liée aux embeddings ; le readout la remplace.
+pub(crate) fn decision_headless() -> bool {
+    DECISION_HEADLESS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn with_decision_headless<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DECISION_HEADLESS.with(|value| value.set(self.0));
+        }
+    }
+    let _restore = Restore(DECISION_HEADLESS.with(|value| value.replace(true)));
+    run()
 }
 
 /// Masque propre à un appel joint, sans modifier les autres threads de génération.

@@ -76,7 +76,9 @@ fn validate_decoder_shape_map<T: TensorShapes>(config: &ModelConfig, tensors: &T
         }
     }
     expect_shape(tensors, "norm.weight", &[hidden])?;
-    expect_shape(tensors, "lm_head.weight", &[vocab, hidden])?;
+    if !crate::runtime_flags::decision_headless() {
+        expect_shape(tensors, "lm_head.weight", &[vocab, hidden])?;
+    }
     Ok(())
 }
 

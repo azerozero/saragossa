@@ -6,7 +6,7 @@ use std::io::Write;
 pub(crate) fn run(args: impl Iterator<Item = String>) -> CliResult<()> {
     let mut args = args.peekable();
     if args.peek().is_some_and(|a| a == "--help" || a == "-h") {
-        println!("saragossa decide --model-dir DOSSIER [--cpu]\nRequêtes JSON {{state,questions}} sur stdin (multiligne ou JSON Lines) ; une réponse par ligne.\nTexte joint uniquement, maximum 2048 tokens, sans TTA ni thinker.");
+        println!("saragossa decide --model-dir DOSSIER [--cpu]\nRequêtes JSON {{state,questions}} sur stdin (multiligne ou JSON Lines) ; une réponse par ligne.\nFormats THX-02 (joint) et d3-code-readout-v1 détectés via decision_config.json ; texte seul, 2048 tokens par séquence, sans TTA ni thinker.");
         return Ok(());
     }
     let mut path = None;

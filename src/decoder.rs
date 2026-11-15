@@ -1940,7 +1940,17 @@ impl CausalDecoder {
             )?);
         }
         let final_norm = take_dense(&mut tensors, "norm.weight")?;
-        let lm_head = linear_from(&mut tensors, "lm_head")?;
+        let lm_head = if crate::runtime_flags::decision_headless() {
+            // NOTE: tête d'une ligne nulle, jamais exécutée par une décision ;
+            // une tête stockée a pu être lue (spec facultative) puis est jetée.
+            tensors.remove("lm_head.weight");
+            Linear::new(
+                Tensor::from_vec(vec![1, final_norm.len()], vec![0.0; final_norm.len()])?,
+                None,
+            )?
+        } else {
+            linear_from(&mut tensors, "lm_head")?
+        };
         // Contrat strict des modèles à sinks (flint) : un tenseur chargé mais
         // jamais assemblé (ex. `mlp.gate_proj.bias` sur une couche MoE) serait
         // ignoré en silence. Les autres familles gardent leur tolérance.

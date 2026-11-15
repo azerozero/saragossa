@@ -923,7 +923,10 @@ fn bake_gemma_norm_offset(config: &ModelConfig, tensors: &mut HashMap<String, De
 /// borné aux modèles tied : les Qwen prod (27B/30B/35B) stockent leur `lm_head`
 /// et empruntent ce chemin sans aucune copie (byte-identité préservée).
 fn tie_lm_head_to_embeddings<T: Clone>(config: &ModelConfig, tensors: &mut HashMap<String, T>) {
-    if !config.tie_word_embeddings || tensors.contains_key(LM_HEAD_WEIGHT) {
+    if !config.tie_word_embeddings
+        || tensors.contains_key(LM_HEAD_WEIGHT)
+        || crate::runtime_flags::decision_headless()
+    {
         return;
     }
     if let Some(embed) = tensors.get(EMBED_TOKENS_WEIGHT).cloned() {
@@ -1084,7 +1087,7 @@ fn decoder_specs(
     specs.extend(specs_for(
         prefixes,
         [LM_HEAD_WEIGHT.to_string()],
-        !config.tie_word_embeddings,
+        !config.tie_word_embeddings && !crate::runtime_flags::decision_headless(),
     ));
     for layer in 0..config.num_hidden_layers {
         let plan = LoaderLayerPlan::build(config, layer);

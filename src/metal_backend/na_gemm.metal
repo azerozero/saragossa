@@ -43,7 +43,9 @@ kernel void gemm_nax_bf16_bn128(device const bfloat* Ap [[buffer(0)]],
 }
 // C[M,N] = A[M,K]·B[N,K]^T, A et B bf16 (poids dense non transposé), accum f32.
 // matmul2d MPP tuiles 64×128 sur 8 simdgroups ; exige N%128=0. Réservé aux
-// décisions THX-02, dont l'oracle couvre l'arrondi bf16 de l'activation.
+// modèles de décision, dont l'oracle couvre l'arrondi bf16 de l'activation.
+// Grille N en x : les groupes voisins partagent la même tuile A (64×K) ; à
+// M=2048, N=12288, K=4096, 64 TFLOP/s contre 26 avec M en x, à l'identique.
 kernel void gemm_nax_bf16_nt_bn128(device const bfloat* Ap [[buffer(0)]],
                                    device const bfloat* Bp [[buffer(1)]],
                                    device float* Cp         [[buffer(2)]],
@@ -56,7 +58,7 @@ kernel void gemm_nax_bf16_nt_bn128(device const bfloat* Ap [[buffer(0)]],
   constexpr auto desc = tensor_ops::matmul2d_descriptor(
       64, 128, static_cast<int>(dynamic_extent), false, true, false);
   tensor_ops::matmul2d<desc, execution_simdgroups<8>> op;
-  uint m0 = tgid.x * 64, n0 = tgid.y * 128;
+  uint m0 = tgid.y * 64, n0 = tgid.x * 128;
   auto mA = A.slice(0, m0);
   auto mB = B.slice(0, n0);
   auto mC = C.slice(n0, m0);

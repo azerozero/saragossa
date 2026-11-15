@@ -1,7 +1,7 @@
 //! Oracle et chronométrage local sur poids réels ; lancer sous le verrou GPU.
 //!
 //! Usage : `decision_bench MODEL FIXTURES [REPETITIONS]`, où `FIXTURES` est
-//! `tests/fixtures/decision`. Écrit une ligne JSON par longueur sur stdout.
+//! `tests/fixtures/decision` ou `tests/fixtures/decision/d3`. Écrit une ligne JSON par longueur sur stdout.
 use saragossa::decision::DecisionModel;
 use serde_json::{json, Value};
 use std::{error::Error, path::Path, time::Instant};
@@ -41,28 +41,47 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let fixtures = Path::new(&args[2]);
     let model = DecisionModel::load(&args[1], true)?;
+    let footprint_mib = || saragossa::memory_guard::process_footprint_bytes().map(|b| b >> 20);
+    let footprint_load_mib = footprint_mib();
     let corpus = read(&fixtures.join("reference-f32.json"))?;
     let (mut corpus_max, mut corpus_kl) = (0.0_f64, 0.0_f64);
     for record in corpus["records"].as_array().ok_or("records absents")? {
-        let e = model.encode(&record["request"])?;
-        if json!(e.tokens) != record["tokens"] || json!(e.markers) != record["markers"] {
-            return Err("encodage différent de la référence".into());
+        // THX : une séquence au niveau du record ; d3 : une par question.
+        let sequences = record["sequences"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| vec![record.clone()]);
+        let encoded = model.encode(&record["request"])?;
+        let mut p = Vec::new();
+        for (e, s) in encoded.iter().zip(&sequences) {
+            if json!(e.tokens) != s["tokens"]
+                || s.get("markers").is_some_and(|m| json!(e.markers) != *m)
+            {
+                return Err("encodage différent de la référence".into());
+            }
+            p.extend(model.probabilities(&e.tokens, &e.markers, &e.counts)?);
         }
-        let p = model.probabilities(&e.tokens, &e.markers, &e.counts)?;
+        if encoded.len() != sequences.len() {
+            return Err("nombre de séquences différent de la référence".into());
+        }
         let (abs, kl) = drift(&p, &record["probabilities"])?;
         corpus_max = corpus_max.max(abs);
         corpus_kl = corpus_kl.max(kl);
     }
     println!(
         "{}",
-        json!({"corpus_max_abs": corpus_max, "corpus_max_kl": corpus_kl})
+        json!({"corpus_max_abs": corpus_max, "corpus_max_kl": corpus_kl,
+               "footprint_load_mib": footprint_load_mib, "footprint_corpus_mib": footprint_mib()})
     );
     for case in read(&fixtures.join("reference-long.json"))?
         .as_array()
         .ok_or("cas longs absents")?
     {
         let tokens: Vec<usize> = serde_json::from_value(case["tokens"].clone())?;
-        let markers: Vec<usize> = serde_json::from_value(case["markers"].clone())?;
+        let markers: Vec<usize> = match case.get("markers") {
+            Some(m) => serde_json::from_value(m.clone())?,
+            None => vec![tokens.len().saturating_sub(1)],
+        };
         let counts: Vec<usize> = serde_json::from_value(case["counts"].clone())?;
         for _ in 0..3 {
             model.probabilities(&tokens, &markers, &counts)?;
@@ -81,7 +100,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!(
             "{}",
             json!({"length": tokens.len(), "p50_ms": sorted[sorted.len() / 2], "p95_ms": p95,
-                   "max_abs": abs, "max_kl": kl, "ms": ms})
+                   "max_abs": abs, "max_kl": kl, "footprint_mib": footprint_mib(), "ms": ms})
         );
     }
     Ok(())
