@@ -344,7 +344,7 @@ pub(super) fn quantized_tensor_from_entry(
         validate_micro_params(quant, &spec.source, mode)?;
         let shape = micro_contract_shape(spec, entry, entries, mode)?;
         let scale_name = replace_weight_suffix(&spec.source, ".scales")?;
-        let scale_entry = &entries[&scale_name];
+        let scale_entry = named_entry(headers, entries, &scale_name)?;
         let scale_shard = headers
             .get(scale_entry.shard_index)
             .ok_or_else(|| InferError::Shape("index shard invalide".into()))?;
@@ -495,7 +495,6 @@ struct MetalBf16Entry {
     len: usize,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
 fn named_entry<'a>(
     headers: &[ShardHeader],
     entries: &'a HashMap<String, TensorEntryRef>,
@@ -916,6 +915,14 @@ fn micro_contract_shape(
     entries: &HashMap<String, TensorEntryRef>,
     mode: crate::MicroMode,
 ) -> Result<Vec<usize>> {
+    // `packed_u32_entry` normalise déjà l'empaquetage U8 ; tout autre dtype
+    // ferait relire des octets sous une mauvaise largeur.
+    if entry.dtype != Dtype::U32 {
+        return Err(InferError::UnsupportedDtype {
+            name: spec.source.clone(),
+            dtype: entry.dtype,
+        });
+    }
     let [rows, packed_cols] = entry.shape.as_slice() else {
         return Err(InferError::Dimension(format!(
             "poids {} attendu rang 2, reçu {:?}",
@@ -988,6 +995,12 @@ mod micro_tests {
                 micro_contract_shape(&spec, &packed, &entries, mode)?,
                 vec![3, 64]
             );
+            let mut wrong = packed.clone();
+            wrong.dtype = Dtype::I32;
+            assert!(matches!(
+                micro_contract_shape(&spec, &wrong, &entries, mode),
+                Err(InferError::UnsupportedDtype { .. })
+            ));
             entries
                 .get_mut(&key)
                 .expect("invariant: scales présentes")
