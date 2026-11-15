@@ -65,3 +65,10 @@ configurations, ordre des codes, template, readout et température sont
 vérifiés. Le chargeur attend aujourd'hui `model.safetensors` et le wrapper
 `backbone_config` de THX ; ajouter la résolution de shards et un adaptateur de
 métadonnées si besoin, puis produire leurs propres oracles.
+
+Écart assumé avec la référence Python : saragossa neutralise tous les
+`added_tokens` marqués `special` du tokenizer (21 pour THX-02), alors que
+`all_special_tokens` de Transformers n'en liste que 9. Un texte utilisateur
+qui contient par exemple `<|im_start|>` littéral ne peut donc pas injecter
+de tour de conversation ; les prompts sans token spécial littéral sont
+identiques.
