@@ -62,6 +62,11 @@ impl TtsModel {
                 "talker.code_predictor.model.codec_embedding.{index}.weight"
             ))?);
         }
+        // La trame fusionnée stocke ces tables en bf16 : exact seulement si
+        // chaque valeur l'est déjà (16 bits de poids faible nuls).
+        let code_predictor_embeddings_bf16_exact = code_predictor_embeddings
+            .iter()
+            .all(|table| table.data().iter().all(|v| v.to_bits() & 0xffff == 0));
 
         tensors.insert(
             "embed_tokens.weight".to_string(),
@@ -363,6 +368,7 @@ impl TtsModel {
             code_predictor,
             code_predictor_heads,
             code_predictor_embeddings,
+            code_predictor_embeddings_bf16_exact,
             codec,
             codec_payload,
             clone_ctx: None,

@@ -450,7 +450,11 @@ where
             }
             Ok(())
         };
-        let worker_gone = || InferError::Metal("thread codec TTS arrêté".to_string());
+        // Le worker s'arrête sur une erreur codec : la remonter plutôt que l'arrêt.
+        let worker_gone = || match pcm_rx.try_recv() {
+            Ok(Err(error)) => error,
+            _ => InferError::Metal("thread codec TTS arrêté".to_string()),
+        };
         let outcome = (|| {
             let job_tx = job_tx;
             let mut sent = 0_usize;

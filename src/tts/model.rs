@@ -16,6 +16,8 @@ pub struct TtsModel {
     pub(super) code_predictor: CausalDecoder,
     pub(super) code_predictor_heads: Vec<crate::Linear>,
     pub(super) code_predictor_embeddings: Vec<Tensor>,
+    /// Les tables ci-dessus sont représentables en bf16 sans arrondi.
+    pub(super) code_predictor_embeddings_bf16_exact: bool,
     pub(super) codec: TtsCodec,
     pub(super) codec_payload: TtsPayloadSummary,
     pub(super) clone_ctx: Option<TtsCloneContext>,

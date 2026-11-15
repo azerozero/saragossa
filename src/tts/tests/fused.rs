@@ -59,6 +59,12 @@ fn fused_codebooks_match_cpu_oracle() -> Result<()> {
         for seed in [0, 17, 42] {
             let params = config.talker_params(seed);
             let sub = config.subtalker_params(seed);
+            assert!(
+                sub.top_k <= crate::decode_resident::TTS_SAMPLER_TRACE_K,
+                "top_k {} dépasse la trace GPU de {} rangs",
+                sub.top_k,
+                crate::decode_resident::TTS_SAMPLER_TRACE_K
+            );
             let sample = TtsCodebookSample {
                 temperature: sub.temperature,
                 top_k: sub.top_k,
