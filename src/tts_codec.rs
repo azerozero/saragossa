@@ -19,6 +19,8 @@ pub(crate) struct TtsCodec {
 
 #[derive(Debug, Default)]
 pub(crate) struct TtsCodecStreamState {
+    /// Préfixe GPU demandé ; `false` : préfixe CPU exact (glouton, oracles).
+    gpu_prefix: bool,
     generated_frames: usize,
     hidden_time: usize,
     emitted_samples: usize,
@@ -167,16 +169,28 @@ impl TtsCodec {
     }
 
     pub(crate) fn decode_codes(&self, generated: &[Vec<i32>]) -> Result<Vec<f32>> {
+        self.decode_codes_with(generated, true)
+    }
+
+    /// Décode avec le préfixe CPU : PCM historique au bit près, pour le
+    /// glouton et ses goldens.
+    pub(crate) fn decode_codes_exact(&self, generated: &[Vec<i32>]) -> Result<Vec<f32>> {
+        self.decode_codes_with(generated, false)
+    }
+
+    fn decode_codes_with(&self, generated: &[Vec<i32>], gpu_prefix: bool) -> Result<Vec<f32>> {
         if generated.is_empty() {
             return Ok(Vec::new());
         }
         // Préfixe GPU : le batch est un unique lot streaming, PCM identique au
         // streaming quel que soit son découpage.
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if self.gpu_prefix_active() {
+        if gpu_prefix && self.gpu_prefix_active() {
             let mut state = self.new_stream_state();
             return self.decode_codes_streaming(&mut state, generated);
         }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = gpu_prefix;
         let hidden = self.decode_prefix(generated)?;
         // Section chaude (`decoder.decoder.*`, ~94 % du coût) : forward GPU résident
         // si disponible, sinon repli CPU octet-identique (l'oracle de parité).
@@ -190,9 +204,18 @@ impl TtsCodec {
 
     pub(crate) fn new_stream_state(&self) -> TtsCodecStreamState {
         TtsCodecStreamState {
+            gpu_prefix: true,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             gpu: self.gpu.as_ref().map(|gpu| gpu.new_stream()),
             ..TtsCodecStreamState::default()
+        }
+    }
+
+    /// État streaming au préfixe CPU (voir [`Self::decode_codes_exact`]).
+    pub(crate) fn new_stream_state_exact(&self) -> TtsCodecStreamState {
+        TtsCodecStreamState {
+            gpu_prefix: false,
+            ..self.new_stream_state()
         }
     }
 
@@ -209,9 +232,9 @@ impl TtsCodec {
         state: &mut TtsCodecStreamState,
         generated: &[Vec<i32>],
     ) -> Result<Vec<f32>> {
-        self.decode_codes_streaming_with(state, generated, self.gpu_prefix_active())
+        let gpu_prefix = state.gpu_prefix && self.gpu_prefix_active();
+        self.decode_codes_streaming_with(state, generated, gpu_prefix)
     }
-
     /// Préfixe GPU actif : forward GPU présent avec son préfixe, RVQ en deux
     /// groupes (sémantique puis acoustique).
     fn gpu_prefix_active(&self) -> bool {
@@ -224,17 +247,6 @@ impl TtsCodec {
         {
             false
         }
-    }
-
-    /// Streaming avec le préfixe CPU et la section GPU, quel que soit le flag
-    /// (oracle du préfixe GPU).
-    #[cfg(test)]
-    pub(crate) fn decode_codes_streaming_cpu_prefix(
-        &self,
-        state: &mut TtsCodecStreamState,
-        generated: &[Vec<i32>],
-    ) -> Result<Vec<f32>> {
-        self.decode_codes_streaming_with(state, generated, false)
     }
 
     fn decode_codes_streaming_with(

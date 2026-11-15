@@ -383,7 +383,7 @@ d'obtenir un nombre de frames représentatif et une mesure stable.";
         let codes = rust.generate_codes_greedy(&text, max_frames)?;
         let gen = gen_start.elapsed();
         let codec_start = Instant::now();
-        let samples = rust.decode_codes_for_mode(&codes)?;
+        let samples = rust.decode_codes_for_mode(&codes, true)?;
         let codec = codec_start.elapsed();
         frames = codes.len();
         audio_s = samples.len() as f64 / sample_rate;
@@ -575,18 +575,19 @@ fn codec_gpu_prefix_matches_cpu_prefix() -> Result<()> {
     let text = "D'accord, je vérifie l'état du projet et je te donne le point utile. La priorité est de garder la réponse courte pour lancer l'audio plus vite.";
     let codes = rust.generate_codes_greedy(text, 160)?;
     let stream = |lot: usize, cpu_prefix: bool| -> Result<Vec<f32>> {
-        let mut state = rust.codec.new_stream_state();
+        let mut state = if cpu_prefix {
+            rust.codec.new_stream_state_exact()
+        } else {
+            rust.codec.new_stream_state()
+        };
         let mut pcm = Vec::new();
         let mut end = 0;
         while end < codes.len() {
             end = (end + lot).min(codes.len());
-            pcm.extend(if cpu_prefix {
+            pcm.extend(
                 rust.codec
-                    .decode_codes_streaming_cpu_prefix(&mut state, &codes[..end])?
-            } else {
-                rust.codec
-                    .decode_codes_streaming(&mut state, &codes[..end])?
-            });
+                    .decode_codes_streaming(&mut state, &codes[..end])?,
+            );
         }
         Ok(pcm)
     };
