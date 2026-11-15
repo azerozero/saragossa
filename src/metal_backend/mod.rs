@@ -403,6 +403,7 @@ pub struct MetalExecutor {
     prefill_kv_bf16_store_min_rows: Option<usize>,
     noncausal_attention_prefill_f32: ComputePipelineState,
     steel_attention_f32_bq32_bk32_bd64: Option<ComputePipelineState>,
+    decision_attention_nax: Option<attention::NaxCausalAttention>,
     add_rms_norm_row_f32: ComputePipelineState,
     topk_softmax_f32: ComputePipelineState,
     /// Top-k softmax 256 < experts ≤ 1024, un thread par logit.
@@ -446,6 +447,8 @@ pub struct MetalExecutor {
     /// GEMM tuilé à poids bf16 denses `[N,K]` et lhs f32 scindé hi + lo,
     /// pour le prefill des modèles BF16.
     na_gemm_bf16_nt_tiled_x2: Option<ComputePipelineState>,
+    /// matmul2d MPP A et B bf16, B `[N,K]` : réservé aux décisions THX-02.
+    na_gemm_bf16_nt_bn128: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_align64: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_gate_up_swiglu: Option<ComputePipelineState>,
     #[cfg(test)]

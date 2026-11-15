@@ -134,3 +134,16 @@ pub use tts::{
 pub use whisper::{
     log_mel_spectrogram, WhisperConfig, WhisperDecoder, WhisperEncoder, WhisperModel,
 };
+pub mod decision;
+
+/// Encode une empreinte en hexadécimal minuscule.
+///
+/// `sha2` 0.11 renvoie un `hybrid_array::Array` sans `LowerHex` : ce format
+/// explicite conserve l'encodage historique de `{:x}` octet par octet.
+pub(crate) fn hex(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}

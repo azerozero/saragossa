@@ -1,0 +1,5 @@
+{
+  "measured_bf16_max_abs": 0.006108671426773071,
+  "max_abs_probability": 0.012218342853546142,
+  "rule": "2 * measured bf16 max absolute probability error + 1e-6; fixed before Rust comparison"
+}
