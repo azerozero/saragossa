@@ -327,6 +327,41 @@ impl MetalExecutor {
                 "matmul bf16 x=[{batch},{in_dim}] rhs=[{out_dim},{rhs_in_dim}]"
             )));
         }
+        // NOTE: les décisions THX-02 tolèrent un GEMM bf16 classique (oracle
+        // f32 figé) ; les autres modèles gardent la correction hi + lo.
+        if let Some(pso) = self.na_gemm_bf16_nt_bn128.as_ref().filter(|_| {
+            crate::runtime_flags::decision_gemm_bf16_enabled()
+                && out_dim % 128 == 0
+                && can_use_dense_bf16_gemm(batch, in_dim, out_dim)
+        }) {
+            let len = checked_len(batch, in_dim, "décision GEMM A bf16")?;
+            let lhs_bf16 = self.private_bf16_buffer(len, "decision_gemm_lhs_bf16")?;
+            self.encode_f32_to_bf16(encoder, lhs, &lhs_bf16, len)?;
+            let mnk = [
+                checked_u32(batch, "bf16 gemm batch")?,
+                checked_u32(out_dim, "bf16 gemm out_dim")?,
+                checked_u32(in_dim, "bf16 gemm in_dim")?,
+                0,
+            ];
+            encoder.set_compute_pipeline_state(pso);
+            encoder.set_buffer(0, Some(&lhs_bf16), 0);
+            encoder.set_buffer(1, Some(rhs), 0);
+            encoder.set_buffer(2, Some(out), 0);
+            encoder.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
+            trace_dispatch_path("gemm_nax_bf16_nt_bn128", batch, out_dim, in_dim);
+            profile_dispatch();
+            encoder.dispatch_thread_groups(
+                MTLSize::new(
+                    checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?,
+                    checked_nsuint(out_dim / 128, "bf16 gemm out tiles")?,
+                    1,
+                ),
+                MTLSize::new(pso.thread_execution_width().max(1) * 8, 1, 1),
+            );
+            // Barrière complète : le scratch A est réécrit par le GEMM suivant.
+            post_dispatch_barrier(encoder);
+            return Ok(out_dim);
+        }
         if let Some(pso) = self
             .na_gemm_bf16_nt_tiled_x2
             .as_ref()

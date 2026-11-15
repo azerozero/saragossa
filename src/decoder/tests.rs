@@ -1485,6 +1485,33 @@ fn causal_attention_sliding_window_matches_truncated_context() {
 }
 
 #[test]
+fn decision_noncausal_mask_reads_future_and_restores_causal() -> Result<()> {
+    let layout = AttentionLayout {
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        head_dim: 2,
+        rope_dims: 2,
+        attn_scalar: 2.0,
+        sliding_window: None,
+    };
+    let q = Tensor::from_vec(vec![2, 2], vec![0.0; 4])?;
+    let k = q.clone();
+    let v = Tensor::from_vec(vec![2, 2], vec![2.0, 4.0, 10.0, 20.0])?;
+    let before = causal_attention(&q, &k, &v, &layout, None)?;
+    let joint = crate::runtime_flags::with_decision_noncausal(|| {
+        causal_attention(&q, &k, &v, &layout, None)
+    })?;
+    assert_eq!(before.row_slice(0)?, &[2.0, 4.0]);
+    assert_eq!(joint.row_slice(0)?, &[6.0, 12.0]);
+    assert_eq!(joint.row_slice(1)?, &[6.0, 12.0]);
+    assert_eq!(
+        causal_attention(&q, &k, &v, &layout, None)?.data(),
+        before.data()
+    );
+    Ok(())
+}
+
+#[test]
 fn cached_attention_sliding_window_matches_truncated_cache() {
     let full_layout = AttentionLayout {
         num_attention_heads: 1,
