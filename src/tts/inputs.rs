@@ -9,6 +9,12 @@ impl TtsModel {
         self
     }
 
+    /// Sélectionne un locuteur CustomVoice ; `None` rétablit Serena.
+    pub fn set_voice(&mut self, voice: Option<&str>) -> Result<()> {
+        self.speaker_id = self.assets.model_config.speaker_id(voice)?;
+        Ok(())
+    }
+
     pub(super) fn prepare_inputs(&self, text: &str) -> Result<PreparedVoiceDesign> {
         match self.clone_ctx.as_ref() {
             Some(ctx) => self.prepare_icl_inputs(text, ctx),
@@ -167,23 +173,7 @@ impl TtsModel {
         let tts_bos = tts_embeds.row_slice(0)?.to_vec();
         let tts_pad = tts_embeds.row_slice(2)?.to_vec();
 
-        let lang_id = cfg.codec_language_id.get("french").copied();
-        let codec_prefill: Vec<i32> = match lang_id {
-            Some(lid) => vec![
-                cfg.codec_think_id,
-                cfg.codec_think_bos_id,
-                lid,
-                cfg.codec_think_eos_id,
-            ],
-            None => vec![
-                cfg.codec_nothink_id,
-                cfg.codec_think_bos_id,
-                cfg.codec_think_eos_id,
-            ],
-        };
-        let mut codec_ids = codec_prefill;
-        codec_ids.push(cfg.codec_pad_id);
-        codec_ids.push(cfg.codec_bos_id);
+        let codec_ids = cfg.codec_prompt_ids(self.speaker_id);
         let codec_embed = self.codec_embed(&codec_ids)?;
         let codec_len = codec_embed.shape()[0];
         let hidden = self.hidden_dim()?;

@@ -335,7 +335,9 @@ impl TtsModel {
             codec_payload_checksum: codec_read.checksum,
         };
 
+        let speaker_id = assets.model_config.speaker_id(None)?;
         Ok(Self {
+            speaker_id,
             assets,
             tokenizer,
             text_embedding,

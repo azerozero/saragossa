@@ -64,6 +64,10 @@ struct TtsSlot {
 // Seule la synthèse est substituable : les tests conservent le choix WAV/PCM
 // du gestionnaire de production, sans charger de poids ni initialiser Metal.
 pub(super) trait SpeechSynthesis {
+    fn configure_voice(&mut self, _voice: Option<&str>) -> ServeResult<()> {
+        Ok(())
+    }
+
     fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput>;
     fn stream_sample_rate(&mut self) -> ServeResult<u32>;
     fn synthesize_streaming(
@@ -165,6 +169,21 @@ impl AudioState {
 }
 
 impl SpeechSynthesis for AudioState {
+    fn configure_voice(&mut self, voice: Option<&str>) -> ServeResult<()> {
+        self.ensure_tts_loaded()?;
+        let model = self
+            .tts
+            .model
+            .as_mut()
+            .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
+        model
+            .set_voice(voice)
+            .map_err(|_| ServeError::InvalidParameter {
+                param: "voice",
+                message: "voix CustomVoice inconnue (défaut : serena)",
+            })
+    }
+
     fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput> {
         self.ensure_tts_loaded()?;
         let model = self
@@ -268,7 +287,8 @@ pub(super) fn handle_speech<S: Write>(
         body,
         // Nom canonique depuis l'origine : pas d'alias `RETI_` à honorer ici.
         saragossa::runtime_flags::env_var_exact(TTS_MAX_FRAMES_ENV).as_deref(),
-        |stream, text, max_frames, streaming| {
+        |stream, text, max_frames, streaming, voice| {
+            audio.configure_voice(voice)?;
             if !streaming {
                 return send_speech(stream, &audio.synthesize(text, max_frames)?);
             }
@@ -287,7 +307,7 @@ fn handle_speech_with<S: Write>(
     stream: &mut S,
     body: &[u8],
     override_value: Option<&str>,
-    synthesize: impl FnOnce(&mut S, &str, usize, bool) -> ServeResult<()>,
+    synthesize: impl FnOnce(&mut S, &str, usize, bool, Option<&str>) -> ServeResult<()>,
 ) -> ServeResult<()> {
     let request: SpeechRequest = serde_json::from_slice(body)
         .map_err(|e| ServeError::json("désérialisation audio/speech", e))?;
@@ -302,6 +322,7 @@ fn handle_speech_with<S: Write>(
         input,
         tts_max_frames(input, override_value),
         request.stream,
+        request.voice.as_deref(),
     )
 }
 
@@ -386,12 +407,13 @@ fn pcm_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
 }
 
-/// Requête `/v1/audio/speech`. Le backend expose une voix VoiceDesign unique,
-/// donc `model`/`voice` (ignorés) sont acceptés sans effet.
+/// Requête `/v1/audio/speech` : `voice` sélectionne un locuteur CustomVoice.
 #[derive(Debug, Deserialize)]
 struct SpeechRequest {
     /// Texte à synthétiser.
     input: String,
+    #[serde(default)]
+    voice: Option<String>,
     /// Extension explicite : PCM s16le mono chunked au lieu du WAV complet.
     #[serde(default)]
     stream: bool,
@@ -728,14 +750,15 @@ mod tests {
             ("é".repeat(200), Some("2000"), 800),
             ("é".repeat(200), Some("0"), 400),
         ] {
-            let body = json!({ "input": format!("  {text}\n") }).to_string();
+            let body = json!({ "input": format!("  {text}\n"), "voice": "vivian" }).to_string();
             let mut response = Vec::new();
             let mut called = false;
             handle_speech_with(
                 &mut response,
                 body.as_bytes(),
                 override_value,
-                |stream, input, max_frames, streaming| {
+                |stream, input, max_frames, streaming, voice| {
+                    assert_eq!(voice, Some("vivian"));
                     called = true;
                     assert!(!streaming);
                     assert_eq!(input, text);

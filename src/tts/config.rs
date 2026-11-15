@@ -77,6 +77,8 @@ pub struct TtsTalkerConfig {
     pub codec_think_eos_id: i32,
     #[serde(default)]
     pub codec_language_id: HashMap<String, i32>,
+    #[serde(default)]
+    pub spk_id: HashMap<String, i32>,
 }
 
 fn default_talker_max_pos() -> i32 {
@@ -120,6 +122,45 @@ impl TtsModelConfig {
             "custom_voice" => TtsModelKind::CustomVoice,
             other => TtsModelKind::Other(other.to_string()),
         }
+    }
+}
+
+impl TtsModelConfig {
+    /// CustomVoice choisit Serena en l'absence de voix explicite.
+    /// VoiceDesign et Base n'utilisent pas de locuteur nommé.
+    pub fn speaker_id(&self, voice: Option<&str>) -> Result<Option<i32>> {
+        if self.model_kind() != TtsModelKind::CustomVoice {
+            return Ok(None);
+        }
+        let voice = voice.unwrap_or("serena").to_lowercase();
+        self.talker_config
+            .spk_id
+            .get(&voice)
+            .copied()
+            .filter(|id| *id >= 0 && *id < self.talker_config.vocab_size)
+            .map(Some)
+            .ok_or_else(|| InferError::Config(format!("voix CustomVoice inconnue: {voice}")))
+    }
+}
+
+impl TtsTalkerConfig {
+    pub(super) fn codec_prompt_ids(&self, speaker: Option<i32>) -> Vec<i32> {
+        let mut ids = match self.codec_language_id.get("french") {
+            Some(&language) => vec![
+                self.codec_think_id,
+                self.codec_think_bos_id,
+                language,
+                self.codec_think_eos_id,
+            ],
+            None => vec![
+                self.codec_nothink_id,
+                self.codec_think_bos_id,
+                self.codec_think_eos_id,
+            ],
+        };
+        ids.extend(speaker);
+        ids.extend([self.codec_pad_id, self.codec_bos_id]);
+        ids
     }
 }
 
