@@ -13,3 +13,21 @@ Source de cet ordre : contrat du correctif TTS du 15 novembre 2026 ; aucun
 paquet Python `qwen_tts`, `qwen3_tts` ou `mlx_audio` trouvé dans les installations
 locales inspectées. Les identifiants viennent exclusivement du `config.json`
 du snapshot chargé. Il ne s'agit pas d'une vérification de la référence amont.
+
+VoiceDesign et CustomVoice chargent `generation_config.json` : `do_sample`,
+`temperature`, `top_k`, `top_p`, `repetition_penalty`, les quatre réglages
+`subtalker_*` et `max_new_tokens`. Un fichier absent ou invalide est une erreur
+explicite. Les budgets serveur restent prioritaires s'ils sont plus courts.
+La pénalité du talker porte sur les cb0 déjà générés, une fois par identifiant :
+logit négatif multiplié, logit positif divisé, avant température et top-k/top-p.
+EOS reste exempt ; le code predictor n'a pas de pénalité inter-codebooks.
+
+La graine hors clonage vaut 0 par défaut ; l'extension JSON `seed` accepte un
+entier non signé et est réinitialisée pour chaque requête. Batch et streaming
+partagent la même politique. `SARAGOSSA_TTS_GREEDY=1` force l'oracle historique
+sur les deux niveaux, sans sampling ni pénalité. Les méthodes explicitement
+nommées `synthesize_greedy*` restent également des oracles.
+
+Les goldens audio VoiceDesign et clone appellent explicitement le chemin par
+défaut sous le flag glouton (override local au thread de test). Aucune tolérance
+ni fixture golden n’est modifiée.

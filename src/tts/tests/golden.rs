@@ -106,7 +106,9 @@ fn golden_voicedesign_e2e_audio_matches_fixture() -> Result<()> {
         return Ok(());
     };
     let rust = TtsModel::load_local(model_dir)?;
-    let rust_audio = rust.synthesize_greedy(TEXT, MAX_FRAMES)?;
+    let rust_audio = crate::runtime_flags::with_tts_greedy_for_test(true, || {
+        rust.synthesize_default(TEXT, MAX_FRAMES)
+    })?;
 
     let (_, golden_samples) = crate::golden::read_f32("voicedesign_e2e_samples")?;
     let (codes_shape, codes_flat) = crate::golden::read_i32("voicedesign_e2e_codes")?;
@@ -262,7 +264,9 @@ fn golden_clone_e2e_audio_matches_fixture() -> Result<()> {
     };
     let (wav_bytes, ref_text) = clone_reference_assets()?;
     let rust = TtsModel::load_clone_local(&model_dir, &wav_bytes, &ref_text)?;
-    let rust_audio = rust.synthesize_greedy(TEXT, MAX_FRAMES)?;
+    let rust_audio = crate::runtime_flags::with_tts_greedy_for_test(true, || {
+        rust.synthesize_default(TEXT, MAX_FRAMES)
+    })?;
 
     let (_, golden_samples) = crate::golden::read_f32("clone_e2e_samples")?;
     let common = rust_audio.samples.len().min(golden_samples.len());

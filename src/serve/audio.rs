@@ -64,7 +64,7 @@ struct TtsSlot {
 // Seule la synthèse est substituable : les tests conservent le choix WAV/PCM
 // du gestionnaire de production, sans charger de poids ni initialiser Metal.
 pub(super) trait SpeechSynthesis {
-    fn configure_voice(&mut self, _voice: Option<&str>) -> ServeResult<()> {
+    fn configure_voice(&mut self, _voice: Option<&str>, _seed: Option<u64>) -> ServeResult<()> {
         Ok(())
     }
 
@@ -169,13 +169,14 @@ impl AudioState {
 }
 
 impl SpeechSynthesis for AudioState {
-    fn configure_voice(&mut self, voice: Option<&str>) -> ServeResult<()> {
+    fn configure_voice(&mut self, voice: Option<&str>, seed: Option<u64>) -> ServeResult<()> {
         self.ensure_tts_loaded()?;
         let model = self
             .tts
             .model
             .as_mut()
             .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
+        model.set_seed(seed);
         model
             .set_voice(voice)
             .map_err(|_| ServeError::InvalidParameter {
@@ -287,8 +288,8 @@ pub(super) fn handle_speech<S: Write>(
         body,
         // Nom canonique depuis l'origine : pas d'alias `RETI_` à honorer ici.
         saragossa::runtime_flags::env_var_exact(TTS_MAX_FRAMES_ENV).as_deref(),
-        |stream, text, max_frames, streaming, voice| {
-            audio.configure_voice(voice)?;
+        |stream, text, max_frames, streaming, voice, seed| {
+            audio.configure_voice(voice, seed)?;
             if !streaming {
                 return send_speech(stream, &audio.synthesize(text, max_frames)?);
             }
@@ -307,7 +308,7 @@ fn handle_speech_with<S: Write>(
     stream: &mut S,
     body: &[u8],
     override_value: Option<&str>,
-    synthesize: impl FnOnce(&mut S, &str, usize, bool, Option<&str>) -> ServeResult<()>,
+    synthesize: impl FnOnce(&mut S, &str, usize, bool, Option<&str>, Option<u64>) -> ServeResult<()>,
 ) -> ServeResult<()> {
     let request: SpeechRequest = serde_json::from_slice(body)
         .map_err(|e| ServeError::json("désérialisation audio/speech", e))?;
@@ -323,6 +324,7 @@ fn handle_speech_with<S: Write>(
         tts_max_frames(input, override_value),
         request.stream,
         request.voice.as_deref(),
+        request.seed,
     )
 }
 
@@ -414,6 +416,8 @@ struct SpeechRequest {
     input: String,
     #[serde(default)]
     voice: Option<String>,
+    #[serde(default)]
+    seed: Option<u64>,
     /// Extension explicite : PCM s16le mono chunked au lieu du WAV complet.
     #[serde(default)]
     stream: bool,
@@ -750,15 +754,17 @@ mod tests {
             ("é".repeat(200), Some("2000"), 800),
             ("é".repeat(200), Some("0"), 400),
         ] {
-            let body = json!({ "input": format!("  {text}\n"), "voice": "vivian" }).to_string();
+            let body = json!({ "input": format!("  {text}\n"), "voice": "vivian", "seed": 123 })
+                .to_string();
             let mut response = Vec::new();
             let mut called = false;
             handle_speech_with(
                 &mut response,
                 body.as_bytes(),
                 override_value,
-                |stream, input, max_frames, streaming, voice| {
+                |stream, input, max_frames, streaming, voice, seed| {
                     assert_eq!(voice, Some("vivian"));
+                    assert_eq!(seed, Some(123));
                     called = true;
                     assert!(!streaming);
                     assert_eq!(input, text);

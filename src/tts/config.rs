@@ -265,3 +265,115 @@ pub(super) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> 
         source,
     })
 }
+
+/// Paramètres du snapshot, sans valeurs de sampling implicites.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct TtsGenerationConfig {
+    pub do_sample: bool,
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub repetition_penalty: f32,
+    pub subtalker_dosample: bool,
+    pub subtalker_temperature: f32,
+    pub subtalker_top_k: usize,
+    pub subtalker_top_p: f32,
+    pub max_new_tokens: usize,
+}
+
+impl TtsGenerationConfig {
+    pub(super) fn validate(&self) -> Result<()> {
+        for (temperature, top_p) in [
+            (self.temperature, self.top_p),
+            (self.subtalker_temperature, self.subtalker_top_p),
+        ] {
+            if !temperature.is_finite()
+                || temperature <= 0.0
+                || !top_p.is_finite()
+                || !(0.0..=1.0).contains(&top_p)
+                || top_p == 0.0
+            {
+                return Err(InferError::Config(
+                    "paramètres de sampling TTS invalides".into(),
+                ));
+            }
+        }
+        if !self.repetition_penalty.is_finite()
+            || self.repetition_penalty <= 0.0
+            || self.max_new_tokens == 0
+        {
+            return Err(InferError::Config("pénalité ou budget TTS invalide".into()));
+        }
+        Ok(())
+    }
+
+    pub(super) fn talker_params(&self, seed: u64) -> super::TtsSampleParams {
+        super::TtsSampleParams {
+            temperature: if self.do_sample {
+                self.temperature
+            } else {
+                0.0
+            },
+            top_k: self.top_k,
+            top_p: self.top_p,
+            repetition_penalty: self.repetition_penalty,
+            seed,
+        }
+    }
+
+    pub(super) fn subtalker_params(&self, seed: u64) -> super::TtsSampleParams {
+        super::TtsSampleParams {
+            temperature: if self.subtalker_dosample {
+                self.subtalker_temperature
+            } else {
+                0.0
+            },
+            top_k: self.subtalker_top_k,
+            top_p: self.subtalker_top_p,
+            repetition_penalty: 1.0,
+            seed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_sampling_parameters_are_loaded_and_validated() {
+        let json = r#"{"do_sample":true,"temperature":0.72,"top_k":7,"top_p":0.8,
+            "repetition_penalty":1.2,"subtalker_dosample":false,
+            "subtalker_temperature":0.65,"subtalker_top_k":9,
+            "subtalker_top_p":0.7,"max_new_tokens":123}"#;
+        let mut config: TtsGenerationConfig =
+            serde_json::from_str(json).expect("invariant: fixture valide");
+        config.validate().expect("invariant: paramètres valides");
+        let params = config.talker_params(42);
+        assert_eq!(
+            (
+                params.temperature,
+                params.top_k,
+                params.top_p,
+                params.repetition_penalty,
+                params.seed
+            ),
+            (0.72, 7, 0.8, 1.2, 42)
+        );
+        let sub = config.subtalker_params(42);
+        assert_eq!(
+            (
+                sub.temperature,
+                sub.top_k,
+                sub.top_p,
+                sub.repetition_penalty
+            ),
+            (0.0, 9, 0.7, 1.0)
+        );
+        config.subtalker_dosample = true;
+        assert_eq!(config.subtalker_params(42).temperature, 0.65);
+        config.repetition_penalty = 0.0;
+        assert!(config.validate().is_err());
+        assert!(serde_json::from_str::<TtsGenerationConfig>("{}").is_err());
+    }
+}

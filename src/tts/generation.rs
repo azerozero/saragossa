@@ -1,9 +1,7 @@
 use super::{
-    clone_effective_frame_cap, clone_sample_seed, greedy_talker_token, greedy_token,
-    repeat_frame_stop_tripped, sample_talker_token, tts_generation_trace_enabled,
-    tts_repeat_frame_stop, TtsModel, TtsSampleParams, CLONE_GENERATION_HARD_CAP,
-    CLONE_SAMPLE_REPETITION_PENALTY, CLONE_SAMPLE_TEMPERATURE, CLONE_SAMPLE_TOP_K,
-    CLONE_SAMPLE_TOP_P,
+    greedy_talker_token, greedy_token, repeat_frame_stop_tripped, sample_talker_token,
+    tts_generation_trace_enabled, tts_repeat_frame_stop, TtsModel, TtsSampleParams,
+    CLONE_GENERATION_HARD_CAP,
 };
 use crate::sampling::DeterministicSampler;
 use crate::{CausalDecoderCache, InferError, Result, Tensor};
@@ -18,30 +16,6 @@ impl TtsModel {
         self.generate_codes_greedy_trace(
             text,
             max_frames,
-            tts_generation_trace_enabled(),
-            &mut |_| Ok(()),
-        )
-    }
-
-    pub(super) fn generate_codes_clone_sampled(
-        &self,
-        text: &str,
-        max_frames: usize,
-    ) -> Result<Vec<Vec<i32>>> {
-        let target_tokens = self.encode_ids(text)?.len();
-        let effective_max_frames = clone_effective_frame_cap(max_frames, target_tokens);
-        let params = TtsSampleParams {
-            temperature: CLONE_SAMPLE_TEMPERATURE,
-            top_k: CLONE_SAMPLE_TOP_K,
-            top_p: CLONE_SAMPLE_TOP_P,
-            repetition_penalty: CLONE_SAMPLE_REPETITION_PENALTY,
-            seed: clone_sample_seed(),
-        };
-        self.generate_codes_clone_sampled_trace(
-            text,
-            max_frames,
-            effective_max_frames,
-            params,
             tts_generation_trace_enabled(),
             &mut |_| Ok(()),
         )
@@ -137,6 +111,10 @@ impl TtsModel {
         let mut repeat_run = 1_usize;
         let mut cb0_history = Vec::with_capacity(effective_max_frames);
         let mut sampler = DeterministicSampler::new(params.seed);
+        let subtalker = self
+            .generation_config
+            .as_ref()
+            .map(|config| config.subtalker_params(params.seed));
 
         for step in 0..effective_max_frames {
             let qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
@@ -164,8 +142,13 @@ impl TtsModel {
                 break;
             }
 
-            let codes_frame =
-                self.predict_codebooks(tok0, &final_state, n_groups, cp_resident_cache.as_mut())?;
+            let codes_frame = self.predict_codebooks(
+                tok0,
+                &final_state,
+                n_groups,
+                cp_resident_cache.as_mut(),
+                subtalker.as_ref().map(|p| (p, &mut sampler)),
+            )?;
 
             let text_embed = if trailing_idx < prepared.trailing.shape()[0] {
                 let row = Tensor::row(prepared.trailing.row_slice(trailing_idx)?.to_vec())?;
@@ -275,6 +258,7 @@ impl TtsModel {
         final_state: &Tensor,
         n_groups: usize,
         cp_resident: Option<&mut CausalDecoderCache>,
+        mut sampling: Option<(&TtsSampleParams, &mut DeterministicSampler)>,
     ) -> Result<Vec<i32>> {
         let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
             crate::runtime_flags::tts_qmm_na_dequant_enabled(),
@@ -302,14 +286,27 @@ impl TtsModel {
                     let head = self.code_predictor_heads.get(code_idx).ok_or_else(|| {
                         InferError::MissingWeight(format!("code_predictor.lm_head.{code_idx}"))
                     })?;
-                    let token = self
-                        .code_predictor
-                        .decode_token_resident_from_embedding_head(cp_cache, &next_input, head)?
-                        .ok_or_else(|| {
-                            InferError::Metal("cp résident: token absent".to_string())
-                        })?;
-                    let code = i32::try_from(token)
-                        .map_err(|_| InferError::Config(format!("code cp hors i32: {token}")))?;
+                    let code = if let Some((params, sampler)) = sampling.as_mut() {
+                        let state = self
+                            .code_predictor
+                            .decode_step_resident_from_embedding(cp_cache, &next_input)?
+                            .ok_or_else(|| InferError::Metal("cp résident: état absent".into()))?;
+                        sample_talker_token(
+                            head.forward(&state)?.as_row()?,
+                            params,
+                            &[],
+                            &[],
+                            None,
+                            sampler,
+                        )?
+                    } else {
+                        let token = self
+                            .code_predictor
+                            .decode_token_resident_from_embedding_head(cp_cache, &next_input, head)?
+                            .ok_or_else(|| InferError::Metal("cp résident: token absent".into()))?;
+                        i32::try_from(token)
+                            .map_err(|_| InferError::Config(format!("code cp hors i32: {token}")))?
+                    };
                     codes_frame.push(code);
                     if code_idx + 1 < n_groups - 1 {
                         let embed = self.code_predictor_embed(code_idx, &[code])?;
@@ -331,7 +328,12 @@ impl TtsModel {
                     let head = self.code_predictor_heads.get(code_idx).ok_or_else(|| {
                         InferError::MissingWeight(format!("code_predictor.lm_head.{code_idx}"))
                     })?;
-                    let code = greedy_token(head.forward(&cp_state)?.as_row()?, &[])?;
+                    let logits = head.forward(&cp_state)?;
+                    let code = if let Some((params, sampler)) = sampling.as_mut() {
+                        sample_talker_token(logits.as_row()?, params, &[], &[], None, sampler)?
+                    } else {
+                        greedy_token(logits.as_row()?, &[])?
+                    };
                     codes_frame.push(code);
                     if code_idx + 1 < n_groups - 1 {
                         let embed = self.code_predictor_embed(code_idx, &[code])?;
@@ -453,8 +455,13 @@ impl TtsModel {
                 break;
             }
 
-            let codes_frame =
-                self.predict_codebooks(tok0, &final_state, n_groups, cp_resident_cache.as_mut())?;
+            let codes_frame = self.predict_codebooks(
+                tok0,
+                &final_state,
+                n_groups,
+                cp_resident_cache.as_mut(),
+                None,
+            )?;
 
             let text_embed = if trailing_idx < prepared.trailing.shape()[0] {
                 let row = Tensor::row(prepared.trailing.row_slice(trailing_idx)?.to_vec())?;

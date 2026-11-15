@@ -335,9 +335,22 @@ impl TtsModel {
             codec_payload_checksum: codec_read.checksum,
         };
 
+        let generation_config = if matches!(
+            assets.model_kind(),
+            TtsModelKind::VoiceDesign | TtsModelKind::CustomVoice
+        ) {
+            let config: super::config::TtsGenerationConfig =
+                super::read_json(&assets.model_dir.join("generation_config.json"))?;
+            config.validate()?;
+            Some(config)
+        } else {
+            None
+        };
         let speaker_id = assets.model_config.speaker_id(None)?;
         Ok(Self {
             speaker_id,
+            generation_config,
+            seed: None,
             assets,
             tokenizer,
             text_embedding,

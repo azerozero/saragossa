@@ -146,7 +146,9 @@ fn speech_stream_is_flushed_during_synthesis_and_matches_batch_wav() -> ServeRes
                 &mut writer,
                 br#"{"input":" Bonjour. ","stream":true}"#,
                 Some("12"),
-                |stream, text, max_frames, streaming, _voice| {
+                |stream, text, max_frames, streaming, voice, seed| {
+                    assert_eq!(voice, None);
+                    assert_eq!(seed, None);
                     assert_eq!(text, "Bonjour.");
                     assert_eq!(max_frames, 12);
                     assert!(streaming);
@@ -270,7 +272,7 @@ fn invalid_stream_option_is_rejected_before_synthesis() {
         &mut bytes,
         br#"{"input":"Bonjour","stream":"true"}"#,
         None,
-        |_, _, _, _, _| unreachable!("invariant: requête invalide rejetée avant synthèse"),
+        |_, _, _, _, _, _| unreachable!("invariant: requête invalide rejetée avant synthèse"),
     );
     assert!(result.is_err());
     assert!(bytes.is_empty());

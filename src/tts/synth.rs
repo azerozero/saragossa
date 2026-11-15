@@ -9,6 +9,40 @@ use crate::{InferError, Result};
 use std::time::{Duration, Instant};
 
 impl TtsModel {
+    /// Graine par requête ; `None` rétablit la graine déterministe 0 hors clonage.
+    pub fn set_seed(&mut self, seed: Option<u64>) {
+        self.seed = seed;
+    }
+
+    fn default_sample_params(&self) -> Option<TtsSampleParams> {
+        if self.clone_ctx.is_some() {
+            return Some(TtsSampleParams {
+                temperature: CLONE_SAMPLE_TEMPERATURE,
+                top_k: CLONE_SAMPLE_TOP_K,
+                top_p: CLONE_SAMPLE_TOP_P,
+                repetition_penalty: CLONE_SAMPLE_REPETITION_PENALTY,
+                seed: self.seed.unwrap_or_else(clone_sample_seed),
+            });
+        }
+        self.generation_config
+            .as_ref()
+            .map(|config| config.talker_params(self.seed.unwrap_or(0)))
+    }
+
+    fn default_frame_cap(&self, text: &str, max_frames: usize) -> Result<usize> {
+        if self.clone_ctx.is_some() {
+            Ok(clone_effective_frame_cap(
+                max_frames,
+                self.encode_ids(text)?.len(),
+            ))
+        } else {
+            Ok(self
+                .generation_config
+                .as_ref()
+                .map_or(max_frames, |config| max_frames.min(config.max_new_tokens)))
+        }
+    }
+
     /// Exécute le forward talker autoregressif sur le préfixe VoiceDesign.
     ///
     /// # Errors
@@ -58,15 +92,21 @@ impl TtsModel {
     ///
     /// Renvoie une erreur si la génération des codes ou le codec échoue.
     pub fn synthesize_default(&self, text: &str, max_frames: usize) -> Result<TtsSynthesisOutput> {
-        let effective_max_frames = if self.clone_ctx.is_some() {
-            clone_effective_frame_cap(max_frames, self.encode_ids(text)?.len())
+        if crate::runtime_flags::tts_greedy_enabled() {
+            return self.synthesize_greedy(text, max_frames);
+        }
+        let effective_max_frames = self.default_frame_cap(text, max_frames)?;
+        let codes = if let Some(params) = self.default_sample_params() {
+            self.generate_codes_clone_sampled_trace(
+                text,
+                max_frames,
+                effective_max_frames,
+                params,
+                tts_generation_trace_enabled(),
+                &mut |_| Ok(()),
+            )?
         } else {
-            max_frames
-        };
-        let codes = if self.clone_ctx.is_some() {
-            self.generate_codes_clone_sampled(text, max_frames)?
-        } else {
-            self.generate_codes_greedy(text, max_frames)?
+            self.generate_codes_greedy(text, effective_max_frames)?
         };
         let samples = self.decode_codes_for_mode(&codes)?;
         Ok(TtsSynthesisOutput {
@@ -79,9 +119,7 @@ impl TtsModel {
 
     /// Synthétise en streaming avec la politique de décodage adaptée au mode.
     ///
-    /// VoiceDesign conserve le chemin greedy historique. Le clone Base/ICL passe
-    /// par le sampling + cap adaptatif utilisés par [`Self::synthesize_default`],
-    /// ce qui évite de réintroduire le chemin greedy clone qui boucle.
+    /// Utilise les mêmes paramètres et la même graine que [`Self::synthesize_default`].
     ///
     /// # Errors
     ///
@@ -95,16 +133,11 @@ impl TtsModel {
     where
         F: FnMut(&[f32]) -> Result<()>,
     {
-        if self.clone_ctx.is_some() {
-            let target_tokens = self.encode_ids(text)?.len();
-            let effective_max_frames = clone_effective_frame_cap(max_frames, target_tokens);
-            let params = TtsSampleParams {
-                temperature: CLONE_SAMPLE_TEMPERATURE,
-                top_k: CLONE_SAMPLE_TOP_K,
-                top_p: CLONE_SAMPLE_TOP_P,
-                repetition_penalty: CLONE_SAMPLE_REPETITION_PENALTY,
-                seed: clone_sample_seed(),
-            };
+        if crate::runtime_flags::tts_greedy_enabled() {
+            return self.synthesize_greedy_streaming(text, max_frames, on_audio);
+        }
+        let effective_max_frames = self.default_frame_cap(text, max_frames)?;
+        if let Some(params) = self.default_sample_params() {
             let trace = tts_generation_trace_enabled();
             return self.synthesize_streaming_from_frames(
                 |on_frame| {
@@ -121,7 +154,7 @@ impl TtsModel {
                 on_audio,
             );
         }
-        self.synthesize_greedy_streaming(text, max_frames, on_audio)
+        self.synthesize_greedy_streaming(text, effective_max_frames, on_audio)
     }
 
     /// Synthétise en STREAMING : `on_audio(&[f32])` est appelé avec chaque nouveau
