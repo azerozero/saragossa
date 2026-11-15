@@ -1,0 +1,4 @@
+# Les mutations de logique restent visibles : aucune exclusion sémantique.
+# Les fichiers sont sélectionnés par la commande locale ou le job hebdomadaire.
+timeout_multiplier = 3.0
+minimum_test_timeout = 30.0

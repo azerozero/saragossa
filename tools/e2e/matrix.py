@@ -1,13 +1,13 @@
 """Executable capability matrix. Unsupported entries always carry source evidence."""
 
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 import io
 import json
 import os
 import re
 import wave
 
+from audio_quality import minimum_seconds, transcription_scores
 import contracts as c
 from launcher import local_path
 from transport import decoded, rejected
@@ -26,6 +26,11 @@ OPENAI_TOOL = {"type": "function", "function": FUNCTION}
 ANTHROPIC_TOOL = {"name": "get_weather", "description": FUNCTION["description"], "input_schema": SCHEMA}
 TOOL_PROMPT = "Call get_weather for Paris. Use the tool before answering; do not invent the weather."
 AUDIO_TEXT = "Bonjour, le petit chat regarde par la fenêtre."
+LONG_AUDIO_TEXT = (
+    "Ce matin, nous avons quitté la maison pour rejoindre le marché du village. "
+    "Sur la place, les commerçants installaient leurs étals de fruits et de légumes. "
+    "Après avoir acheté des pommes, nous avons pris le chemin du retour en longeant la rivière."
+)
 
 
 def sdk_body(body, anthropic=False):
@@ -47,7 +52,7 @@ class Case:
 
 
 class Matrix:
-    def __init__(self, clients, model, family, flint=False, similarity=0.6, model_type=None):
+    def __init__(self, clients, model, family, flint=False, similarity=0.8, model_type=None):
         self.clients, self.model, self.family = clients, model, family
         self.flint, self.similarity = flint, similarity
         if model_type is None:
@@ -224,15 +229,18 @@ class Matrix:
             model=self.model, input=inputs, encoding_format="float"))
         c.embeddings(value, self.model, 2 if many else 1)
 
-    def speech(self):
+    def speech(self, text=AUDIO_TEXT, voice="alloy"):
         with self.clients.openai.audio.speech.with_streaming_response.create(
-            model=self.model, input=AUDIO_TEXT, voice="alloy", response_format="wav"
+            model=self.model, input=text, voice=voice, response_format="wav"
         ) as response:
             c.require(response.headers.get("content-type", "").startswith("audio/wav"), "Content-Type WAV")
             audio = response.read()
         with wave.open(io.BytesIO(audio), "rb") as wav:
             c.require(wav.getnchannels() == 1 and wav.getsampwidth() == 2, "WAV mono PCM16 requis")
             c.require(8000 <= wav.getframerate() <= 192000 and wav.getnframes() > 0, "WAV vide/fréquence")
+            duration = wav.getnframes() / wav.getframerate()
+            c.require(duration >= minimum_seconds(text),
+                      f"audio trop court: {duration:.3f}s < {minimum_seconds(text):.3f}s")
             frames = wav.readframes(wav.getnframes())
             c.require(len(frames) == wav.getnframes() * 2 and any(frames), "WAV tronqué/silencieux")
         return audio
@@ -251,10 +259,20 @@ class Matrix:
             c.require(content_type.startswith("text/plain"), "Content-Type transcription texte")
             c.require(type(parsed) is str and bool(parsed.strip()), "transcription texte vide")
             output = parsed
-        words = lambda text: re.findall(r"\w+", text.casefold())
-        score = SequenceMatcher(None, words(expected), words(output), autojunk=False).ratio()
-        c.require(score >= self.similarity, f"similarité de mots {score:.3f} < {self.similarity:.3f}")
-        return {"word_similarity": round(score, 4)}
+        scores = transcription_scores(expected, output)
+        threshold = max(0.8, self.similarity)
+        c.require(scores["word_similarity"] >= threshold,
+                  f"similarité de mots {scores['word_similarity']:.3f} < {threshold:.3f}")
+        c.require(scores["wer"] <= 0.2, f"WER {scores['wer']:.3f} > 0.200")
+        return scores
+
+    def custom_voice(self):
+        voice = os.environ.get("E2E_CUSTOM_VOICE", "").strip()
+        c.require(bool(voice), "E2E_CUSTOM_VOICE requis avec un modèle CustomVoice local")
+        config = json.loads((local_path("E2E_QWEN3_TTS_MODEL") / "config.json").read_text())
+        c.require(config.get("tts_model_type") == "custom_voice",
+                  "le cas voice_custom exige un snapshot CustomVoice local")
+        return self.speech(text=LONG_AUDIO_TEXT, voice=voice)
 
     def audio(self, fmt):
         if self.family == "audio":
@@ -378,6 +396,11 @@ class Matrix:
         for option in ("dimensions_override", "encoding_base64", "usage"):
             self.add(EMBED, option, unsupported="src/serve/embeddings.rs: dimension fixe 384, float seulement, usage absent.")
         self.add(SPEECH, "wav", self.speech, "" if self.family in {"tts", "audio"} else "Profil sans Qwen3-TTS.")
+        self.add(SPEECH, "wav_long", lambda: self.speech(text=LONG_AUDIO_TEXT),
+                 "" if self.family in {"tts", "audio"} else "Profil sans Qwen3-TTS.")
+        self.add(SPEECH, "voice_custom", self.custom_voice,
+                 "Profil sans Qwen3-TTS." if self.family not in {"tts", "audio"}
+                 else "" if os.environ.get("E2E_CUSTOM_VOICE", "").strip() else "E2E_CUSTOM_VOICE absent.")
         for fmt in ("mp3", "opus", "aac", "flac", "pcm"):
             self.add(SPEECH, "format_" + fmt, unsupported=(
                 "src/serve/audio.rs SpeechRequest: response_format ignoré, WAV; PCM via extension stream seulement."))
