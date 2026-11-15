@@ -225,7 +225,7 @@ impl Store {
             let item = io(&root, item)?;
             let name = item.file_name().to_string_lossy().into_owned();
             if name == "pending" {
-                remove(&item.path())?;
+                discard_startup_entry(&item.path());
                 continue;
             }
             let Some(hash) = name.strip_prefix("entry-") else {
@@ -236,19 +236,19 @@ impl Store {
             }
             let path = item.path();
             if !io(&path, fs::symlink_metadata(&path))?.is_dir() {
-                remove(&path)?;
+                discard_startup_entry(&path);
                 continue;
             }
             let manifest = path.join("manifest.json");
             let bytes = match tree_bytes(&path) {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    remove(&path)?;
+                    discard_startup_entry(&path);
                     continue;
                 }
             };
             if !manifest.is_file() || bytes > budget {
-                remove(&path)?;
+                discard_startup_entry(&path);
                 continue;
             }
             let header = match verify_manifest(&path) {
@@ -260,7 +260,7 @@ impl Store {
                     header
                 }
                 _ => {
-                    remove(&path)?;
+                    discard_startup_entry(&path);
                     continue;
                 }
             };
@@ -669,6 +669,13 @@ fn sync_dir(path: &Path) -> Result<()> {
     {
         let _ = path;
         Ok(())
+    }
+}
+fn discard_startup_entry(path: &Path) {
+    // Un résidu inutilisable ne doit pas empêcher le démarrage du serveur.
+    // L'appelant l'exclut de l'index même si son nettoyage est refusé.
+    if let Err(error) = remove(path) {
+        eprintln!("prefix_ssd cleanup_refused: {error}");
     }
 }
 fn remove(path: &Path) -> Result<()> {

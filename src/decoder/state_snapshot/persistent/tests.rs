@@ -269,6 +269,61 @@ fn interrupted_publication_and_oversized_entry() {
 
 #[test]
 #[cfg(unix)]
+fn startup_ignores_entries_that_cannot_be_removed() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    for failure in [
+        "pending",
+        "not_directory",
+        "tree",
+        "missing_manifest",
+        "oversized",
+        "header",
+    ] {
+        let root = private_dir();
+        let budget = 1 << 20;
+        let initial = Store::open(root.path(), budget, 0).unwrap();
+        let (model, request, state) = fixture(&initial, 1);
+        publish(&initial, &request, payload(&model, &request, &state));
+        drop(initial);
+        let rejected = root.path().join(if failure == "pending" {
+            "pending".into()
+        } else {
+            format!("entry-{}", storage::digest(&[2]))
+        });
+        if failure == "not_directory" {
+            fs::write(&rejected, b"invalid").unwrap();
+        } else {
+            fs::create_dir(&rejected).unwrap();
+            fs::write(rejected.join("manifest.json"), b"{}").unwrap();
+            match failure {
+                "tree" => symlink("manifest.json", rejected.join("linked")).unwrap(),
+                "missing_manifest" => fs::remove_file(rejected.join("manifest.json")).unwrap(),
+                "oversized" => File::create(rejected.join("large"))
+                    .unwrap()
+                    .set_len(budget + 1)
+                    .unwrap(),
+                "header" => fs::write(rejected.join("manifest.sha256"), b"invalid").unwrap(),
+                _ => {}
+            }
+        }
+        // Le verrou existe déjà. La racine reste lisible, mais ses enfants ne
+        // peuvent pas être supprimés : l'ouverture doit conserver l'entrée saine.
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let restarted = Store::open(root.path(), budget, 0);
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let restarted = restarted.unwrap_or_else(|error| panic!("{failure}: {error}"));
+        assert!(
+            rejected.exists(),
+            "{failure}: suppression réellement refusée"
+        );
+        assert_eq!(restarted.disk.lock().unwrap().entries.len(), 1, "{failure}");
+        assert!(restarted.read(&model, &request).is_some(), "{failure}");
+    }
+}
+
+#[test]
+#[cfg(unix)]
 fn symlinks_and_public_directory_are_refused() {
     use std::os::unix::fs::{symlink, PermissionsExt};
     let root = private_dir();
