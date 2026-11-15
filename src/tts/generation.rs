@@ -122,11 +122,16 @@ impl TtsModel {
             .as_ref()
             .map(|config| config.subtalker_params(params.seed));
 
+        let mut logits = {
+            let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+                crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+            );
+            self.talker.logits_from_final_state(&final_state)?
+        };
         for step in 0..effective_max_frames {
             let qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
                 crate::runtime_flags::tts_qmm_na_dequant_enabled(),
             );
-            let logits = self.talker.logits_from_final_state(&final_state)?;
             let tok0 = sample_talker_token(
                 logits.as_row()?,
                 &params,
@@ -169,17 +174,20 @@ impl TtsModel {
                 codec_embed = codec_embed.add(&self.code_predictor_embed(codebook, &[code])?)?;
             }
             let next_input = text_embed.add(&codec_embed)?;
-            final_state = if talker_resident {
+            (final_state, logits) = if talker_resident {
                 self.talker
-                    .decode_step_resident_from_embedding(&mut talker_cache, &next_input)?
+                    .decode_state_logits_resident_from_embedding(&mut talker_cache, &next_input)?
                     .ok_or_else(|| {
                         InferError::Metal(
                             "decode résident talker indisponible en cours de frame".to_string(),
                         )
                     })?
             } else {
-                self.talker
-                    .next_state_from_embedding(&mut talker_cache, &next_input)?
+                let state = self
+                    .talker
+                    .next_state_from_embedding(&mut talker_cache, &next_input)?;
+                let logits = self.talker.logits_from_final_state(&state)?;
+                (state, logits)
             };
 
             let repeated_frame = generated.last().is_some_and(|prev| prev == &codes_frame);
@@ -281,9 +289,9 @@ impl TtsModel {
         match cp_resident {
             Some(cp_cache) => {
                 // position 0 : final_state (seed KV, pas de code). Puis un pas par
-                // codebook avec la tête FUSIONNÉE on-device (matmul tête + argmax
-                // greedy dans le command buffer du pas → readback d'1 u32, plus de
-                // cp_state relu ni de matmul de tête CPU). KV remis à zéro par frame.
+                // codebook avec la tête dans le command buffer du pas. En greedy,
+                // on relit un u32 ; en sampling, uniquement les logits. Aucun état
+                // cp relu pour projeter la tête sur CPU. KV remis à zéro par frame.
                 self.code_predictor.reset_resident_decode_cache(cp_cache)?;
                 let fs_proj = self.code_predictor_projection.forward(final_state)?;
                 self.code_predictor
@@ -297,18 +305,17 @@ impl TtsModel {
                         InferError::MissingWeight(format!("code_predictor.lm_head.{code_idx}"))
                     })?;
                     let code = if let Some((params, sampler)) = sampling.as_mut() {
-                        let state = self
+                        let logits = self
                             .code_predictor
-                            .decode_step_resident_from_embedding(cp_cache, &next_input)?
-                            .ok_or_else(|| InferError::Metal("cp résident: état absent".into()))?;
-                        sample_talker_token(
-                            head.forward(&state)?.as_row()?,
-                            params,
-                            &[],
-                            &[],
-                            None,
-                            sampler,
-                        )?
+                            .decode_logits_resident_from_embedding_head(
+                                cp_cache,
+                                &next_input,
+                                head,
+                            )?
+                            .ok_or_else(|| {
+                                InferError::Metal("cp résident: logits absents".into())
+                            })?;
+                        sample_talker_token(logits.as_row()?, params, &[], &[], None, sampler)?
                     } else {
                         let token = self
                             .code_predictor

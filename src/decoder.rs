@@ -2175,9 +2175,9 @@ impl CausalDecoder {
                 Some(crate::decoder::resident::ResidentEmbeddingOut::State(state)) => {
                     Ok(Some(state))
                 }
-                Some(crate::decoder::resident::ResidentEmbeddingOut::Token(_)) => Err(
-                    InferError::Metal("pas résident embedding: token inattendu".to_string()),
-                ),
+                Some(_) => Err(InferError::Metal(
+                    "pas résident embedding: token inattendu".to_string(),
+                )),
                 None => Ok(None),
             }
         }
@@ -2213,19 +2213,108 @@ impl CausalDecoder {
                 return Ok(None);
             };
             let head_buffers = metal.resolve_linear_weight_buffers(head.weight(), "tts_cp_head")?;
-            match self.next_resident_embedding_step(cache, embedding, Some(&head_buffers))? {
+            match self.next_resident_embedding_step(
+                cache,
+                embedding,
+                Some(resident::ResidentEmbeddingHead::Greedy(&head_buffers)),
+            )? {
                 Some(crate::decoder::resident::ResidentEmbeddingOut::Token(token)) => {
                     Ok(Some(token))
                 }
-                Some(crate::decoder::resident::ResidentEmbeddingOut::State(_)) => Err(
-                    InferError::Metal("pas résident tête: état inattendu".to_string()),
-                ),
+                Some(_) => Err(InferError::Metal(
+                    "pas résident tête: état inattendu".to_string(),
+                )),
                 None => Ok(None),
             }
         }
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (cache, embedding, head);
+            Ok(None)
+        }
+    }
+
+    /// Décode un embedding et projette la tête dans le même command buffer.
+    /// Seuls les logits sont relus ; le sampler CPU conserve son ordre de tirage.
+    /// Renvoie `None` si le résident est indisponible, sans avancer le cache.
+    ///
+    /// # Errors
+    /// Renvoie une erreur pour une tête avec biais ou un encodage Metal invalide.
+    pub fn decode_logits_resident_from_embedding_head(
+        &self,
+        cache: &mut CausalDecoderCache,
+        embedding: &Tensor,
+        head: &crate::Linear,
+    ) -> Result<Option<Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if head.bias().is_some() {
+                return Err(InferError::Config(
+                    "tête résidente avec biais non supportée".into(),
+                ));
+            }
+            let Some(metal) = self.forward_runtime().metal_executor() else {
+                return Ok(None);
+            };
+            let buffers = metal.resolve_linear_weight_buffers(head.weight(), "tts_cp_head")?;
+            match self.next_resident_embedding_step(
+                cache,
+                embedding,
+                Some(resident::ResidentEmbeddingHead::Logits(&buffers)),
+            )? {
+                Some(resident::ResidentEmbeddingOut::Logits(logits)) => Ok(Some(logits)),
+                Some(_) => Err(InferError::Metal(
+                    "pas résident tête: logits absents".into(),
+                )),
+                None => Ok(None),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, embedding, head);
+            Ok(None)
+        }
+    }
+
+    /// Décode un embedding avec la tête du modèle, et relit état et logits.
+    /// Le talker TTS a besoin de l'état pour amorcer son code predictor.
+    ///
+    /// # Errors
+    /// Renvoie une erreur pour une tête avec biais ou un encodage Metal invalide.
+    pub fn decode_state_logits_resident_from_embedding(
+        &self,
+        cache: &mut CausalDecoderCache,
+        embedding: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if self.lm_head.bias().is_some() {
+                return Err(InferError::Config(
+                    "tête résidente avec biais non supportée".into(),
+                ));
+            }
+            let Some(metal) = self.forward_runtime().metal_executor() else {
+                return Ok(None);
+            };
+            let buffers =
+                metal.resolve_linear_weight_buffers(self.lm_head.weight(), "tts_talker_head")?;
+            match self.next_resident_embedding_step(
+                cache,
+                embedding,
+                Some(resident::ResidentEmbeddingHead::StateLogits(&buffers)),
+            )? {
+                Some(resident::ResidentEmbeddingOut::StateLogits(state, logits)) => {
+                    Ok(Some((state, self.finalize_logits(&logits)?)))
+                }
+                Some(_) => Err(InferError::Metal(
+                    "pas résident tête: état/logits absents".into(),
+                )),
+                None => Ok(None),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, embedding);
             Ok(None)
         }
     }
