@@ -148,50 +148,14 @@ impl DecisionModel {
         }
         escapes.sort_by_key(|v| std::cmp::Reverse(v.len()));
         escapes.dedup();
-        let top = read_json(&path.join("config.json"))?;
-        // THX enveloppe le backbone, d3 publie directement la config Qwen3_5Model.
-        let backbone = top.get("backbone_config").unwrap_or(&top);
-        if backbone["model_type"] != "qwen3_5" {
-            return Err(invalid("backbone qwen3_5 requis"));
-        }
-        let raw: crate::config::RawModelConfig =
-            serde_json::from_value(backbone.clone()).map_err(|e| invalid(e.to_string()))?;
-        let config = raw.resolve()?;
+        let (decoder, hidden_size) = load_headless(path, &tokenizer, metal)?;
         let readout =
             crate::safetensor::load_float_tensor(path.join("readout.safetensors"), "weight")?;
-        if readout.shape() != [codes.len(), config.hidden_size]
+        if readout.shape() != [codes.len(), hidden_size]
             || readout.data().iter().any(|x| !x.is_finite())
         {
             return Err(invalid("readout non fini ou de forme incompatible"));
         }
-        let shards = shard_paths(path)?;
-        let assets = ModelAssets {
-            model_dir: path.into(),
-            config,
-            tokenizer: tokenizer.clone(),
-            catalog: WeightCatalog::from_shards(&shards)?,
-            shards,
-            mtp: Default::default(),
-        };
-        // Sans tête de vocabulaire : le readout la remplace (Qwen3_5Model n'en
-        // a pas, THX la lierait aux embeddings).
-        let decoder = crate::runtime_flags::with_decision_headless(|| -> Result<CausalDecoder> {
-            Ok(if metal {
-                #[cfg(all(target_os = "macos", feature = "metal"))]
-                {
-                    let executor =
-                        crate::runtime_flags::with_decision_noncausal(crate::MetalExecutor::new)?;
-                    crate::qwen_loader::load_causal_decoder_for_metal(&assets, &executor)?
-                        .with_metal_executor(executor)?
-                }
-                #[cfg(not(all(target_os = "macos", feature = "metal")))]
-                {
-                    return Err(invalid("Metal indisponible sur cette plateforme"));
-                }
-            } else {
-                crate::load_causal_decoder(&assets)?
-            })
-        })?;
         Ok(Self {
             decoder,
             tokenizer,
@@ -517,6 +481,53 @@ impl DecisionModel {
             json!({"answers":answers,"usage":{"input_tokens":tokens,"output_tokens":0,"sequences":sequences}}),
         )
     }
+}
+
+/// Backbone Qwen3.5 texte sans tête de vocabulaire, remplacée par le readout
+/// ou les lignes de labels (Qwen3_5Model n'en a pas, THX la lierait aux
+/// embeddings) ; renvoie aussi la largeur cachée.
+fn load_headless(
+    path: &Path,
+    tokenizer: &RustTokenizer,
+    metal: bool,
+) -> Result<(CausalDecoder, usize)> {
+    let top = read_json(&path.join("config.json"))?;
+    // THX enveloppe le backbone, d3 publie directement la config Qwen3_5Model.
+    let backbone = top.get("backbone_config").unwrap_or(&top);
+    if backbone["model_type"] != "qwen3_5" {
+        return Err(invalid("backbone qwen3_5 requis"));
+    }
+    let raw: crate::config::RawModelConfig =
+        serde_json::from_value(backbone.clone()).map_err(|e| invalid(e.to_string()))?;
+    let config = raw.resolve()?;
+    let hidden_size = config.hidden_size;
+    let shards = shard_paths(path)?;
+    let assets = ModelAssets {
+        model_dir: path.into(),
+        config,
+        tokenizer: tokenizer.clone(),
+        catalog: WeightCatalog::from_shards(&shards)?,
+        shards,
+        mtp: Default::default(),
+    };
+    let decoder = crate::runtime_flags::with_decision_headless(|| -> Result<CausalDecoder> {
+        Ok(if metal {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            {
+                let executor =
+                    crate::runtime_flags::with_decision_noncausal(crate::MetalExecutor::new)?;
+                crate::qwen_loader::load_causal_decoder_for_metal(&assets, &executor)?
+                    .with_metal_executor(executor)?
+            }
+            #[cfg(not(all(target_os = "macos", feature = "metal")))]
+            {
+                return Err(invalid("Metal indisponible sur cette plateforme"));
+            }
+        } else {
+            crate::load_causal_decoder(&assets)?
+        })
+    })?;
+    Ok((decoder, hidden_size))
 }
 
 fn shard_paths(path: &Path) -> Result<Vec<std::path::PathBuf>> {
@@ -900,6 +911,8 @@ fn format_answer(question: &Value, p: &[f64], d3: bool) -> Result<Value> {
         json!({"type":"score","probabilities":probabilities,"legend":legend,"score":score,"confidence":confidence}),
     )
 }
+
+pub mod letters;
 
 #[cfg(test)]
 mod tests;
