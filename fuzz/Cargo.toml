@@ -1,0 +1,39 @@
+[package]
+name = "saragossa-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+saragossa = { path = "..", default-features = false }
+
+# Crate autonome : ni libFuzzer ni nightly dans le build du moteur.
+[workspace]
+
+[[bin]]
+name = "wav_decode"
+path = "fuzz_targets/wav_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "multipart"
+path = "fuzz_targets/multipart.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sse_parse"
+path = "fuzz_targets/sse_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "chat_template"
+path = "fuzz_targets/chat_template.rs"
+test = false
+doc = false
