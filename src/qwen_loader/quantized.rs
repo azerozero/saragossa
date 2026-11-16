@@ -329,7 +329,8 @@ pub(super) fn tensor_from_entry(
 }
 
 /// Lit un poids de base dense, y ajoute `s·B·A` en f32, puis le range comme le
-/// chemin sans LoRA : bf16 single-copy sous Metal pour une base bf16, f32 sinon.
+/// chemin sans LoRA : bf16 single-copy sous Metal pour une base BF16, f32 pour
+/// une base F16 ou F32 et sur CPU.
 /// La cible a été validée par `validate_lora_targets` (2D, non quantifiée).
 fn lora_merged_tensor(
     spec: &TensorSpec,

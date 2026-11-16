@@ -233,7 +233,8 @@ pub fn load_causal_decoder_with_lora(
 }
 
 /// Charge un décodeur Metal en fusionnant `lora` dans les poids qu'il cible.
-/// Les poids fusionnés sont stockés en bf16, comme la base single-copy.
+/// La base doit être non quantifiée (BF16, F16 ou F32). Une base BF16 garde
+/// son stockage single-copy bf16 après fusion ; F16 et F32 restent en f32.
 ///
 /// # Errors
 ///
@@ -929,7 +930,7 @@ fn load_decoder_tensors_with_context(
 }
 
 /// Vérifie avant toute lecture que chaque module LoRA corrige un poids de base
-/// chargé, 2D et non quantifié. Un module sans cible serait ignoré en silence.
+/// chargé, 2D et non quantifié (BF16, F16 ou F32). Un module sans cible serait ignoré en silence.
 fn validate_lora_targets(
     lora: &LoraAdapter,
     specs: &[TensorSpec],
@@ -947,8 +948,9 @@ fn validate_lora_targets(
         let dense = matches!(entry.entry.dtype, Dtype::BF16 | Dtype::F16 | Dtype::F32);
         if !dense || entry.entry.shape.len() != 2 {
             return Err(InferError::Config(format!(
-                "LoRA : {name} doit être une matrice BF16, F16 ou F32 (reçu {:?} {:?}) ; \
-                 la fusion sur une base quantifiée n'est pas prise en charge",
+                "LoRA : {name} doit être une matrice de base non quantifiée (BF16, F16 \
+                 ou F32), reçu {:?} {:?} ; la fusion sur une base quantifiée n'est pas \
+                 prise en charge",
                 entry.entry.dtype, entry.entry.shape
             )));
         }
