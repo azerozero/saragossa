@@ -232,17 +232,25 @@ fn first_regex(value: &serde_json::Value) -> Option<&str> {
 }
 
 fn warn_once(path: &Path, message: &str) {
+    warn_once_to(path, message, &mut std::io::stderr());
+}
+
+/// Écrit `message` dans `out` à la première alerte pour ce fichier ; renvoie
+/// `true` si l'alerte est émise (même si l'écriture échoue).
+fn warn_once_to(path: &Path, message: &str, out: &mut impl Write) -> bool {
     static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
     let mut warned = WARNED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Un même fichier atteint par deux chemins (lien, `..`) n'alerte qu'une fois.
     let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !warned.contains(&path) {
-        warned.push(path);
-        // NOTE: Un stderr fermé ou plein ne doit pas faire échouer le chargement.
-        let _ = writeln!(std::io::stderr(), "{message}");
+    if warned.contains(&path) {
+        return false;
     }
+    warned.push(path);
+    // NOTE: Un stderr fermé ou plein ne doit pas faire échouer le chargement.
+    let _ = writeln!(out, "{message}");
+    true
 }
 
 fn byte_fallback_token(token: &str) -> Option<u8> {
@@ -376,6 +384,53 @@ mod tests {
         }
         std::fs::remove_file(tmp.path().join("config.json")).expect("remove");
         assert!(foreign_regex_warning(&path, &inner).is_none());
+    }
+
+    #[test]
+    fn regex_warning_emitted_once_and_never_fails_loading() {
+        use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+        use tokenizers::SplitDelimiterBehavior;
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("stderr fermé"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("stderr fermé"))
+            }
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("sub")).expect("sub");
+        let path = tmp.path().join("tokenizer.json");
+        // Émission unique, y compris par un autre chemin vers le même fichier.
+        std::fs::write(&path, "").expect("fichier");
+        let mut out = Vec::new();
+        assert!(warn_once_to(&path, "alerte", &mut out));
+        let alias = tmp.path().join("sub/../tokenizer.json");
+        assert!(!warn_once_to(&alias, "alerte", &mut out));
+        assert_eq!(out, b"alerte\n");
+        // Écrivain défaillant : ni panique ni erreur.
+        let other = tmp.path().join("sub/tokenizer.json");
+        assert!(warn_once_to(&other, "alerte", &mut Broken));
+        // Regex Qwen2 sur un qwen3_5 : alerte, mais le chargement aboutit.
+        save_test_tokenizer(&path);
+        let mut inner = Tokenizer::from_file(&path).expect("tokenizer");
+        let split = Split::new(
+            SplitPattern::Regex(crate::decision::letters::QWEN2_REGEX.into()),
+            SplitDelimiterBehavior::Isolated,
+            false,
+        )
+        .expect("split");
+        inner.with_pre_tokenizer(Some(split));
+        inner.save(&path, false).expect("save");
+        std::fs::write(
+            tmp.path().join("config.json"),
+            r#"{"model_type":"qwen3_5"}"#,
+        )
+        .expect("config");
+        let tokenizer = RustTokenizer::from_file(&path).expect("chargement poursuivi");
+        assert!(foreign_regex_warning(&path, &inner).is_some());
+        assert_eq!(tokenizer.token_to_id("reti"), Some(2));
     }
 
     #[test]
