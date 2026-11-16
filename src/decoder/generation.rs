@@ -4613,6 +4613,80 @@ impl CausalDecoder {
         else {
             return Ok(None);
         };
+        let history = self.mtp_history_from_seed(head, seed, &spec)?;
+        let state = rms_norm(
+            &hidden.into_tensor(spec.hidden_dim)?,
+            &self.final_norm,
+            self.config.rms_eps,
+        )?;
+        Ok(Some((cache, state, history)))
+    }
+
+    /// Comme [`Self::prefill_resident_with_mtp_history`], avec les captures des
+    /// couches cibles DFlash bornées à `keep_rows` : le prefill DFlash sème
+    /// l'historique MTP sans relire ni normer les états de toutes les positions.
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    fn prefill_resident_with_captures_and_mtp_history(
+        &self,
+        prompt: &[usize],
+        layer_ids: &[usize],
+        keep_rows: usize,
+    ) -> Result<Option<(CausalDecoderCache, Tensor, PrefixCaptures, LayerKvCache)>> {
+        if prompt.len() < 2
+            || !prefill_resident_enabled()
+            || !crate::runtime_flags::mtp_seed_gpu_enabled()
+            || !crate::runtime_flags::prefill_kv_shared_enabled()
+        {
+            return Ok(None);
+        }
+        validate_capture_layer_ids(layer_ids, self.layers.len())?;
+        let (Some(head), Some(metal)) =
+            (self.mtp.as_ref(), self.forward_runtime().metal_executor())
+        else {
+            return Ok(None);
+        };
+        let Some((weights, spec)) = self.mtp_seed_parameters(head, prompt.len() - 1)? else {
+            return Ok(None);
+        };
+        let mut seed = crate::metal_backend::MtpPrefillSeed::new(
+            metal,
+            weights,
+            spec,
+            &self.final_norm,
+            &prompt[1..],
+            SEED_CHUNK,
+            super::mtp_history::bf16_capacity(),
+        )?;
+        let Some((cache, hidden, Some(captures))) = self
+            .prefill_resident_cache_hidden_captures_and_mtp(
+                prompt,
+                layer_ids,
+                keep_rows.max(1),
+                true,
+                crate::runtime_flags::prefill_resident_chunk_tokens(),
+                Some(&mut seed),
+            )?
+        else {
+            return Ok(None);
+        };
+        let history = self.mtp_history_from_seed(head, seed, &spec)?;
+        let state = rms_norm(
+            &hidden.into_tensor(spec.hidden_dim)?,
+            &self.final_norm,
+            self.config.rms_eps,
+        )?;
+        let captures = PrefixCaptures::tail(layer_ids, captures.from, captures.hidden, keep_rows)?;
+        Ok(Some((cache, state, captures, history)))
+    }
+
+    /// KV de l'historique MTP committed à partir des lignes du semis GPU.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn mtp_history_from_seed(
+        &self,
+        head: &MtpHead,
+        seed: crate::metal_backend::MtpPrefillSeed<'_>,
+        spec: &crate::metal_backend::PrefillAttentionSpec,
+    ) -> Result<LayerKvCache> {
         let (k, v) = seed.into_rows()?;
         let attention = &head.layer.attention;
         let (q, _) = super::attention_ops::split_attention_gate(
@@ -4630,12 +4704,7 @@ impl CausalDecoder {
         )?;
         let mut history = LayerKvCache::default();
         history.append_prefill(k, v, kv_dim, 0, &layout)?;
-        let state = rms_norm(
-            &hidden.into_tensor(spec.hidden_dim)?,
-            &self.final_norm,
-            self.config.rms_eps,
-        )?;
-        Ok(Some((cache, state, history)))
+        Ok(history)
     }
 
     /// FC de la tête sur un bloc du semis. Côté Metal, la projection batchée
@@ -4871,20 +4940,42 @@ impl CausalDecoder {
         // Lu une seule fois : `dflash_switch_min` relit l'environnement à chaque
         // appel, le semis doit voir la même décision que le prefill.
         let needs_history = self.dflash_switch_needs_history();
-        let (cache, final_states, PrefixCaptures { from, hidden, .. }) = self
-            .prefill_cache_state_with_layer_capture_all(
-                prompt,
-                layer_ids,
-                keep_rows.max(1),
-                needs_history,
-            )?;
-        let captures = PrefixCaptures::tail(layer_ids, from, hidden, keep_rows)?;
-        let mtp_history = if needs_history {
-            Some(self.dflash_switch_mtp_history(prompt, &final_states)?)
+        // Semis sur GPU pendant le prefill (comme MTP committed) : le semis CPU
+        // depuis les états normés de toutes les positions coûtait +5,7 % de
+        // prefill à 32k (16 novembre).
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let fused = if needs_history {
+            self.prefill_resident_with_captures_and_mtp_history(prompt, layer_ids, keep_rows)?
         } else {
             None
         };
-        let state = (cache, Tensor::row(final_states.last_row()?.to_vec())?);
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let fused: Option<(CausalDecoderCache, Tensor, PrefixCaptures, LayerKvCache)> = None;
+        let (state, captures, mtp_history) = match fused {
+            Some((cache, final_state, captures, history)) => {
+                ((cache, final_state), captures, Some(history))
+            }
+            None => {
+                let (cache, final_states, PrefixCaptures { from, hidden, .. }) = self
+                    .prefill_cache_state_with_layer_capture_all(
+                        prompt,
+                        layer_ids,
+                        keep_rows.max(1),
+                        needs_history,
+                    )?;
+                let captures = PrefixCaptures::tail(layer_ids, from, hidden, keep_rows)?;
+                let mtp_history = if needs_history {
+                    Some(self.dflash_switch_mtp_history(prompt, &final_states)?)
+                } else {
+                    None
+                };
+                (
+                    (cache, Tensor::row(final_states.last_row()?.to_vec())?),
+                    captures,
+                    mtp_history,
+                )
+            }
+        };
         if prefix_cache_enabled() {
             self.prefix_cache_put(prompt, &state, mtp_history.as_ref(), Some(&captures))?;
         }
@@ -4967,10 +5058,11 @@ impl CausalDecoder {
         self.seed_mtp_history_batched(&states, suffix, history)
     }
 
-    /// Vrai si le prefill DFlash doit semer l'historique MTP committed (depuis
-    /// les états finaux de toutes les positions du prompt) : bascule armée, ou
-    /// routage par classe de prompt, dont le tour MTP suivant prolonge alors
-    /// l'entrée DFlash au lieu de repartir d'un prefill complet.
+    /// Vrai si le prefill DFlash doit semer l'historique MTP committed : bascule
+    /// armée, ou routage par classe de prompt, dont le tour MTP suivant prolonge
+    /// l'entrée DFlash au lieu de repartir d'un prefill complet. Sans cet
+    /// historique, MTP reprendrait l'entrée en historique frais, 26 % plus lent
+    /// en decode (P1, P2, 16 novembre).
     #[cfg(feature = "devtools")]
     fn dflash_switch_needs_history(&self) -> bool {
         self.mtp.is_some()

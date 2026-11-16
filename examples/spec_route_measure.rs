@@ -75,8 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let routed = match request.mode.as_str() {
             "ar" => None,
-            "mtp" => Some(false),
-            "dflash" => Some(true),
+            "mtp" | "mtp_off" => Some(false),
+            "dflash" | "dflash_off" => Some(true),
             "route" => Some(prefers_dflash([("user", user_text.as_str())], false)),
             _ => return Err("mode inconnu".into()),
         };

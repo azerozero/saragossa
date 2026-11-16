@@ -20,11 +20,17 @@ import subprocess
 import time
 
 MODES = ["ar", "mtp", "dflash", "route"]
+# `dflash_off` et `mtp_off` : servis par un second worker dont l'environnement
+# reçoit `--off-env` (par défaut `SARAGOSSA_RUST_SPEC_ROUTE=0`, DFlash seul).
+ALL_MODES = MODES + ["dflash_off", "mtp_off"]
 
 
-def environment(drafter):
+def environment(drafter, off_env=None):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("SARAGOSSA_", "RETI_"))}
+    for assignment in off_env or []:
+        key, _, value = assignment.partition("=")
+        env[key] = value
     env.update(SARAGOSSA_RUST_PREFIX_CACHE="0", SARAGOSSA_RUST_DFLASH_SWITCH_MIN="0",
                SARAGOSSA_RUST_MTP_LOOKUP_DRAFT="0", SARAGOSSA_RUST_DFLASH_QUANT_BITS="4",
                SARAGOSSA_RUST_DFLASH_DRAFT_DIR=str(drafter))
@@ -32,10 +38,10 @@ def environment(drafter):
 
 
 class Worker:
-    def __init__(self, binary, args, log):
+    def __init__(self, binary, args, log, off_env=None):
         self.process = subprocess.Popen(
             [str(binary.resolve()), str(args.model.resolve())],
-            env=environment(args.drafter.resolve()), stdin=subprocess.PIPE,
+            env=environment(args.drafter.resolve(), off_env), stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=log, text=True, bufsize=1)
         try:
             if self.read() != {"ready": True}:
@@ -68,8 +74,8 @@ class Worker:
             self.process.wait(timeout=30)
 
 
-def mode_order(repeat):
-    return list(reversed(MODES)) if repeat >= 0 and repeat % 2 else list(MODES)
+def mode_order(repeat, modes=MODES):
+    return list(reversed(modes)) if repeat >= 0 and repeat % 2 else list(modes)
 
 
 def bootstrap(values):
@@ -111,9 +117,9 @@ def model_manifest(directory):
     return result
 
 
-def paired_gain(subset, mode, base_mode):
+def paired_gain(subset, mode, base_mode, key="decode_tok_s"):
     base = {r["repeat"]: r for r in subset if r["mode"] == base_mode}
-    return [100 * (r["decode_tok_s"] / base[r["repeat"]]["decode_tok_s"] - 1)
+    return [100 * (r[key] / base[r["repeat"]][key] - 1)
             for r in subset if r["mode"] == mode and r["repeat"] in base]
 
 
@@ -122,7 +128,7 @@ def summarize(rows):
     for case in dict.fromkeys(r["case"] for r in rows):
         subset = [r for r in rows if r["case"] == case and not r["warmup"]]
         modes = {}
-        for mode in MODES:
+        for mode in ALL_MODES:
             runs = [r for r in subset if r["mode"] == mode]
             if not runs:
                 continue
@@ -136,6 +142,12 @@ def summarize(rows):
                 routed=sorted({r.get("routed") or "ar" for r in runs}),
                 ids_equal=all(r["ids_equal"] for r in runs))
         entry = dict(case=case, modes=modes)
+        for key, label in (("ttft_ms", "ttft"), ("decode_tok_s", "tok_s")):
+            for mode, base in (("route", "dflash_off"), ("mtp", "mtp_off")):
+                gains = paired_gain(subset, mode, base, key)
+                if gains:
+                    entry[f"{mode}_vs_{base}_{label}_pct"] = statistics.median(gains)
+                    entry[f"{mode}_vs_{base}_{label}_ci95"] = bootstrap(gains)
         best = max(("mtp", "dflash"), key=lambda m: modes.get(m, {}).get("tok_s", 0))
         gains = paired_gain(subset, "route", best)
         if gains:
@@ -155,6 +167,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=6)
     parser.add_argument("--ids", nargs="+")
+    parser.add_argument("--modes", nargs="+", choices=ALL_MODES, default=MODES)
+    parser.add_argument("--off-env", nargs="+", default=["SARAGOSSA_RUST_SPEC_ROUTE=0"])
     parser.add_argument("--calm-wait", type=float, default=0,
                         help="avant chaque passage, attendre au plus N s une charge 1 min < 2 sans compilateur")
     args = parser.parse_args()
@@ -175,17 +189,19 @@ def main():
                            if k.startswith("SARAGOSSA_") and not k.endswith("_DIR")})
     (args.output / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
     rows = []
-    worker = None
+    worker = off = None
     try:
         with (args.output / "worker.stderr").open("x") as log, \
              (args.output / "results.jsonl").open("x") as report:
             worker = Worker(args.binary, args, log)
+            off = (Worker(args.binary, args, log, args.off_env)
+                   if {"dflash_off", "mtp_off"} & set(args.modes) else None)
             for case in cases:
                 reference = None
                 for repeat in range(-1, args.repeats):
                     load = wait_calm(args.calm_wait)
-                    for mode in mode_order(repeat):
-                        row = worker.run(case, mode, 256)
+                    for mode in mode_order(repeat, args.modes):
+                        row = (off if mode.endswith("_off") else worker).run(case, mode, 256)
                         if reference is None:
                             reference = row["ids"]
                         row.update(case=case["id"], prompt_class=case["class"],
@@ -201,8 +217,9 @@ def main():
                               f'diff={row["first_divergence"]}', flush=True)
                 (args.output / "summary.json").write_text(json.dumps(summarize(rows), indent=2))
     finally:
-        if worker:
-            worker.close()
+        for each in (worker, off):
+            if each:
+                each.close()
 
 
 if __name__ == "__main__":

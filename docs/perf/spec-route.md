@@ -25,9 +25,16 @@ garder DFlash, et toute prose non latine reste en DFlash.
 
 Alternance dans une conversation : quand MTP (ou l'AR) prolonge une entrée du
 cache de préfixe qui porte des captures DFlash, il prolonge aussi ces captures,
-et le prefill DFlash sème l'historique MTP quand le routage est actif. Un tour
-MTP reprend donc l'entrée du tour DFlash, et le tour DFlash suivant reprend
-l'entrée MTP, sans prefill complet (oracle
+et le prefill DFlash sème l'historique MTP committed sur GPU pendant le prefill
+résident, comme MTP. Coût mesuré dans le moteur (ligne `dflash_prefill ms=`,
+ABBA, charge sous 2) : C1 150,5 contre 147,5 ms (+2,0 %), C3 153,5 contre
+149 ms (+3,0 %), 32k 45,6 contre 44,5 s (+2,5 %), contre +5,7 % à 32k avec
+l'ancien semis CPU. Un semis paresseux est impossible (l'entrée ne garde pas les
+états de toutes les positions) et la reprise en historique frais coûte 26 % de
+decode MTP (P1 41,5 contre 30,4 tok/s). Le comparatif TTFT à deux workers est
+inutilisable : son A/A montre déjà +27 % sur C1. Le tour MTP reprend donc
+l'entrée du tour DFlash, et le tour DFlash suivant reprend l'entrée MTP, sans
+prefill complet (oracle
 `spec_route_alternation_reuses_prefix_real_model`, sous et au-delà de 16k).
 
 Classifieur sur embeddings (opt-in, `SARAGOSSA_RUST_SPEC_ROUTE_EMBED_DIR=<snapshot
