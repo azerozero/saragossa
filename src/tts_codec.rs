@@ -142,6 +142,15 @@ impl TtsCodec {
         }
 
         // Forward GPU résident de la section chaude : best-effort au chargement.
+        if crate::tts::memory::enabled() {
+            crate::tts::memory::checkpoint(
+                "codec_cpu",
+                &[(
+                    "codec_cpu",
+                    weights.values().map(Tensor::capacity_bytes).sum(),
+                )],
+            );
+        }
         // Échec (pas de Metal, kernel KO, poids absent) ⇒ repli CPU silencieux.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let gpu = if crate::runtime_flags::env_flag("SARAGOSSA_TTS_CODEC_GPU", true) {
@@ -155,6 +164,7 @@ impl TtsCodec {
         } else {
             None
         };
+        crate::tts::memory::checkpoint("codec_gpu", &[]);
 
         let lazy_cpu = crate::runtime_flags::tts_codec_lazy_cpu_enabled();
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -173,7 +183,12 @@ impl TtsCodec {
             false
         };
         let weights = CodecWeights::new(weights, payload, discard);
-
+        if crate::tts::memory::enabled() {
+            crate::tts::memory::checkpoint(
+                "codec_retained",
+                &[("codec_cpu", weights.retained_bytes())],
+            );
+        }
 
         Ok(Self {
             cfg,

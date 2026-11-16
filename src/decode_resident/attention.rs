@@ -705,6 +705,10 @@ struct AttentionSinks {
 }
 
 impl FullAttentionMetalState {
+    /// Octets physiques des charges utiles K/V (hors échelles quantifiées).
+    pub(crate) fn payload_allocated_bytes(&self) -> usize {
+        (self.keys.buffer().allocated_size() + self.values.buffer().allocated_size()) as usize
+    }
     /// Attache les sinks appris `[q_heads]` (f32) de la couche : l'attention
     /// decode passe alors par les kernels avec sink (naïf fenêtré ou 2-passes
     /// d128), jamais par le flash. Refusé sur un KV quantifié, dont le 2-passes

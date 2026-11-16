@@ -23,7 +23,9 @@ impl TtsModel {
     /// absent/incompatible.
     pub fn load_local(model_dir: impl AsRef<Path>) -> Result<Self> {
         let assets = TtsAssets::load_local(model_dir)?;
+        super::memory::checkpoint("start", &[]);
         let tokenizer = load_qwen3_tts_tokenizer(&assets.model_dir)?;
+        super::memory::checkpoint("tokenizer", &[]);
         let talker_header = SafetensorPayload::open(&assets.talker_weights)?;
         let codec_header = SafetensorPayload::open(&assets.codec_weights)?;
 
@@ -67,6 +69,10 @@ impl TtsModel {
         let code_predictor_embeddings_bf16_exact = code_predictor_embeddings
             .iter()
             .all(|table| table.data().iter().all(|v| v.to_bits() & 0xffff == 0));
+        super::memory::checkpoint(
+            "embeddings",
+            &[("text_cpu", text_embedding.capacity_bytes())],
+        );
 
         tensors.insert(
             "embed_tokens.weight".to_string(),
@@ -277,9 +283,11 @@ impl TtsModel {
             ..CausalDecoderConfig::default()
         };
         let mut talker = CausalDecoder::from_decoder_tensors(tensors, decoder_config)?;
+        super::memory::checkpoint("talker_cpu", &[]);
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             talker = talker.with_metal_runtime()?;
+            super::memory::checkpoint("talker_gpu", &[]);
         }
         let cp_config =
             CausalDecoderConfig {
@@ -337,9 +345,11 @@ impl TtsModel {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             code_predictor = code_predictor.with_metal_runtime()?;
+            super::memory::checkpoint("code_predictor_gpu", &[]);
         }
 
         let codec = TtsCodec::load(&codec_header, &assets.codec_config)?;
+        super::memory::checkpoint("loaded", &[]);
 
         let codec_read = codec_header.read_payload_summary()?;
         let codec_payload = TtsPayloadSummary {
