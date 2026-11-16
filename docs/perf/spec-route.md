@@ -13,7 +13,7 @@ Règle prudente, retenue après relecture : en cas de doute, DFlash. MTP exige
 - aucune clôture ```` ``` ```` dans toute la conversation, messages assistant
   compris ;
 - un dernier message utilisateur non vide, en écriture latine, sans syntaxe de
-  code (accolades, `==`, `=>`, `def `, `fn `, `ident(`, indentation,
+  code (accolades, `==`, `=>`, `def`, `fn`, `ident(`, indentation,
   `SELECT … FROM`…), sans nom de langage ou de format (ASCII, bornes non
   alphanumériques, donc aussi au milieu d'un texte CJK) et sans radical de mot
   de code (`cod`, `fonction`, `program`, `compil`…), lu en entier. La négation
