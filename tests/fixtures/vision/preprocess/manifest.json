@@ -1,0 +1,982 @@
+{
+  "backend": "PIL",
+  "pillow": "12.2.0",
+  "torch": "2.12.0",
+  "torchvision": null,
+  "transformers": "5.8.1",
+  "smart_resize_source_sha256": "f19497685281402691f0049a0ab5be8085f92fb5c37adfcc680e4ccd17863a77",
+  "generator_sha256": "1624640066660eb82112e8129285d7b0a2379dba34835424a1bef4b247b72c93",
+  "normalized_sha256": "b4925e7ab450610f0996fb5700e2b9cda8e3a8d98983df9659a9d9d6b952397b",
+  "fixtures": [
+    {
+      "name": "square",
+      "height": 256,
+      "width": 256,
+      "pattern": "ramp",
+      "profile": "Qwen38",
+      "resized": [
+        256,
+        256
+      ],
+      "file": "square-rgb.bin",
+      "sha256": "210a51407298656709c88c7cd5dc63a914aa90d16a9f291973009681a2dd9694",
+      "grid_thw": [
+        1,
+        16,
+        16
+      ],
+      "patches_sha256": "65c9c6cd09eb6bce2e4f42aed27e4a65f132ab531ea22805afa012eef3947829"
+    },
+    {
+      "name": "portrait",
+      "height": 320,
+      "width": 224,
+      "pattern": "ramp",
+      "profile": "Qwen36",
+      "resized": [
+        320,
+        224
+      ],
+      "file": "portrait-rgb.bin",
+      "sha256": "e4f358359b2952143995dbcbfe4f574f9358b444264999e4f04c63b5612e99e1",
+      "grid_thw": [
+        1,
+        20,
+        14
+      ],
+      "patches_sha256": "8e1910f8d207185f0319c7d2407e9bbbc2a69e583a9db1812eacf7dffeb0d7bb"
+    },
+    {
+      "name": "landscape",
+      "height": 224,
+      "width": 320,
+      "pattern": "ramp",
+      "profile": "Qwen38",
+      "resized": [
+        224,
+        320
+      ],
+      "file": "landscape-rgb.bin",
+      "sha256": "f417d529fad6ea74e159354e5fe52bbd2ed01d7ca287c53597e6dde231c731df",
+      "grid_thw": [
+        1,
+        14,
+        20
+      ],
+      "patches_sha256": "053273e26c8c9872a92179871c5fc39bb44089da0b9000330728b8e519902f50"
+    },
+    {
+      "name": "colors",
+      "height": 256,
+      "width": 256,
+      "pattern": "colors",
+      "profile": "Thx02",
+      "resized": [
+        256,
+        256
+      ],
+      "file": "colors-rgb.bin",
+      "sha256": "c3ff73498d0d79d17f22fe5116f5b66726b558170a7e0b7fb3deceda86837c85",
+      "grid_thw": [
+        1,
+        16,
+        16
+      ],
+      "patches_sha256": "efd5c2722103a6d0a603af1dd7a732657b646aaad1626110e3483abe921cde49"
+    },
+    {
+      "name": "checker",
+      "height": 256,
+      "width": 256,
+      "pattern": "checker",
+      "profile": "D3Flash",
+      "resized": [
+        256,
+        256
+      ],
+      "file": "checker-rgb.bin",
+      "sha256": "ea3d6a3565e9585a2255be9d8b3718872da581b5b1f004591a401013dfd41e31",
+      "grid_thw": [
+        1,
+        16,
+        16
+      ],
+      "patches_sha256": "bd249b4fe5003fbc158361eca8ecf1dac7d5eed4f22326dbc4b3b4ce1fe1741b"
+    },
+    {
+      "name": "ties",
+      "height": 272,
+      "width": 304,
+      "pattern": "ramp",
+      "profile": "Qwen38",
+      "resized": [
+        256,
+        320
+      ],
+      "file": "ties-rgb.bin",
+      "sha256": "946aaa9f2ee91ccbb836f2759f6b1ca982708c9cf84b8725dbd2238604278779",
+      "grid_thw": [
+        1,
+        16,
+        20
+      ],
+      "patches_sha256": "f643135275724f1668afed826ad6c046cbf274b5df3136093e70ad56fe38a00f"
+    },
+    {
+      "name": "tiny",
+      "height": 17,
+      "width": 31,
+      "pattern": "ramp",
+      "profile": "Qwen36",
+      "resized": [
+        192,
+        352
+      ],
+      "file": "tiny-rgb.bin",
+      "sha256": "97bfb249458bec65f12ebe5620664876544bb4474379e383011c1face9d6f069",
+      "grid_thw": [
+        1,
+        12,
+        22
+      ],
+      "patches_sha256": "aa399751340894c57f47c2e29dbe475c0e6b964ce0310bc08512d34988079ad9"
+    },
+    {
+      "name": "up-portrait",
+      "height": 129,
+      "width": 63,
+      "pattern": "checker",
+      "profile": "Thx02",
+      "resized": [
+        384,
+        192
+      ],
+      "file": "up-portrait-rgb.bin",
+      "sha256": "8f7df0b0e96a97aa323a5ee338e821a644486401716e8aeef2ea719f19392e3b",
+      "grid_thw": [
+        1,
+        24,
+        12
+      ],
+      "patches_sha256": "760411280c9671e4a6c32d55bce04da039306cda52f34216179e6cb963d53de6"
+    },
+    {
+      "name": "up-landscape",
+      "height": 63,
+      "width": 129,
+      "pattern": "impulse",
+      "profile": "D3Flash",
+      "resized": [
+        192,
+        384
+      ],
+      "file": "up-landscape-rgb.bin",
+      "sha256": "a6bbf6a4aa61d703eab2e9238b4f3c68003415f652b0408f6f9ba392861e589c",
+      "grid_thw": [
+        1,
+        12,
+        24
+      ],
+      "patches_sha256": "cc89877627dc5d7750c98adf9e31152b886d84977baa377fbb876052a0634725"
+    },
+    {
+      "name": "down-budget",
+      "height": 1313,
+      "width": 1297,
+      "pattern": "ramp",
+      "profile": "Thx02",
+      "resized": [
+        1280,
+        1248
+      ],
+      "file": "down-budget-rgb.bin",
+      "sha256": "06ec7c2ace60ac25511f5f75ae76e418e518b1031bc4f07f87bdb2979aaf8377",
+      "grid_thw": [
+        1,
+        80,
+        78
+      ],
+      "patches_sha256": "e9e72a04607b35b025cb4010b8565cd2417cacca6ae3affdf176be45eec69d43"
+    },
+    {
+      "name": "down-checker",
+      "height": 513,
+      "width": 777,
+      "pattern": "checker",
+      "profile": "Qwen38",
+      "resized": [
+        512,
+        768
+      ],
+      "file": "down-checker-rgb.bin",
+      "sha256": "d79b86ce37caa6c3bb32c1ccc350efb9f7a78fc8206216414b19c29193c013ce",
+      "grid_thw": [
+        1,
+        32,
+        48
+      ],
+      "patches_sha256": "b26d60aa3b69d30fa9ac53fbfdfdeadfd6b354102238dbbd6d0f90d0653e3047"
+    },
+    {
+      "name": "one-axis",
+      "height": 256,
+      "width": 511,
+      "pattern": "ramp",
+      "profile": "Qwen36",
+      "resized": [
+        256,
+        512
+      ],
+      "file": "one-axis-rgb.bin",
+      "sha256": "91061698fdb28ebc372bc528621a4683860f2c13b1f6362cd06ca3021efba116",
+      "grid_thw": [
+        1,
+        16,
+        32
+      ],
+      "patches_sha256": "038fab668cd6680c64dad50cd97fa2a3251e1f72b4aef1f63d8a37b36f1dbdb6"
+    }
+  ],
+  "smart_resize": [
+    {
+      "profile": "Qwen38",
+      "input": [
+        1,
+        1
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        1,
+        200
+      ],
+      "output": [
+        32,
+        3648
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        200,
+        1
+      ],
+      "output": [
+        3648,
+        32
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        240,
+        272
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        272,
+        304
+      ],
+      "output": [
+        256,
+        320
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        255,
+        256
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        257,
+        257
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        4096,
+        4096
+      ],
+      "output": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        4112,
+        4112
+      ],
+      "output": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        4113,
+        4113
+      ],
+      "output": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        1280,
+        1280
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        1296,
+        1296
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        1297,
+        1297
+      ],
+      "output": [
+        1312,
+        1312
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        6000,
+        3000
+      ],
+      "output": [
+        5792,
+        2880
+      ]
+    },
+    {
+      "profile": "Qwen38",
+      "input": [
+        4294967295,
+        4294967295
+      ],
+      "output": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        1,
+        1
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        1,
+        200
+      ],
+      "output": [
+        32,
+        3648
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        200,
+        1
+      ],
+      "output": [
+        3648,
+        32
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        240,
+        272
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        272,
+        304
+      ],
+      "output": [
+        256,
+        320
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        255,
+        256
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        257,
+        257
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        4096,
+        4096
+      ],
+      "output": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        4112,
+        4112
+      ],
+      "output": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        4113,
+        4113
+      ],
+      "output": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        1280,
+        1280
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        1296,
+        1296
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        1297,
+        1297
+      ],
+      "output": [
+        1312,
+        1312
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        6000,
+        3000
+      ],
+      "output": [
+        5792,
+        2880
+      ]
+    },
+    {
+      "profile": "Qwen36",
+      "input": [
+        4294967295,
+        4294967295
+      ],
+      "output": [
+        4096,
+        4096
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        1,
+        1
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        1,
+        200
+      ],
+      "output": [
+        32,
+        3648
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        200,
+        1
+      ],
+      "output": [
+        3648,
+        32
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        240,
+        272
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        272,
+        304
+      ],
+      "output": [
+        256,
+        320
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        255,
+        256
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        257,
+        257
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        4096,
+        4096
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        4112,
+        4112
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        4113,
+        4113
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        1280,
+        1280
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        1296,
+        1296
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        1297,
+        1297
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        6000,
+        3000
+      ],
+      "output": [
+        1792,
+        896
+      ]
+    },
+    {
+      "profile": "Thx02",
+      "input": [
+        4294967295,
+        4294967295
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        1,
+        1
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        1,
+        200
+      ],
+      "output": [
+        32,
+        3648
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        200,
+        1
+      ],
+      "output": [
+        3648,
+        32
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        240,
+        272
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        272,
+        304
+      ],
+      "output": [
+        256,
+        320
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        255,
+        256
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        257,
+        257
+      ],
+      "output": [
+        256,
+        256
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        4096,
+        4096
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        4112,
+        4112
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        4113,
+        4113
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        1280,
+        1280
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        1296,
+        1296
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        1297,
+        1297
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        6000,
+        3000
+      ],
+      "output": [
+        1792,
+        896
+      ]
+    },
+    {
+      "profile": "D3Flash",
+      "input": [
+        4294967295,
+        4294967295
+      ],
+      "output": [
+        1280,
+        1280
+      ]
+    }
+  ],
+  "filter_probes": [
+    {
+      "name": "probe-0",
+      "height": 257,
+      "width": 259,
+      "pattern": "checker",
+      "profile": "Qwen38",
+      "resized": [
+        32,
+        32
+      ],
+      "file": "probe-0-rgb.bin",
+      "sha256": "49aae135f1d2c4468f0c69d70291403b9842d22b7f11563622abeda373616586"
+    },
+    {
+      "name": "probe-1",
+      "height": 33,
+      "width": 49,
+      "pattern": "ramp",
+      "profile": "Qwen38",
+      "resized": [
+        7,
+        11
+      ],
+      "file": "probe-1-rgb.bin",
+      "sha256": "a0504daf9419d0425ce2204cccee163499821693125f9efb1030ae79f73a0b44"
+    },
+    {
+      "name": "probe-2",
+      "height": 1,
+      "width": 73,
+      "pattern": "ramp",
+      "profile": "Qwen38",
+      "resized": [
+        32,
+        32
+      ],
+      "file": "probe-2-rgb.bin",
+      "sha256": "58c8532ffaa0609748f0b97ae542d7dffcbea5e91eeddd0786b46b0029bd1a9a"
+    },
+    {
+      "name": "probe-3",
+      "height": 73,
+      "width": 1,
+      "pattern": "ramp",
+      "profile": "Qwen38",
+      "resized": [
+        32,
+        32
+      ],
+      "file": "probe-3-rgb.bin",
+      "sha256": "8339d51e82b83d0dd8aeeff048d1e3b4fe394ce166e8097e68fe54c8f02123be"
+    },
+    {
+      "name": "probe-4",
+      "height": 64,
+      "width": 64,
+      "pattern": "impulse",
+      "profile": "Qwen38",
+      "resized": [
+        17,
+        64
+      ],
+      "file": "probe-4-rgb.bin",
+      "sha256": "82959e92b161674adfeac36a4281c9d6bf6f3cec1287963f4e6846f876aa9a96"
+    },
+    {
+      "name": "probe-5",
+      "height": 64,
+      "width": 64,
+      "pattern": "colors",
+      "profile": "Qwen38",
+      "resized": [
+        64,
+        17
+      ],
+      "file": "probe-5-rgb.bin",
+      "sha256": "a9f4772bf36a960332cb65a0e60db140b5cc6c213ed7a8a44f867ab2a9c7a999"
+    }
+  ]
+}

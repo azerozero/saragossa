@@ -2,6 +2,69 @@
 
 use crate::{InferError, Result};
 
+mod resize;
+
+/// Image RGB uint8 contiguë, dans l'ordre [H,W,C], sans padding.
+#[derive(Debug)]
+pub struct RgbImage {
+    height: u32,
+    width: u32,
+    pixels: Vec<u8>,
+}
+
+impl RgbImage {
+    /// Valide les dimensions et la longueur d'un tampon RGB déjà décodé.
+    pub fn from_rgb8(height: u32, width: u32, pixels: Vec<u8>) -> Result<Self> {
+        if pixels.len() != rgb_len(height, width)? {
+            return Err(invalid("longueur RGB différente de H × W × 3"));
+        }
+        Ok(Self {
+            height,
+            width,
+            pixels,
+        })
+    }
+
+    /// Hauteur en pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Largeur en pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Pixels RGB dans l'ordre HWC.
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// Applique les dimensions Qwen puis le bicubique antialiasé uint8 de PIL.
+    pub fn resized(&self, profile: ImageProfile) -> Result<Self> {
+        let (height, width) = smart_resize(self.height, self.width, profile)?;
+        resize::bicubic(self, height, width)
+    }
+}
+
+fn rgb_len(height: u32, width: u32) -> Result<usize> {
+    if height == 0 || width == 0 {
+        return Err(invalid("dimensions nulles"));
+    }
+    (height as usize)
+        .checked_mul(width as usize)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| invalid("taille RGB non représentable"))
+}
+
+fn allocate<T: Default + Clone>(len: usize) -> Result<Vec<T>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(len)
+        .map_err(|_| invalid("allocation du tampon impossible"))?;
+    data.resize(len, T::default());
+    Ok(data)
+}
+
 /// Profil de budget image ; d3 utilise sa limite runtime, pas celle du fichier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageProfile {
@@ -58,6 +121,9 @@ pub fn smart_resize(height: u32, width: u32, profile: ImageProfile) -> Result<(u
     }
     Ok((resized_h as u32, resized_w as u32))
 }
+
+#[cfg(test)]
+mod fixtures;
 
 #[cfg(test)]
 mod tests {
