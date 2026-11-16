@@ -51,6 +51,27 @@ impl RustTokenizer {
         })
     }
 
+    /// Tokenizer depuis un `tokenizer.json` déjà lu et ajusté, sans profil de
+    /// template ; `path` ne sert qu'aux messages d'erreur.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le JSON n'est pas un tokenizer valide.
+    pub fn from_json(path: impl AsRef<Path>, json: &str) -> Result<Self> {
+        let path = path.as_ref();
+        let inner: Tokenizer =
+            json.parse()
+                .map_err(|e: tokenizers::Error| InferError::Tokenizer {
+                    path: path.to_path_buf(),
+                    message: e.to_string(),
+                })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            inner,
+            qwen_profile: None,
+        })
+    }
+
     /// Profil de rendu associé au template local, lu une seule fois au chargement.
     ///
     /// # Errors
