@@ -4,6 +4,11 @@ Contrat : [vision-spec.md](vision-spec.md). Base : `bdc2dadc3cbc`.
 La vision reste explicitement indisponible dans le moteur ; le texte reste
 utilisable avec `VISION=0`.
 
+Sous `VISION=0` (défaut), une tour vision non inventoriée, quantifiée ou
+incompatible est ignorée avec un avertissement stderr unique par processus.
+La validation des fichiers safetensors reste active. Sous `VISION=1`, le
+chargement reste refusé tant que le chemin vision n'est pas implémenté.
+
 | Inventaire | Identifiés / attendus | Layout Conv3D |
 |---|---:|---|
 | Qwen3.8-27B-BF16 | 333 / 333 | OITHW |

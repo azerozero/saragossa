@@ -131,6 +131,25 @@ pub(super) fn validate_headers(
     config: &ModelConfig,
     entries: &HashMap<String, TensorEntryRef>,
 ) -> Result<()> {
+    let enabled = crate::runtime_flags::vision_enabled()?;
+    if let Err(error) = validate_supported_headers(config, entries) {
+        if enabled {
+            return Err(error);
+        }
+        // Les chemins dense et quantifié peuvent contrôler le même catalogue.
+        // Une tour inutilisée ne doit ni bloquer le texte ni répéter le diagnostic.
+        static WARNING: std::sync::Once = std::sync::Once::new();
+        WARNING.call_once(|| {
+            eprintln!("avertissement : VISION=0, tour vision ignorée : {error}");
+        });
+    }
+    Ok(())
+}
+
+fn validate_supported_headers(
+    config: &ModelConfig,
+    entries: &HashMap<String, TensorEntryRef>,
+) -> Result<()> {
     for name in entries.keys() {
         if name
             .split('.')
@@ -220,9 +239,9 @@ mod tests {
                     },
                 );
             }
-            validate_headers(&config, &entries)?;
+            validate_supported_headers(&config, &entries)?;
             config.hidden_size += 1;
-            assert!(validate_headers(&config, &entries).is_err());
+            assert!(validate_supported_headers(&config, &entries).is_err());
             config.hidden_size -= 1;
             let key = format!(
                 "{}patch_embed.proj.weight",
@@ -231,18 +250,18 @@ mod tests {
                     .ok_or_else(|| incompatible("prefix"))?
             );
             let original = entries.remove(&key).ok_or_else(|| incompatible("patch"))?;
-            assert!(validate_headers(&config, &entries).is_err());
+            assert!(validate_supported_headers(&config, &entries).is_err());
             let mut corrupt = original.clone();
             corrupt.entry.shape.swap(1, 4);
             entries.insert(key.clone(), corrupt);
-            assert!(validate_headers(&config, &entries).is_err());
+            assert!(validate_supported_headers(&config, &entries).is_err());
             let mut wrong_dtype = original.clone();
             wrong_dtype.entry.dtype = safetensors::Dtype::F32;
             entries.insert(key.clone(), wrong_dtype);
-            assert!(validate_headers(&config, &entries).is_err());
+            assert!(validate_supported_headers(&config, &entries).is_err());
             entries.insert(key.clone(), original.clone());
             entries.insert(format!("unknown.{key}"), original.clone());
-            assert!(validate_headers(&config, &entries).is_err());
+            assert!(validate_supported_headers(&config, &entries).is_err());
             entries.remove(&format!("unknown.{key}"));
             entries.insert(key.clone(), original.clone());
             entries.insert(
@@ -254,7 +273,7 @@ mod tests {
                 ),
                 original,
             );
-            assert!(validate_headers(&config, &entries).is_err());
+            assert!(validate_supported_headers(&config, &entries).is_err());
         }
         Ok(())
     }
@@ -320,6 +339,97 @@ mod tests {
                 output.status.success(),
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn text_loader_ignores_unknown_and_quantized_vision(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        const CHILD: &str = "SARAGOSSA_TEST_UNSUPPORTED_VISION_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            use safetensors::{serialize, tensor::TensorView, Dtype};
+
+            let directory = tempfile::tempdir()?;
+            let text = directory.path().join("text.safetensors");
+            crate::qwen_loader::test_fixtures::write_safetensors(&text, "model.", "lm_head.", None);
+            let config = test_config();
+            let shards = [text.clone()];
+            let catalog = WeightCatalog::from_shards(&shards)?;
+            let reference = if mode != "1" {
+                Some(
+                    crate::qwen_loader::load_causal_decoder_from_shards(
+                        &config, &shards, &catalog,
+                    )?
+                    .next_logits(&[0, 1])?
+                    .data()
+                    .to_vec(),
+                )
+            } else {
+                None
+            };
+            for quantized in [false, true] {
+                let mut config = config.clone();
+                config.vision_config = Some(serde_json::json!({
+                    "depth": 1, "hidden_size": 2, "intermediate_size": 4,
+                    "out_hidden_size": config.hidden_size,
+                }));
+                let vision = directory.path().join("vision.safetensors");
+                let payload = [0_u8; 4];
+                let mut tensors = vec![(
+                    "vision_tower.blocks.0.attn.qkv.weight",
+                    TensorView::new(
+                        if quantized { Dtype::U32 } else { Dtype::BF16 },
+                        vec![1, if quantized { 1 } else { 2 }],
+                        &payload,
+                    )?,
+                )];
+                if quantized {
+                    for suffix in [
+                        "vision_tower.blocks.0.attn.qkv.scales",
+                        "vision_tower.blocks.0.attn.qkv.biases",
+                    ] {
+                        tensors.push((suffix, TensorView::new(Dtype::F32, vec![1, 1], &payload)?));
+                    }
+                }
+                std::fs::write(&vision, serialize(tensors, None)?)?;
+                let shards = [text.clone(), vision];
+                let catalog = WeightCatalog::from_shards(&shards)?;
+                for _ in 0..2 {
+                    let result = crate::qwen_loader::load_causal_decoder_from_shards(
+                        &config, &shards, &catalog,
+                    );
+                    if let Some(expected) = &reference {
+                        assert_eq!(result?.next_logits(&[0, 1])?.data(), expected);
+                    } else {
+                        let error = result.err().ok_or("demande vision acceptée")?.to_string();
+                        assert!(error.contains("vision non implémentée"));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        for mode in ["default", "0", "1"] {
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "qwen_loader::vision::tests::text_loader_ignores_unknown_and_quantized_vision",
+                    "--nocapture",
+                ])
+                .env(CHILD, mode)
+                .env_remove("VISION");
+            if mode != "default" {
+                command.env("VISION", mode);
+            }
+            let output = command.output()?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stderr}");
+            assert_eq!(
+                stderr.matches("tour vision ignorée").count(),
+                usize::from(mode != "1"),
+                "{stderr}"
             );
         }
         Ok(())

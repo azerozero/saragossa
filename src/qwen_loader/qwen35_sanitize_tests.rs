@@ -135,7 +135,7 @@ fn write_checkpoint(
         owned.push((name, shape, payload));
     }
     // MTP ne doit pas fournir les poids texte ni déclencher leur offset.
-    // Les sentinelles vision invalides servent à vérifier le refus préalable.
+    // Les sentinelles vision invalides restent ignorées en chargement texte.
     for name in [
         "model.visual.norm.weight",
         "mtp.norm.weight",
@@ -188,17 +188,8 @@ fn qwen35_hf_bf16_matches_sanitized_mlx_tensors_and_cpu_logits() -> Result<()> {
         ] {
             let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
             let shards = [tmp.path().to_path_buf()];
-            // Les anciens sentinelles vision ne constituent pas un ViT : le
-            // contrat les refuse, même lorsque seul le texte est demandé.
+            // Une tour vision non prise en charge ne doit pas changer le texte.
             write_checkpoint(tmp.path(), prefix, head, hf, tied, true);
-            let catalog = WeightCatalog::from_shards(&shards)?;
-            let rejected = load_causal_decoder_from_shards(&config, &shards, &catalog);
-            assert!(
-                matches!(rejected, Err(InferError::Config(message)) if message.contains("contrat vision Qwen incompatible"))
-            );
-
-            // Garder l'oracle de logits HF/MLX sur un export texte valide.
-            write_checkpoint(tmp.path(), prefix, head, hf, tied, false);
             let catalog = WeightCatalog::from_shards(&shards)?;
             let tensors =
                 load_decoder_tensors(&config, &shards, &catalog, &QwenPrefixes::detect(&catalog))?;
