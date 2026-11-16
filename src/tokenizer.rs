@@ -236,8 +236,10 @@ fn warn_once(path: &Path, message: &str) {
     let mut warned = WARNED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !warned.iter().any(|p| p == path) {
-        warned.push(path.to_path_buf());
+    // Un même fichier atteint par deux chemins (lien, `..`) n'alerte qu'une fois.
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !warned.contains(&path) {
+        warned.push(path);
         // NOTE: Un stderr fermé ou plein ne doit pas faire échouer le chargement.
         let _ = writeln!(std::io::stderr(), "{message}");
     }
