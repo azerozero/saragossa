@@ -1481,6 +1481,97 @@ pub(crate) fn prefix_extend_resident_min_tokens() -> usize {
     })
 }
 
+/// Réglage `SARAGOSSA_RUST_PREFIX_ALIGN` des reprises du prefill résident.
+/// `None` : alignement automatique, choisi par modèle
+/// ([`prefix_align_for_model`]). `Some(None)` : coupé (`0`), reprises à la
+/// longueur exacte du préfixe (écart au near-tie près). `Some(Some(n))` :
+/// alignement explicite, multiple de 16. Une valeur invalide avertit une fois
+/// sur stderr et garde le choix automatique.
+fn prefix_align_setting() -> Option<Option<usize>> {
+    #[cfg(test)]
+    if let Some(align) = PREFIX_ALIGN_TEST_OVERRIDE.with(Cell::get) {
+        return Some(align);
+    }
+    static SETTING: OnceLock<Option<Option<usize>>> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        match env_var("SARAGOSSA_RUST_PREFIX_ALIGN")
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("" | "1" | "true" | "on" | "auto") => None,
+            Some("0" | "false" | "off") => Some(None),
+            Some(value) => match value
+                .parse::<usize>()
+                .ok()
+                .filter(|rows| *rows >= 16 && rows % 16 == 0)
+            {
+                Some(rows) => Some(Some(rows)),
+                None => {
+                    // Lu une seule fois (OnceLock) : l'avertissement l'est aussi.
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "saragossa: SARAGOSSA_RUST_PREFIX_ALIGN={value:?} invalide \
+                         (0, ou multiple de 16 d'au moins 16) : alignement automatique"
+                    );
+                    None
+                }
+            },
+        }
+    })
+}
+
+/// Alignement et queue minimale (tokens) des frontières de morceaux du
+/// prefill résident : 64 et 64, sauf alignement coupé. Un multiple de 64 est
+/// aussi aligné pour un modèle à 16.
+#[must_use]
+pub fn prefix_align() -> Option<(usize, usize)> {
+    match prefix_align_setting() {
+        Some(None) => None,
+        _ => Some((PREFIX_ALIGN_ROWS, PREFIX_ALIGN_ROWS)),
+    }
+}
+
+/// Alignement et queue minimale (tokens) des reprises du cache de préfixe et
+/// des blocs de serve pour un modèle. Le gated delta NAX découpe la récurrence
+/// en blocs de 16 depuis le début de chaque appel, et les GEMM changent de
+/// noyau sous 32 (quantifié) ou 64 (dense bf16, `dense_bf16_gemm`) lignes :
+/// une reprise alignée suivie d'au moins `tail` lignes calcule chaque position
+/// avec les mêmes noyaux, dans le même ordre, que le prefill à froid. Auto :
+/// (64, 64) si une projection dense bf16 prend le GEMM, (16, 32) sinon ; une
+/// valeur explicite `n` donne (n, max(n, 32)).
+#[must_use]
+pub fn prefix_align_for_model(dense_bf16_gemm: bool) -> Option<(usize, usize)> {
+    let align = match prefix_align_setting() {
+        Some(explicit) => explicit?,
+        None if dense_bf16_gemm => PREFIX_ALIGN_ROWS,
+        None => 16,
+    };
+    Some((align, align.max(if dense_bf16_gemm { 64 } else { 32 })))
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREFIX_ALIGN_TEST_OVERRIDE: Cell<Option<Option<usize>>> = const { Cell::new(None) };
+}
+
+/// Exécute `run` avec l'alignement `align` (`None` : reprises à la longueur
+/// exacte, comme `SARAGOSSA_RUST_PREFIX_ALIGN=0`) sur le thread courant.
+#[cfg(test)]
+pub(crate) fn with_prefix_align_for_test<R>(align: Option<usize>, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Option<usize>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREFIX_ALIGN_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(PREFIX_ALIGN_TEST_OVERRIDE.with(|cell| cell.replace(Some(align))));
+    run()
+}
+
+/// Alignement par défaut de [`prefix_align`].
+pub const PREFIX_ALIGN_ROWS: usize = 64;
+
 /// Récurrence gated delta du prefill linéaire (16/48 têtes, dk = dv =
 /// 128, état f32) sur les accélérateurs neuronaux : noyau
 /// `gated_delta_fused_nax` de MLX figé. Défaut ON depuis le 2026-10-25 (M5 Max,

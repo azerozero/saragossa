@@ -1556,7 +1556,27 @@ impl MetalExecutor {
         {
             return rows;
         }
-        rows.div_ceil(rows.div_ceil(target))
+        let balanced = rows.div_ceil(rows.div_ceil(target));
+        // Un découpage imposé par un test garde ses morceaux tels quels.
+        #[cfg(test)]
+        if PREFILL_KV_LAYOUT_OVERRIDE.with(Cell::get).is_some() {
+            return balanced;
+        }
+        // Des morceaux plus petits que l'alignement (tests de découpage) restent
+        // équilibrés : la production en vise au moins 512.
+        let Some((align, tail)) =
+            crate::runtime_flags::prefix_align().filter(|&(align, _)| target >= align)
+        else {
+            return balanced;
+        };
+        // Morceaux multiples de l'alignement et dernier morceau d'au moins
+        // `tail` lignes : un préfixe aligné repris du cache retrouve les
+        // frontières et les noyaux du prefill à froid.
+        let mut chunk = balanced.next_multiple_of(align);
+        while chunk < rows && rows % chunk != 0 && rows % chunk < tail {
+            chunk += align;
+        }
+        chunk.min(rows)
     }
 
     fn resident_prefill_layer_shape<'a>(
