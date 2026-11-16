@@ -141,6 +141,48 @@ jobs:
       - name: Tests
         run: cargo test --locked --all-features
 
+  feature-check:
+    name: Features (Apple Silicon, ${{ matrix.partition }}/2)
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 4
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: features-macos-${{ matrix.partition }}
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
+        with:
+          tool: cargo-hack
+      - name: Each feature with Metal
+        run: taskpolicy -b cargo hack check --locked --each-feature --features metal --all-targets --partition ${{ matrix.partition }}/2
+      - name: All except one
+        if: matrix.partition == 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          features=(devtools stt tts vision denoise embed serve decision)
+          for omitted in "${features[@]}"; do
+            selected=metal
+            for feature in "${features[@]}"; do
+              if [[ "$feature" != "$omitted" ]]; then selected+=",$feature"; fi
+            done
+            taskpolicy -b cargo check --locked --all-targets --no-default-features --features "$selected"
+          done
+      - name: Minimal LLM clippy
+        if: matrix.partition == 1
+        run: taskpolicy -b cargo clippy --locked --no-default-features --features metal -- -D warnings
+
   cpu:
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
@@ -170,7 +212,7 @@ jobs:
       - name: CPU library and conversion tests
         run: cargo test --locked --lib --no-default-features --features devtools
       - name: CPU transport tests
-        run: cargo test --locked --bin saragossa --no-default-features --features devtools "serve::"
+        run: cargo test --locked --bin saragossa --no-default-features --features devtools,serve,stt,tts,embed "serve::"
 
   msrv:
     needs: [changes]
@@ -264,7 +306,7 @@ jobs:
   required:
     name: Required checks
     if: always()
-    needs: [changes, prek, rust, cpu, msrv, gitleaks, validate-yaml, coverage, release-build-check]
+    needs: [changes, prek, rust, feature-check, cpu, msrv, gitleaks, validate-yaml, coverage, release-build-check]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
