@@ -4717,7 +4717,7 @@ impl CausalDecoder {
             )?;
             output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
             let captures =
-                carry_captures(captures, suffix_captures, keep, cached_len, prompt.len())?;
+                carry_captures(captures, suffix_captures, keep, cached_len, prompt.len());
             self.prefix_cache_put(prompt, &output, None, captures.as_ref())?;
         }
         Ok(Some((output, cached_len)))
@@ -5008,7 +5008,7 @@ impl CausalDecoder {
             self.extend_mtp_history_suffix(&output.1, &final_states, suffix, &mut history)?;
             output.1 = final_state;
             let captures =
-                carry_captures(captures, suffix_captures, keep, cached_len, prompt.len())?;
+                carry_captures(captures, suffix_captures, keep, cached_len, prompt.len());
             self.prefix_cache_put(prompt, &output, Some(&history), captures.as_ref())?;
         } else if !on_final_state(&output.1)? {
             history = LayerKvCache::default();
@@ -6386,21 +6386,25 @@ fn concat_layer_captures(
 }
 
 /// Captures DFlash d'une entrée prolongées par celles de son suffixe ; `None`
-/// si l'une manque (entrée sans captures, aucun drafter chargé).
-fn carry_captures(
+/// si l'une manque (entrée sans captures, aucun drafter chargé) ou si le
+/// recollage échoue : la requête MTP ou AR n'en dépend pas, l'entrée est alors
+/// écrite sans captures et le tour DFlash suivant refera son prefill.
+pub(super) fn carry_captures(
     prefix: Option<PrefixCaptures>,
     suffix: Option<PrefixCaptures>,
     keep: Option<(Vec<usize>, usize)>,
     cached_len: usize,
     prompt_len: usize,
-) -> Result<Option<PrefixCaptures>> {
+) -> Option<PrefixCaptures> {
     #[cfg(feature = "devtools")]
     if let (Some(prefix), Some(suffix), Some((_, rows))) = (prefix, suffix, keep) {
-        return stitch_captures(prefix, suffix, cached_len, prompt_len, rows).map(Some);
+        return stitch_captures(prefix, suffix, cached_len, prompt_len, rows)
+            .map_err(|error| eprintln!("captures DFlash abandonnées à l'extension : {error}"))
+            .ok();
     }
     #[cfg(not(feature = "devtools"))]
     let _ = (prefix, suffix, keep, cached_len, prompt_len);
-    Ok(None)
+    None
 }
 
 /// Recolle des captures contiguës, ou garde le suffixe s'il couvre déjà la queue.

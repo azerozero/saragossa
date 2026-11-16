@@ -940,6 +940,24 @@ fn prefix_captures_stitch_rejects_shifted_from_cpu() -> Result<()> {
     Ok(())
 }
 
+/// Un recollage impossible à l'extension MTP ou AR n'échoue pas la requête :
+/// l'entrée est écrite sans captures.
+#[test]
+#[cfg(feature = "devtools")]
+fn carry_captures_drops_unstitchable_captures_cpu() -> Result<()> {
+    let prefix = PrefixCaptures::new(&[0], 2, Tensor::zeros(vec![3, 1])?);
+    let suffix = PrefixCaptures::new(&[0], 6, Tensor::zeros(vec![2, 1])?);
+    assert!(
+        generation::carry_captures(Some(prefix), Some(suffix), Some((vec![0], 4)), 6, 8).is_none()
+    );
+    let prefix = PrefixCaptures::new(&[0], 3, Tensor::zeros(vec![3, 1])?);
+    let suffix = PrefixCaptures::new(&[0], 6, Tensor::zeros(vec![2, 1])?);
+    assert!(
+        generation::carry_captures(Some(prefix), Some(suffix), Some((vec![0], 4)), 6, 8).is_some()
+    );
+    Ok(())
+}
+
 #[test]
 #[cfg(feature = "devtools")]
 fn prefix_cache_dflash_exact_hit_bounds_unlimited_captures_cpu() -> Result<()> {
