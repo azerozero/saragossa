@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5](https://github.com/azerozero/saragossa/compare/v0.3.4...v0.3.5) - 2026-11-16
+
+### Added
+
+- *(denoise)* débruitage DeepFilterNet3 sur CPU, saragossa enhance et /v1/audio/enhance
+
+### Fixed
+
+- *(audio)* refuse les fréquences invalides sans panique
+- *(denoise)* borne les allocations audio avant traitement
+
+### Other
+
+- Merge pull request #240 from azerozero/release-plz-2026-11-16T21-21-17Z
+- *(docs)* une seule ligne vide entre les sections de voice-isolation.md
+- Merge remote-tracking branch 'origin/main' into feat/voix-isolation
+- *(docs)* retire les lignes vides finales de voice-isolation.md
+- Merge remote-tracking branch 'origin/main' into feat/voix-isolation
+- *(voix)* corrige la fenêtre de Vorbis
+- *(audio)* couvre les limites et les hops incomplets
+- *(serve)* fusionne main en conservant le débruitage DFN3
+- *(voix)* spécifications DFN3, MossFormer2 et RE-USE, mesures et licences
+
 ## [0.3.4](https://github.com/azerozero/saragossa/compare/v0.3.3...v0.3.4) - 2026-11-16
 
 ### Added
