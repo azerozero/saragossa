@@ -159,12 +159,16 @@ impl WhisperDecoder {
             Some(metal)
                 if crate::runtime_flags::env_var_os("SARAGOSSA_STT_DECODER_PEROP").is_none() =>
             {
+                let t_kv = std::time::Instant::now();
                 let dec = self.build_resident_decoder(metal)?;
                 let kv = metal.build_whisper_decode_kv_resident(
                     audio_features,
                     &dec,
                     self.config.max_target_positions,
                 )?;
+                if crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some() {
+                    eprintln!("[dec] kv cross: {} us", t_kv.elapsed().as_micros());
+                }
                 Some(ResidentDecode { metal, dec, kv })
             }
             _ => None,

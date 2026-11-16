@@ -86,6 +86,21 @@ fn golden_log_mel_matches_fixture() -> Result<()> {
     Ok(())
 }
 
+/// Le log-mel parallèle par trames reste identique au bit au calcul séquentiel.
+#[test]
+fn log_mel_parallel_matches_serial_bitwise() -> Result<()> {
+    let samples: Vec<f32> = (0..N_SAMPLES / 3)
+        .map(|i| ((i as f32) * 0.013).sin() * 0.5 + ((i * 7919) % 101) as f32 * 1.0e-3)
+        .collect();
+    for bins in [80, 128] {
+        let serial = log_mel_impl(&samples, bins, false)?;
+        let parallel = log_mel_impl(&samples, bins, true)?;
+        let bits = |t: &Tensor| t.data().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&serial), bits(&parallel), "bins={bins}");
+    }
+    Ok(())
+}
+
 /// Encodeur Whisper metal-rs ≡ golden mlx-rs figé (sans mlx-rs ; charge le snapshot
 /// whisper-tiny local pour l'inférence metal-rs). Mêmes tolérances que `live_encoder_*`.
 #[test]

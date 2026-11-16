@@ -591,6 +591,12 @@ impl WhisperEncoder {
 ///
 /// Renvoie une erreur si `num_mel_bins` n'est pas supporté.
 pub fn log_mel_spectrogram(samples: &[f32], num_mel_bins: usize) -> Result<Tensor> {
+    let serial = crate::runtime_flags::env_var_os("SARAGOSSA_STT_MEL_SERIAL").is_some();
+    log_mel_impl(samples, num_mel_bins, !serial)
+}
+
+/// Corps du log-mel ; `parallel` répartit les trames sur rayon.
+fn log_mel_impl(samples: &[f32], num_mel_bins: usize, parallel: bool) -> Result<Tensor> {
     use rustfft::num_complex::Complex;
 
     let filters = mel_filter_bank(num_mel_bins)?;
@@ -613,36 +619,55 @@ pub fn log_mel_spectrogram(samples: &[f32], num_mel_bins: usize) -> Result<Tenso
     }
 
     let fft = fft_400();
-    let mut mel = vec![0.0_f32; num_mel_bins * N_FRAMES];
-    let mut buf = vec![Complex::new(0.0_f32, 0.0_f32); N_FFT];
-    let mut power = [0.0_f32; N_FREQS];
-    for frame in 0..N_FRAMES {
+    // Lu une fois : la lecture d'environnement prend un verrou global et coûtait
+    // 3000 appels par fenêtre.
+    let dense = crate::runtime_flags::env_var_os("SARAGOSSA_STT_DENSE_MEL").is_some();
+    // Chaque trame est une FFT et une projection indépendantes, sans
+    // accumulation entre trames : le calcul parallèle reste identique au bit au
+    // calcul séquentiel. `SARAGOSSA_STT_MEL_SERIAL=1` garde la boucle séquentielle.
+    let frame_mel = |frame: usize, out: &mut [f32]| {
+        let mut buf = [Complex::new(0.0_f32, 0.0_f32); N_FFT];
         let start = frame * HOP;
         for index in 0..N_FFT {
             let sample = padded.get(start + index).copied().unwrap_or(0.0);
             buf[index] = Complex::new(sample * hann[index], 0.0);
         }
         fft.process(&mut buf);
+        let mut power = [0.0_f32; N_FREQS];
         for (freq, power_value) in power.iter_mut().enumerate().take(N_FREQS) {
             let value = buf[freq];
             *power_value = value.re * value.re + value.im * value.im;
         }
-        if crate::runtime_flags::env_var_os("SARAGOSSA_STT_DENSE_MEL").is_some() {
-            for mel_bin in 0..num_mel_bins {
-                let mut acc = 0.0_f32;
+        for (mel_bin, slot) in out.iter_mut().enumerate() {
+            let mut acc = 0.0_f32;
+            if dense {
                 for (freq, &power_value) in power.iter().enumerate().take(N_FREQS) {
                     acc += filters.dense_weight(mel_bin, freq) * power_value;
                 }
-                mel[mel_bin * N_FRAMES + frame] = acc;
-            }
-        } else {
-            for mel_bin in 0..num_mel_bins {
-                let mut acc = 0.0_f32;
+            } else {
                 for entry in filters.row(mel_bin) {
                     acc += entry.weight * power[entry.freq];
                 }
-                mel[mel_bin * N_FRAMES + frame] = acc;
             }
+            *slot = acc;
+        }
+    };
+    // Disposition trame-majeure `[frames, bins]`, transposée ensuite.
+    let mut by_frame = vec![0.0_f32; num_mel_bins * N_FRAMES];
+    if !parallel {
+        for (frame, out) in by_frame.chunks_mut(num_mel_bins).enumerate() {
+            frame_mel(frame, out);
+        }
+    } else {
+        by_frame
+            .par_chunks_mut(num_mel_bins)
+            .enumerate()
+            .for_each(|(frame, out)| frame_mel(frame, out));
+    }
+    let mut mel = vec![0.0_f32; num_mel_bins * N_FRAMES];
+    for (frame, row) in by_frame.chunks(num_mel_bins).enumerate() {
+        for (mel_bin, &value) in row.iter().enumerate() {
+            mel[mel_bin * N_FRAMES + frame] = value;
         }
     }
 
