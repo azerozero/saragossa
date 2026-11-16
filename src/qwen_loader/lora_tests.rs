@@ -211,11 +211,11 @@ fn quantized_base_target_is_refused() {
 /// modèle fusionné se charge sur Metal. `mtp.safetensors` n'est pas lu.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
-#[ignore = "requiert les poids THX-02 (SARAGOSSA_THX02_DIR)"]
+#[ignore = "poids THX-02 locaux (SARAGOSSA_DECISION_MODEL) et verrou GPU requis"]
 fn thx02_thinker_adapter_fuses_on_metal() {
-    let root = std::env::var_os("SARAGOSSA_THX02_DIR").map_or_else(
-        || PathBuf::from("/Users/ludwig/workspace/ai_model/THX-02"),
-        PathBuf::from,
+    let root = PathBuf::from(
+        crate::runtime_flags::env_var_os("SARAGOSSA_DECISION_MODEL")
+            .expect("invariant: SARAGOSSA_DECISION_MODEL requis (répertoire THX-02)"),
     );
     let adapter = LoraAdapter::load(root.join("thinker")).expect("invariant: adaptateur thinker");
     assert_eq!(adapter.module_count(), 200);
