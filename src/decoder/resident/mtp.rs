@@ -1287,6 +1287,9 @@ impl CausalDecoder {
         retain_hidden: bool,
         after_submit: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<Option<ResidentMtpSpecOneOutput>> {
+        if cache.vision_positions.is_some() {
+            return Ok(None);
+        }
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
         };
@@ -1969,6 +1972,9 @@ impl CausalDecoder {
         retain_hidden: bool,
         after_submit: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<Option<ResidentMtpSpecTwoOutput>> {
+        if cache.vision_positions.is_some() {
+            return Ok(None);
+        }
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
         };

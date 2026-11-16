@@ -178,3 +178,81 @@ fn vision_resident_prefill_and_decode_match_cpu() -> Result<()> {
     assert!(cpu_cache.current_pos().is_err());
     Ok(())
 }
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn vision_mtp_resident_cycles_fall_back_before_mutating_cache() -> Result<()> {
+    use crate::decoder::MtpFinalState;
+    use crate::vision::prompt::{MediaSpan, VisionPositions};
+
+    let Some(_) = crate::test_support::metal_executor()? else {
+        return Ok(());
+    };
+    let mut model = model()?.with_metal_runtime()?;
+    // Le chemin texte atteint cette validation ; le repli vision doit la
+    // précéder, même à une frontière textuelle dont le delta est encore nul.
+    model.config.head_dim = None;
+    let state = MtpFinalState::Cpu(Tensor::row(vec![0.0; 256])?);
+    for depth in [1, 2] {
+        for vision in [false, true] {
+            for position in [1, 5] {
+                let mut cache = model.empty_cache();
+                cache.position = position;
+                cache.rope_delta = if position == 1 { 0 } else { -2 };
+                if vision {
+                    cache.vision_positions = Some(VisionPositions {
+                        rows: vec![[0; 3], [1; 3], [1, 1, 2], [1, 2, 1], [1, 2, 2]],
+                        media: vec![MediaSpan {
+                            start: 1,
+                            end: 5,
+                            hash: [42; 32],
+                        }],
+                    });
+                }
+                let mut submitted = false;
+                let mut after_submit = || {
+                    submitted = true;
+                    true
+                };
+                let result = if depth == 1 {
+                    model
+                        .next_mtp_spec_one_resident(
+                            &mut cache,
+                            &state,
+                            0,
+                            0,
+                            &[],
+                            true,
+                            Some(&mut after_submit),
+                        )
+                        .map(|output| output.is_none())
+                } else {
+                    model
+                        .next_mtp_spec_two_resident(
+                            &mut cache,
+                            &state,
+                            0,
+                            0,
+                            &[],
+                            true,
+                            Some(&mut after_submit),
+                        )
+                        .map(|output| output.is_none())
+                };
+                if vision {
+                    assert!(result?, "repli vision D{depth}");
+                } else {
+                    assert!(
+                        matches!(result, Err(InferError::Dimension(message)) if message.contains("head_dim"))
+                    );
+                }
+                assert!(!submitted);
+                assert_eq!(cache.position, position);
+                assert_eq!(cache.rope_delta, if position == 1 { 0 } else { -2 });
+                assert_eq!(cache.vision_positions.is_some(), vision);
+                assert!(cache.resident.is_none());
+            }
+        }
+    }
+    Ok(())
+}
