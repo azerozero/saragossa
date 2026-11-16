@@ -1287,7 +1287,14 @@ impl CausalDecoder {
         options: &GenerationOptions,
         max_draft_tokens: usize,
     ) -> Result<SpeculativeOutput> {
-        self.generate_greedy_mtp_inner(prompt, max_new_tokens, options, max_draft_tokens, |_| true)
+        self.generate_greedy_mtp_inner(
+            prompt,
+            max_new_tokens,
+            options,
+            max_draft_tokens,
+            true,
+            |_| true,
+        )
     }
 
     /// Comme `generate_greedy_mtp_batched_with_options` mais émet chaque token
@@ -1307,7 +1314,43 @@ impl CausalDecoder {
         max_draft_tokens: usize,
         on_token: impl FnMut(usize) -> bool,
     ) -> Result<SpeculativeOutput> {
-        self.generate_greedy_mtp_inner(prompt, max_new_tokens, options, max_draft_tokens, on_token)
+        self.generate_greedy_mtp_inner(
+            prompt,
+            max_new_tokens,
+            options,
+            max_draft_tokens,
+            true,
+            on_token,
+        )
+    }
+
+    /// Comme `generate_greedy_mtp_streaming_with_options`, mais en greedy
+    /// (température nulle) le drafter DFlash chargé n'est pris que si
+    /// `allow_dflash` : l'appelant route par classe de prompt
+    /// (`crate::spec_route::allows_dflash`), sinon la tête MTP sert la requête.
+    /// Les deux vérifieurs sont exacts : la suite greedy est la même.
+    /// L'échantillonné ignore `allow_dflash`.
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que `generate_greedy_mtp_streaming_with_options`.
+    pub fn generate_greedy_mtp_routed(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        max_draft_tokens: usize,
+        allow_dflash: bool,
+        on_token: impl FnMut(usize) -> bool,
+    ) -> Result<SpeculativeOutput> {
+        self.generate_greedy_mtp_inner(
+            prompt,
+            max_new_tokens,
+            options,
+            max_draft_tokens,
+            allow_dflash,
+            on_token,
+        )
     }
 
     fn generate_greedy_mtp_inner(
@@ -1316,6 +1359,7 @@ impl CausalDecoder {
         max_new_tokens: usize,
         options: &GenerationOptions,
         max_draft_tokens: usize,
+        allow_dflash: bool,
         on_token: impl FnMut(usize) -> bool,
     ) -> Result<SpeculativeOutput> {
         // NOTE: sans ce scope, le scratch du prefill MTP (clé label × longueur)
@@ -1329,8 +1373,14 @@ impl CausalDecoder {
         // sampler GPU sait tirer ses paramètres, sinon il garde la tête MTP comme
         // les contraintes. Phase 7 pairwise : code +31 à +88 %, prose longue
         // +7 à +22 %, prose courte −13 à −27 % (docs/perf/mtp-pairwise.md).
+        // Le routage par classe de prompt ne vaut que pour le greedy (seul mesuré) :
+        // l'échantillonné garde DFlash quel que soit `allow_dflash`.
         #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-        if let Some(draft) = self.dflash.as_ref() {
+        if let Some(draft) = self
+            .dflash
+            .as_ref()
+            .filter(|_| allow_dflash || options.temperature > f32::EPSILON)
+        {
             if super::resident::dflash::dflash_sampling_refusal(options).is_none()
                 && options.token_constraint.is_none()
             {
@@ -1344,6 +1394,8 @@ impl CausalDecoder {
                 );
             }
         }
+        #[cfg(not(all(target_os = "macos", feature = "metal", feature = "devtools")))]
+        let _ = allow_dflash;
         self.generate_greedy_mtp_core(prompt, max_new_tokens, options, max_draft_tokens, on_token)
     }
 
@@ -3354,7 +3406,7 @@ impl CausalDecoder {
     /// résidente. Le repli CPU du prefill complet ignore cette borne et rend
     /// encore toutes les lignes avec `from = 0` ; l'appelant tronque ensuite.
     #[cfg(feature = "devtools")]
-    fn prefill_cache_state_with_layer_capture_all(
+    pub(super) fn prefill_cache_state_with_layer_capture_all(
         &self,
         prompt: &[usize],
         layer_ids: &[usize],
@@ -4162,8 +4214,8 @@ impl CausalDecoder {
             }
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some((cache, final_state, history)) =
-            self.prefill_resident_with_mtp_history(prompt)?
+        if let Some((cache, final_state, _, history)) =
+            self.prefill_resident_with_mtp_history(prompt, &[], usize::MAX)?
         {
             if !on_final_state(&final_state)? {
                 return Ok((cache, final_state, LayerKvCache::default(), 0));
@@ -4525,11 +4577,27 @@ impl CausalDecoder {
 
     /// Le semis consomme chaque hidden avant réutilisation du scratch. Les
     /// snapshots de préfixe partagent le K/V figé, comme celui du tronc.
+    /// Avec `layer_ids` non vide (prefill DFlash), rend aussi les captures de
+    /// ces couches bornées à `keep_rows`, sans relire ni normer les états de
+    /// toutes les positions.
     #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[expect(
+        clippy::type_complexity,
+        reason = "cache, état final, captures facultatives et historique MTP"
+    )]
     fn prefill_resident_with_mtp_history(
         &self,
         prompt: &[usize],
-    ) -> Result<Option<(CausalDecoderCache, Tensor, LayerKvCache)>> {
+        layer_ids: &[usize],
+        keep_rows: usize,
+    ) -> Result<
+        Option<(
+            CausalDecoderCache,
+            Tensor,
+            Option<PrefixCaptures>,
+            LayerKvCache,
+        )>,
+    > {
         if prompt.len() < 2
             || !prefill_resident_enabled()
             || !mtp_prefill_resident_enabled()
@@ -4538,6 +4606,7 @@ impl CausalDecoder {
         {
             return Ok(None);
         }
+        validate_capture_layer_ids(layer_ids, self.layers.len())?;
         let (Some(head), Some(metal)) =
             (self.mtp.as_ref(), self.forward_runtime().metal_executor())
         else {
@@ -4555,10 +4624,10 @@ impl CausalDecoder {
             SEED_CHUNK,
             super::mtp_history::bf16_capacity(),
         )?;
-        let Some((cache, hidden, _)) = self.prefill_resident_cache_hidden_captures_and_mtp(
+        let Some((cache, hidden, captures)) = self.prefill_resident_cache_hidden_captures_and_mtp(
             prompt,
-            &[],
-            usize::MAX,
+            layer_ids,
+            keep_rows.max(1),
             true,
             crate::runtime_flags::prefill_resident_chunk_tokens(),
             Some(&mut seed),
@@ -4567,6 +4636,33 @@ impl CausalDecoder {
         else {
             return Ok(None);
         };
+        let captures = match captures {
+            Some(captures) if !layer_ids.is_empty() => Some(PrefixCaptures::tail(
+                layer_ids,
+                captures.from,
+                captures.hidden,
+                keep_rows,
+            )?),
+            None if !layer_ids.is_empty() => return Ok(None),
+            _ => None,
+        };
+        let history = self.mtp_history_from_seed(head, seed, &spec)?;
+        let state = rms_norm(
+            &hidden.into_tensor(spec.hidden_dim)?,
+            &self.final_norm,
+            self.config.rms_eps,
+        )?;
+        Ok(Some((cache, state, captures, history)))
+    }
+
+    /// KV de l'historique MTP committed à partir des lignes du semis GPU.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn mtp_history_from_seed(
+        &self,
+        head: &MtpHead,
+        seed: crate::metal_backend::MtpPrefillSeed<'_>,
+        spec: &crate::metal_backend::PrefillAttentionSpec,
+    ) -> Result<LayerKvCache> {
         let (k, v) = seed.into_rows()?;
         let attention = &head.layer.attention;
         let (q, _) = super::attention_ops::split_attention_gate(
@@ -4584,12 +4680,7 @@ impl CausalDecoder {
         )?;
         let mut history = LayerKvCache::default();
         history.append_prefill(k, v, kv_dim, 0, &layout)?;
-        let state = rms_norm(
-            &hidden.into_tensor(spec.hidden_dim)?,
-            &self.final_norm,
-            self.config.rms_eps,
-        )?;
-        Ok(Some((cache, state, history)))
+        Ok(history)
     }
 
     /// FC de la tête sur un bloc du semis. Côté Metal, la projection batchée
@@ -4616,23 +4707,56 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
     ) -> Result<Option<((CausalDecoderCache, Tensor), usize)>> {
-        let Some((mut output, cached_len, _, _)) =
+        let Some((mut output, cached_len, _, captures)) =
             self.prefix_cache_hit(prompt, false, usize::MAX)?
         else {
             return Ok(None);
         };
         if cached_len < prompt.len() {
-            let (final_states, _) = self.forward_suffix_batched(
+            let keep = self.dflash_capture_window(captures.as_ref());
+            let (final_states, suffix_captures) = self.forward_suffix_batched(
                 &mut output.0,
                 &prompt[cached_len..],
-                None,
-                usize::MAX,
+                keep.as_ref().map(|(layers, _)| layers.as_slice()),
+                keep.as_ref().map_or(usize::MAX, |(_, rows)| *rows),
                 false,
             )?;
             output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
-            self.prefix_cache_put(prompt, &output, None, None)?;
+            let captures =
+                carry_captures(captures, suffix_captures, keep, cached_len, prompt.len());
+            self.prefix_cache_put(prompt, &output, None, captures.as_ref())?;
         }
         Ok(Some((output, cached_len)))
+    }
+
+    /// Couches et fenêtre des captures DFlash à prolonger quand un autre chemin
+    /// (MTP, AR) étend une entrée qui en porte. Sans elles, l'entrée prolongée
+    /// remplace celle du tour DFlash et le tour DFlash suivant repart d'un
+    /// prefill complet (alternance du routage par classe de prompt).
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    fn dflash_capture_window(
+        &self,
+        captures: Option<&PrefixCaptures>,
+    ) -> Option<(Vec<usize>, usize)> {
+        let draft = self.dflash.as_ref()?;
+        let captures =
+            captures.filter(|captures| captures.layer_ids == draft.info.target_layer_ids)?;
+        let window = super::resident::dflash::drafter_window(
+            &draft.info.layer_types,
+            draft.info.sliding_window,
+        );
+        Some((
+            captures.layer_ids.clone(),
+            window.unwrap_or(usize::MAX).max(1),
+        ))
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "metal", feature = "devtools")))]
+    fn dflash_capture_window(
+        &self,
+        _captures: Option<&PrefixCaptures>,
+    ) -> Option<(Vec<usize>, usize)> {
+        None
     }
 
     /// Variante DFlash de [`Self::prefix_cache_get`] : exige une entrée portant
@@ -4792,20 +4916,47 @@ impl CausalDecoder {
         // Lu une seule fois : `dflash_switch_min` relit l'environnement à chaque
         // appel, le semis doit voir la même décision que le prefill.
         let needs_history = self.dflash_switch_needs_history();
-        let (cache, final_states, PrefixCaptures { from, hidden, .. }) = self
-            .prefill_cache_state_with_layer_capture_all(
-                prompt,
-                layer_ids,
-                keep_rows.max(1),
-                needs_history,
-            )?;
-        let captures = PrefixCaptures::tail(layer_ids, from, hidden, keep_rows)?;
-        let mtp_history = if needs_history {
-            Some(self.dflash_switch_mtp_history(prompt, &final_states)?)
+        // Semis sur GPU pendant le prefill (comme MTP committed) : le semis CPU
+        // depuis les états normés de toutes les positions coûtait +5,7 % de
+        // prefill à 32k (16 novembre).
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let fused = if needs_history {
+            self.prefill_resident_with_mtp_history(prompt, layer_ids, keep_rows)?
         } else {
             None
         };
-        let state = (cache, Tensor::row(final_states.last_row()?.to_vec())?);
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let fused: Option<(
+            CausalDecoderCache,
+            Tensor,
+            Option<PrefixCaptures>,
+            LayerKvCache,
+        )> = None;
+        let (state, captures, mtp_history) = match fused {
+            Some((cache, final_state, Some(captures), history)) => {
+                ((cache, final_state), captures, Some(history))
+            }
+            _ => {
+                let (cache, final_states, PrefixCaptures { from, hidden, .. }) = self
+                    .prefill_cache_state_with_layer_capture_all(
+                        prompt,
+                        layer_ids,
+                        keep_rows.max(1),
+                        needs_history,
+                    )?;
+                let captures = PrefixCaptures::tail(layer_ids, from, hidden, keep_rows)?;
+                let mtp_history = if needs_history {
+                    Some(self.dflash_switch_mtp_history(prompt, &final_states)?)
+                } else {
+                    None
+                };
+                (
+                    (cache, Tensor::row(final_states.last_row()?.to_vec())?),
+                    captures,
+                    mtp_history,
+                )
+            }
+        };
         if prefix_cache_enabled() {
             self.prefix_cache_put(prompt, &state, mtp_history.as_ref(), Some(&captures))?;
         }
@@ -4836,15 +4987,21 @@ impl CausalDecoder {
         prompt: &[usize],
         on_final_state: &mut dyn FnMut(&Tensor) -> Result<bool>,
     ) -> Result<Option<(CausalDecoderCache, Tensor, LayerKvCache, usize)>> {
-        let Some((mut output, cached_len, Some(mut history), _)) =
+        let Some((mut output, cached_len, Some(mut history), captures)) =
             self.prefix_cache_hit(prompt, true, usize::MAX)?
         else {
             return Ok(None);
         };
         if cached_len < prompt.len() {
             let suffix = &prompt[cached_len..];
-            let (final_states, _) =
-                self.forward_suffix_batched(&mut output.0, suffix, None, usize::MAX, true)?;
+            let keep = self.dflash_capture_window(captures.as_ref());
+            let (final_states, suffix_captures) = self.forward_suffix_batched(
+                &mut output.0,
+                suffix,
+                keep.as_ref().map(|(layers, _)| layers.as_slice()),
+                keep.as_ref().map_or(usize::MAX, |(_, rows)| *rows),
+                true,
+            )?;
             let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
             if !on_final_state(&final_state)? {
                 return Ok(Some((
@@ -4856,7 +5013,9 @@ impl CausalDecoder {
             }
             self.extend_mtp_history_suffix(&output.1, &final_states, suffix, &mut history)?;
             output.1 = final_state;
-            self.prefix_cache_put(prompt, &output, Some(&history), None)?;
+            let captures =
+                carry_captures(captures, suffix_captures, keep, cached_len, prompt.len());
+            self.prefix_cache_put(prompt, &output, Some(&history), captures.as_ref())?;
         } else if !on_final_state(&output.1)? {
             history = LayerKvCache::default();
         }
@@ -4880,12 +5039,15 @@ impl CausalDecoder {
         self.seed_mtp_history_batched(&states, suffix, history)
     }
 
-    /// Vrai si la bascule DFlash → MTP est armée : son historique MTP committed
-    /// se sème depuis les états finaux de toutes les positions du prompt.
+    /// Vrai si le prefill DFlash doit semer l'historique MTP committed : bascule
+    /// armée, ou routage par classe de prompt, dont le tour MTP suivant prolonge
+    /// l'entrée DFlash au lieu de repartir d'un prefill complet. Sans cet
+    /// historique, MTP reprendrait l'entrée en historique frais, 26 % plus lent
+    /// en decode (P1, P2, 16 novembre).
     #[cfg(feature = "devtools")]
     fn dflash_switch_needs_history(&self) -> bool {
         self.mtp.is_some()
-            && dflash_switch_min() > 0.0
+            && (dflash_switch_min() > 0.0 || crate::runtime_flags::spec_route_enabled())
             && mtp_history_policy() == MtpHistoryPolicy::Committed
     }
 
@@ -4899,7 +5061,7 @@ impl CausalDecoder {
     /// boucle résidente coupe pourtant la bascule ; le prefill ne voit pas les
     /// options et l'entrée reste utile aux requêtes suivantes du même préfixe.
     #[cfg(feature = "devtools")]
-    fn dflash_switch_mtp_history(
+    pub(super) fn dflash_switch_mtp_history(
         &self,
         prompt: &[usize],
         final_states: &Tensor,
@@ -6244,6 +6406,28 @@ fn concat_layer_captures(
         }
     }
     Tensor::from_vec(vec![expected_rows, output_cols], out)
+}
+
+/// Captures DFlash d'une entrée prolongées par celles de son suffixe ; `None`
+/// si l'une manque (entrée sans captures, aucun drafter chargé) ou si le
+/// recollage échoue : la requête MTP ou AR n'en dépend pas, l'entrée est alors
+/// écrite sans captures et le tour DFlash suivant refera son prefill.
+pub(super) fn carry_captures(
+    prefix: Option<PrefixCaptures>,
+    suffix: Option<PrefixCaptures>,
+    keep: Option<(Vec<usize>, usize)>,
+    cached_len: usize,
+    prompt_len: usize,
+) -> Option<PrefixCaptures> {
+    #[cfg(feature = "devtools")]
+    if let (Some(prefix), Some(suffix), Some((_, rows))) = (prefix, suffix, keep) {
+        return stitch_captures(prefix, suffix, cached_len, prompt_len, rows)
+            .map_err(|error| eprintln!("captures DFlash abandonnées à l'extension : {error}"))
+            .ok();
+    }
+    #[cfg(not(feature = "devtools"))]
+    let _ = (prefix, suffix, keep, cached_len, prompt_len);
+    None
 }
 
 /// Recolle des captures contiguës, ou garde le suffixe s'il couvre déjà la queue.
