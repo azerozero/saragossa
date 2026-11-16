@@ -127,7 +127,7 @@ const CODE_SYNTAX: &[&str] = &[
     "function(",
 ];
 
-/// Mots qui, dans les deux mots précédents, annulent un marqueur (« sans code »).
+/// Mots qui, dans les deux mots précédents, annulent le radical `cod` (« sans code »).
 const NEGATIONS: &[&str] = &["sans", "no", "without", "pas", "aucun"];
 
 /// Formules qui excluent les mots de code (pas la syntaxe d'un code collé).
@@ -241,9 +241,12 @@ fn has_word_hint(lower: &str) -> bool {
         .filter(|word| !word.is_empty())
         .collect();
     words.iter().enumerate().any(|(index, word)| {
-        let negated = words[index.saturating_sub(2)..index]
-            .iter()
-            .any(|previous| NEGATIONS.contains(previous));
+        // Seul « code » se nie (« sans code ») : « il n'y a pas de fonction
+        // main » parle toujours de code.
+        let negated = word.starts_with("cod")
+            && words[index.saturating_sub(2)..index]
+                .iter()
+                .any(|previous| NEGATIONS.contains(previous));
         CODE_STEMS.iter().any(|stem| word.starts_with(stem)) && !negated
     })
 }
@@ -354,6 +357,12 @@ mod tests {
             false,
         ));
         assert!(prefers_dflash::<&str, &str>([], false));
+        // La négation ne vaut que pour « code » : les autres radicaux restent.
+        assert!(user("Il n'y a pas de fonction main dans mon fichier."));
+        assert!(user("Pourquoi pas un script de sauvegarde ?"));
+        assert!(user("No refactoring today, just explain the algorithm."));
+        assert!(!user("Explique les marées, sans code."));
+        assert!(!user("Raconte une légende, pas de code."));
         // Prix de la prudence : « vue » (Vue.js) envoie aussi cette prose en DFlash.
         assert!(user("Décris la vue depuis le phare."));
     }
