@@ -202,6 +202,17 @@ fn decision_d3_real_weight_oracle() -> Result<()> {
 }
 
 #[test]
+#[ignore = "poids d3-mini locaux, référence f32 et verrou GPU requis"]
+fn decision_d3_mini_real_weight_oracle() -> Result<()> {
+    real_weight_oracle(
+        "SARAGOSSA_DECISION_D3_MINI_MODEL",
+        "tests/fixtures/decision/d3-mini",
+        0.013_256_834_579_467_773,
+    )
+    .map(drop)
+}
+
+#[test]
 fn tta_plan_matches_reference_engine() -> Result<()> {
     // engine.orders(3, 4), orders(2, 4) (inverse = décalage), orders(4, 1).
     assert_eq!(orders(3, 4), [[0, 1, 2], [2, 1, 0], [1, 2, 0], [2, 0, 1]]);
