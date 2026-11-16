@@ -584,14 +584,7 @@ fn h2o_tokenizer(path: &Path) -> Result<RustTokenizer> {
     if contract["actual_served_tokenizer_class"] != "Qwen2Tokenizer" {
         return Err(invalid("tokenizer servi Qwen2Tokenizer requis"));
     }
-    let file = path.join("tokenizer.json");
-    let mut spec = read_json(&file)?;
-    let regex = spec
-        .pointer_mut("/pre_tokenizer/pretokenizers/0/pattern/Regex")
-        .filter(|regex| *regex == QWEN35_REGEX)
-        .ok_or_else(|| invalid("pré-tokenizer Qwen3.5 attendu dans tokenizer.json"))?;
-    *regex = json!(QWEN2_REGEX);
-    let tokenizer = RustTokenizer::from_json(&file, &spec.to_string())?;
+    let tokenizer = qwen2_tokenizer(path)?;
     let probes = contract["probes"]
         .as_array()
         .filter(|p| !p.is_empty())
@@ -610,6 +603,20 @@ fn h2o_tokenizer(path: &Path) -> Result<RustTokenizer> {
         }
     }
     Ok(tokenizer)
+}
+
+/// `tokenizer.json` d'un dossier Qwen3.5 relu avec la regex de
+/// `Qwen2Tokenizer`, que transformers 5.x (avant 5.18) impose à la place de
+/// celle du fichier ; les modèles entraînés sous cette classe en dépendent.
+pub(super) fn qwen2_tokenizer(path: &Path) -> Result<RustTokenizer> {
+    let file = path.join("tokenizer.json");
+    let mut spec = read_json(&file)?;
+    let regex = spec
+        .pointer_mut("/pre_tokenizer/pretokenizers/0/pattern/Regex")
+        .filter(|regex| *regex == QWEN35_REGEX)
+        .ok_or_else(|| invalid("pré-tokenizer Qwen3.5 attendu dans tokenizer.json"))?;
+    *regex = json!(QWEN2_REGEX);
+    RustTokenizer::from_json(&file, &spec.to_string())
 }
 
 /// Préfixe commun laissant au moins `rows` tokens à chaque lecture et en
