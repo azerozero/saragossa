@@ -17,3 +17,10 @@ condition = "AND"
 paths = ['''^tests/fixtures/goldens/(chat_templates|embedder|whisper|logits|kld)/[^/]+\.json$''']
 regexTarget = "line"
 regexes = ['''^\s*"tokenizer(_config)?\.json": "[0-9a-f]{64}",?\s*$''']
+
+[[allowlists]]
+description = "SHA256 publics des tokenizers du manifeste vision"
+condition = "AND"
+paths = ['''^tests/fixtures/vision/manifest\.json$''']
+regexTarget = "line"
+regexes = ['''^\s*"tokenizer_sha256": "[0-9a-f]{64}",?\s*$''']

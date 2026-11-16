@@ -156,6 +156,9 @@ impl CausalDecoder {
         stops: &[usize],
         kernels: &MtpD1Kernels,
     ) -> Result<Option<MtpGpuBlockOutput>> {
+        if cache.vision_positions.is_some() {
+            return Ok(None);
+        }
         if !mtp_fresh_cache_enabled()
             || remaining < 2
             || self.config.sliding_window.is_some()
@@ -278,6 +281,7 @@ impl CausalDecoder {
             layers,
             position: cache_position,
             resident,
+            ..
         } = cache;
         let arena = resident
             .as_mut()
@@ -376,6 +380,7 @@ impl CausalDecoder {
                         &mut owned,
                         dims,
                         GpuPosition {
+                            rope_delta: 0,
                             ctrl: &ctrl,
                             slot: MTP_CTRL_POSITION,
                             max_position,

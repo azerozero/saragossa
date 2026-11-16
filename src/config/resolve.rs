@@ -21,6 +21,7 @@ impl RawModelConfig {
         let rest = self.rest;
         let top_eos = rest.get("eos_token_id").cloned();
         let top_vocab_size = rest.get("vocab_size").cloned();
+        let vision_config = rest.get("vision_config").cloned();
         let mut base = self.text_config.unwrap_or(rest);
 
         if let serde_json::Value::Object(ref mut map) = base {
@@ -51,6 +52,9 @@ impl RawModelConfig {
         let mut cfg: ModelConfig =
             serde_json::from_value(base).map_err(|e| InferError::Config(e.to_string()))?;
         cfg.quantization = quant;
+        if vision_config.is_some() {
+            cfg.vision_config = vision_config;
+        }
         if cfg.num_experts_per_tok.is_none() {
             cfg.num_experts_per_tok = cfg.top_k_experts;
         }

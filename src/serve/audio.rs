@@ -1,9 +1,8 @@
 //! Endpoints audio OpenAI-compatibles de `saragossa serve`.
 //!
-//! Deux routes purement additives :
-//! - `POST /v1/audio/transcriptions` : STT Whisper, requête `multipart/form-data`
-//!   (`file` = WAV, plus `model`/`language`/`response_format` optionnels), réponse
-//!   JSON `{"text": ...}` (ou texte brut si `response_format=text`).
+//! - `POST /v1/audio/transcriptions` et la session incrémentale
+//!   `/v1/audio/transcriptions/stream` : voir [`super::stt`], qui emprunte le
+//!   modèle Whisper de cet état.
 //! - `POST /v1/audio/speech` : TTS Qwen3, requête JSON `{"model", "input", "voice"?}`,
 //!   réponse WAV par défaut, ou PCM s16le mono chunked avec `stream: true`.
 //!
@@ -20,16 +19,18 @@ use std::path::PathBuf;
 use hound::WavReader;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use serde::Deserialize;
+#[cfg(test)]
 use serde_json::json;
 
 use saragossa::tts::TTS_GENERATION_HARD_CAP;
+use saragossa::wire_audio::extract_boundary;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use saragossa::MetalExecutor;
 use saragossa::{ForwardRuntime, TtsModel, TtsSynthesisOutput, WhisperModel};
 
 use super::args::ServeArgs;
 use super::error::{ServeError, ServeResult};
-use super::http::{send_json, write_headers};
+use super::http::write_headers;
 use crate::RuntimeKind;
 
 /// Budget minimal conservé pour les clauses courtes.
@@ -48,6 +49,8 @@ pub(super) struct AudioState {
     tts: TtsSlot,
     enhance_path: Option<PathBuf>,
     enhancer: Option<saragossa::denoise::DeepFilterNet3>,
+    /// Sessions STT à entrée incrémentale, indépendantes du modèle chargé.
+    pub(super) stt_sessions: super::stt::SttSessions,
 }
 
 struct SttSlot {
@@ -100,6 +103,7 @@ impl AudioState {
             },
             enhance_path: args.enhance_model.clone(),
             enhancer: None,
+            stt_sessions: super::stt::SttSessions::default(),
         }
     }
 
@@ -134,6 +138,22 @@ impl AudioState {
     ///
     /// Renvoie une erreur si le modèle STT n'est pas configuré ou si l'inférence échoue.
     pub(super) fn transcribe(&mut self, samples: &[f32], lang: &str) -> ServeResult<String> {
+        self.with_stt(|model, runtime| Ok(model.transcribe(samples, lang, runtime)?.0))
+    }
+
+    /// Comme [`Self::with_stt`], en prêtant aussi les sessions incrémentales.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le modèle STT n'est pas configuré, ou celle de `use_model`.
+    pub(super) fn with_stt_sessions<T>(
+        &mut self,
+        use_model: impl FnOnce(
+            &WhisperModel,
+            ForwardRuntime<'_>,
+            &mut super::stt::SttSessions,
+        ) -> ServeResult<T>,
+    ) -> ServeResult<T> {
         self.ensure_stt_loaded()?;
         let runtime = self.stt.forward_runtime(self.backend);
         let model = self
@@ -141,8 +161,26 @@ impl AudioState {
             .model
             .as_ref()
             .ok_or_else(|| ServeError::args("modèle STT absent après chargement"))?;
-        let (text, _lang) = model.transcribe(samples, lang, runtime)?;
-        Ok(text)
+        use_model(model, runtime, &mut self.stt_sessions)
+    }
+
+    /// Charge Whisper si besoin, puis prête le modèle et son runtime.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le modèle STT n'est pas configuré, ou celle de `use_model`.
+    pub(super) fn with_stt<T>(
+        &mut self,
+        use_model: impl FnOnce(&WhisperModel, ForwardRuntime<'_>) -> ServeResult<T>,
+    ) -> ServeResult<T> {
+        self.ensure_stt_loaded()?;
+        let runtime = self.stt.forward_runtime(self.backend);
+        let model = self
+            .stt
+            .model
+            .as_ref()
+            .ok_or_else(|| ServeError::args("modèle STT absent après chargement"))?;
+        use_model(model, runtime)
     }
 
     fn ensure_stt_loaded(&mut self) -> ServeResult<()> {
@@ -291,33 +329,6 @@ fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
                 .max(MIN_TTS_MAX_FRAMES)
         })
         .min(TTS_GENERATION_HARD_CAP)
-}
-
-/// Sert `POST /v1/audio/transcriptions`.
-pub(super) fn handle_transcription<S: Write>(
-    stream: &mut S,
-    audio: &mut AudioState,
-    content_type: Option<&str>,
-    body: &[u8],
-) -> ServeResult<()> {
-    let content_type = content_type
-        .ok_or_else(|| ServeError::Http("Content-Type multipart/form-data requis".to_string()))?;
-    let boundary = extract_boundary(content_type).ok_or_else(|| {
-        ServeError::Http("boundary multipart absente du Content-Type".to_string())
-    })?;
-    let fields = parse_multipart(body, &boundary)?;
-    let file = fields
-        .iter()
-        .find(|field| field.name == "file")
-        .ok_or_else(|| ServeError::Http("champ multipart 'file' requis".to_string()))?;
-    let language = text_field(&fields, "language").unwrap_or_else(|| "auto".to_string());
-    let response_format = text_field(&fields, "response_format").unwrap_or_default();
-    let samples = wav_to_mono_16k(&file.data)?;
-    let text = audio.transcribe(&samples, &language)?;
-    if response_format.eq_ignore_ascii_case("text") {
-        return send_text(stream, &text);
-    }
-    send_json(stream, 200, &json!({ "text": text }), Vec::new())
 }
 
 /// Sert `POST /v1/audio/enhance` : WAV quelconque en entrée, WAV mono 48 kHz débruité en sortie.
@@ -537,7 +548,7 @@ struct SpeechRequest {
     stream: bool,
 }
 
-fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
+pub(super) fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
     let body = text.as_bytes();
     write_headers(
         stream,
@@ -557,8 +568,10 @@ fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
 
 // Les cibles fuzz et le serveur exécutent le même décodeur, sans copie.
 #[cfg(test)]
+use saragossa::wire_audio::text_field;
+use saragossa::wire_audio::MultipartField;
+#[cfg(test)]
 use saragossa::wire_audio::MAX_WAV_SAMPLES;
-use saragossa::wire_audio::{extract_boundary, text_field, MultipartField};
 
 #[cfg(test)]
 fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult<Vec<f32>> {
@@ -566,11 +579,11 @@ fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult
         .map_err(|e| ServeError::Http(e.0))
 }
 
-fn parse_multipart(body: &[u8], boundary: &str) -> ServeResult<Vec<MultipartField>> {
+pub(super) fn parse_multipart(body: &[u8], boundary: &str) -> ServeResult<Vec<MultipartField>> {
     saragossa::wire_audio::parse_multipart(body, boundary).map_err(|e| ServeError::Http(e.0))
 }
 
-fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
+pub(super) fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
     saragossa::wire_audio::wav_to_mono_16k(bytes).map_err(|e| ServeError::Http(e.0))
 }
 
@@ -614,7 +627,9 @@ mod tests {
     use std::io::Cursor;
 
     use super::super::args::ServeArgs;
+    use super::super::stt::handle_transcription;
     use super::*;
+    use saragossa::wire_audio::extract_boundary;
 
     fn multipart_body(boundary: &str, file: &[u8], language: Option<&str>) -> Vec<u8> {
         let mut body = Vec::new();

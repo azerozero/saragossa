@@ -13,7 +13,7 @@ use sources::Source;
 use std::path::{Path, PathBuf};
 use storage::{invalid, io, Blob, Writer};
 
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,6 +94,31 @@ impl SnapshotSources {
         ))
     }
 
+    /// Comme [`Self::capture`], suivi des sources déjà lues en mémoire
+    /// (`read`), dont l'empreinte vient des octets effectivement consommés.
+    pub(crate) fn capture_with_read<'a>(
+        paths: impl IntoIterator<Item = &'a Path>,
+        read: &[ReadSource],
+    ) -> Self {
+        let mut sources = Self::capture(paths);
+        if let Some(Ok(list)) = &mut sources.0 {
+            for source in read {
+                match &source.0 {
+                    Some(Ok(source)) => list.push(source.clone()),
+                    Some(Err(error)) => {
+                        sources.0 = Some(Err(error.clone()));
+                        break;
+                    }
+                    None => {
+                        sources.0 = Some(Err("identité d'une source lue absente".into()));
+                        break;
+                    }
+                }
+            }
+        }
+        sources
+    }
+
     fn verified(&self) -> Result<&[Source]> {
         snapshot_calculations_complete()?;
         let sources = self
@@ -131,6 +156,23 @@ impl SnapshotSources {
     }
 }
 
+/// Identité d'un fichier lu entièrement en mémoire, prise au moment de la
+/// lecture. Vide quand aucun instantané n'est actif : rien n'est haché.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReadSource(Option<std::result::Result<Source, String>>);
+
+impl ReadSource {
+    /// `before` est la métadonnée prise avant de lire `bytes` depuis `path`.
+    pub(crate) fn new(path: &Path, before: &std::fs::Metadata, bytes: &[u8]) -> Self {
+        if crate::runtime_flags::state_snapshot_dir().is_none() && !persistent::enabled() {
+            return Self::default();
+        }
+        Self(Some(
+            Source::from_read(path, before, bytes).map_err(|e| e.to_string()),
+        ))
+    }
+}
+
 /// Les ablations ne doivent ni relire un calcul complet ni publier un calcul tronqué.
 fn snapshot_calculations_complete() -> Result<()> {
     if let Some(flag) = crate::runtime_flags::state_snapshot_ablation() {
@@ -148,6 +190,7 @@ thread_local! { static HITS: std::cell::Cell<usize> = const { std::cell::Cell::n
 struct Key {
     version: u32,
     prompt_sha256: String,
+    position_sha256: Option<String>,
     tokens: usize,
     sources: Vec<Source>,
     binary_sha256: String,
@@ -352,6 +395,8 @@ struct Captures {
 struct Manifest {
     key: Key,
     position: usize,
+    rope_delta: i64,
+    vision_positions: Option<crate::vision::prompt::VisionPositions>,
     layers: Vec<Layer>,
     final_state: Dense,
     history: Option<Layer>,
@@ -410,6 +455,18 @@ impl CausalDecoder {
         prompt: &[usize],
         mode: SnapshotMode,
     ) -> Result<Option<Request>> {
+        self.snapshot_request_positioned(prompt, mode, None)
+    }
+
+    pub(super) fn snapshot_request_positioned(
+        &self,
+        prompt: &[usize],
+        mode: SnapshotMode,
+        positions: Option<&crate::vision::prompt::VisionPositions>,
+    ) -> Result<Option<Request>> {
+        if let Some(positions) = positions {
+            positions.delta_at(prompt.len())?;
+        }
         if crate::runtime_flags::state_snapshot_warmup() {
             return Ok(None);
         }
@@ -449,6 +506,10 @@ impl CausalDecoder {
             .map(|metal| metal.snapshot_kernel_profile());
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let kernel_profile: Option<String> = None;
+        let position_sha256 = position_digest(positions, prompt.len())?;
+        if let Some(identity) = &position_sha256 {
+            hash.update(identity.as_bytes());
+        }
         let prompt_sha256 = crate::hex(hash.finalize());
         // Une bascule DFlash vers MTP préremplit un autre prompt : son écriture
         // ne doit pas remplacer l'instantané du prompt initial à accélérer.
@@ -458,6 +519,7 @@ impl CausalDecoder {
             key: Key {
                 version: FORMAT_VERSION,
                 prompt_sha256,
+                position_sha256,
                 tokens: prompt.len(),
                 sources: sources.to_vec(),
                 binary_sha256: storage::binary_sha256()?.to_owned(),
@@ -595,6 +657,11 @@ impl CausalDecoder {
         if manifest.position != request.key.tokens || manifest.layers.len() != self.layers.len() {
             return Err(invalid("position ou nombre de couches incorrect"));
         }
+        if position_digest(manifest.vision_positions.as_ref(), request.key.tokens)?
+            != request.key.position_sha256
+        {
+            return Err(invalid("contexte positionnel différent de la clé"));
+        }
         manifest.validate(self, request.key.tokens)?;
         let root = &request.root;
         let mut cache = self.empty_cache();
@@ -604,6 +671,9 @@ impl CausalDecoder {
             .map(|layer| layer.read(root))
             .collect::<Result<_>>()?;
         cache.position = manifest.position;
+        cache.rope_delta = manifest.rope_delta;
+        cache.vision_positions = manifest.vision_positions;
+        cache.current_pos()?;
         let final_state = manifest.final_state.read(root)?;
         if final_state.shape() != [1, self.final_norm.data().len()] {
             return Err(invalid("dernière ligne invalide"));
@@ -674,6 +744,14 @@ impl CausalDecoder {
         let Some(request) = request else {
             return;
         };
+        if position_digest(cache.vision_positions.as_ref(), cache.position)
+            .ok()
+            .as_ref()
+            != Some(&request.key.position_sha256)
+        {
+            eprintln!("state_snapshot refusé : contexte positionnel différent de la clé");
+            return;
+        }
         let store = persistent::store().filter(|store| request.root.starts_with(&store.root));
         let mut reservation = None;
         let permit = if let Some(store) = store {
@@ -726,6 +804,16 @@ impl CausalDecoder {
             let manifest = Manifest {
                 key,
                 position: cache.position,
+                rope_delta: cache
+                    .vision_positions
+                    .as_ref()
+                    .map_or(Ok(cache.rope_delta), |p| p.delta_at(cache.position))?,
+                vision_positions: cache
+                    .vision_positions
+                    .as_ref()
+                    .map(|p| p.prefix(cache.position))
+                    .transpose()?
+                    .flatten(),
                 layers,
                 final_state: Dense::write(final_state, &mut writer)?,
                 history,
@@ -813,4 +901,20 @@ impl CausalDecoder {
         self.snapshot_save(&request, &state.cache, &state.final_state, None, None);
         Ok(())
     }
+}
+
+fn position_digest(
+    positions: Option<&crate::vision::prompt::VisionPositions>,
+    tokens: usize,
+) -> Result<Option<String>> {
+    positions
+        .map(|p| p.prefix(tokens))
+        .transpose()?
+        .flatten()
+        .map(|positions| {
+            serde_json::to_vec(&positions)
+                .map(|bytes| storage::digest(&bytes))
+                .map_err(|e| invalid(e.to_string()))
+        })
+        .transpose()
 }

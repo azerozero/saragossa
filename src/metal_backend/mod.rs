@@ -68,6 +68,7 @@ mod linear_attention_encode;
 pub(super) use linear_attention_encode::LinearAttnBatchLayout;
 mod lm_head;
 mod matmul;
+pub(crate) use matmul::DENSE_BF16_GEMM_MIN_BATCH;
 mod matmul_align64;
 mod matmul_encode;
 mod matmul_resident;
@@ -183,6 +184,7 @@ pub(crate) fn qmvt_dispatches_for_test() -> usize {
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
     WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
+    WhisperStepEmit, WhisperStepOutput,
 };
 
 fn ensure_valid_top_k(top_k: usize, expert_count: usize) -> Result<()> {
@@ -356,6 +358,7 @@ pub struct MetalExecutor {
     whisper_attn_decode_vec64_f32: ComputePipelineState,
     im2col_f32: ComputePipelineState,
     rms_norm_rope_heads_f32: ComputePipelineState,
+    rms_norm_mrope_heads_f32: ComputePipelineState,
     rms_norm_heads_no_scale_f32: ComputePipelineState,
     causal_attention_prefill_f32: ComputePipelineState,
     causal_attention_prefill_mid_f32: ComputePipelineState,
@@ -426,6 +429,8 @@ pub struct MetalExecutor {
     sample_gumbel_blocks_f32: ComputePipelineState,
     sample_topk_blocks_f32: ComputePipelineState,
     sample_topk_finalize_f32: ComputePipelineState,
+    sample_topk_scan_blocks_f32: ComputePipelineState,
+    sample_topk_scan_finalize_f32: ComputePipelineState,
     argmax_blocks_f32: ComputePipelineState,
     argmax_finalize_f32: ComputePipelineState,
     talker_greedy_argmax_f32: ComputePipelineState,
@@ -486,6 +491,8 @@ pub struct MetalExecutor {
     /// demande (qmv-T du mode strict, une instance par largeur de lot).
     library: metal::Library,
     micro_library: Mutex<Option<metal::Library>>,
+    /// Bibliothèque micro compilée en fast-math, réservée au MLP fusionné.
+    micro_fast_library: Mutex<Option<metal::Library>>,
     /// Pipelines qmv-T déjà créés, par nom de kernel.
     qmvt_pipelines: Mutex<HashMap<String, ComputePipelineState>>,
     /// Force la rétention des dérivés de poids avant de libérer leurs payloads CPU.
@@ -937,6 +944,8 @@ pub(crate) struct PrefillCaptures {
 pub(crate) enum PrefillInput<'a> {
     /// Flux résiduel déjà plongé `[rows, hidden]`.
     Hidden(&'a Tensor),
+    /// Embeddings fournis et positions par ligne, sans encodeur vision.
+    PositionedHidden(&'a Tensor, &'a [[usize; 3]]),
     /// Jetons plongés sur le GPU morceau par morceau : ni `[rows, hidden]` CPU
     /// ni sa copie GPU (2 × 5,4 Go à 256k sur le 27B). Réservé à un embedding
     /// dont le gather Metal est l'octet près celui du CPU.

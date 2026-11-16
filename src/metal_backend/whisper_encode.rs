@@ -1050,8 +1050,9 @@ impl MetalExecutor {
         h_input: &Tensor,
         dec: &WhisperResidentDecoder,
         kv: &mut WhisperDecodeKv,
-        emit_argmax: bool,
-    ) -> Result<Option<u32>> {
+        emit: WhisperStepEmit,
+    ) -> Result<WhisperStepOutput> {
+        let emit_argmax = emit == WhisperStepEmit::Argmax;
         let (rows, dim) = h_input.as_matrix()?;
         if rows != 1 || dim != dec.d_model {
             return Err(InferError::Dimension(format!(
@@ -1250,13 +1251,15 @@ impl MetalExecutor {
         guard.end();
         commit_and_wait(command_buffer)?;
         kv.len += 1;
-        match next_index {
-            Some(next_index) => read_u32_buffer(&next_index, 1)?
+        match (emit, next_index) {
+            (WhisperStepEmit::Argmax, Some(next_index)) => read_u32_buffer(&next_index, 1)?
                 .into_iter()
                 .next()
-                .map(Some)
+                .map(WhisperStepOutput::Token)
                 .ok_or_else(|| InferError::Metal("decode résident: argmax sans token".to_string())),
-            None => Ok(None),
+            // `h` précède le LayerNorm final : l'appelant applique la tête complète.
+            (WhisperStepEmit::Hidden, _) => read_f32_buffer(&h, dim).map(WhisperStepOutput::Hidden),
+            _ => Ok(WhisperStepOutput::Advanced),
         }
     }
 
@@ -1487,4 +1490,23 @@ pub(crate) struct WhisperDecodeKv {
     pub cross_len: usize,
     pub len: usize,
     pub capacity: usize,
+}
+
+/// Sortie demandée à un pas de decode Whisper résident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WhisperStepEmit {
+    /// Avance le KV sans sortie (préfixe).
+    Nothing,
+    /// Argmax GPU de la tête : seul l'id du token est relu.
+    Argmax,
+    /// Relit l'état caché avant LayerNorm final, pour des logits complets.
+    Hidden,
+}
+
+/// Résultat d'un pas de decode Whisper résident.
+#[derive(Debug)]
+pub(crate) enum WhisperStepOutput {
+    Advanced,
+    Token(u32),
+    Hidden(Vec<f32>),
 }

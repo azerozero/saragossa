@@ -21,6 +21,7 @@ fn fixture(store: &Store, id: u8) -> (CausalDecoder, Request, CausalDecoderPromp
         root: store.root.join(format!("entry-{}", storage::digest(&[id]))),
         key: Key {
             version: FORMAT_VERSION,
+            position_sha256: None,
             prompt_sha256: storage::digest(&[0, 1]),
             tokens: 2,
             sources: vec![],
@@ -43,6 +44,8 @@ fn payload(model: &CausalDecoder, request: &Request, state: &CausalDecoderPrompt
         .map(|layer| Layer::write(layer, &mut writer, model).unwrap())
         .collect();
     let manifest = Manifest {
+        rope_delta: 0,
+        vision_positions: None,
         key: request.key.clone(),
         position: state.position(),
         layers,

@@ -213,8 +213,8 @@ pub(super) fn help_text() -> String {
          --port enables TCP on 127.0.0.1 for grob and requires --api-key \\
          or {API_KEY_ENV}.\n\
          Endpoints: GET /v1/models, POST /v1/chat/completions, \\
-         POST /v1/audio/transcriptions, POST /v1/audio/speech, POST /v1/audio/enhance, \\
-         POST /v1/embeddings"
+         POST /v1/audio/transcriptions, POST /v1/audio/transcriptions/stream, \
+         POST /v1/audio/speech, POST /v1/audio/enhance, POST /v1/embeddings"
     )
 }
 

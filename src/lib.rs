@@ -54,6 +54,7 @@ pub(crate) mod tts_codec;
 pub(crate) mod tts_codec_gpu;
 pub mod tts_mimi;
 pub mod tts_speaker;
+pub(crate) mod vision;
 pub mod whisper;
 #[doc(hidden)]
 pub mod wire_audio;
@@ -135,6 +136,7 @@ pub use tts::{
 };
 pub use whisper::{
     log_mel_spectrogram, WhisperConfig, WhisperDecoder, WhisperEncoder, WhisperModel,
+    WhisperSegment, WhisperStream, WhisperStreamUpdate, WhisperTranscript,
 };
 pub mod decision;
 

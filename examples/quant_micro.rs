@@ -115,15 +115,25 @@ mod macos {
             .with_metal_executor(executor)?;
         if args[0] == "bench" {
             let corpus: Vec<usize> = protocol.chunks.iter().flatten().copied().collect();
+            // Mêmes variables que le mlx_bench.py du banc : longueurs, tokens
+            // décodés et essais (le premier est la chauffe).
+            let env =
+                |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+            let lengths = env("BENCH_LENGTHS", "1024,4096")
+                .split(',')
+                .map(str::parse)
+                .collect::<std::result::Result<Vec<usize>, _>>()?;
+            let decode: usize = env("BENCH_DECODE", "64").parse()?;
+            let trials: usize = env("BENCH_TRIALS", "4").parse()?;
             let mut results = Vec::new();
-            for n in [1024, 4096] {
+            for n in lengths {
                 let prompt: Vec<_> = corpus.iter().copied().cycle().take(n).collect();
-                for trial in 0..4 {
+                for trial in 0..trials {
                     let started = std::time::Instant::now();
                     let mut emissions = Vec::new();
                     let generated = model.generate_greedy_streaming_with_options(
                         &prompt,
-                        64,
+                        decode,
                         &GenerationOptions::default(),
                         |_| {
                             emissions.push(started.elapsed().as_secs_f64());

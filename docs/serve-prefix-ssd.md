@@ -50,7 +50,9 @@ le tier disque ; elle ne change pas la politique historique du cache RAM MTP.
 
 ## Intégrité et publication
 
-Le format post-prefill version 4 est réutilisé sans conversion de précision.
+Le format post-prefill version 5 conserve les précisions existantes et ajoute
+le delta RoPE signé et le contexte positionnel des oracles vision internes.
+Le format v4 est refusé ; les transports média restent fermés.
 La clé inclut les tokens exacts, le format KV, les réglages numériques, le
 binaire, la configuration et les sources du modèle. Les sources comprennent
 **tous les octets des shards**, les sidecars, le tokenizer et sa configuration :
