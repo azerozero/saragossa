@@ -385,6 +385,47 @@ fn micro_fused_mlp_all_scale_bytes_bit_exact() -> Result<()> {
     Ok(())
 }
 
+/// QMV micro à quatre lignes égal au bit au QMV à une ligne : lots 1 et 3,
+/// N non multiple de 16, tous les octets d'échelle.
+#[test]
+#[ignore = "oracle QMV micro : nécessite Metal, lancer sous verrou GPU"]
+fn micro_qmv_rows4_bit_exact_vs_rows1() -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    for mode in [MicroMode::Mxfp4, MicroMode::Nvfp4, MicroMode::Mxfp8] {
+        let (n, k) = (67_usize, 512_usize);
+        let base = weight(mode, n, k)?;
+        let scales = (0..n * k / mode.group_size())
+            .map(|i| (i % 256) as u8)
+            .collect();
+        for w in [
+            base.clone(),
+            MicroQuantizedTensor::new([n, k], base.packed().to_vec(), scales, mode)?,
+        ] {
+            for m in [1_usize, 3] {
+                let x = Tensor::from_vec(
+                    vec![m, k],
+                    (0..m * k)
+                        .map(|i| ((i * 31 % 97) as f32 / 97.0 - 0.5) * 0.3)
+                        .collect(),
+                )?;
+                let one = super::flags::with_micro_qmv_rows4_override(false, || {
+                    metal.matmul_rhs_t_micro(&x, &w)
+                })?;
+                let four = super::flags::with_micro_qmv_rows4_override(true, || {
+                    metal.matmul_rhs_t_micro(&x, &w)
+                })?;
+                assert_eq!(
+                    same_bits(four.data(), one.data()),
+                    None,
+                    "{} M={m}",
+                    mode.name()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Sonde du déroulement `NAX_KK_UNROLL` kernel par kernel, aux formes du 27B :
 /// même source compilée avec et sans la macro.
 #[test]

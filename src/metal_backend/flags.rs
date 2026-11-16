@@ -89,8 +89,31 @@ pub(crate) fn nax_source_prelude() -> &'static str {
 /// gagne 7 à 13 % de bande passante, mais le decode mxfp4 du 27B perd 13 %
 /// (31,2 → 27,2 tok/s, 16 nov. 2026), quatre fois moins de simdgroups en vol.
 pub(crate) fn micro_qmv_rows4_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = MICRO_QMV_ROWS4_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MICRO_QMV_ROWS4", false))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MICRO_QMV_ROWS4_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force le QMV micro à quatre lignes sur ce thread le temps de `run`.
+#[cfg(test)]
+pub(crate) fn with_micro_qmv_rows4_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MICRO_QMV_ROWS4_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(MICRO_QMV_ROWS4_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
+    run()
 }
 
 /// Même fusion pour les poids à micro-échelles (`micro_gemm_gate_up_swiglu_*`),
