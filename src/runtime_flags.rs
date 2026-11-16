@@ -3046,6 +3046,36 @@ pub(crate) fn with_tts_sampler_partial_topk<T>(enabled: bool, work: impl FnOnce(
     out
 }
 
+/// Tirage CPU top-k : sélection des `k` premiers rangs en un balayage des
+/// probabilités (seuil sur la clé `total_cmp` du k-ième) au lieu de
+/// `select_nth_unstable` sur 248k couples. `by_rank` est un ordre total strict :
+/// mêmes rangs, même ordre, au bit près. Défaut ON ;
+/// `SARAGOSSA_SAMPLING_TOPK_SCAN=0` rétablit la sélection historique.
+pub(crate) fn sampling_topk_scan_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = SAMPLING_TOPK_SCAN_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_SAMPLING_TOPK_SCAN", true))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAMPLING_TOPK_SCAN_OVERRIDE: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Force la sélection top-k par balayage pendant `work` (oracles).
+#[cfg(test)]
+pub(crate) fn with_sampling_topk_scan<T>(enabled: bool, work: impl FnOnce() -> T) -> T {
+    let previous = SAMPLING_TOPK_SCAN_OVERRIDE.with(|flag| flag.replace(Some(enabled)));
+    let out = work();
+    SAMPLING_TOPK_SCAN_OVERRIDE.with(|flag| flag.set(previous));
+    out
+}
+
 /// Force le décodage glouton TTS historique pour les oracles.
 #[must_use]
 pub fn tts_greedy_enabled() -> bool {
