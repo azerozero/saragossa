@@ -410,11 +410,13 @@ fn run() -> CliResult<()> {
                 pass_started.elapsed().as_millis()
             );
         }
-        let spec = decoder.generate_greedy_mtp_batched_with_options(
+        let spec = decoder.generate_greedy_mtp_routed(
             &prompt_ids,
             args.max_tokens,
             &options,
             max_draft,
+            saragossa::spec_route::allows_dflash(prompt),
+            |_| true,
         )?;
         let loop_duration = spec.loop_duration;
         let prefill = generate_started.elapsed().saturating_sub(loop_duration);

@@ -2109,6 +2109,15 @@ pub fn mtp_sampled_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_SAMPLED", true))
 }
 
+/// Routage spéculatif par classe de prompt (`SARAGOSSA_RUST_SPEC_ROUTE=1`,
+/// opt-in) : avec un drafter DFlash chargé, seules les consignes qui demandent
+/// du code passent par DFlash, la prose garde la tête MTP
+/// (`crate::spec_route::prompt_prefers_dflash`).
+pub fn spec_route_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_SPEC_ROUTE", false))
+}
+
 /// Route les requêtes échantillonnées (température > 0) vers le drafter DFlash
 /// quand il est configuré (`SARAGOSSA_RUST_DFLASH_DRAFT_DIR`), au lieu de la tête
 /// MTP : chaque ligne de vérification (chaîne ou arbre) est tirée sur le GPU par

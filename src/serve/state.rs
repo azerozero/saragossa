@@ -709,11 +709,12 @@ impl LoadedModel {
             // snapshots par blocs de serve pour ces seules requêtes greedy
             // non guidées ; le chemin AR reste strictement inchangé.
             let mut text_stop = TextStop::new(&self.assets, stop_texts, max_tokens);
-            let output = self.decoder.generate_greedy_mtp_streaming_with_options(
+            let output = self.decoder.generate_greedy_mtp_routed(
                 prompt_tokens_ids,
                 max_tokens,
                 options,
                 mtp::max_draft_tokens(),
+                saragossa::spec_route::allows_dflash(&request.last_user_text()),
                 |token| text_stop.push(token),
             )?;
             text_stop.finish()?;
@@ -820,11 +821,12 @@ impl LoadedModel {
             // du décodeur et by-passe les snapshots serve v1. Le callback observe
             // uniquement les tokens committés, puis le detokenizer existant garde
             // l'exacte même politique de stops et de texte visible.
-            let output = self.decoder.generate_greedy_mtp_streaming_with_options(
+            let output = self.decoder.generate_greedy_mtp_routed(
                 prompt_tokens_ids,
                 max_tokens,
                 options,
                 mtp::max_draft_tokens(),
+                saragossa::spec_route::allows_dflash(&request.last_user_text()),
                 |token| {
                     if stream_error.is_some() {
                         return false;

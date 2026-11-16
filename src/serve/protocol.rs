@@ -115,6 +115,17 @@ const MAX_STOP_SEQUENCES: usize = 16;
 const MAX_STOP_BYTES: usize = 1024;
 
 impl ChatCompletionRequest {
+    /// Texte du dernier message utilisateur, vide s'il n'y en a pas : c'est la
+    /// consigne que lit le routage spéculatif (`saragossa::spec_route`).
+    pub(super) fn last_user_text(&self) -> String {
+        self.messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map(WireMessage::content_text)
+            .unwrap_or_default()
+    }
+
     /// Désérialise sans exposer le diagnostic serde, qui peut citer une valeur.
     /// Le JSON brut reste utilisé sur le chemin valide (ordre des outils).
     pub(super) fn parse(body: &[u8]) -> ServeResult<Self> {

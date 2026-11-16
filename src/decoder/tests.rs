@@ -4276,6 +4276,20 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         routed.stats.proposed_by_position.len(),
         draft.info.block_size
     );
+    // Routage par classe de prompt : sans DFlash, la tête MTP (2 positions)
+    // sert la requête et rend la même suite.
+    if model.mtp.is_some() {
+        let prose = model.generate_greedy_mtp_routed(
+            &prompt,
+            max_new_tokens,
+            &options,
+            2,
+            false,
+            |_| true,
+        )?;
+        assert_eq!(prose.tokens, ar, "greedy routé vers MTP divergent de l'AR");
+        assert!(prose.stats.proposed_by_position.len() <= 2);
+    }
     Ok(())
 }
 

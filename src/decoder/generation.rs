@@ -1285,7 +1285,14 @@ impl CausalDecoder {
         options: &GenerationOptions,
         max_draft_tokens: usize,
     ) -> Result<SpeculativeOutput> {
-        self.generate_greedy_mtp_inner(prompt, max_new_tokens, options, max_draft_tokens, |_| true)
+        self.generate_greedy_mtp_inner(
+            prompt,
+            max_new_tokens,
+            options,
+            max_draft_tokens,
+            true,
+            |_| true,
+        )
     }
 
     /// Comme `generate_greedy_mtp_batched_with_options` mais émet chaque token
@@ -1305,7 +1312,41 @@ impl CausalDecoder {
         max_draft_tokens: usize,
         on_token: impl FnMut(usize) -> bool,
     ) -> Result<SpeculativeOutput> {
-        self.generate_greedy_mtp_inner(prompt, max_new_tokens, options, max_draft_tokens, on_token)
+        self.generate_greedy_mtp_inner(
+            prompt,
+            max_new_tokens,
+            options,
+            max_draft_tokens,
+            true,
+            on_token,
+        )
+    }
+
+    /// Comme `generate_greedy_mtp_streaming_with_options`, mais le drafter DFlash
+    /// chargé n'est pris que si `allow_dflash` : l'appelant route par classe de
+    /// prompt (`crate::spec_route::allows_dflash`), sinon la tête MTP sert la
+    /// requête. Les deux vérifieurs sont exacts : la suite greedy est la même.
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que `generate_greedy_mtp_streaming_with_options`.
+    pub fn generate_greedy_mtp_routed(
+        &self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        options: &GenerationOptions,
+        max_draft_tokens: usize,
+        allow_dflash: bool,
+        on_token: impl FnMut(usize) -> bool,
+    ) -> Result<SpeculativeOutput> {
+        self.generate_greedy_mtp_inner(
+            prompt,
+            max_new_tokens,
+            options,
+            max_draft_tokens,
+            allow_dflash,
+            on_token,
+        )
     }
 
     fn generate_greedy_mtp_inner(
@@ -1314,6 +1355,7 @@ impl CausalDecoder {
         max_new_tokens: usize,
         options: &GenerationOptions,
         max_draft_tokens: usize,
+        allow_dflash: bool,
         on_token: impl FnMut(usize) -> bool,
     ) -> Result<SpeculativeOutput> {
         // NOTE: sans ce scope, le scratch du prefill MTP (clé label × longueur)
@@ -1328,7 +1370,7 @@ impl CausalDecoder {
         // les contraintes. Phase 7 pairwise : code +31 à +88 %, prose longue
         // +7 à +22 %, prose courte −13 à −27 % (docs/perf/mtp-pairwise.md).
         #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-        if let Some(draft) = self.dflash.as_ref() {
+        if let Some(draft) = self.dflash.as_ref().filter(|_| allow_dflash) {
             if super::resident::dflash::dflash_sampling_refusal(options).is_none()
                 && options.token_constraint.is_none()
             {
@@ -1342,6 +1384,8 @@ impl CausalDecoder {
                 );
             }
         }
+        #[cfg(not(all(target_os = "macos", feature = "metal", feature = "devtools")))]
+        let _ = allow_dflash;
         self.generate_greedy_mtp_core(prompt, max_new_tokens, options, max_draft_tokens, on_token)
     }
 

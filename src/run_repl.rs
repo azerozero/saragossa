@@ -280,11 +280,19 @@ impl ChatTurnGenerator for ReplModel {
         let tokens = if self.mtp_active && crate::serve::mtp::supports_options(&self.options, false)
         {
             self.decoder
-                .generate_greedy_mtp_streaming_with_options(
+                .generate_greedy_mtp_routed(
                     &prompt_ids,
                     self.max_tokens,
                     &self.options,
                     crate::serve::mtp::max_draft_tokens(),
+                    saragossa::spec_route::allows_dflash(
+                        history
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == "user")
+                            .and_then(|message| message.content.as_deref())
+                            .unwrap_or(""),
+                    ),
                     on_token,
                 )?
                 .tokens
