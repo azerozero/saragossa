@@ -14,12 +14,13 @@ Requête `multipart/form-data` compatible OpenAI : `file` (WAV), `language`
 | `verbose_json` | tokens `<|t.tt|>` | `text`, `language`, `duration`, `segments[]` |
 
 Chaque segment porte `id`, `seek`, `start`, `end`, `text`, `tokens`,
-`temperature` (toujours 0), `avg_logprob` et `no_speech_prob`. Les règles de
+`temperature` (toujours 0), `avg_logprob`, `compression_ratio` et
+`no_speech_prob`. Les règles de
 timestamps sont celles d'OpenAI (premier timestamp ≤ 1 s, paires croissantes,
-masse des timestamps contre le meilleur token texte). `avg_logprob` et
-`no_speech_prob` sont calculés par fenêtre de 30 s, comme dans `whisper`.
+masse des timestamps contre le meilleur token texte). `avg_logprob`,
+`compression_ratio` (zlib) et `no_speech_prob` sont calculés par fenêtre de
+30 s, comme dans `whisper`.
 En `auto`, `language` est le code ISO détecté après `<|startoftranscript|>`.
-`compression_ratio` est absent.
 
 `timestamp_granularities[]=segment` exige `verbose_json`. `word` répond 501 :
 l'alignement par mot demanderait un DTW sur les têtes de cross-attention.

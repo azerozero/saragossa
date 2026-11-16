@@ -25,6 +25,9 @@ pub struct WhisperSegment {
     pub temperature: f32,
     /// Moyenne des logprobs de la fenêtre, EOT compris, comme OpenAI.
     pub avg_logprob: f32,
+    /// Octets UTF-8 du texte de la fenêtre sur sa taille zlib : une valeur
+    /// haute signale une boucle de répétition.
+    pub compression_ratio: f32,
     /// Probabilité de `<|nospeech|>` après `<|startoftranscript|>`.
     pub no_speech_prob: f32,
 }
@@ -166,6 +169,22 @@ pub(super) fn parse_segments(
     segments
 }
 
+/// Ratio de compression zlib d'OpenAI : `len(texte) / len(zlib(texte))`.
+pub(super) fn compression_ratio(text: &str) -> f32 {
+    use std::io::Write;
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    // Écrire dans un `Vec` n'échoue pas ; sinon le ratio neutre vaut 1.
+    let compressed = encoder
+        .write_all(bytes)
+        .and_then(|()| encoder.finish())
+        .map_or(bytes.len(), |out| out.len());
+    bytes.len() as f32 / compressed.max(1) as f32
+}
+
 fn log_softmax(logits: &[f32]) -> Vec<f32> {
     let norm = log_sum_exp(logits);
     logits.iter().map(|&value| value - norm).collect()
@@ -209,6 +228,15 @@ mod tests {
         let mut logits = vec![0.0; VOCAB];
         logits[token] = 10.0;
         logits
+    }
+
+    #[test]
+    fn compression_ratio_flags_repetition() {
+        assert_eq!(compression_ratio(""), 0.0);
+        let plain = compression_ratio("Le romantisme présentait un élément culturel.");
+        let looped = compression_ratio(&"merci beaucoup ".repeat(40));
+        assert!(plain < 1.5, "{plain}");
+        assert!(looped > 2.4, "{looped}");
     }
 
     #[test]

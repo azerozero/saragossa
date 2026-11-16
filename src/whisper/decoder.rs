@@ -841,6 +841,9 @@ impl WhisperModel {
             )?;
             language = language.or(rules.language);
             let avg_logprob = (rules.sum_logprob / (generated.len() + 1) as f64) as f32;
+            let compression_ratio = super::timestamps::compression_ratio(
+                decode_generated_tokens(&self.tokenizer, &generated)?.trim(),
+            );
             for (start, end, tokens) in
                 parse_segments(&generated, self.eot_token, ts_begin, window_seconds)
             {
@@ -853,6 +856,7 @@ impl WhisperModel {
                     tokens,
                     temperature: 0.0,
                     avg_logprob,
+                    compression_ratio,
                     no_speech_prob: rules.no_speech_prob,
                 });
             }

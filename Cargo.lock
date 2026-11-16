@@ -1729,6 +1729,7 @@ name = "saragossa"
 version = "0.3.1"
 dependencies = [
  "bytemuck",
+ "flate2",
  "fs2",
  "hf-hub",
  "hound",
