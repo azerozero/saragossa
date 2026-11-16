@@ -3052,6 +3052,12 @@ pub(crate) fn with_tts_sampler_partial_topk<T>(enabled: bool, work: impl FnOnce(
 /// token ; un logit NaN, infini ou égal à -FLT_MAX rend la main aux kernels
 /// historiques sur le GPU. Défaut ON ; `SARAGOSSA_SAMPLER_TOPK_SCAN=0`
 /// rétablit le chemin historique.
+///
+/// Contrat : la régularité est jugée sur la valeur classée, donc APRÈS le
+/// softcap (`cap * tanh(x / cap)`), comme le chemin historique qui classe
+/// les logits plafonnés. Un ±inf brut devient ±cap, fini, et reste sur le
+/// balayage ; un NaN reste NaN et part en repli. Sans softcap, la valeur
+/// classée est le logit brut.
 pub(crate) fn sampler_topk_scan_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = SAMPLER_TOPK_SCAN_OVERRIDE.with(std::cell::Cell::get) {
