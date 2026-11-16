@@ -29,6 +29,8 @@ pub(super) struct ServeArgs {
     pub(super) models: Vec<ServeModelConfig>,
     /// Répertoire du modèle STT Whisper exposé sur `/v1/audio/transcriptions`.
     pub(super) stt_model: Option<PathBuf>,
+    /// Répertoire du modèle de diarisation exposé sur `/v1/audio/diarization`.
+    pub(super) diar_model: Option<PathBuf>,
     /// Répertoire du modèle TTS Qwen3 exposé sur `/v1/audio/speech`.
     pub(super) tts_model: Option<PathBuf>,
     /// Répertoire du modèle d'embeddings e5-small exposé sur `/v1/embeddings`.
@@ -66,6 +68,7 @@ impl ServeArgs {
         let mut models = Vec::new();
         let mut stt_model = None;
         let mut tts_model = None;
+        let mut diar_model = None;
         let mut embed_model = None;
         let mut backend = RuntimeKind::default_backend();
         let mut preload = false;
@@ -115,6 +118,9 @@ impl ServeArgs {
                 "--stt-model" => {
                     stt_model = Some(next_value(&mut iter, "--stt-model")?.into());
                 }
+                "--diar-model" => {
+                    diar_model = Some(next_value(&mut iter, "--diar-model")?.into());
+                }
                 "--tts-model" => {
                     tts_model = Some(next_value(&mut iter, "--tts-model")?.into());
                 }
@@ -159,6 +165,7 @@ impl ServeArgs {
             api_key,
             models,
             stt_model,
+            diar_model,
             tts_model,
             embed_model,
             backend,
@@ -186,7 +193,7 @@ pub(super) fn help_text() -> String {
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
          [--api-key TOKEN] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
-         [--stt-model DIR] [--tts-model DIR] [--embed-model DIR] \\
+         [--stt-model DIR] [--diar-model DIR] [--tts-model DIR] [--embed-model DIR] \\
          [--backend cpu|metal] [--preload]\n\
          SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
          --prefix-cache-ssd-priority-tokens 4096 (0 disables priority).\n\
@@ -197,7 +204,8 @@ pub(super) fn help_text() -> String {
          Backward-compatible aliases: --model-27b registers reti-27b, \\
          --model-35b registers reti-35b.\n\
          Audio/embeddings (opt-in, lazy-loaded): --stt-model enables Whisper STT \\
-         on /v1/audio/transcriptions, --tts-model enables Qwen3 TTS on \\
+         on /v1/audio/transcriptions, --diar-model enables Nemotron-3-Diarization \\
+         on /v1/audio/diarization, --tts-model enables Qwen3 TTS on \\
          /v1/audio/speech, --embed-model enables e5-small on /v1/embeddings.\n\
          Safety defaults: --read-timeout-secs {DEFAULT_READ_TIMEOUT_SECS}, \\
          --max-tokens-cap {DEFAULT_MAX_TOKENS_CAP}.\n\
@@ -205,7 +213,7 @@ pub(super) fn help_text() -> String {
          --port enables TCP on 127.0.0.1 for grob and requires --api-key \\
          or {API_KEY_ENV}.\n\
          Endpoints: GET /v1/models, POST /v1/chat/completions, \\
-         POST /v1/audio/transcriptions, POST /v1/audio/speech, POST /v1/embeddings"
+         POST /v1/audio/transcriptions, POST /v1/audio/diarization, POST /v1/audio/speech, POST /v1/embeddings"
     )
 }
 

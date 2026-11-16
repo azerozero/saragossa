@@ -1881,6 +1881,7 @@ impl MetalExecutor {
             v_buffer,
             output_buffer,
             spec,
+            spec.seq,
         )? {
             return Ok(());
         }
@@ -1916,6 +1917,51 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Attention non causale où seules les `key_rows` premières clés comptent :
+    /// les clés de queue sont masquées, toutes les requêtes restent calculées
+    /// (trame de remplissage finale de la diarisation). Exige le Steel d64.
+    #[expect(clippy::too_many_arguments, reason = "buffers d'attention + spec")]
+    pub(super) fn encode_noncausal_attention_prefill_keys(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buffer: &BufferRef,
+        k_buffer: &BufferRef,
+        v_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        spec: PrefillAttentionSpec,
+        key_rows: usize,
+    ) -> Result<()> {
+        if key_rows == spec.seq {
+            return self.encode_noncausal_attention_prefill(
+                encoder,
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                spec,
+            );
+        }
+        if key_rows == 0
+            || key_rows > spec.seq
+            || !self.encode_steel_noncausal_attention_prefill(
+                encoder,
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                spec,
+                key_rows,
+            )?
+        {
+            return Err(InferError::Config(format!(
+                "attention à clés masquées : Steel d64 et 1..={} clés requis, reçu {key_rows}",
+                spec.seq
+            )));
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "buffers d'attention + spec")]
     fn encode_steel_noncausal_attention_prefill(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1924,6 +1970,7 @@ impl MetalExecutor {
         v_buffer: &BufferRef,
         output_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
+        key_rows: usize,
     ) -> Result<bool> {
         let Some(pipeline) = self.steel_attention_f32_bq32_bk32_bd64.as_ref() else {
             return Ok(false);
@@ -1932,13 +1979,21 @@ impl MetalExecutor {
             return Ok(false);
         }
         let n_q = spec.seq.div_ceil(STEEL_ATTN_BQ);
-        let params = steel_attn_params(
+        let mut params = steel_attn_params(
             spec,
             STEEL_ATTN_BQ,
             STEEL_ATTN_BK,
             spec.seq,
             "steel attention",
         )?;
+        if key_rows < spec.seq {
+            // Sans masque causal, `qL_off` est ignoré : réduire kL borne la
+            // boucle des clés et masque le reste du dernier bloc (`kL_rem`).
+            params.k_l = checked_i32(key_rows, "steel attention kL")?;
+            params.n_k = checked_i32(key_rows.div_ceil(STEEL_ATTN_BK), "steel attention")?;
+            params.n_k_aligned = checked_i32(key_rows / STEEL_ATTN_BK, "steel attention")?;
+            params.k_l_rem = checked_i32(key_rows % STEEL_ATTN_BK, "steel attention")?;
+        }
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q_buffer), 0);
         encoder.set_buffer(1, Some(k_buffer), 0);

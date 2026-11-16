@@ -4,6 +4,9 @@
 //! - `POST /v1/audio/transcriptions` : STT Whisper, requête `multipart/form-data`
 //!   (`file` = WAV, plus `model`/`language`/`response_format` optionnels), réponse
 //!   JSON `{"text": ...}` (ou texte brut si `response_format=text`).
+//! - `POST /v1/audio/diarization` : diarisation Nemotron-3-Diarization, même
+//!   multipart (`file` = WAV, `response_format` = `json` par défaut ou `rttm`),
+//!   réponse `{"duration", "segments": [{"speaker", "start", "end"}]}`.
 //! - `POST /v1/audio/speech` : TTS Qwen3, requête JSON `{"model", "input", "voice"?}`,
 //!   réponse WAV par défaut, ou PCM s16le mono chunked avec `stream: true`.
 //!
@@ -42,7 +45,13 @@ const TTS_NOT_CONFIGURED: &str =
 pub(super) struct AudioState {
     backend: RuntimeKind,
     stt: SttSlot,
+    diar: DiarSlot,
     tts: TtsSlot,
+}
+
+struct DiarSlot {
+    path: Option<PathBuf>,
+    model: Option<saragossa::diarization::DiarizationModel>,
 }
 
 struct SttSlot {
@@ -88,6 +97,10 @@ impl AudioState {
                 model: None,
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 metal: None,
+            },
+            diar: DiarSlot {
+                path: args.diar_model.clone(),
+                model: None,
             },
             tts: TtsSlot {
                 path: args.tts_model.clone(),
@@ -144,6 +157,42 @@ impl AudioState {
         }
         self.stt.model = Some(model);
         Ok(())
+    }
+
+    /// Diarise des échantillons mono 16 kHz ; partage l'exécuteur Metal du STT.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le modèle n'est pas configuré ou si l'inférence échoue.
+    pub(super) fn diarize(
+        &mut self,
+        samples: &[f32],
+    ) -> ServeResult<Vec<saragossa::diarization::SpeakerSegment>> {
+        if self.diar.model.is_none() {
+            let path = self.diar.path.clone().ok_or_else(|| {
+                ServeError::args(
+                    "endpoint diarisation non configuré: relancez saragossa serve avec --diar-model <dir>",
+                )
+            })?;
+            eprintln!(
+                "saragossa serve loading diarization model path={}",
+                path.display()
+            );
+            self.diar.model = Some(saragossa::diarization::DiarizationModel::from_model_dir(
+                &path,
+            )?);
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            if self.backend == RuntimeKind::Metal && self.stt.metal.is_none() {
+                self.stt.metal = Some(MetalExecutor::new()?);
+            }
+        }
+        let runtime = self.stt.forward_runtime(self.backend);
+        let model = self
+            .diar
+            .model
+            .as_ref()
+            .ok_or_else(|| ServeError::args("modèle de diarisation absent après chargement"))?;
+        Ok(model.diarize(samples, runtime)?.segments)
     }
 
     fn ensure_tts_loaded(&mut self) -> ServeResult<()> {
@@ -286,6 +335,38 @@ pub(super) fn handle_transcription<S: Write>(
         return send_text(stream, &text);
     }
     send_json(stream, 200, &json!({ "text": text }), Vec::new())
+}
+
+/// Sert `POST /v1/audio/diarization`.
+pub(super) fn handle_diarization<S: Write>(
+    stream: &mut S,
+    audio: &mut AudioState,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> ServeResult<()> {
+    let content_type = content_type
+        .ok_or_else(|| ServeError::Http("Content-Type multipart/form-data requis".to_string()))?;
+    let boundary = extract_boundary(content_type).ok_or_else(|| {
+        ServeError::Http("boundary multipart absente du Content-Type".to_string())
+    })?;
+    let fields = parse_multipart(body, &boundary)?;
+    let file = fields
+        .iter()
+        .find(|field| field.name == "file")
+        .ok_or_else(|| ServeError::Http("champ multipart 'file' requis".to_string()))?;
+    let response_format = text_field(&fields, "response_format").unwrap_or_default();
+    let samples = wav_to_mono_16k(&file.data)?;
+    let segments = audio.diarize(&samples)?;
+    if response_format.eq_ignore_ascii_case("rttm") {
+        return send_text(stream, &saragossa::diarization::to_rttm(&segments, "audio"));
+    }
+    let duration = samples.len() as f64 / 16_000.0;
+    send_json(
+        stream,
+        200,
+        &json!({ "duration": duration, "segments": saragossa::diarization::to_json(&segments) }),
+        Vec::new(),
+    )
 }
 
 /// Sert `POST /v1/audio/speech`.

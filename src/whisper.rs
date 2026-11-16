@@ -424,6 +424,7 @@ impl WhisperEncoder {
             heads: self.config.encoder_attention_heads,
             ffn_dim,
             eps: LAYER_NORM_EPS,
+            rope_theta: None,
         })
     }
 

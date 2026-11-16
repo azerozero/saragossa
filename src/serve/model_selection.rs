@@ -14,6 +14,7 @@ pub(super) fn select_if_missing(args: &mut ServeArgs) -> ServeResult<()> {
     if !args.models.is_empty()
         || args.embed_model.is_some()
         || args.stt_model.is_some()
+        || args.diar_model.is_some()
         || args.tts_model.is_some()
     {
         return Ok(());

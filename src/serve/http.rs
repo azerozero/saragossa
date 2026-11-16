@@ -18,7 +18,7 @@ use serde::Serialize;
 use super::anthropic::{
     anthropic_chat, handle_anthropic_messages, send_anthropic_error, AnthropicSse,
 };
-use super::audio::{handle_speech, handle_transcription};
+use super::audio::{handle_diarization, handle_speech, handle_transcription};
 use super::dispatch::{self, Front};
 use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
@@ -272,6 +272,12 @@ fn route_engine<S: Write>(
             Err(error) => send_failure(stream, &error, true),
         },
         ("POST", "/v1/audio/transcriptions") => handle_transcription(
+            stream,
+            state.audio_mut(),
+            request.header("content-type"),
+            &request.body,
+        ),
+        ("POST", "/v1/audio/diarization") => handle_diarization(
             stream,
             state.audio_mut(),
             request.header("content-type"),

@@ -17,6 +17,7 @@ pub(crate) mod decode_resident;
 pub mod decoder;
 #[cfg(feature = "devtools")]
 pub mod devtools;
+pub mod diarization;
 pub mod embedding;
 pub mod error;
 #[cfg(test)]

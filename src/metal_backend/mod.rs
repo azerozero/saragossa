@@ -354,6 +354,7 @@ pub struct MetalExecutor {
     whisper_attn_decode_vec64_f32: ComputePipelineState,
     im2col_f32: ComputePipelineState,
     rms_norm_rope_heads_f32: ComputePipelineState,
+    rope_heads_inplace_f32: ComputePipelineState,
     rms_norm_heads_no_scale_f32: ComputePipelineState,
     causal_attention_prefill_f32: ComputePipelineState,
     causal_attention_prefill_mid_f32: ComputePipelineState,

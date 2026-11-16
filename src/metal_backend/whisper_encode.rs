@@ -713,9 +713,25 @@ impl MetalExecutor {
         h_input: &Tensor,
         enc: &WhisperResidentEncoder,
     ) -> Result<Tensor> {
+        let (seq, _) = h_input.as_matrix()?;
+        self.encode_whisper_encoder_keys(h_input, enc, seq)
+    }
+
+    /// Comme [`Self::encode_whisper_encoder`], mais seules les `key_rows`
+    /// premières trames servent de clés (trames de queue masquées).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde ou si Metal échoue.
+    pub(crate) fn encode_whisper_encoder_keys(
+        &self,
+        h_input: &Tensor,
+        enc: &WhisperResidentEncoder,
+        key_rows: usize,
+    ) -> Result<Tensor> {
         let (seq, dim) = h_input.as_matrix()?;
         let h = self.upload_f32_buffer(h_input.data(), "we_h")?;
-        let resident = self.encode_whisper_encoder_buffer(&h, seq, dim, enc)?;
+        let resident = self.encode_whisper_encoder_buffer(&h, seq, dim, enc, key_rows)?;
         Tensor::from_vec(
             vec![resident.rows, resident.cols],
             read_f32_buffer(
@@ -731,6 +747,7 @@ impl MetalExecutor {
         seq: usize,
         dim: usize,
         enc: &WhisperResidentEncoder,
+        key_rows: usize,
     ) -> Result<WhisperResidentMatrix> {
         if dim != enc.d_model {
             return Err(InferError::Dimension(format!(
@@ -864,7 +881,13 @@ impl MetalExecutor {
                 dim,
             )?;
             self.encode_proj_bias(encoder, &v, layer.v.bias.as_ref(), seq, dim)?;
-            self.encode_noncausal_attention_prefill(encoder, &q, &k, &v, &ctx, attn_spec)?;
+            if let Some(theta) = enc.rope_theta {
+                self.encode_rope_heads_inplace(encoder, &q, seq, enc.heads, head_dim, theta)?;
+                self.encode_rope_heads_inplace(encoder, &k, seq, enc.heads, head_dim, theta)?;
+            }
+            self.encode_noncausal_attention_prefill_keys(
+                encoder, &q, &k, &v, &ctx, attn_spec, key_rows,
+            )?;
             if na {
                 self.encode_f32_to_bf16(encoder, &ctx, &ctx_bf16, nd)?;
             }
@@ -963,6 +986,44 @@ impl MetalExecutor {
             rows: seq,
             cols: dim,
         })
+    }
+
+    /// RoPE rotate-half en place sur `[seq, heads * head_dim]`, positions `0..seq`.
+    fn encode_rope_heads_inplace(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        x: &BufferRef,
+        seq: usize,
+        heads: usize,
+        head_dim: usize,
+        theta: f32,
+    ) -> Result<()> {
+        if head_dim % 2 != 0 {
+            return Err(InferError::Dimension(format!(
+                "RoPE encodeur: head_dim={head_dim} impair"
+            )));
+        }
+        let dims = [
+            checked_u32(seq, "rope seq")?,
+            checked_u32(heads, "rope heads")?,
+            checked_u32(head_dim, "rope head_dim")?,
+        ];
+        let frequencies = self.rope_frequencies(theta, head_dim)?;
+        encoder.set_compute_pipeline_state(&self.rope_heads_inplace_f32);
+        encoder.set_buffer(0, Some(x), 0);
+        set_u32_bytes(encoder, 1, &dims, "rope_inplace_dims")?;
+        encoder.set_buffer(2, Some(&frequencies), 0);
+        profile_dispatch();
+        encoder.dispatch_threads(
+            MTLSize::new(
+                checked_nsuint(head_dim / 2, "rope pairs")?,
+                checked_nsuint(heads, "rope heads")?,
+                checked_nsuint(seq, "rope seq")?,
+            ),
+            MTLSize::new(32, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
     }
 
     /// GEMM d'une projection encodeur : matmul2d NA (`na`, lhs bf16 + `weight_na`)
@@ -1447,6 +1508,9 @@ pub(crate) struct WhisperResidentEncoder {
     pub heads: usize,
     pub ffn_dim: usize,
     pub eps: f32,
+    /// RoPE rotate-half sur q et k avant l'attention (diarisation Nemotron) ;
+    /// `None` pour Whisper, dont les positions sont apprises.
+    pub rope_theta: Option<f32>,
 }
 
 /// Poids GPU d'une couche décodeur Whisper (self-attn + cross-attn + FFN).
