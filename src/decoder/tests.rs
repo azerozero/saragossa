@@ -7141,9 +7141,11 @@ fn prefix_cache_purge_recovers_poisoned_mutex() -> Result<()> {
 /// Alternance du routage par classe de prompt sur un même décodeur, cache de
 /// préfixe actif : DFlash (tour 1), MTP sur l'entrée DFlash (tour 2), DFlash
 /// sur l'entrée MTP (tour 3), sous 16k et au-delà. Chaque tour égale l'AR non
-/// caché ; le tour MTP reprend tout le tour 1 avec l'historique MTP semé par
-/// le prefill DFlash et le tour DFlash trouve une entrée avec captures, donc
-/// aucun prefill complet. Requiert
+/// caché ; l'historique MTP semé sur GPU par le prefill DFlash (captures et
+/// semis fusionnés) égale, à la tolérance du semis, celui de la référence
+/// semée depuis les états normés de toutes les positions ; le tour MTP reprend
+/// tout le tour 1 avec cet historique et le tour DFlash trouve une entrée avec
+/// captures, donc aucun prefill complet. Requiert
 /// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` (sidecar MTP) et
 /// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`, routage et cache de préfixe actifs.
 #[test]
@@ -7217,6 +7219,39 @@ fn spec_route_alternation_reuses_prefix_real_model() -> Result<()> {
         );
         let turn1 = model.generate_greedy_mtp_routed(&p1, 24, &options, 2, true, |_| true)?;
         assert_eq!(turn1.tokens, ar(&p1)?, "tour DFlash {}", p1.len());
+        let seeded = model
+            .prefix_cache
+            .lock()
+            .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?
+            .entries
+            .iter()
+            .find(|entry| entry.tokens == p1)
+            .and_then(|entry| entry.mtp_history.clone())
+            .ok_or_else(|| InferError::Config("entrée DFlash sans historique MTP".to_string()))?;
+        let (_, final_states, _) =
+            model.prefill_cache_state_with_layer_capture_all(&p1, &layer_ids, keep_rows, true)?;
+        let reference = model.dflash_switch_mtp_history(&p1, &final_states)?;
+        assert_eq!(seeded.len(), p1.len() - 1, "historique semé incomplet");
+        assert_eq!(seeded.len(), reference.len());
+        for (label, gpu, cpu) in [
+            ("K", seeded.keys.to_vec(), reference.keys.to_vec()),
+            ("V", seeded.values.to_vec(), reference.values.to_vec()),
+        ] {
+            assert_eq!(gpu.len(), cpu.len(), "longueur {label}");
+            let scale = cpu.iter().fold(0.0f32, |acc, x| acc.max(x.abs()));
+            let max_err = cpu
+                .iter()
+                .zip(&gpu)
+                .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+            eprintln!(
+                "historique semé {label} prompt={} : max_abs={scale:e} max_err={max_err:e}",
+                p1.len()
+            );
+            assert!(
+                gpu.iter().all(|value| value.is_finite()) && max_err <= 5e-3 * scale,
+                "historique {label} : dérive {max_err:e} / {scale:e}"
+            );
+        }
         let mut p2 = p1.clone();
         p2.extend_from_slice(&turn1.tokens);
         p2.extend(encode(

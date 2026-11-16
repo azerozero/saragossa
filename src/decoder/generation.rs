@@ -3404,7 +3404,7 @@ impl CausalDecoder {
     /// résidente. Le repli CPU du prefill complet ignore cette borne et rend
     /// encore toutes les lignes avec `from = 0` ; l'appelant tronque ensuite.
     #[cfg(feature = "devtools")]
-    fn prefill_cache_state_with_layer_capture_all(
+    pub(super) fn prefill_cache_state_with_layer_capture_all(
         &self,
         prompt: &[usize],
         layer_ids: &[usize],
@@ -5055,7 +5055,7 @@ impl CausalDecoder {
     /// boucle résidente coupe pourtant la bascule ; le prefill ne voit pas les
     /// options et l'entrée reste utile aux requêtes suivantes du même préfixe.
     #[cfg(feature = "devtools")]
-    fn dflash_switch_mtp_history(
+    pub(super) fn dflash_switch_mtp_history(
         &self,
         prompt: &[usize],
         final_states: &Tensor,
