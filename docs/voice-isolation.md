@@ -324,4 +324,3 @@ Pas de référence exécutée : le code dépend de `mamba_ssm` (noyaux CUDA), ab
 sur macOS. Un oracle demanderait d'abord un scan Mamba de référence en PyTorch
 pur. Estimation du port : 6 à 10 jours (scan bidirectionnel GPU, convs 2D
 denses, InstanceNorm, sous-pixel, iSTFT).
-
