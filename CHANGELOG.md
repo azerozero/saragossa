@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6](https://github.com/azerozero/saragossa/compare/v0.3.5...v0.3.6) - 2026-11-16
+
+### Added
+
+- *(denoise)* débruite en flux à mémoire bornée
+
+### Fixed
+
+- *(tts)* réinjecter EOS après le filtre top-k/top-p du talker
+
+### Other
+
+- Merge pull request #244 from azerozero/feat/denoise-flux
+- Merge pull request #243 from azerozero/release-plz-2026-11-16T22-06-49Z
+- Merge pull request #242 from azerozero/fix/tts-wer
+- Merge remote-tracking branch 'origin/main' into feat/denoise-flux
+- Merge remote-tracking branch 'origin/main' into fix/tts-wer
+
 ## [0.3.5](https://github.com/azerozero/saragossa/compare/v0.3.4...v0.3.5) - 2026-11-16
 
 ### Added
