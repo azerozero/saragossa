@@ -1,0 +1,59 @@
+[
+  {
+    "id": "C1",
+    "class": "code",
+    "prompt": "Write a complete Python implementation of Dijkstra's shortest path algorithm, then explain the algorithm step by step."
+  },
+  {
+    "id": "C2",
+    "class": "code",
+    "prompt": "Écris en Rust un cache LRU générique de capacité fixe, avec les méthodes get et put. Donne le code complet puis explique les invariants."
+  },
+  {
+    "id": "C3",
+    "class": "code",
+    "prompt": "Implement a TypeScript async retry function with exponential backoff, jitter, a maximum attempt count and AbortSignal support. Include usage examples."
+  },
+  {
+    "id": "P1",
+    "class": "prose",
+    "prompt": "Explique en français comment les marées influencent la vie dans un port breton. Écris un texte suivi, accessible et concret, sans code."
+  },
+  {
+    "id": "P2",
+    "class": "prose",
+    "prompt": "Write a short story about a lighthouse keeper who receives an unexpected letter during a winter storm. Use vivid prose and dialogue."
+  },
+  {
+    "id": "P3",
+    "class": "prose",
+    "prompt": "Compare les avantages et les difficultés du travail à distance pour une petite équipe. Rédige une analyse nuancée en plusieurs paragraphes avec des exemples concrets."
+  },
+  {
+    "id": "C32",
+    "class": "code",
+    "context_tokens": 32768,
+    "prompt": "Le contexte précédent décrit un journal de port. Écris un programme Python complet qui valide des événements JSON contenant numero, source et charge, détecte les doublons et résume les erreurs."
+  },
+  {
+    "id": "P32",
+    "class": "prose",
+    "context_tokens": 32768,
+    "prompt": "À partir du journal précédent, rédige un récit en français sur une journée dans ce port, depuis les premières livraisons jusqu’à la relève du soir. Utilise uniquement de la prose."
+  },
+  {
+    "id": "M1",
+    "class": "mixed",
+    "prompt": "Écris une fonction Python de tri fusion avec une explication."
+  },
+  {
+    "id": "M2",
+    "class": "mixed",
+    "prompt": "Explique la différence entre un processus et un thread sous Linux, avec un court exemple en Python."
+  },
+  {
+    "id": "M3",
+    "class": "mixed",
+    "prompt": "Voici une fonction.\n\n```python\ndef fusion(a, b):\n    sortie = []\n    while a and b:\n        sortie.append(a.pop(0) if a[0] <= b[0] else b.pop(0))\n    return sortie + a + b\n```\n\nExplique en quelques paragraphes ce que fait ce code et quelles sont ses limites."
+  }
+]

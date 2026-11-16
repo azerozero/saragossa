@@ -1,0 +1,198 @@
+{
+  "code": {
+    "fr": [
+      "Écris une fonction qui trie une liste d'entiers par fusion.",
+      "Implémente une file de priorité générique avec un tas binaire.",
+      "Corrige le bug dans ma boucle qui dépasse la fin du tableau.",
+      "Donne-moi une requête qui compte les commandes par client.",
+      "Écris un script qui renomme tous les fichiers d'un dossier.",
+      "Refactorise cette classe pour séparer la lecture et l'écriture.",
+      "Ajoute des tests unitaires pour la fonction de parsing des dates.",
+      "Écris un serveur HTTP minimal qui répond bonjour.",
+      "Convertis ce programme Java en Kotlin idiomatique.",
+      "Implémente l'algorithme de Dijkstra sur un graphe pondéré."
+    ],
+    "en": [
+      "Write a function that reverses a linked list in place.",
+      "Implement a thread-safe LRU cache with get and put.",
+      "Fix the off-by-one error in this binary search.",
+      "Write a SQL query returning the top five customers by revenue.",
+      "Create a shell script that backs up a directory every night.",
+      "Refactor this module to use dependency injection.",
+      "Add unit tests for the tokenizer and cover edge cases.",
+      "Write a REST endpoint that uploads a file and returns its hash.",
+      "Port this Python class to idiomatic Rust.",
+      "Implement quicksort and explain its complexity."
+    ],
+    "es": [
+      "Escribe una función que valide direcciones de correo.",
+      "Implementa una pila con un arreglo dinámico.",
+      "Corrige el error de compilación de este programa.",
+      "Escribe una consulta que agrupe las ventas por mes.",
+      "Crea un script que descargue una página y cuente las palabras.",
+      "Refactoriza este código para eliminar la duplicación.",
+      "Añade pruebas unitarias a la clase de facturación.",
+      "Programa un servidor web que sirva archivos estáticos.",
+      "Traduce esta función de JavaScript a TypeScript.",
+      "Implementa la búsqueda binaria de forma recursiva."
+    ],
+    "de": [
+      "Schreibe eine Funktion, die Primzahlen bis n berechnet.",
+      "Implementiere eine Warteschlange mit zwei Stapeln.",
+      "Behebe den Fehler in dieser Schleife, die nie endet.",
+      "Schreibe eine Abfrage, die doppelte Einträge findet.",
+      "Erstelle ein Skript, das Logdateien komprimiert.",
+      "Refaktoriere diese Klasse in kleinere Methoden.",
+      "Füge Unit-Tests für den Parser hinzu.",
+      "Programmiere einen kleinen Webserver, der JSON zurückgibt.",
+      "Übersetze dieses Programm von C nach Go.",
+      "Implementiere den Algorithmus von Kruskal."
+    ],
+    "zh": [
+      "写一个函数，判断字符串是否是回文。",
+      "实现一个线程安全的队列。",
+      "修复这段代码里的空指针错误。",
+      "写一个查询，统计每个用户的订单数量。",
+      "写一个脚本，批量压缩图片。",
+      "重构这个类，把读写逻辑分开。",
+      "为解析函数添加单元测试。",
+      "实现一个简单的HTTP服务器。",
+      "把这个程序从Java改写成Go。",
+      "实现快速排序算法并分析复杂度。"
+    ],
+    "ja": [
+      "文字列を反転する関数を書いてください。",
+      "スレッドセーフなキャッシュを実装してください。",
+      "このコードのコンパイルエラーを直してください。",
+      "ユーザーごとの注文数を数えるクエリを書いて。",
+      "フォルダ内のファイル名を一括変更するスクリプトを書いて。",
+      "このクラスをリファクタリングして責務を分けて。",
+      "パーサーのユニットテストを追加してください。",
+      "簡単なWebサーバーをプログラムしてください。",
+      "このプログラムをPythonからRustに移植して。",
+      "二分探索のアルゴリズムを実装してください。"
+    ],
+    "ko": [
+      "문자열을 뒤집는 함수를 작성해 줘.",
+      "스레드 안전한 큐를 구현해 줘.",
+      "이 코드의 컴파일 오류를 고쳐 줘.",
+      "사용자별 주문 수를 세는 쿼리를 작성해 줘.",
+      "폴더의 파일 이름을 바꾸는 스크립트를 작성해 줘.",
+      "이 클래스를 리팩터링해서 역할을 나눠 줘.",
+      "파서에 대한 단위 테스트를 추가해 줘.",
+      "간단한 웹 서버를 프로그래밍해 줘.",
+      "이 프로그램을 자바에서 코틀린으로 옮겨 줘.",
+      "퀵 정렬 알고리즘을 구현해 줘."
+    ],
+    "ru": [
+      "Напиши функцию, которая проверяет палиндром.",
+      "Реализуй потокобезопасную очередь.",
+      "Исправь ошибку компиляции в этой программе.",
+      "Напиши запрос, который считает заказы по клиентам.",
+      "Напиши скрипт, который архивирует логи.",
+      "Отрефактори этот класс и раздели ответственность.",
+      "Добавь модульные тесты для парсера.",
+      "Напиши простой веб-сервер, возвращающий JSON.",
+      "Перепиши эту программу с Java на Go.",
+      "Реализуй алгоритм быстрой сортировки."
+    ]
+  },
+  "prose": {
+    "fr": [
+      "Raconte une histoire courte sur un phare pendant une tempête.",
+      "Explique pourquoi le ciel est bleu à un enfant de dix ans.",
+      "Rédige une lettre de remerciement à une ancienne professeure.",
+      "Résume les causes de la Révolution française en quelques paragraphes.",
+      "Décris une matinée de marché dans un village provençal.",
+      "Donne-moi des conseils pour mieux dormir.",
+      "Écris un poème sur l'automne et les feuilles mortes.",
+      "Compare la vie en ville et la vie à la campagne.",
+      "Explique comment fonctionne la photosynthèse.",
+      "Propose un itinéraire de trois jours en Bretagne."
+    ],
+    "en": [
+      "Tell me a short story about a lighthouse keeper.",
+      "Explain why the sky is blue to a ten-year-old.",
+      "Write a thank-you note to a former teacher.",
+      "Summarize the causes of the First World War.",
+      "Describe a busy morning at a fish market.",
+      "Give me advice on how to sleep better.",
+      "Write a poem about autumn leaves.",
+      "Compare living in the city with living in the countryside.",
+      "Explain how photosynthesis works.",
+      "Suggest a three-day itinerary in Scotland."
+    ],
+    "es": [
+      "Cuéntame una historia corta sobre un faro durante una tormenta.",
+      "Explica por qué el cielo es azul a un niño.",
+      "Escribe una carta de agradecimiento a una antigua profesora.",
+      "Resume las causas de la independencia de México.",
+      "Describe una mañana de mercado en un pueblo andaluz.",
+      "Dame consejos para dormir mejor.",
+      "Escribe un poema sobre el otoño.",
+      "Compara la vida en la ciudad y en el campo.",
+      "Explica cómo funciona la fotosíntesis.",
+      "Propón un itinerario de tres días por Galicia."
+    ],
+    "de": [
+      "Erzähl mir eine kurze Geschichte über einen Leuchtturm im Sturm.",
+      "Erkläre einem Kind, warum der Himmel blau ist.",
+      "Schreibe einen Dankesbrief an eine ehemalige Lehrerin.",
+      "Fasse die Ursachen des Dreißigjährigen Krieges zusammen.",
+      "Beschreibe einen Markttag in einem bayerischen Dorf.",
+      "Gib mir Tipps, um besser zu schlafen.",
+      "Schreibe ein Gedicht über den Herbst.",
+      "Vergleiche das Leben in der Stadt und auf dem Land.",
+      "Erkläre, wie die Photosynthese funktioniert.",
+      "Schlage eine dreitägige Reise an die Ostsee vor."
+    ],
+    "zh": [
+      "讲一个关于暴风雨中灯塔的短故事。",
+      "向十岁的孩子解释为什么天空是蓝色的。",
+      "给以前的老师写一封感谢信。",
+      "概括第一次世界大战的起因。",
+      "描写一个小镇早晨的集市。",
+      "给我一些改善睡眠的建议。",
+      "写一首关于秋天落叶的诗。",
+      "比较城市生活和乡村生活。",
+      "解释光合作用是如何进行的。",
+      "推荐一个三天的云南旅行路线。"
+    ],
+    "ja": [
+      "嵐の中の灯台についての短い物語を書いて。",
+      "空が青い理由を子どもに説明して。",
+      "昔の先生へのお礼の手紙を書いて。",
+      "明治維新の原因を要約して。",
+      "朝の魚市場の様子を描写して。",
+      "よく眠るためのアドバイスをください。",
+      "秋の落ち葉についての詩を書いて。",
+      "都会の生活と田舎の生活を比べて。",
+      "光合成の仕組みを説明して。",
+      "京都での三日間の旅行プランを提案して。"
+    ],
+    "ko": [
+      "폭풍 속 등대에 관한 짧은 이야기를 들려줘.",
+      "하늘이 파란 이유를 아이에게 설명해 줘.",
+      "옛 선생님께 감사 편지를 써 줘.",
+      "조선 왕조가 멸망한 원인을 요약해 줘.",
+      "아침 시장의 풍경을 묘사해 줘.",
+      "잠을 잘 자는 방법을 알려 줘.",
+      "가을 낙엽에 관한 시를 써 줘.",
+      "도시 생활과 시골 생활을 비교해 줘.",
+      "광합성이 어떻게 일어나는지 설명해 줘.",
+      "제주도 삼 일 여행 일정을 추천해 줘."
+    ],
+    "ru": [
+      "Расскажи короткую историю о маяке во время шторма.",
+      "Объясни ребёнку, почему небо голубое.",
+      "Напиши благодарственное письмо бывшей учительнице.",
+      "Кратко изложи причины Первой мировой войны.",
+      "Опиши утро на рыбном рынке.",
+      "Дай советы, как лучше спать.",
+      "Напиши стихотворение об осени.",
+      "Сравни жизнь в городе и в деревне.",
+      "Объясни, как работает фотосинтез.",
+      "Предложи маршрут на три дня по Карелии."
+    ]
+  }
+}
