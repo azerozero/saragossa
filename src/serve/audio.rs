@@ -12,14 +12,14 @@
 //! Les modèles sont opt-in (`--stt-model`, `--tts-model`) et chargés paresseusement
 //! au premier appel : sans configuration, la route renvoie une erreur 400 claire.
 
-#[cfg(feature = "tts")]
+#[cfg(any(feature = "tts", feature = "denoise"))]
 use std::io::Cursor;
 use std::io::Write;
 use std::path::PathBuf;
 
 #[cfg(all(test, feature = "tts"))]
 use hound::WavReader;
-#[cfg(feature = "tts")]
+#[cfg(any(feature = "tts", feature = "denoise"))]
 use hound::{SampleFormat, WavSpec, WavWriter};
 #[cfg(feature = "tts")]
 use serde::Deserialize;
@@ -28,6 +28,7 @@ use serde_json::json;
 
 #[cfg(feature = "tts")]
 use saragossa::tts::TTS_GENERATION_HARD_CAP;
+#[cfg(feature = "denoise")]
 use saragossa::wire_audio::extract_boundary;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[cfg(feature = "stt")]
@@ -64,7 +65,9 @@ pub(super) struct AudioState {
     stt: SttSlot,
     #[cfg(feature = "tts")]
     tts: TtsSlot,
+    #[cfg(feature = "denoise")]
     enhance_path: Option<PathBuf>,
+    #[cfg(feature = "denoise")]
     enhancer: Option<saragossa::denoise::DeepFilterNet3>,
     /// Sessions STT à entrée incrémentale, indépendantes du modèle chargé.
     #[cfg(feature = "stt")]
@@ -125,7 +128,9 @@ impl AudioState {
                 path: args.tts_model.clone(),
                 model: None,
             },
+            #[cfg(feature = "denoise")]
             enhance_path: args.enhance_model.clone(),
+            #[cfg(feature = "denoise")]
             enhancer: None,
             #[cfg(feature = "stt")]
             stt_sessions: super::stt::SttSessions::default(),
@@ -137,6 +142,7 @@ impl AudioState {
     /// # Errors
     ///
     /// Renvoie une erreur si `--enhance-model` est absent ou si les poids sont invalides.
+    #[cfg(feature = "denoise")]
     pub(super) fn enhance(&mut self, samples: &[f32]) -> ServeResult<Vec<f32>> {
         if self.enhancer.is_none() {
             let path = self.enhance_path.clone().ok_or_else(|| {
@@ -365,6 +371,7 @@ fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
 }
 
 /// Sert `POST /v1/audio/enhance` : WAV quelconque en entrée, WAV mono 48 kHz débruité en sortie.
+#[cfg(feature = "denoise")]
 pub(super) fn handle_enhance<S: Write>(
     stream: &mut S,
     audio: &mut AudioState,
@@ -384,7 +391,7 @@ pub(super) fn handle_enhance<S: Write>(
     let (mono, rate) =
         saragossa::denoise::decode_wav(&file.data).map_err(|e| ServeError::Http(e.to_string()))?;
     let rate48 = saragossa::denoise::SAMPLE_RATE;
-    let samples = saragossa::tts_clone::resample(&mono, rate, rate48)
+    let samples = saragossa::denoise::resample(&mono, rate, rate48)
         .map_err(|e| ServeError::Http(e.to_string()))?;
     let wav = mono_f32_to_wav(&audio.enhance(&samples)?, rate48)?;
     write_headers(stream, 200, "OK", "audio/wav", Some(wav.len()), Vec::new())?;
@@ -570,7 +577,7 @@ fn write_pcm_chunk<S: Write>(stream: &mut S, samples: &[f32]) -> std::io::Result
     stream.flush()
 }
 
-#[cfg(feature = "tts")]
+#[cfg(any(feature = "tts", feature = "denoise"))]
 fn pcm_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
 }
@@ -612,7 +619,7 @@ pub(super) fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()>
 // Les cibles fuzz et le serveur exécutent le même décodeur, sans copie.
 #[cfg(all(test, feature = "stt", feature = "tts"))]
 use saragossa::wire_audio::text_field;
-#[cfg(feature = "stt")]
+#[cfg(any(feature = "stt", feature = "denoise"))]
 use saragossa::wire_audio::MultipartField;
 #[cfg(all(test, feature = "stt", feature = "tts"))]
 use saragossa::wire_audio::MAX_WAV_SAMPLES;
@@ -623,7 +630,7 @@ fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult
         .map_err(|e| ServeError::Http(e.0))
 }
 
-#[cfg(feature = "stt")]
+#[cfg(any(feature = "stt", feature = "denoise"))]
 pub(super) fn parse_multipart(body: &[u8], boundary: &str) -> ServeResult<Vec<MultipartField>> {
     saragossa::wire_audio::parse_multipart(body, boundary).map_err(|e| ServeError::Http(e.0))
 }
@@ -634,7 +641,7 @@ pub(super) fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
 }
 
 /// Encode des échantillons mono f32 en WAV PCM i16 en mémoire.
-#[cfg(feature = "tts")]
+#[cfg(any(feature = "tts", feature = "denoise"))]
 fn mono_f32_to_wav(samples: &[f32], sample_rate: u32) -> ServeResult<Vec<u8>> {
     let spec = WavSpec {
         channels: 1,
@@ -1063,6 +1070,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "denoise")]
     fn enhance_without_model_returns_clear_error() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut audio = AudioState::new(&args);
@@ -1083,6 +1091,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "denoise")]
     fn enhance_rejects_invalid_audio_with_http_400_before_model_loading() {
         for (rate, channels, samples, expected) in [
             (0, 1, 8, "taux WAV"),
@@ -1123,6 +1132,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "denoise")]
     fn enhance_model_flag_is_parsed() {
         let args = ServeArgs::parse([
             "--enhance-model".to_string(),

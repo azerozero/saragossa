@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::{cli_error, CliResult};
+use saragossa::denoise::resample;
 use saragossa::denoise::{decode_wav, DeepFilterNet3, SAMPLE_RATE};
-use saragossa::tts_clone::resample;
 
 struct IoArgs {
     model: PathBuf,

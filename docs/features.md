@@ -12,17 +12,27 @@ emplacement ; les gardes portent sur leurs entrées et leurs dépendances.
 | `stt` | Whisper, transcription et sessions incrémentales | `dep:flate2`, `dep:rustfft`, `dep:hound` |
 | `tts` | Talker Qwen3, codec, Mimi, clonage et voix | `dep:rustfft`, `dep:hound` |
 | `vision` | Entrées internes image/embeddings et oracles M-RoPE | Aucune |
-| `denoise` | Nom réservé ; aucun moteur de débruitage dans cette version | Aucune |
+| `denoise` | DeepFilterNet3 CPU, commande `enhance` et route `/v1/audio/enhance` | `dep:rustfft`, `dep:hound` |
 | `embed` | Embedder texte e5-small | Aucune |
 | `serve` | Serveur HTTP/Unix et commandes `serve`, `bench-serve` | Aucune |
 | `decision` | Têtes de décision, lectures empaquetées et classifieurs | Aucune |
 
 Le classifieur spéculatif sur embeddings nécessite `decision` **et** `embed`.
 Sans lui, le routage heuristique du cœur LLM reste disponible. `serve` n'active
-aucune modalité implicitement. Une route STT/TTS/embeddings non compilée répond
-HTTP **501** avec la feature à activer, y compris pour un corps invalide ; une
+aucune modalité implicitement. Une route STT/TTS/débruitage/embeddings non
+compilée répond HTTP **501** avec la feature à activer, y compris pour un corps invalide ; une
 modalité compilée mais non configurée garde son erreur **400** habituelle.
 Les commandes absentes n'apparaissent pas dans l'aide CLI.
+Sans `denoise`, `enhance` est absent et `serve --enhance-model` est refusé,
+comme les options STT/TTS/embeddings. La route `POST /v1/audio/enhance`
+répond alors **501** avant de décoder le corps. Avec `denoise`, les poids DFN3
+sont chargés à la demande depuis `--enhance-model FILE` ; une route non
+configurée conserve son erreur **400**.
+
+`denoise` n'active ni `stt`, ni `tts`, ni `metal` : le moteur DFN3 et son
+rééchantillonnage fonctionnent sur CPU. L'entrée WAV est convertie en mono
+48 kHz et la sortie reste à 48 kHz. Le rééchantillonnage est partagé avec
+TTS et les fixtures STT, sans dépendance entre ces modalités.
 
 `vision` ne livre pas de transport image public ni d'encodeur complet : les
 requêtes média restent refusées comme auparavant. Les validations des en-têtes
@@ -35,7 +45,7 @@ Les pipelines Metal génériques restent partagés entre modalités.
 LLM seul, avec CLI et Metal, sans serveur ni outils de développement :
 
 ```sh
-CARGO_BUILD_JOBS=4 taskpolicy -b cargo build --release --no-default-features --features metal
+CARGO_BUILD_JOBS=2 taskpolicy -b cargo build --release --no-default-features --features metal
 ./target/release/saragossa --help
 ./target/release/saragossa run ./models/llm --backend metal
 ```
@@ -44,13 +54,21 @@ STT comme seule modalité supplémentaire, exposée par le serveur ; le cœur LL
 reste compilé mais aucun modèle LLM n'est chargé :
 
 ```sh
-CARGO_BUILD_JOBS=4 taskpolicy -b cargo build --release --no-default-features --features metal,stt,serve
+CARGO_BUILD_JOBS=2 taskpolicy -b cargo build --release --no-default-features --features metal,stt,serve
 ./target/release/saragossa serve --stt-model ./models/whisper
 ```
 
 Pour intégrer seulement la bibliothèque STT : `--no-default-features --features
 metal,stt`. Pour un moteur CPU, omettre `metal`. L'absence de `devtools` ne
 supprime plus le binaire. Les poids des exemples doivent être présents localement.
+
+Débruitage seul sur CPU, avec la CLI et le serveur :
+
+```sh
+CARGO_BUILD_JOBS=2 taskpolicy -b cargo build --release --no-default-features --features denoise,serve
+./target/release/saragossa enhance --model ./models/dfn3.safetensors --input bruit.wav --output propre.wav
+./target/release/saragossa serve --enhance-model ./models/dfn3.safetensors
+```
 
 ## Vérification des combinaisons
 
@@ -62,7 +80,7 @@ d'outil ni télécharger de dépendance :
 
 ```bash
 set -euo pipefail
-export CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=4
+export CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2
 features=(devtools stt tts vision denoise embed serve decision)
 taskpolicy -b cargo check --all-targets --no-default-features --features metal
 for feature in "${features[@]}"; do

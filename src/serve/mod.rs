@@ -32,7 +32,7 @@
 mod anthropic;
 #[cfg(feature = "serve")]
 mod args;
-#[cfg(any(feature = "stt", feature = "tts"))]
+#[cfg(any(feature = "stt", feature = "tts", feature = "denoise"))]
 #[cfg(feature = "serve")]
 mod audio;
 #[cfg(feature = "serve")]

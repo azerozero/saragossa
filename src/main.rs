@@ -12,6 +12,7 @@ mod hf_cache;
 mod hf_resolve;
 mod run_repl;
 mod serve;
+#[cfg(feature = "denoise")]
 mod voice_cli;
 
 use std::env;
@@ -111,6 +112,7 @@ fn run() -> CliResult<()> {
             "doctor" => return doctor_bench::run_doctor(raw_args.into_iter().skip(1)),
             #[cfg(feature = "decision")]
             "decide" => return decide_cli::run(raw_args.into_iter().skip(1)),
+            #[cfg(feature = "denoise")]
             "enhance" => return voice_cli::run_enhance(raw_args.into_iter().skip(1)),
             "bench" => return doctor_bench::run_bench(raw_args.into_iter().skip(1)),
             #[cfg(feature = "serve")]
@@ -926,7 +928,7 @@ fn help_text() -> String {
     let commands = [
         Some("doctor"),
         Some("bench"),
-        Some("enhance"),
+        cfg!(feature = "denoise").then_some("enhance"),
         cfg!(feature = "serve").then_some("serve"),
         cfg!(feature = "serve").then_some("bench-serve"),
         cfg!(feature = "decision").then_some("decide"),
@@ -1061,6 +1063,7 @@ mod tests {
         for (command, available) in [
             ("bench-serve", cfg!(feature = "serve")),
             ("decide", cfg!(feature = "decision")),
+            ("enhance", cfg!(feature = "denoise")),
             ("convert-qwen4exp", cfg!(feature = "devtools")),
         ] {
             assert_eq!(help.contains(command), available, "{command}: {help}");

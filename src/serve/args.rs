@@ -128,6 +128,7 @@ impl ServeArgs {
                     embed_model = Some(next_value(&mut iter, "--embed-model")?.into());
                 }
                 "--enhance-model" => {
+                    require_feature("--enhance-model", "denoise", cfg!(feature = "denoise"))?;
                     enhance_model = Some(next_value(&mut iter, "--enhance-model")?.into());
                 }
                 "--backend" | "--runtime" => {
@@ -211,7 +212,7 @@ pub(super) fn help_text() -> String {
             "e5-small on /v1/embeddings",
         ),
         (
-            true,
+            cfg!(feature = "denoise"),
             "--enhance-model",
             "DeepFilterNet3 denoising on /v1/audio/enhance",
         ),
@@ -373,6 +374,7 @@ mod tests {
             (cfg!(feature = "stt"), "--stt-model", "stt"),
             (cfg!(feature = "tts"), "--tts-model", "tts"),
             (cfg!(feature = "embed"), "--embed-model", "embed"),
+            (cfg!(feature = "denoise"), "--enhance-model", "denoise"),
         ] {
             assert_eq!(help.contains(flag), enabled, "{flag}");
             let parsed = ServeArgs::parse([flag.to_string(), "/m/modality".to_string()]);
@@ -381,6 +383,7 @@ mod tests {
                 let path = match feature {
                     "stt" => args.stt_model,
                     "tts" => args.tts_model,
+                    "denoise" => args.enhance_model,
                     _ => args.embed_model,
                 };
                 assert_eq!(path, Some(PathBuf::from("/m/modality")));

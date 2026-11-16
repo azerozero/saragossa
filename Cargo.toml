@@ -52,8 +52,7 @@ default = ["metal", "devtools", "stt", "tts", "vision", "denoise", "embed", "ser
 stt = ["dep:flate2", "dep:rustfft", "dep:hound"]
 tts = ["dep:rustfft", "dep:hound"]
 vision = []
-# Réservée : aucun moteur de débruitage dans cette version.
-denoise = []
+denoise = ["dep:rustfft", "dep:hound"]
 embed = []
 serve = []
 decision = []

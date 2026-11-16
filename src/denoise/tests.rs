@@ -228,3 +228,15 @@ fn enhance_rejects_excessive_duration() {
     assert!(matches!(error, InferError::Audio(_)));
     assert!(error.to_string().contains("300 s"));
 }
+
+#[test]
+fn enhance_resampling_preserves_validation_without_tts() {
+    for (from, to) in [(0, SAMPLE_RATE), (SAMPLE_RATE, 0)] {
+        assert!(matches!(resample(&[], from, to), Err(InferError::Audio(_))));
+    }
+    let signal = vec![0.25; 160];
+    assert_eq!(resample(&signal, SAMPLE_RATE, SAMPLE_RATE).unwrap(), signal);
+    let converted = resample(&signal, 16_000, SAMPLE_RATE).unwrap();
+    assert_eq!(converted.len(), 480);
+    assert!(converted.iter().all(|value| value.is_finite()));
+}

@@ -9,7 +9,7 @@
 
 pub mod activation;
 pub mod assets;
-#[cfg(any(feature = "tts", all(test, feature = "stt")))]
+#[cfg(any(feature = "tts", feature = "denoise", all(test, feature = "stt")))]
 mod audio_resample;
 pub mod catalog;
 pub mod chat_template;
@@ -17,6 +17,7 @@ pub mod config;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) mod decode_resident;
 pub mod decoder;
+#[cfg(feature = "denoise")]
 pub mod denoise;
 #[cfg(feature = "devtools")]
 pub mod devtools;
@@ -68,7 +69,7 @@ pub(crate) mod vision;
 #[cfg(feature = "stt")]
 pub mod whisper;
 #[doc(hidden)]
-#[cfg(any(feature = "stt", feature = "tts"))]
+#[cfg(any(feature = "stt", feature = "tts", feature = "denoise"))]
 pub mod wire_audio;
 
 #[cfg(test)]

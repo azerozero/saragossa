@@ -18,6 +18,7 @@ use serde::Serialize;
 use super::anthropic::{
     anthropic_chat, handle_anthropic_messages, send_anthropic_error, AnthropicSse,
 };
+#[cfg(feature = "denoise")]
 use super::audio::handle_enhance;
 #[cfg(feature = "tts")]
 use super::audio::handle_speech;
@@ -301,6 +302,7 @@ fn route_engine<S: Write>(
         ),
         #[cfg(feature = "tts")]
         ("POST", "/v1/audio/speech") => handle_speech(stream, state.audio_mut(), &request.body),
+        #[cfg(feature = "denoise")]
         ("POST", "/v1/audio/enhance") => handle_enhance(
             stream,
             state.audio_mut(),
@@ -322,6 +324,12 @@ fn route_engine<S: Write>(
             stream,
             501,
             "modalité TTS absente : recompiler avec --features tts",
+        ),
+        #[cfg(not(feature = "denoise"))]
+        ("POST", "/v1/audio/enhance") => send_error(
+            stream,
+            501,
+            "modalité débruitage absente : recompiler avec --features denoise",
         ),
         #[cfg(not(feature = "embed"))]
         ("POST", "/v1/embeddings") => send_error(
@@ -1476,6 +1484,7 @@ mod tests {
             ),
             (cfg!(feature = "tts"), "/v1/audio/speech", "tts"),
             (cfg!(feature = "embed"), "/v1/embeddings", "embed"),
+            (cfg!(feature = "denoise"), "/v1/audio/enhance", "denoise"),
         ] {
             if enabled {
                 continue;
