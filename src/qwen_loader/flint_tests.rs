@@ -754,10 +754,7 @@ fn synthetic_flint_prefix_extension_matches_full_prefill() {
         gpu.extend_prompt_state(&mut state, &prompt[split..])
             .expect("invariant: prolongement résident");
         assert_eq!(state.position(), prompt.len());
-        let gap = max_gap(
-            full.final_state_for_test().data(),
-            state.final_state_for_test().data(),
-        );
+        let gap = max_gap(full.final_state().data(), state.final_state().data());
         assert!(gap <= 1.0e-5, "préfixe de {split}: écart {gap}");
         let tokens = gpu
             .generate_greedy_timed_from_prompt_state_with_options(
@@ -1005,8 +1002,8 @@ fn synthetic_flint_window_kv_matches_full_kv_bit_for_bit() {
             );
             assert_eq!(all.kv_rows_for_test(), vec![(0, len); 3], "{label}");
             assert_eq!(
-                bits(kept.final_state_for_test()),
-                bits(all.final_state_for_test()),
+                bits(kept.final_state()),
+                bits(all.final_state()),
                 "{label}: hidden final"
             );
             for options in [&crate::GenerationOptions::default(), &sampled] {
