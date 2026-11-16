@@ -135,19 +135,8 @@ impl DecisionModel {
             }
             Some(id as usize)
         };
-        let tokenizer_json = read_json(&path.join("tokenizer.json"))?;
-        let mut escapes: Vec<String> = tokenizer_json["added_tokens"]
-            .as_array()
-            .ok_or_else(|| invalid("tokens spéciaux absents"))?
-            .iter()
-            .filter(|v| v["special"] == true)
-            .filter_map(|v| v["content"].as_str().map(str::to_owned))
-            .collect();
-        if marker_id.is_some() {
-            escapes.push(MARKER.into());
-        }
-        escapes.sort_by_key(|v| std::cmp::Reverse(v.len()));
-        escapes.dedup();
+        let extra: &[&str] = if marker_id.is_some() { &[MARKER] } else { &[] };
+        let escapes = special_tokens(path, extra)?;
         let (decoder, hidden_size) = load_headless(path, &tokenizer, metal)?;
         let readout =
             crate::safetensor::load_float_tensor(path.join("readout.safetensors"), "weight")?;
@@ -168,11 +157,7 @@ impl DecisionModel {
     }
 
     fn escape(&self, value: &Value) -> String {
-        let mut text = describe(value);
-        for token in &self.escapes {
-            text = text.replace(token, &token.replace('<', "＜").replace('>', "＞"));
-        }
-        text
+        neutralize(&describe(value), &self.escapes)
     }
 
     /// Encode une requête `{state, questions}` dans l'ordre reçu : une
@@ -481,6 +466,33 @@ impl DecisionModel {
             json!({"answers":answers,"usage":{"input_tokens":tokens,"output_tokens":0,"sequences":sequences}}),
         )
     }
+}
+
+/// `added_tokens` spéciaux de `tokenizer.json` plus `extra`, du plus long au
+/// plus court pour que [`neutralize`] remplace d'abord les plus longs.
+fn special_tokens(path: &Path, extra: &[&str]) -> Result<Vec<String>> {
+    let tokenizer_json = read_json(&path.join("tokenizer.json"))?;
+    let mut escapes: Vec<String> = tokenizer_json["added_tokens"]
+        .as_array()
+        .ok_or_else(|| invalid("tokens spéciaux absents"))?
+        .iter()
+        .filter(|v| v["special"] == true)
+        .filter_map(|v| v["content"].as_str().map(str::to_owned))
+        .chain(extra.iter().map(|&t| t.to_owned()))
+        .collect();
+    escapes.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    escapes.dedup();
+    Ok(escapes)
+}
+
+/// Les tokens spéciaux du contenu deviennent des chevrons pleine largeur :
+/// le contenu reste une donnée et ne peut pas ouvrir de tour.
+fn neutralize(text: &str, escapes: &[String]) -> String {
+    let mut text = text.to_owned();
+    for token in escapes {
+        text = text.replace(token, &token.replace('<', "＜").replace('>', "＞"));
+    }
+    text
 }
 
 /// Backbone Qwen3.5 texte sans tête de vocabulaire, remplacée par le readout

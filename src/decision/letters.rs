@@ -8,7 +8,10 @@
 //! pas du prompt ; Sieve-31B ou openjev y ajouteront leur rendu et leurs
 //! lignes (cf. `docs/decision-models.md`).
 
-use super::{calibrated_readout, describe, invalid, load_headless, read_json, truthy};
+use super::{
+    calibrated_readout, describe, invalid, load_headless, neutralize, read_json, special_tokens,
+    truthy,
+};
 use crate::{CausalDecoder, InferError, Result, RustTokenizer, Tensor};
 use serde_json::{json, Map, Value};
 use std::path::Path;
@@ -196,16 +199,7 @@ impl LetterModel {
                 return Err(invalid(format!("label {label:?} : token {id} attendu")));
             }
         }
-        let tokenizer_json = read_json(&path.join("tokenizer.json"))?;
-        let mut escapes: Vec<String> = tokenizer_json["added_tokens"]
-            .as_array()
-            .ok_or_else(|| invalid("tokens spéciaux absents"))?
-            .iter()
-            .filter(|v| v["special"] == true)
-            .filter_map(|v| v["content"].as_str().map(str::to_owned))
-            .collect();
-        escapes.sort_by_key(|v| std::cmp::Reverse(v.len()));
-        escapes.dedup();
+        let escapes = special_tokens(path, &[])?;
         let (decoder, hidden) = load_headless(path, &tokenizer, metal)?;
         if rows.shape()[1] != hidden {
             return Err(invalid("lignes de labels de largeur incompatible"));
@@ -239,11 +233,7 @@ impl LetterModel {
     }
 
     fn escape_text(&self, text: &str) -> String {
-        let mut text = text.to_owned();
-        for token in &self.escapes {
-            text = text.replace(token, &token.replace('<', "＜").replace('>', "＞"));
-        }
-        text
+        neutralize(text, &self.escapes)
     }
 
     /// Mode demandé par une requête (`attention_mode`), sinon celui du modèle.
