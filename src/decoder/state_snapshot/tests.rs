@@ -1202,3 +1202,38 @@ fn vision_snapshot_resume_before_and_after_image_keeps_decode_logits() -> Result
     }
     Ok(())
 }
+
+#[test]
+fn vision_snapshot_before_first_image_resets_delta_and_resumes_text() -> Result<()> {
+    use crate::vision::prompt::{MediaSpan, VisionPositions};
+
+    let dir = tempfile::tempdir().expect("invariant: répertoire temporaire");
+    let (model, request) = fixture(dir.path());
+    let (mut cache, state) = model.prefill_cache_state(&[0, 1])?;
+    let mut expected = cache.clone();
+    // Le KV ne contient que le préfixe texte ; le contexte et son delta
+    // décrivent encore le prompt complet, dont l'image commence après lui.
+    cache.vision_positions = Some(VisionPositions {
+        rows: vec![[0; 3], [1; 3], [2; 3], [2, 2, 3], [2, 3, 2], [2, 3, 3]],
+        media: vec![MediaSpan {
+            start: 2,
+            end: 6,
+            hash: [42; 32],
+        }],
+    });
+    cache.rope_delta = -2;
+    model.snapshot_save(&request, &cache, &state, None, None);
+    let mut restored = model
+        .snapshot_read(request.as_ref().expect("invariant: requête"))?
+        .cache;
+    assert_eq!(restored.position(), 2);
+    assert_eq!(restored.rope_delta, 0);
+    assert!(restored.vision_positions.is_none());
+    assert_eq!(restored.current_pos()?, 2);
+    for token in [0, 1, 0] {
+        let left = model.next_logits_cached(&mut expected, token)?;
+        let right = model.next_logits_cached(&mut restored, token)?;
+        assert_eq!(left.data(), right.data());
+    }
+    Ok(())
+}

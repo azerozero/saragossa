@@ -762,7 +762,10 @@ impl CausalDecoder {
             let manifest = Manifest {
                 key,
                 position: cache.position,
-                rope_delta: cache.rope_delta,
+                rope_delta: cache
+                    .vision_positions
+                    .as_ref()
+                    .map_or(Ok(cache.rope_delta), |p| p.delta_at(cache.position))?,
                 vision_positions: cache
                     .vision_positions
                     .as_ref()
