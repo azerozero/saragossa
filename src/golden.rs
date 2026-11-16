@@ -26,6 +26,7 @@ mod embedder;
 pub(crate) mod external;
 pub(crate) mod kld;
 mod logits;
+mod vision;
 
 /// SHA reti (HEAD à la capture) — le fork mlx-rs vendoré est figé sur MLX 0.31.2.
 pub const MLX_SHA: &str = "be456e2";

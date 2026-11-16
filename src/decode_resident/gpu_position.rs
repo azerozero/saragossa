@@ -1,7 +1,7 @@
 //! Positions lues sur GPU pour RoPE, append KV et SDPA decode.
 //!
 //! Contrat : `ctrl[slot]` (u32) contient la position `P` de la ligne 0 au
-//! moment où le GPU exécute la couche. La ligne `row` est rotée à `P + row`,
+//! moment où le GPU exécute la couche. La ligne `row` est rotée à `P + row + rope_delta`,
 //! écrite dans le KV à `P + row` et attend sur `P + row + 1` lignes. `len` hôte
 //! du KV n'est ni lu ni modifié : l'appelant le resynchronise une seule fois
 //! après le bloc (`FullAttentionMetalState::truncate(position_finale)`).
@@ -53,7 +53,9 @@ kernel void gpu_position_params(
     const GpuPositionTemplate t = templates[i];
     uint4 v = t.base;
     if (t.meta.x < 4u) {
-        v[t.meta.x] = min(ctrl[cfg.x], t.meta.z - t.meta.y) + t.meta.y;
+        const uint token_position = min(ctrl[cfg.x], t.meta.z - t.meta.y) + t.meta.y;
+        // w est un delta signé, nul pour SDPA ; seul RoPE le transporte.
+        v[t.meta.x] = uint(max(0L, long(token_position) + long(as_type<int>(t.meta.w))));
     }
     device uint4* dst = (device uint4*)(params + i * 64u);
     *dst = v;
@@ -78,6 +80,7 @@ pub(crate) struct GpuPosition<'a> {
     pub ctrl: &'a BufferRef,
     pub slot: usize,
     pub max_position: usize,
+    pub rope_delta: i32,
 }
 
 /// Paramètre `constant uint4` : octets hôte ou buffer GPU.
@@ -169,7 +172,7 @@ pub(crate) fn check_gpu_position_rows(
     Ok(())
 }
 
-/// Templates `[base(4), lane, add, max, 0]` pour `rows` lignes, dans l'ordre
+/// Templates `[base(4), lane, add, max, delta_signé]` pour `rows` lignes, dans l'ordre
 /// RoPE q, RoPE k, SDPA `[q, kv, hd, len]`, SDPA 2-passes `[q, kv, len, blocks]`.
 ///
 /// # Errors
@@ -182,7 +185,19 @@ pub(crate) fn gpu_position_templates(
     rope_dims: usize,
     max_position: usize,
     rows: usize,
+    rope_delta: i32,
 ) -> Result<Vec<[u32; 8]>> {
+    if rows == 0 || rows > GPU_POSITION_MAX_ROWS || max_position > u32::MAX as usize - rows {
+        return Err(InferError::Dimension(
+            "géométrie position GPU hors limites".into(),
+        ));
+    }
+    let max_rope = i64::from(rope_delta) + max_position as i64;
+    if max_rope < 0 || max_rope + rows as i64 > i64::from(u32::MAX) {
+        return Err(InferError::Dimension(
+            "position GPU + delta RoPE hors u32".into(),
+        ));
+    }
     let q = to_u32(q_heads, "position GPU q_heads")?;
     let kv = to_u32(kv_heads, "position GPU kv_heads")?;
     let hd = to_u32(head_dim, "position GPU head_dim")?;
@@ -196,8 +211,8 @@ pub(crate) fn gpu_position_templates(
             sdpa_2pass_blocks(max_position + row + 1),
             "position GPU blocks",
         )?;
-        templates.push([q, hd, rd, 0, 3, r, pos_max, 0]);
-        templates.push([kv, hd, rd, 0, 3, r, pos_max, 0]);
+        templates.push([q, hd, rd, 0, 3, r, pos_max, rope_delta as u32]);
+        templates.push([kv, hd, rd, 0, 3, r, pos_max, rope_delta as u32]);
         templates.push([q, kv, hd, 0, 3, r + 1, len_max, 0]);
         templates.push([q, kv, 0, blocks, 2, r + 1, len_max, 0]);
     }
@@ -213,7 +228,8 @@ pub(crate) fn gpu_position_params_cpu(templates: &[[u32; 8]], ctrl_value: u32) -
         .map(|t| {
             let mut v = [t[0], t[1], t[2], t[3]];
             if let Some(slot) = v.get_mut(t[4] as usize) {
-                *slot = ctrl_value.min(t[6] - t[5]) + t[5];
+                *slot = (i64::from(ctrl_value.min(t[6] - t[5]) + t[5]) + i64::from(t[7] as i32))
+                    .max(0) as u32;
             }
             v
         })
@@ -341,6 +357,7 @@ impl DecodeResidentState {
             rope_dims,
             position.max_position,
             rows,
+            position.rope_delta,
         )?;
         let params = self
             .scratch()
@@ -375,4 +392,18 @@ impl DecodeResidentState {
             copy_at_position: kernels.copy_at_position.clone(),
         })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn vision_gpu_position_delta_changes_only_rope_parameters() -> Result<()> {
+    let templates = gpu_position_templates(4, 2, 256, 64, 90, 2, -56)?;
+    let actual = gpu_position_params_cpu(&templates, 80);
+    assert_eq!(actual[0], [4, 256, 64, 24]);
+    assert_eq!(actual[1], [2, 256, 64, 24]);
+    assert_eq!(actual[2], [4, 2, 256, 81]);
+    assert_eq!(actual[4], [4, 256, 64, 25]);
+    assert_eq!(actual[6], [4, 2, 256, 82]);
+    assert!(gpu_position_templates(4, 2, 256, 64, 20, 2, -56).is_err());
+    Ok(())
 }

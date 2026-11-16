@@ -36,6 +36,11 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def hash_records(hashes):
+    """Sépare les chemins des empreintes pour éviter les faux secrets JSON."""
+    return [{"path": path, "sha256": sha256} for path, sha256 in hashes.items()]
+
+
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n")
@@ -68,7 +73,7 @@ def environment():
     if versions["transformers"] != "5.8.1" or versions["torch"] != "2.12.0":
         raise RuntimeError("oracle figé pour transformers 5.8.1 / torch 2.12.0")
     root = Path(transformers.__file__).parent
-    sources = {name: digest((root / name).read_bytes()) for name in SOURCES}
+    sources = hash_records({name: digest((root / name).read_bytes()) for name in SOURCES})
     return {
         "versions": versions,
         "transformers_source_sha256": sources,
@@ -189,8 +194,8 @@ def inspect_model(path):
         "declared_transformers_version": config.get("transformers_version"),
         "config_sha256": digest((path / "config.json").read_bytes()),
         "tokenizer_sha256": digest((path / "tokenizer.json").read_bytes()),
-        "runtime_source_sha256": {p.name: digest(p.read_bytes()) for p in
-                                  [path / "d3_runtime.py"] if p.is_file()},
+        "runtime_source_sha256": hash_records({p.name: digest(p.read_bytes()) for p in
+                                               [path / "d3_runtime.py"] if p.is_file()}),
         "prefix": next(iter(prefixes)), "conv_layout": "OTHWI" if path.name == MODELS[1] else "OITHW",
         "linear_layout": "OI", "processors": processors,
         "effective_image_pixels": [65536, 1638400 if path.name in MODELS[2:] else 16777216],
