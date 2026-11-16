@@ -167,16 +167,17 @@ def main():
                         "threshold": {k: (2 * v).tolist() for k, v in noise.items()}})
     import transformers
     source_root = Path(transformers.__file__).parent
-    environment["loaded_transformers_sources_sha256"] = {
+    environment["loaded_transformers_sources_sha256"] = helpers["hash_records"]({
         str(Path(module.__file__).relative_to(source_root)): hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
         for name, module in sorted(sys.modules.items())
         if name.startswith("transformers.") and getattr(module, "__file__", None)
         and Path(module.__file__).suffix == ".py"
         and Path(module.__file__).is_relative_to(source_root)
-    }
+    })
     result = {"schema_version": 1, "checkpoint": args.model.name, "environment": environment,
               "device": args.device, "attention": "eager", "weights_source_dtype": "BF16", "head_chunk_rows": 32768,
-              "weight_sha256": weight_hashes, "embedding_sha256": embedding_hashes,
+              "weight_sha256": helpers["hash_records"](weight_hashes),
+              "embedding_sha256": helpers["hash_records"](embedding_hashes),
               "config_sha256": hashlib.sha256((args.model / "config.json").read_bytes()).hexdigest(),
               "mrope_inputs_sha256": hashlib.sha256((args.fixtures / "mrope-inputs.json").read_bytes()).hexdigest(),
               "rule": "exactly twice BF16 versus f32; frozen before Rust comparison", "cases": records}

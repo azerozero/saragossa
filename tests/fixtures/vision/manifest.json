@@ -10,19 +10,37 @@
       "tokenizers": "0.22.2",
       "pillow": "12.2.0"
     },
-    "transformers_source_sha256": {
-      "models/qwen3_5/modeling_qwen3_5.py": "641da34484f6b9769e28615c680cc4e3202afbf5bdbf1da7d56d5a3d678918c7",
-      "models/qwen3_5/configuration_qwen3_5.py": "e2ca3e05c3f3e7ed2c4f452043bc33640c67a24799adb054ba24fab6badfbd8c",
-      "models/qwen2_vl/image_processing_qwen2_vl.py": "f19497685281402691f0049a0ab5be8085f92fb5c37adfcc680e4ccd17863a77",
-      "models/qwen3_vl/processing_qwen3_vl.py": "b51f77d783b4a88d503bf9198828d46f71e3ead3833da2631748188b159253ba",
-      "models/qwen3_vl/video_processing_qwen3_vl.py": "1ca916fbb1531bf3c2ef4bf862ecb790f88c084ba99f27e324ff491a5b7abc67",
-      "image_processing_backends.py": "88ca316e2e804ccea2b0d6fb5971e2a4bc5765d89a114e902698b0b1909e34e1"
-    },
-    "transformers_sha256": "7ad6164777f7781930200df36f70b40dbbc9e5c037899702413d624f2f5895ee",
+    "transformers_source_sha256": [
+      {
+        "path": "models/qwen3_5/modeling_qwen3_5.py",
+        "sha256": "641da34484f6b9769e28615c680cc4e3202afbf5bdbf1da7d56d5a3d678918c7"
+      },
+      {
+        "path": "models/qwen3_5/configuration_qwen3_5.py",
+        "sha256": "e2ca3e05c3f3e7ed2c4f452043bc33640c67a24799adb054ba24fab6badfbd8c"
+      },
+      {
+        "path": "models/qwen2_vl/image_processing_qwen2_vl.py",
+        "sha256": "f19497685281402691f0049a0ab5be8085f92fb5c37adfcc680e4ccd17863a77"
+      },
+      {
+        "path": "models/qwen3_vl/processing_qwen3_vl.py",
+        "sha256": "b51f77d783b4a88d503bf9198828d46f71e3ead3833da2631748188b159253ba"
+      },
+      {
+        "path": "models/qwen3_vl/video_processing_qwen3_vl.py",
+        "sha256": "1ca916fbb1531bf3c2ef4bf862ecb790f88c084ba99f27e324ff491a5b7abc67"
+      },
+      {
+        "path": "image_processing_backends.py",
+        "sha256": "88ca316e2e804ccea2b0d6fb5971e2a4bc5765d89a114e902698b0b1909e34e1"
+      }
+    ],
+    "transformers_sha256": "84650b7dcdbde2ec65c9d9a4328bfa7c99fdb300a5a86ef5553718133beeb868",
     "transformers_git_sha": null,
     "git_sha_note": "wheel installé sans métadonnée Git ; SHA256 des sources exécutées",
     "python": "3.13.15",
-    "reference_script_sha256": "0f4bf215be8e32979c3e3c8a93989a71fd4f98cd522a9eac9bf0c0ee98eda29a"
+    "reference_script_sha256": "64bd6a683f23876d2416368417dc1f5118a06f4d6521048af04e3d532f579789"
   },
   "checkpoints": [
     {
@@ -59,7 +77,7 @@
       "declared_transformers_version": "5.8.0.dev0",
       "config_sha256": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
       "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
-      "runtime_source_sha256": {},
+      "runtime_source_sha256": [],
       "prefix": "model.visual.",
       "conv_layout": "OITHW",
       "linear_layout": "OI",
@@ -5011,7 +5029,7 @@
       "declared_transformers_version": "4.57.1",
       "config_sha256": "a822a9e48b0aafbe3144ec37d4fb067e178ed96615ce6e4420b3149893cc5767",
       "tokenizer_sha256": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4",
-      "runtime_source_sha256": {},
+      "runtime_source_sha256": [],
       "prefix": "vision_tower.",
       "conv_layout": "OTHWI",
       "linear_layout": "OI",
@@ -9979,7 +9997,7 @@
       "declared_transformers_version": "5.17.0",
       "config_sha256": "3d035715dce62a43e2a85fe3640db71418a0c0cf7cc92e11418c839caedc10e9",
       "tokenizer_sha256": "6f32ce20dc35f57a7f9ad1eac03525bd7d30f9df8cea6507e958279cc3657706",
-      "runtime_source_sha256": {},
+      "runtime_source_sha256": [],
       "prefix": "visual.",
       "conv_layout": "OITHW",
       "linear_layout": "OI",
@@ -14371,9 +14389,12 @@
       "declared_transformers_version": "5.17.0",
       "config_sha256": "9c3e6eea217964096c7b032285bab6757720a847fbb9d0a04e551d2b1606c0eb",
       "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
-      "runtime_source_sha256": {
-        "d3_runtime.py": "adf7f7aa085674b5682e492d8b2e3cc4f11c67b0d153515c742e907e9b550917"
-      },
+      "runtime_source_sha256": [
+        {
+          "path": "d3_runtime.py",
+          "sha256": "adf7f7aa085674b5682e492d8b2e3cc4f11c67b0d153515c742e907e9b550917"
+        }
+      ],
       "prefix": "visual.",
       "conv_layout": "OITHW",
       "linear_layout": "OI",

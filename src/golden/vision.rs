@@ -30,8 +30,13 @@ struct Calibration {
     schema_version: u32,
     mrope_inputs_sha256: String,
     config_sha256: String,
-    embedding_sha256: std::collections::BTreeMap<String, String>,
+    embedding_sha256: Vec<SourceHash>,
     cases: Vec<CalibratedCase>,
+}
+#[derive(Deserialize)]
+struct SourceHash {
+    path: String,
+    sha256: String,
 }
 #[derive(Deserialize)]
 struct CalibratedCase {
@@ -164,10 +169,10 @@ fn calibration_is_frozen() -> TestResult {
     assert_eq!(calibration.cases.len(), 6);
     assert_eq!(calibration.config_sha256.len(), 64);
     assert_eq!(calibration.embedding_sha256.len(), 3);
-    for (name, expected) in &calibration.embedding_sha256 {
+    for entry in &calibration.embedding_sha256 {
         assert_eq!(
-            crate::hex(Sha256::digest(std::fs::read(root().join(name))?)),
-            *expected
+            crate::hex(Sha256::digest(std::fs::read(root().join(&entry.path))?)),
+            entry.sha256
         );
     }
     assert_eq!(
