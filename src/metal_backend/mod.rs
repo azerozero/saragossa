@@ -429,6 +429,8 @@ pub struct MetalExecutor {
     sample_gumbel_blocks_f32: ComputePipelineState,
     sample_topk_blocks_f32: ComputePipelineState,
     sample_topk_finalize_f32: ComputePipelineState,
+    sample_topk_scan_blocks_f32: ComputePipelineState,
+    sample_topk_scan_finalize_f32: ComputePipelineState,
     argmax_blocks_f32: ComputePipelineState,
     argmax_finalize_f32: ComputePipelineState,
     talker_greedy_argmax_f32: ComputePipelineState,
