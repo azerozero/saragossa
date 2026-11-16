@@ -1547,8 +1547,24 @@ impl MetalExecutor {
         profile_dispatch();
         encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 1, 1));
         post_dispatch_barrier(encoder);
+        #[cfg(test)]
+        SAMPLER_SCAN_RUNS.with(|runs| runs.borrow_mut().push(run.clone()));
         Ok(run)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Drapeaux `run` des balayages encodés, pour que les oracles vérifient le
+    /// chemin réellement pris (0 : balayage, 1 : repli historique).
+    static SAMPLER_SCAN_RUNS: std::cell::RefCell<Vec<metal::Buffer>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Vide et rend les drapeaux `run` des balayages encodés sur ce thread.
+#[cfg(test)]
+pub(super) fn take_sampler_scan_runs() -> Vec<metal::Buffer> {
+    SAMPLER_SCAN_RUNS.with(|runs| std::mem::take(&mut *runs.borrow_mut()))
 }
 
 /// Logits par threadgroup du balayage top-k (1024 threads × 8).
