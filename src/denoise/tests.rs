@@ -149,3 +149,82 @@ fn dfn3_hop_latency() {
         q(0.5) / 10_000.0
     );
 }
+
+mod synthetic;
+
+#[test]
+fn enhance_limits_duration_and_resampled_size_without_allocation() {
+    for rate in [8_000, 16_000, 44_100, 48_000, 192_000] {
+        let limit = MAX_DURATION_SECS * u64::from(rate);
+        assert_eq!(
+            validate_input_length(limit, rate).unwrap(),
+            MAX_AUDIO_SAMPLES
+        );
+        assert!(validate_input_length(limit + 1, rate)
+            .unwrap_err()
+            .0
+            .contains("300 s"));
+    }
+    assert!(validate_input_length(u64::MAX, 8_000).is_err());
+    assert!(validate_input_length(1, 0)
+        .unwrap_err()
+        .0
+        .contains("taux WAV"));
+    assert_eq!(validate_input_length(1, 44_100).unwrap(), 2);
+}
+
+#[test]
+fn enhance_preserves_partial_hops_and_matches_streaming() {
+    let model = synthetic::model();
+    for len in [
+        0,
+        1,
+        HOP_SIZE - 1,
+        HOP_SIZE,
+        HOP_SIZE + 1,
+        2 * HOP_SIZE - 1,
+        2 * HOP_SIZE + 17,
+    ] {
+        let input: Vec<f32> = (0..len)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+            .collect();
+        let output = model.enhance(&input).unwrap();
+        assert_eq!(output.len(), len);
+        assert!(output.iter().all(|x| x.is_finite()));
+        // Oracle par flux : conserve le hop partiel et vide explicitement le retard.
+        let mut stream = model.stream();
+        let mut reference = Vec::new();
+        let mut hop = [0.0; HOP_SIZE];
+        for chunk in input.chunks(HOP_SIZE) {
+            let mut padded = [0.0; HOP_SIZE];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            stream.process_hop(&padded, &mut hop).unwrap();
+            reference.extend_from_slice(&hop);
+        }
+        for _ in 0..FFT_SIZE / HOP_SIZE {
+            stream.process_hop(&[0.0; HOP_SIZE], &mut hop).unwrap();
+            reference.extend_from_slice(&hop);
+        }
+        reference.extend(stream.finish());
+        assert_eq!(
+            output,
+            reference[DfStream::DELAY_SAMPLES..DfStream::DELAY_SAMPLES + len]
+        );
+        if len > HOP_SIZE {
+            assert!(
+                output.last().unwrap().abs() > 0.01,
+                "fin de signal perdue: {len}"
+            );
+        }
+    }
+}
+
+#[test]
+fn enhance_rejects_excessive_duration() {
+    let model = synthetic::model();
+    let error = model
+        .enhance(&vec![0.0; MAX_AUDIO_SAMPLES + 1])
+        .unwrap_err();
+    assert!(matches!(error, InferError::Audio(_)));
+    assert!(error.to_string().contains("300 s"));
+}

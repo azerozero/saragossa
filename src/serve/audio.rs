@@ -1037,6 +1037,46 @@ mod tests {
     }
 
     #[test]
+    fn enhance_rejects_invalid_audio_with_http_400_before_model_loading() {
+        for (rate, channels, samples, expected) in [
+            (0, 1, 8, "taux WAV"),
+            (8_000, 1, 8_000 * 300 + 1, "300 s"),
+            (8_000, 2, 2 * (8_000 * 300 + 1), "300 s"),
+        ] {
+            let wav = pcm_wav(rate, channels, 16, samples);
+            let body = multipart_body("BND", &wav, None);
+            let mut raw = format!(
+                "POST /v1/audio/enhance HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=BND\r\nContent-Length: {}\r\n\r\n", body.len()
+            ).into_bytes();
+            raw.extend_from_slice(&body);
+            let request = super::super::http::read_request(
+                &mut Cursor::new(raw),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap()
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let args = ServeArgs::parse([
+                "--enhance-model".to_string(),
+                dir.path()
+                    .join("absent.safetensors")
+                    .to_string_lossy()
+                    .into_owned(),
+            ])
+            .unwrap();
+            let mut state = super::super::state::ServeState::new(&args);
+            let mut response = Vec::new();
+            let error =
+                super::super::http::handle_job(&mut response, &mut state, &request).unwrap_err();
+            assert!(matches!(error, ServeError::Http(_)), "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+            assert!(String::from_utf8_lossy(&response).contains(expected));
+            assert!(state.audio_mut().enhancer.is_none());
+        }
+    }
+
+    #[test]
     fn enhance_model_flag_is_parsed() {
         let args = ServeArgs::parse([
             "--enhance-model".to_string(),

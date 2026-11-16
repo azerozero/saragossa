@@ -309,6 +309,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zero_rates_return_typed_errors_even_for_empty_audio() {
+        for samples in [&[][..], &[0.25][..]] {
+            for (from, to) in [(0, 24_000), (24_000, 0), (0, 0)] {
+                assert!(matches!(
+                    resample(samples, from, to),
+                    Err(InferError::Audio(_))
+                ));
+            }
+        }
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(
+                &mut cursor,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 24_000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            writer.write_sample(1_i16).unwrap();
+            writer.finalize().unwrap();
+        }
+        let mut wav = cursor.into_inner();
+        wav[24..32].fill(0);
+        assert!(matches!(decode_wav_mono(&wav), Err(InferError::Audio(_))));
+        assert!(matches!(load_wav_24k(&wav), Err(InferError::Audio(_))));
+    }
+
+    #[test]
     fn resample_preserves_same_rate() {
         let samples = vec![0.1, -0.2, 0.3, 0.4];
         assert_eq!(resample(&samples, 24_000, 24_000).unwrap(), samples);

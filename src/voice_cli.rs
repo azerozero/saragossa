@@ -84,3 +84,40 @@ pub(crate) fn run_enhance(args: impl Iterator<Item = String>) -> CliResult<()> {
     );
     write_wav(&io.output, &out, SAMPLE_RATE)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enhance_rejects_zero_rate_before_loading_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.wav");
+        let output = dir.path().join("output.wav");
+        write_wav(&input, &[0.25], SAMPLE_RATE).unwrap();
+        let mut wav = std::fs::read(&input).unwrap();
+        wav[24..32].fill(0);
+        std::fs::write(&input, wav).unwrap();
+        let error = run_enhance(
+            [
+                "--model".into(),
+                dir.path()
+                    .join("absent.safetensors")
+                    .to_string_lossy()
+                    .into_owned(),
+                "--input".into(),
+                input.to_string_lossy().into_owned(),
+                "--output".into(),
+                output.to_string_lossy().into_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<saragossa::InferError>(),
+            Some(saragossa::InferError::Audio(_))
+        ));
+        assert!(error.to_string().contains("taux WAV"));
+        assert!(!output.exists());
+    }
+}
