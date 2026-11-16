@@ -1531,11 +1531,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "stt", feature = "tts", feature = "embed"))]
     fn auxiliary_only_startup_keeps_llm_routes_explicitly_unavailable() {
         for flags in [
+            #[cfg(feature = "embed")]
             vec!["--embed-model"],
+            #[cfg(feature = "stt")]
             vec!["--stt-model"],
+            #[cfg(feature = "tts")]
             vec!["--tts-model"],
+            #[cfg(all(feature = "stt", feature = "tts", feature = "embed"))]
             vec!["--stt-model", "--tts-model", "--embed-model"],
         ] {
             let mut args = ServeArgs::parse(
