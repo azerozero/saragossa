@@ -131,6 +131,66 @@ fn micro_dequant_and_matmul_bit_exact() -> Result<()> {
     Ok(())
 }
 
+/// MLP micro fusionné (gate+up+SwiGLU, H bf16, down sur H bf16) égal au bit
+/// au chemin séparé du prefill : gate, up, `swiglu_f32`, conversion bf16, down.
+/// Entrées non dyadiques et lots 16/65/130 : bords M, exp et arrondis exercés.
+#[test]
+#[ignore = "oracle MLP micro : nécessite Metal, lancer sous verrou GPU"]
+fn micro_fused_mlp_bit_exact_vs_unfused() -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    let (hidden, inter) = (256_usize, 192_usize);
+    for mode in [MicroMode::Mxfp4, MicroMode::Nvfp4, MicroMode::Mxfp8] {
+        let weights = [
+            weight(mode, inter, hidden)?,
+            weight(mode, inter, hidden)?,
+            weight(mode, hidden, inter)?,
+        ];
+        let [g, u, d] = [
+            metal.resolve_micro(&weights[0])?,
+            metal.resolve_micro(&weights[1])?,
+            metal.resolve_micro(&weights[2])?,
+        ];
+        let [gate, up, down] =
+            [g.clone(), u.clone(), d.clone()].map(MetalLinearWeightBuffers::MicroScaled);
+        for m in [16_usize, 65, 130] {
+            assert!(metal.fused_dense_mlp_supported(m, hidden, &gate, &up, &down, inter));
+            let x: Vec<f32> = (0..m * hidden)
+                .map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * 0.37)
+                .collect();
+            let lhs = metal.upload_f32_buffer(&x, "micro_mlp_lhs")?;
+            let fused = metal.new_f32_buffer(m * hidden, "micro_mlp_fused")?;
+            let gate_out = metal.new_f32_buffer(m * inter, "micro_mlp_gate")?;
+            let up_out = metal.new_f32_buffer(m * inter, "micro_mlp_up")?;
+            let h = metal.new_f32_buffer(m * inter, "micro_mlp_h")?;
+            let split = metal.new_f32_buffer(m * hidden, "micro_mlp_split")?;
+            let cb = metal.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            metal.encode_fused_dense_mlp(enc, &lhs, m, hidden, &gate, &up, &down, inter, &fused)?;
+            metal.encode_micro(enc, &lhs, &gate_out, m, hidden, &g)?;
+            metal.encode_micro(enc, &lhs, &up_out, m, hidden, &u)?;
+            metal.encode_swiglu(enc, &mut Vec::new(), &gate_out, &up_out, &h, m * inter)?;
+            metal.encode_micro(enc, &h, &split, m, inter, &d)?;
+            enc.end_encoding();
+            commit_and_wait(cb)?;
+            let bits = |b: &Buffer, n| -> Result<Vec<u32>> {
+                Ok(read_f32_buffer(b, n)?.iter().map(|v| v.to_bits()).collect())
+            };
+            let (fused, split) = (bits(&fused, m * hidden)?, bits(&split, m * hidden)?);
+            let first = fused.iter().zip(&split).position(|(a, b)| a != b);
+            let h_g = read_f32_buffer(&gate_out, m * inter)?;
+            let h_u = read_f32_buffer(&up_out, m * inter)?;
+            let g_max = h_g.iter().fold(0f32, |a, v| a.max(v.abs()));
+            assert!(
+                first.is_none(),
+                "{} M={m} premier écart {first:?} max|gate|={g_max} u0={}",
+                mode.name(),
+                h_u[0]
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "oracle des échelles : nécessite Metal, lancer sous verrou GPU"]
 fn micro_all_scale_bytes_bit_exact() -> Result<()> {
@@ -256,6 +316,143 @@ fn micro_bandwidth_and_gemm_probe() -> Result<()> {
                     "MICRO mode=u4 M={m} N={n} K={k} ms={:.6} TFLOPS={:.4}",
                     times[3] * 1e3,
                     2.0 * m as f64 * n as f64 * k as f64 / times[3] / 1e12
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Sonde du déroulement `NAX_KK_UNROLL` kernel par kernel, aux formes du 27B :
+/// même source compilée avec et sans la macro.
+#[test]
+#[ignore = "sonde de performance : nécessite Metal, lancer sous verrou GPU"]
+fn nax_kk_unroll_probe() -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    let src = format!(
+        "{}\n{}",
+        include_str!("../na_gemm.metal"),
+        include_str!("../micro.metal")
+    );
+    let compile = |prelude: &str| -> Result<metal::Library> {
+        metal
+            .device
+            .new_library_with_source(
+                &format!("{prelude}{src}"),
+                &super::pipelines::compile_options(true),
+            )
+            .map_err(InferError::Metal)
+    };
+    let libs = [
+        ("unroll", compile("")?),
+        ("plain", compile("#define NAX_KK_UNROLL\n")?),
+    ];
+    let m = 1024_usize;
+    let time = |encode: &dyn Fn(&ComputeCommandEncoderRef)| -> Result<f64> {
+        let mut times = Vec::new();
+        for trial in 0..9 {
+            let cb = metal.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            encode(enc);
+            encode(enc);
+            enc.end_encoding();
+            let start = std::time::Instant::now();
+            commit_and_wait(cb)?;
+            if trial >= 2 {
+                times.push(start.elapsed().as_secs_f64() / 2.0);
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        Ok(times[3])
+    };
+    for (n, k) in [(17408, 5120), (5120, 17408), (1024, 5120)] {
+        let u4 = |seed: f32| -> Result<_> {
+            let w = LinearWeight::AffineQuantized(test_affine(n, k, seed)?);
+            match metal.resolve_linear_weight_buffers(&w, "unroll_u4")? {
+                MetalLinearWeightBuffers::AffineQuantized {
+                    packed,
+                    scales,
+                    biases,
+                    ..
+                } => Ok((packed, scales, biases)),
+                _ => Err(InferError::Config("u4 attendu".into())),
+            }
+        };
+        let (gp, gs, gb) = u4(0.125)?;
+        let (up, us, ub) = u4(0.25)?;
+        let mx = metal.resolve_micro(&weight(MicroMode::Mxfp4, n, k)?)?;
+        let mx2 = metal.resolve_micro(&weight(MicroMode::Mxfp4, n, k)?)?;
+        let a32 = metal.buffer_from_f32(&vec![0.125; m * k], "unroll_a32")?;
+        let a16 = metal.private_bf16_buffer(m * k, "unroll_a16")?;
+        let cb = metal.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        metal.encode_f32_to_bf16(enc, &a32, &a16, m * k)?;
+        enc.end_encoding();
+        commit_and_wait(cb)?;
+        let out = metal.uncached_f32_buffer(m * n, "unroll_out")?;
+        let mnk = [m as u32, n as u32, k as u32, 0];
+        let grid = MTLSize::new(m.div_ceil(64) as u64, n.div_ceil(64) as u64, 1);
+        let tg = MTLSize::new(128, 1, 1);
+        for (label, lib) in &libs {
+            let p = |name: &str| super::pipelines::pipeline(lib, &metal.device, name);
+            let kernels: [(&str, ComputePipelineState); 5] = [
+                ("tiled_u4", p("gemm_nax_coop_qb_tiled_u4")?),
+                ("tiled_u4_x3", p("gemm_nax_coop_qb_tiled_u4_x3")?),
+                (
+                    "gate_up_swiglu_u4",
+                    p("gemm_nax_coop_qb_tiled_u4_gate_up_swiglu")?,
+                ),
+                ("micro_gemm_mxfp4", p("micro_gemm_mxfp4")?),
+                ("micro_gate_up_mxfp4", p("micro_gemm_gate_up_swiglu_mxfp4")?),
+            ];
+            for (name, pso) in &kernels {
+                let sec = time(&|enc: &ComputeCommandEncoderRef| {
+                    enc.set_compute_pipeline_state(pso);
+                    match *name {
+                        "tiled_u4" | "tiled_u4_x3" => {
+                            enc.set_buffer(
+                                0,
+                                Some(if *name == "tiled_u4" { &a16 } else { &a32 }),
+                                0,
+                            );
+                            enc.set_buffer(1, Some(&gp), 0);
+                            enc.set_buffer(2, Some(&gs), 0);
+                            enc.set_buffer(3, Some(&gb), 0);
+                            enc.set_buffer(4, Some(&out), 0);
+                            enc.set_bytes(5, 16, mnk.as_ptr().cast());
+                        }
+                        "gate_up_swiglu_u4" => {
+                            enc.set_buffer(0, Some(&a16), 0);
+                            for (i, b) in [&gp, &gs, &gb, &up, &us, &ub].into_iter().enumerate() {
+                                enc.set_buffer(1 + i as u64, Some(b), 0);
+                            }
+                            enc.set_buffer(7, Some(&out), 0);
+                            enc.set_bytes(8, 16, mnk.as_ptr().cast());
+                        }
+                        "micro_gemm_mxfp4" => {
+                            enc.set_buffer(0, Some(&a16), 0);
+                            enc.set_buffer(1, Some(&mx.packed), 0);
+                            enc.set_buffer(2, Some(&mx.scales), 0);
+                            enc.set_buffer(4, Some(&out), 0);
+                            enc.set_bytes(5, 16, mnk.as_ptr().cast());
+                        }
+                        _ => {
+                            enc.set_buffer(0, Some(&a16), 0);
+                            enc.set_buffer(1, Some(&mx.packed), 0);
+                            enc.set_buffer(2, Some(&mx.scales), 0);
+                            enc.set_buffer(3, Some(&mx2.packed), 0);
+                            enc.set_buffer(4, Some(&mx2.scales), 0);
+                            enc.set_buffer(5, Some(&out), 0);
+                            enc.set_bytes(6, 16, mnk.as_ptr().cast());
+                        }
+                    }
+                    enc.dispatch_thread_groups(grid, tg);
+                })?;
+                let flops = if name.contains("gate_up") { 4.0 } else { 2.0 } * (m * n * k) as f64;
+                eprintln!(
+                    "UNROLL {label} {name} M={m} N={n} K={k} ms={:.4} TFLOPS={:.2}",
+                    sec * 1e3,
+                    flops / sec / 1e12
                 );
             }
         }

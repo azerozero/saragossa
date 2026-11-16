@@ -55,42 +55,50 @@ inline void micro_store_c(const thread metal::vec<float, 8>& src, device float* 
     }
 }
 
-// Une ligne par simdgroup, un mot U32 par lane et par pas. L'échelle est
+// R lignes par simdgroup, un mot U32 par lane et par pas : le vecteur x est
+// lu une fois pour les R lignes (R = 1 retrouve l'ancien noyau). L'échelle est
 // décodée une fois par mot : dans la plage normale, `code * échelle` est le
-// même produit f32 exact que `micro_scaled`, et l'ordre des additions ne
-// change pas. Les échelles extrêmes gardent le chemin entier de `micro_scaled`.
-template<uint B, uint G>
+// même produit f32 exact que `micro_scaled`, et l'ordre des additions de chaque
+// ligne ne dépend pas de R. Les échelles extrêmes gardent le chemin entier.
+template<uint B, uint G, uint R>
 inline void micro_qmv(device const float* x, device const uint* w, device const uchar* scales,
                       device float* y, constant uint3& dims, uint2 tg, uint sg, uint lane) {
     constexpr uint P = 32 / B;
-    uint row = tg.x * 4 + sg, K = dims.z;
-    if (row >= dims.y) return;
-    device const uint* wr = w + size_t(row) * (K / P);
-    device const uchar* sr = scales + size_t(row) * (K / G);
+    uint row0 = (tg.x * 4 + sg) * R, K = dims.z;
+    if (row0 >= dims.y) return;
+    uint rows = min(R, dims.y - row0);
     device const float* xr = x + size_t(tg.y) * K;
-    float acc = 0;
+    float acc[R];
+    for (uint r = 0; r < R; ++r) acc[r] = 0;
     for (uint k = lane * P; k < K; k += 32 * P) {
-        uint word = wr[k / P];
-        uchar scale = sr[k / G];
         device const float4* xv = (device const float4*)(xr + k);
-        if (G == 16 || (scale >= 10 && scale <= 246)) {
-            float s = micro_scale<G>(scale);
-            for (uint v = 0; v < P / 4; ++v) {
-                float4 xs = xv[v];
-                for (uint j = 0; j < 4; ++j) {
-                    uint q = (word >> ((v * 4 + j) * B)) & ((1u << B) - 1u);
-                    acc += xs[j] * (micro_code<B>(q) * s);
+        float4 xs[P / 4];
+        for (uint v = 0; v < P / 4; ++v) xs[v] = xv[v];
+        for (uint r = 0; r < R; ++r) {
+            if (r >= rows) break;
+            size_t row = row0 + r;
+            uint word = w[row * (K / P) + k / P];
+            uchar scale = scales[row * (K / G) + k / G];
+            if (G == 16 || (scale >= 10 && scale <= 246)) {
+                float s = micro_scale<G>(scale);
+                for (uint v = 0; v < P / 4; ++v) {
+                    for (uint j = 0; j < 4; ++j) {
+                        uint q = (word >> ((v * 4 + j) * B)) & ((1u << B) - 1u);
+                        acc[r] += xs[v][j] * (micro_code<B>(q) * s);
+                    }
                 }
-            }
-        } else {
-            for (uint j = 0; j < P; ++j) {
-                float value = micro_scaled<B, G>((word >> (j * B)) & ((1u << B) - 1u), scale);
-                acc += xr[k + j] * value;
+            } else {
+                for (uint j = 0; j < P; ++j) {
+                    float value = micro_scaled<B, G>((word >> (j * B)) & ((1u << B) - 1u), scale);
+                    acc[r] += xs[j / 4][j % 4] * value;
+                }
             }
         }
     }
-    acc = simd_sum(acc);
-    if (lane == 0) y[size_t(tg.y) * dims.y + row] = acc;
+    for (uint r = 0; r < R; ++r) {
+        float total = simd_sum(acc[r]);
+        if (lane == 0 && r < rows) y[size_t(tg.y) * dims.y + row0 + r] = total;
+    }
 }
 
 // Chaque thread charge une demi-ligne (32 poids) et écrit quatre vecteurs
@@ -135,7 +143,10 @@ inline void micro_load_b(threadgroup bfloat* tile, device const uint* w,
 }
 
 kernel void micro_qmv_mxfp4(device const float* x [[buffer(0)]], device const uint* w [[buffer(1)]], device const uchar* scales [[buffer(2)]], device float* y [[buffer(4)]], constant uint3& dims [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    micro_qmv<4, 32>(x, w, scales, y, dims, tg, sg, lane);
+    micro_qmv<4, 32, 1>(x, w, scales, y, dims, tg, sg, lane);
+}
+kernel void micro_qmv4_mxfp4(device const float* x [[buffer(0)]], device const uint* w [[buffer(1)]], device const uchar* scales [[buffer(2)]], device float* y [[buffer(4)]], constant uint3& dims [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    micro_qmv<4, 32, 4>(x, w, scales, y, dims, tg, sg, lane);
 }
 kernel void micro_embed_mxfp4(device const uint* w [[buffer(0)]], device const uchar* scales [[buffer(1)]], device const uint* ids [[buffer(2)]], device float* y [[buffer(3)]], constant uint2& dims [[buffer(4)]], constant float& factor [[buffer(5)]], constant uint& recast [[buffer(6)]], uint2 i [[thread_position_in_grid]]) {
     uint row = ids[i.y];
@@ -167,6 +178,7 @@ kernel void micro_gemm_mxfp4(device const bfloat* A [[buffer(0)]],
   for (uint k = 0; k < K; k += BK) {
     micro_load_b<4, 32>(Ws, Bp, Bs, n0, k, N, K, lid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    NAX_KK_UNROLL
     for (uint kk = 0; kk < BK; kk += 16u) {
       metal::vec<bfloat,8> af0, af1, b0, b1;
       if (m0 + 32u <= M) {
@@ -190,7 +202,10 @@ kernel void micro_gemm_mxfp4(device const bfloat* A [[buffer(0)]],
 }
 
 kernel void micro_qmv_nvfp4(device const float* x [[buffer(0)]], device const uint* w [[buffer(1)]], device const uchar* scales [[buffer(2)]], device float* y [[buffer(4)]], constant uint3& dims [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    micro_qmv<4, 16>(x, w, scales, y, dims, tg, sg, lane);
+    micro_qmv<4, 16, 1>(x, w, scales, y, dims, tg, sg, lane);
+}
+kernel void micro_qmv4_nvfp4(device const float* x [[buffer(0)]], device const uint* w [[buffer(1)]], device const uchar* scales [[buffer(2)]], device float* y [[buffer(4)]], constant uint3& dims [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    micro_qmv<4, 16, 4>(x, w, scales, y, dims, tg, sg, lane);
 }
 kernel void micro_embed_nvfp4(device const uint* w [[buffer(0)]], device const uchar* scales [[buffer(1)]], device const uint* ids [[buffer(2)]], device float* y [[buffer(3)]], constant uint2& dims [[buffer(4)]], constant float& factor [[buffer(5)]], constant uint& recast [[buffer(6)]], uint2 i [[thread_position_in_grid]]) {
     uint row = ids[i.y];
@@ -222,6 +237,7 @@ kernel void micro_gemm_nvfp4(device const bfloat* A [[buffer(0)]],
   for (uint k = 0; k < K; k += BK) {
     micro_load_b<4, 16>(Ws, Bp, Bs, n0, k, N, K, lid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    NAX_KK_UNROLL
     for (uint kk = 0; kk < BK; kk += 16u) {
       metal::vec<bfloat,8> af0, af1, b0, b1;
       if (m0 + 32u <= M) {
@@ -245,7 +261,10 @@ kernel void micro_gemm_nvfp4(device const bfloat* A [[buffer(0)]],
 }
 
 kernel void micro_qmv_mxfp8(device const float* x [[buffer(0)]], device const uint* w [[buffer(1)]], device const uchar* scales [[buffer(2)]], device float* y [[buffer(4)]], constant uint3& dims [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    micro_qmv<8, 32>(x, w, scales, y, dims, tg, sg, lane);
+    micro_qmv<8, 32, 1>(x, w, scales, y, dims, tg, sg, lane);
+}
+kernel void micro_qmv4_mxfp8(device const float* x [[buffer(0)]], device const uint* w [[buffer(1)]], device const uchar* scales [[buffer(2)]], device float* y [[buffer(4)]], constant uint3& dims [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    micro_qmv<8, 32, 4>(x, w, scales, y, dims, tg, sg, lane);
 }
 kernel void micro_embed_mxfp8(device const uint* w [[buffer(0)]], device const uchar* scales [[buffer(1)]], device const uint* ids [[buffer(2)]], device float* y [[buffer(3)]], constant uint2& dims [[buffer(4)]], constant float& factor [[buffer(5)]], constant uint& recast [[buffer(6)]], uint2 i [[thread_position_in_grid]]) {
     uint row = ids[i.y];
@@ -277,6 +296,7 @@ kernel void micro_gemm_mxfp8(device const bfloat* A [[buffer(0)]],
   for (uint k = 0; k < K; k += BK) {
     micro_load_b<8, 32>(Ws, Bp, Bs, n0, k, N, K, lid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    NAX_KK_UNROLL
     for (uint kk = 0; kk < BK; kk += 16u) {
       metal::vec<bfloat,8> af0, af1, b0, b1;
       if (m0 + 32u <= M) {
@@ -298,3 +318,58 @@ kernel void micro_gemm_mxfp8(device const bfloat* A [[buffer(0)]],
   micro_store_c(c1a, C, m0 + 16u, n0 + ns, N, M);
   micro_store_c(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
 }
+
+// MLP fusionné gate+up+SwiGLU à micro-échelles : mêmes tuiles et même ordre
+// d'accumulation que `micro_gemm_*`, deux tuiles B par pas de K, sortie H bf16
+// par le store SwiGLU du u4 fusionné. Ce kernel est tiré d'une compilation en
+// fast-math (`micro_pipeline`), comme `swiglu_f32` : H reste égal au bit aux
+// passes séparées gate, up, swiglu, conversion bf16.
+#define MICRO_GATE_UP_SWIGLU(NAME, B, G)                                                     \
+kernel void micro_gemm_gate_up_swiglu_##NAME(device const bfloat* A [[buffer(0)]],          \
+    device const uint* Gp [[buffer(1)]], device const uchar* Gs [[buffer(2)]],              \
+    device const uint* Up [[buffer(3)]], device const uchar* Us [[buffer(4)]],              \
+    device bfloat* H [[buffer(5)]], constant uint3& mnk [[buffer(6)]],                      \
+    uint2 tgid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]], \
+    uint sgid [[simdgroup_index_in_threadgroup]]) {                                         \
+  uint M = mnk.x, N = mnk.y, K = mnk.z;                                                     \
+  constexpr uint BN = 64, BK = 64, BKP = BK + 8, WN = 2;                                    \
+  threadgroup metal::vec<bfloat,8> Wg8[BN * BKP / 8];                                       \
+  threadgroup metal::vec<bfloat,8> Wu8[BN * BKP / 8];                                       \
+  threadgroup bfloat* Wg = (threadgroup bfloat*)Wg8;                                        \
+  threadgroup bfloat* Wu = (threadgroup bfloat*)Wu8;                                        \
+  uint sg_m = sgid / WN, sg_n = sgid - sg_m * WN;                                           \
+  uint m0 = tgid.x * 64u + sg_m * 32u, n0 = tgid.y * BN, ns = sg_n * 32u;                   \
+  metal::vec<float,8> g0a = float(0), g0b = float(0), g1a = float(0), g1b = float(0);       \
+  metal::vec<float,8> u0a = float(0), u0b = float(0), u1a = float(0), u1b = float(0);       \
+  for (uint k = 0; k < K; k += BK) {                                                        \
+    micro_load_b<B, G>(Wg, Gp, Gs, n0, k, N, K, lid);                                       \
+    micro_load_b<B, G>(Wu, Up, Us, n0, k, N, K, lid);                                       \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                        \
+    for (uint kk = 0; kk < BK; kk += 16u) {                                                 \
+      metal::vec<bfloat,8> af0, af1, b0, b1;                                                \
+      if (m0 + 32u <= M) {                                                                  \
+        NaxFrag::load_a(af0, A + m0 * K + k + kk, int(K));                                  \
+        NaxFrag::load_a(af1, A + (m0 + 16u) * K + k + kk, int(K));                          \
+      } else {                                                                              \
+        NaxFrag::load_a_masked(af0, A, m0, k + kk, K, M);                                   \
+        NaxFrag::load_a_masked(af1, A, m0 + 16u, k + kk, K, M);                             \
+      }                                                                                     \
+      NaxFrag::load_a_tg(b0, Wg + ns * BKP + kk, int(BKP));                                 \
+      NaxFrag::load_a_tg(b1, Wg + (ns + 16u) * BKP + kk, int(BKP));                         \
+      NaxFrag::mma(g0a, g0b, af0, b0, b1);                                                  \
+      NaxFrag::mma(g1a, g1b, af1, b0, b1);                                                  \
+      NaxFrag::load_a_tg(b0, Wu + ns * BKP + kk, int(BKP));                                 \
+      NaxFrag::load_a_tg(b1, Wu + (ns + 16u) * BKP + kk, int(BKP));                         \
+      NaxFrag::mma(u0a, u0b, af0, b0, b1);                                                  \
+      NaxFrag::mma(u1a, u1b, af1, b0, b1);                                                  \
+    }                                                                                       \
+    threadgroup_barrier(mem_flags::mem_threadgroup);                                        \
+  }                                                                                         \
+  NaxFrag::store_swiglu_bf16_masked(g0a, u0a, H, m0, n0 + ns, N, M);                                  \
+  NaxFrag::store_swiglu_bf16_masked(g0b, u0b, H, m0, n0 + ns + 16u, N, M);                            \
+  NaxFrag::store_swiglu_bf16_masked(g1a, u1a, H, m0 + 16u, n0 + ns, N, M);                            \
+  NaxFrag::store_swiglu_bf16_masked(g1b, u1b, H, m0 + 16u, n0 + ns + 16u, N, M);                      \
+}
+MICRO_GATE_UP_SWIGLU(mxfp4, 4, 32)
+MICRO_GATE_UP_SWIGLU(nvfp4, 4, 16)
+MICRO_GATE_UP_SWIGLU(mxfp8, 8, 32)

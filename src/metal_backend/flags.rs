@@ -67,6 +67,38 @@ pub(crate) fn prefill_fused_mlp_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_FUSED_MLP", true))
 }
 
+/// Déroulement complet des pas K des GEMM tuilés NAX (`NAX_KK_UNROLL` de
+/// `na_gemm.metal`), égal au bit. Kill-switch `SARAGOSSA_RUST_NAX_KK_UNROLL=0`.
+pub(crate) fn nax_kk_unroll_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_NAX_KK_UNROLL", true))
+}
+
+/// Préambule des sources NAX : vide par défaut, macro de déroulement vide
+/// sous le kill-switch.
+pub(crate) fn nax_source_prelude() -> &'static str {
+    if nax_kk_unroll_enabled() {
+        ""
+    } else {
+        "#define NAX_KK_UNROLL\n"
+    }
+}
+
+/// QMV micro à quatre lignes par simdgroup (`micro_qmv4_*`), égal au bit au
+/// QMV à une ligne. Kill-switch `SARAGOSSA_RUST_MICRO_QMV_ROWS4=0`.
+pub(crate) fn micro_qmv_rows4_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MICRO_QMV_ROWS4", true))
+}
+
+/// Même fusion pour les poids à micro-échelles (`micro_gemm_gate_up_swiglu_*`),
+/// égale au bit aux passes séparées. Kill-switch
+/// `SARAGOSSA_RUST_PREFILL_FUSED_MLP_MICRO=0`.
+pub(crate) fn prefill_fused_mlp_micro_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_FUSED_MLP_MICRO", true))
+}
+
 /// Flag historique retiré. Une demande `SARAGOSSA_RUST_LINEAR_CHUNKED=1`
 /// est refusée dès la construction du backend : garder le NAX ou le scan par défaut.
 pub(crate) fn linear_chunked_enabled() -> bool {

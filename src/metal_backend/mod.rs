@@ -484,6 +484,8 @@ pub struct MetalExecutor {
     /// demande (qmv-T du mode strict, une instance par largeur de lot).
     library: metal::Library,
     micro_library: Mutex<Option<metal::Library>>,
+    /// Bibliothèque micro compilée en fast-math, réservée au MLP fusionné.
+    micro_fast_library: Mutex<Option<metal::Library>>,
     /// Pipelines qmv-T déjà créés, par nom de kernel.
     qmvt_pipelines: Mutex<HashMap<String, ComputePipelineState>>,
     /// Force la rétention des dérivés de poids avant de libérer leurs payloads CPU.
