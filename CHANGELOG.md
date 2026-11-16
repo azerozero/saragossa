@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4](https://github.com/azerozero/saragossa/compare/v0.3.3...v0.3.4) - 2026-11-16
+
+### Added
+
+- *(spec)* classe code et prose sur embeddings e5, en opt-in
+- *(spec)* cherche les indices de code en sous-chaînes, toutes langues
+- *(spec)* active le routage par classe de prompt par défaut
+- *(spec)* route le greedy vers DFlash ou MTP selon la consigne
+
+### Fixed
+
+- *(spec)* écrit l'entrée sans captures si leur recollage échoue
+- *(spec)* ne laisse la négation annuler que le radical code
+- *(spec)* limite le routage par classe de prompt au greedy
+- *(spec)* garde les captures DFlash quand MTP prolonge l'entrée
+- *(spec)* ne route vers MTP que la prose sans aucun indice de code
+
+### Other
+
+- Merge pull request #237 from azerozero/fix/lint-docs
+- *(release)* publication continue des PR release-plz, comme grob
+- *(lint)* corrige markdownlint (pipes de tableau, espaces en code) et shellcheck (shebang bash, SC2155, SC2034)
+- Merge pull request #232 from azerozero/release-plz-2026-11-16T18-41-46Z
+- Merge remote-tracking branch 'origin/main' into perf/spec-routage
+- *(spec)* compare l'historique MTP semé par le prefill DFlash
+- *(spec)* corrige la doc de l'oracle d'alternance
+- *(spec)* fusionne les deux prefills résidents avec semis MTP
+- *(spec)* sème l'historique MTP sur GPU pendant le prefill DFlash
+- Merge remote-tracking branch 'origin/main' into perf/spec-routage
+- *(perf)* mesure le routage spéculatif par classe de prompt
+
 ## [0.3.3](https://github.com/azerozero/saragossa/compare/v0.3.2...v0.3.3) - 2026-11-16
 
 ### Added

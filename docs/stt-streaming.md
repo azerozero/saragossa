@@ -9,9 +9,9 @@ Requête `multipart/form-data` compatible OpenAI : `file` (WAV), `language`
 
 | `response_format` | Décodage | Réponse |
 |---|---|---|
-| `json` (défaut) | `<|notimestamps|>` | `{"text": …}` |
-| `text` | `<|notimestamps|>` | texte brut |
-| `verbose_json` | tokens `<|t.tt|>` | `text`, `language`, `duration`, `segments[]` |
+| `json` (défaut) | `<\|notimestamps\|>` | `{"text": …}` |
+| `text` | `<\|notimestamps\|>` | texte brut |
+| `verbose_json` | tokens `<\|t.tt\|>` | `text`, `language`, `duration`, `segments[]` |
 
 Chaque segment porte `id`, `seek`, `start`, `end`, `text`, `tokens`,
 `temperature` (toujours 0), `avg_logprob`, `compression_ratio` et
