@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::{cli_error, CliResult};
-use saragossa::denoise::{DeepFilterNet3, SAMPLE_RATE};
-use saragossa::tts_clone::{decode_wav_mono, resample};
+use saragossa::denoise::{decode_wav, DeepFilterNet3, SAMPLE_RATE};
+use saragossa::tts_clone::resample;
 
 struct IoArgs {
     model: PathBuf,
@@ -43,8 +43,8 @@ fn parse(args: impl Iterator<Item = String>, usage: &str) -> CliResult<Option<Io
 }
 
 fn read_wav(path: &PathBuf, rate: u32) -> CliResult<(Vec<f32>, u32)> {
-    let (samples, sr) = decode_wav_mono(&std::fs::read(path)?)?;
-    Ok((resample(&samples, sr, rate), sr))
+    let (samples, sr) = decode_wav(&std::fs::read(path)?)?;
+    Ok((resample(&samples, sr, rate)?, sr))
 }
 
 fn write_wav(path: &PathBuf, samples: &[f32], rate: u32) -> CliResult<()> {
@@ -72,8 +72,8 @@ pub(crate) fn run_enhance(args: impl Iterator<Item = String>) -> CliResult<()> {
     let Some(io) = parse(args, USAGE)? else {
         return Ok(());
     };
-    let model = DeepFilterNet3::load(&io.model)?;
     let (audio, sr) = read_wav(&io.input, SAMPLE_RATE)?;
+    let model = DeepFilterNet3::load(&io.model)?;
     let started = Instant::now();
     let out = model.enhance(&audio)?;
     let elapsed = started.elapsed().as_secs_f64();

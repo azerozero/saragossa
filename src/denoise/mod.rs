@@ -71,7 +71,7 @@ pub fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     crate::wire_audio::wav_to_mono_validated(bytes, |samples, rate| {
         validate_input_length(samples, rate).map(|_| ())
     })
-    .map_err(|e| InferError::Config(e.0))
+    .map_err(InferError::Audio)
 }
 
 /// Modèle DeepFilterNet3 chargé.
@@ -124,8 +124,7 @@ impl DeepFilterNet3 {
     ///
     /// Refuse les signaux de plus de cinq minutes avant toute allocation audio.
     pub fn enhance(&self, audio: &[f32]) -> Result<Vec<f32>> {
-        validate_input_length(audio.len() as u64, SAMPLE_RATE)
-            .map_err(|e| InferError::Config(e.0))?;
+        validate_input_length(audio.len() as u64, SAMPLE_RATE).map_err(InferError::Audio)?;
         let padded_len = (audio.len() + FFT_SIZE).div_ceil(HOP_SIZE) * HOP_SIZE;
         let mut stream = self.stream();
         let mut padded = audio.to_vec();

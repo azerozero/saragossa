@@ -351,7 +351,8 @@ pub(super) fn handle_enhance<S: Write>(
     let (mono, rate) =
         saragossa::denoise::decode_wav(&file.data).map_err(|e| ServeError::Http(e.to_string()))?;
     let rate48 = saragossa::denoise::SAMPLE_RATE;
-    let samples = saragossa::tts_clone::resample(&mono, rate, rate48);
+    let samples = saragossa::tts_clone::resample(&mono, rate, rate48)
+        .map_err(|e| ServeError::Http(e.to_string()))?;
     let wav = mono_f32_to_wav(&audio.enhance(&samples)?, rate48)?;
     write_headers(stream, 200, "OK", "audio/wav", Some(wav.len()), Vec::new())?;
     stream

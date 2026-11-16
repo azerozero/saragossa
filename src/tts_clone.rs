@@ -19,18 +19,29 @@ const N_FREQS: usize = N_FFT / 2 + 1;
 /// Renvoie une erreur si le WAV est invalide ou si le format est unsupported.
 pub fn load_wav_24k(bytes: &[u8]) -> Result<Vec<f32>> {
     let (mono, sample_rate) = decode_wav_mono(bytes)?;
-    Ok(resample(&mono, sample_rate, 24_000))
+    resample(&mono, sample_rate, 24_000)
 }
 
 /// Rééchantillonne un signal mono par polyphase rationnel.
-#[must_use]
-pub fn resample(samples: &[f32], from_hz: u32, to_hz: u32) -> Vec<f32> {
+///
+/// # Errors
+///
+/// Refuse une fréquence hors de la plage WAV ou une taille de sortie qui déborde.
+pub fn resample(samples: &[f32], from_hz: u32, to_hz: u32) -> Result<Vec<f32>> {
+    crate::wire_audio::validate_wav_limits(from_hz, 1, 0).map_err(InferError::Audio)?;
+    crate::wire_audio::validate_wav_limits(to_hz, 1, 0).map_err(InferError::Audio)?;
     if from_hz == to_hz || samples.is_empty() {
-        return samples.to_vec();
+        return Ok(samples.to_vec());
     }
     let g = gcd(from_hz, to_hz);
     let up = (to_hz / g) as usize;
     let down = (from_hz / g) as usize;
+    let n_out = samples
+        .len()
+        .checked_mul(up)
+        .map(|n| n.div_ceil(down))
+        .filter(|&n| n <= isize::MAX as usize / std::mem::size_of::<f32>())
+        .ok_or_else(|| InferError::Dimension("taille audio rééchantillonnée trop grande".into()))?;
     let max_rate = up.max(down);
     let half_len = 10 * max_rate;
     let numtaps = 2 * half_len + 1;
@@ -39,7 +50,7 @@ pub fn resample(samples: &[f32], from_hz: u32, to_hz: u32) -> Vec<f32> {
     for value in &mut h {
         *value *= up as f64;
     }
-    upfirdn(samples, &h, up, down, numtaps)
+    Ok(upfirdn(samples, &h, up, down, numtaps, n_out))
 }
 
 /// Calcule le log-mel speaker `[1, frames, 128]`.
@@ -94,7 +105,13 @@ pub fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))
         .map_err(|err| InferError::Config(format!("parse WAV clone: {err}")))?;
     let spec = reader.spec();
-    let channels = spec.channels.max(1) as usize;
+    crate::wire_audio::validate_wav_limits(
+        spec.sample_rate,
+        spec.channels,
+        u64::from(reader.len()),
+    )
+    .map_err(InferError::Audio)?;
+    let channels = usize::from(spec.channels);
     let interleaved = match spec.sample_format {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
@@ -126,9 +143,15 @@ pub fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     Ok((mono, spec.sample_rate))
 }
 
-fn upfirdn(samples: &[f32], h: &[f64], up: usize, down: usize, numtaps: usize) -> Vec<f32> {
+fn upfirdn(
+    samples: &[f32],
+    h: &[f64],
+    up: usize,
+    down: usize,
+    numtaps: usize,
+    n_out: usize,
+) -> Vec<f32> {
     let n_in = samples.len();
-    let n_out = n_in.checked_mul(up).map(|v| v.div_ceil(down)).unwrap_or(0);
     let pad = (numtaps - 1) / 2;
     let mut out = Vec::with_capacity(n_out);
     for i in 0..n_out {
@@ -288,13 +311,13 @@ mod tests {
     #[test]
     fn resample_preserves_same_rate() {
         let samples = vec![0.1, -0.2, 0.3, 0.4];
-        assert_eq!(resample(&samples, 24_000, 24_000), samples);
+        assert_eq!(resample(&samples, 24_000, 24_000).unwrap(), samples);
     }
 
     #[test]
     fn resample_32k_to_24k_has_expected_length() {
         let samples = vec![0.0_f32; 32_000];
-        let out = resample(&samples, 32_000, 24_000);
+        let out = resample(&samples, 32_000, 24_000).unwrap();
         assert_eq!(out.len(), (samples.len() * 3).div_ceil(4));
     }
 
