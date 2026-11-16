@@ -127,7 +127,39 @@ class VisionFixtures(unittest.TestCase):
     def test_only_required_binary_payloads_are_stored(self):
         self.assertEqual(len(list((FIXTURES / "images").glob("*.bin"))), 3)
         self.assertEqual(len(list((FIXTURES / "tables").glob("*.bin"))), 6)
-        self.assertEqual(len(list(FIXTURES.rglob("*.bin"))), 21)
+        directory = FIXTURES / "Qwen3.8-27B-BF16"
+        calibration = json.loads((directory / "llm-calibration.json").read_bytes())
+        llm = {directory / p["file"] for c in calibration["cases"] for p in c["payloads"].values()}
+        self.assertEqual(len(llm), 12)
+        stored = set(FIXTURES.rglob("*.bin"))
+        self.assertTrue(llm <= stored)
+        self.assertEqual(len(stored - llm), 21)
+
+    def test_llm_calibration_is_frozen(self):
+        directory = FIXTURES / "Qwen3.8-27B-BF16"
+        calibration = json.loads((directory / "llm-calibration.json").read_bytes())
+        self.assertEqual(calibration["schema_version"], 1)
+        self.assertEqual(len(calibration["cases"]), 6)
+        self.assertEqual(calibration["environment"]["llm_script_sha256"],
+                         vision.digest(Path(__file__).with_name("vision_llm.py").read_bytes()))
+        for case in calibration["cases"]:
+            self.assertEqual(case["shape"][0], 17)
+            arrays = {}
+            for kind, payload in case["payloads"].items():
+                data = (directory / payload["file"]).read_bytes()
+                self.assertEqual(vision.digest(data), payload["sha256"])
+                arrays[kind] = np.frombuffer(data, dtype="<f4").reshape(case["shape"]).astype(np.float64)
+                self.assertTrue(np.isfinite(arrays[kind]).all())
+            error = arrays["bf16"] - arrays["f32"]
+            def softmax(x):
+                e = np.exp(x - x.max(axis=1, keepdims=True))
+                return e / e.sum(axis=1, keepdims=True)
+            measured = {"rms": np.sqrt((error * error).mean(axis=1)),
+                        "max_abs": np.abs(error).max(axis=1),
+                        "max_probability": np.abs(softmax(arrays["bf16"]) - softmax(arrays["f32"])).max(axis=1)}
+            for name, values in measured.items():
+                np.testing.assert_array_equal(values, case["noise"][name])
+                np.testing.assert_array_equal(values * 2, case["threshold"][name])
 
     def test_rejects_resize_and_unknown_profiles(self):
         for shape in ((255, 256, 3), (32, 32, 3), (2048, 2048, 3)):
