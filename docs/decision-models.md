@@ -209,17 +209,26 @@ relecture « DI » du shim ne sont pas pris en charge.
   requête entière, sans troncature.
 
 Cache de préfixe, mode causal seulement (le KV non causal dépend du suffixe) :
-le préfixe de tokens commun aux questions, arrondi à 64 positions, est
-préfillé une fois ; chaque question prolonge une copie de l'état (KV et
-récurrence gated-delta, snapshot Metal). Arrondi nécessaire : un préfixe coupé
-au milieu d'un bloc de 64 du prefill gated-delta change l'ordre des
-réductions (écart 1,9e-4 en probabilité sans arrondi). Avec lui, les
-probabilités sont égales au bit à celles des prefills complets.
+le préfixe de tokens commun aux questions est préfillé une fois ; chaque
+question prolonge une copie de l'état (KV et récurrence gated-delta, snapshot
+Metal). Les probabilités sont égales au bit à celles des prefills complets à
+deux conditions, mesurées : le prolongement passe par le prefill résident
+(au moins 32 tokens, `prefix_extend_resident_min_tokens` ; en dessous,
+l'extension en lignes diffère), et préfixe comme suffixes comptent au moins
+64 lignes (`DENSE_BF16_GEMM_MIN_BATCH` ; en dessous, les projections passent
+du GEMM bf16 au qmv : 63 lignes donnent 4,8e-3 d'écart sur le hidden, exact
+avec `SARAGOSSA_RUST_DENSE_BF16_GEMM=0`). Le préfixe partagé est donc borné à
+la plus courte question moins 64 tokens. Ni son alignement (préfixes de 3879
+à 7910 tokens) ni le découpage du prefill en morceaux (8000 tokens, deux
+morceaux de 4000) ne changent un bit. Sans prefill résident (CPU), pas de
+partage.
 
 Oracle : `tests/fixtures/decision/h2o/`, référence f32 Transformers (MPS) dans
 les deux modes sur 21 requêtes (corpus d3, sondes de démarrage du shim,
 instructions objet, hindi), prompts bidirectionnels de 128, 512 et 2048
-tokens, et 8 questions causales sur un état de 3986 à 4014 tokens. La
+tokens, et 8 questions causales sur un état de 3986 à 4014 tokens ; égalité
+au bit du cache vérifiée sur ces 8 questions, sur un état de plus de 8000
+tokens et sur deux questions identiques (suffixe borné). La
 référence retrouve les réponses de `two_way.probe_reference` à 0,0012 près
 (seuil du shim 0,05). Tolérance figée 0,0215 (deux fois le bruit bf16 mesuré,
 + 1e-6).

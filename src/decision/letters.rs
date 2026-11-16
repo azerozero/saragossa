@@ -27,10 +27,6 @@ const QWEN2_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}
 const MAX_BIDIRECTIONAL_TOKENS: usize = 2048;
 /// `MAX_LEN` du `serve.sh` H2O (état de 32 000 tokens plus la question).
 const MAX_CAUSAL_TOKENS: usize = 40_960;
-/// Frontière de cache causal : un préfixe arrêté au milieu d'un bloc de 64
-/// positions du prefill gated-delta change l'ordre des réductions (mesuré :
-/// 16 diverge, 64 et ses multiples sont égaux au bit sur l'état de 4000 tokens).
-const PREFIX_ALIGN: usize = 64;
 const CHATML_GENERATION: &str = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
 /// Masque des couches d'attention complète ; les gated-delta restent causales.
@@ -300,9 +296,9 @@ impl LetterModel {
     }
 
     /// Hidden normés au dernier token de chaque séquence. En causal avec
-    /// `share_prefix`, le préfixe commun (arrondi à `PREFIX_ALIGN`) est
-    /// préfillé une fois et chaque lecture prolonge une copie de son état (KV
-    /// et récurrence gated-delta) : mêmes bits qu'un prefill complet.
+    /// `share_prefix`, le préfixe commun ([`Self::exact_prefix`]) est préfillé
+    /// une fois et chaque lecture prolonge une copie de son état (KV et
+    /// récurrence gated-delta) : mêmes bits qu'un prefill complet.
     fn last_hidden(
         &self,
         reads: &[&[usize]],
@@ -340,8 +336,8 @@ impl LetterModel {
                 Ok(out)
             }
             AttentionMode::Causal => {
-                let shared = if share_prefix && reads.len() > 1 {
-                    common_prefix(reads) / PREFIX_ALIGN * PREFIX_ALIGN
+                let shared = if share_prefix {
+                    self.exact_prefix(reads)
                 } else {
                     0
                 };
@@ -370,6 +366,29 @@ impl LetterModel {
                     .collect()
             }
         }
+    }
+
+    /// Préfixe partageable sans changer un bit : le prolongement résident
+    /// refait alors les calculs d'un prefill complet, quel que soit
+    /// l'alignement du préfixe ou le découpage en morceaux (mesuré sur H2O,
+    /// préfixes de 3879 à 7910 tokens). Deux conditions : le prolongement doit
+    /// passer par le prefill résident (sous `prefix_extend_resident_min_tokens`,
+    /// 32, il retombe sur l'extension en lignes, qui diffère), et
+    /// chaque passe (préfixe, suffixes) doit compter au moins
+    /// `DENSE_BF16_GEMM_MIN_BATCH` lignes, sous lesquelles les projections
+    /// passent du GEMM bf16 au qmv (63 lignes : écart 4,8e-3 sur le hidden).
+    /// 0 : pas de partage (CPU, prolongement non résident, suffixes courts).
+    fn exact_prefix(&self, reads: &[&[usize]]) -> usize {
+        let longest = reads.iter().map(|t| t.len()).max().unwrap_or(0);
+        if reads.len() < 2 || !self.decoder.prefix_extend_as_cheap_as_cold(longest) {
+            return 0;
+        }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let rows = crate::metal_backend::DENSE_BF16_GEMM_MIN_BATCH
+            .max(crate::runtime_flags::prefix_extend_resident_min_tokens());
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let rows = usize::MAX;
+        bounded_prefix(reads, rows)
     }
 
     /// Probabilités étalonnées de chaque lecture (oracles et mesures).
@@ -428,7 +447,11 @@ impl LetterModel {
             0
         };
         let input = total - shared * (tokens.len() - 1);
-        let cached = shared / PREFIX_ALIGN * PREFIX_ALIGN;
+        let cached = if mode == AttentionMode::Causal {
+            self.exact_prefix(&tokens)
+        } else {
+            0
+        };
         let processed = if mode == AttentionMode::Causal {
             total - cached * (tokens.len() - 1)
         } else {
@@ -587,6 +610,18 @@ fn h2o_tokenizer(path: &Path) -> Result<RustTokenizer> {
         }
     }
     Ok(tokenizer)
+}
+
+/// Préfixe commun laissant au moins `rows` tokens à chaque lecture et en
+/// comptant lui-même au moins `rows`, sinon 0.
+fn bounded_prefix(reads: &[&[usize]], rows: usize) -> usize {
+    let shortest = reads.iter().map(|t| t.len()).min().unwrap_or(0);
+    let shared = common_prefix(reads).min(shortest.saturating_sub(rows));
+    if shared >= rows {
+        shared
+    } else {
+        0
+    }
 }
 
 /// Préfixe de tokens commun, en laissant au moins un token à chaque lecture.
