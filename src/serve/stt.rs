@@ -722,6 +722,84 @@ mod tests {
         Ok(())
     }
 
+    /// Requête complète sur le thread moteur, sans modèle : seules les
+    /// validations faites avant le chargement peuvent répondre.
+    fn route(head: &str, body: &[u8]) -> (ServeResult<()>, String) {
+        let mut raw = format!("{head}Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        raw.extend_from_slice(body);
+        let request = super::super::http::read_request(
+            &mut std::io::Cursor::new(raw),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .expect("invariant: requête HTTP valide")
+        .expect("invariant: requête présente");
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = super::super::state::ServeState::new(&args);
+        let mut response = Vec::new();
+        let result = super::super::http::handle_job(&mut response, &mut state, &request);
+        (result, String::from_utf8_lossy(&response).into_owned())
+    }
+
+    fn form(fields: &[(&str, &str)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(
+                format!(
+                    "--B\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(b"--B--\r\n");
+        body
+    }
+
+    #[test]
+    fn routes_validate_stt_parameters_before_loading_the_model() {
+        let multipart = "POST /v1/audio/transcriptions HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=B\r\n";
+        for (fields, status) in [
+            (
+                vec![
+                    ("file", "x"),
+                    ("response_format", "verbose_json"),
+                    ("timestamp_granularities[]", "word"),
+                ],
+                "501",
+            ),
+            (
+                vec![("file", "x"), ("timestamp_granularities[]", "segment")],
+                "400",
+            ),
+            (
+                vec![
+                    ("file", "x"),
+                    ("response_format", "verbose_json"),
+                    ("stream", "true"),
+                ],
+                "400",
+            ),
+        ] {
+            let (result, response) = route(multipart, &form(&fields));
+            assert!(result.is_err());
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{fields:?}: {response}"
+            );
+        }
+        let stream =
+            "POST /v1/audio/transcriptions/stream HTTP/1.1\r\nX-Saragossa-STT-Final: true\r\n";
+        let (_, response) = route(stream, &[0; 3]);
+        assert!(
+            response.starts_with("HTTP/1.1 400 ") && response.contains("impair"),
+            "{response}"
+        );
+        let (_, response) = route(stream, &vec![0; MAX_CHUNK_SAMPLES * 2 + 2]);
+        assert!(
+            response.starts_with("HTTP/1.1 400 ") && response.contains("30 s"),
+            "{response}"
+        );
+    }
+
     #[test]
     fn sessions_evict_the_least_recently_used() {
         let mut sessions = SttSessions::default();
