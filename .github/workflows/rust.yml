@@ -182,6 +182,9 @@ jobs:
       - name: Minimal LLM clippy
         if: matrix.partition == 1
         run: taskpolicy -b cargo clippy --locked --no-default-features --features metal -- -D warnings
+      - name: Serve tests without modalities (including HTTP 501)
+        if: matrix.partition == 1
+        run: taskpolicy -b cargo test --locked --no-default-features --features metal,serve --bin saragossa "serve::"
 
   cpu:
     needs: [changes]
