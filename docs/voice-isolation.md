@@ -39,7 +39,7 @@ Tous les paramètres viennent de `config.ini` du checkpoint officiel
 **Signal et STFT** (`libDF`) :
 
 - 48 kHz mono, FFT et fenêtre de 960 échantillons (20 ms), pas de 480 (10 ms) ;
-- fenêtre de Vorbis `w[n] = sin(π/2 · sin²(π(n + ½)/480))`, dont la somme des
+- fenêtre de Vorbis `w[n] = sin(π/2 · sin²(π(n + ½)/960))`, dont la somme des
   carrés vaut 1 à 50 % de recouvrement ;
 - STFT « temps réel » : la trame `t` concatène les 480 échantillons du hop
   précédent et ceux du hop `t`, sans centrage. L'analyse multiplie par
