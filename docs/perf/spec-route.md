@@ -30,6 +30,17 @@ MTP reprend donc l'entrée du tour DFlash, et le tour DFlash suivant reprend
 l'entrée MTP, sans prefill complet (oracle
 `spec_route_alternation_reuses_prefix_real_model`, sous et au-delà de 16k).
 
+Classifieur sur embeddings (opt-in, `SARAGOSSA_RUST_SPEC_ROUTE_EMBED_DIR=<snapshot
+local de multilingual-e5-small>`, jamais téléchargé) : il remplace la règle
+« écriture latine » une fois les indices de code écartés, pour envoyer aussi la
+prose non latine vers MTP. 160 exemples de référence (10 par classe et par
+langue : fr, en, es, de, zh, ja, ko, ru, `src/spec_route/refs.json`), moyenne
+des 5 meilleurs cosinus code moins prose, MTP seulement sous −0,01. Jeu tenu à
+part de 64 consignes (`tools/fixtures/spec_route_embed_test.json`) : 61 justes,
+3 proses gardées en DFlash, aucun code envoyé vers MTP. Latence médiane
+35 ms, p95 44 ms sur CPU (charge 1 min 4,7) : loin de la cible de 2 ms, d'où
+l'opt-in. Test : `embed_router_accuracy_and_latency` (ignoré sans poids).
+
 ## Pourquoi DFlash perd en prose
 
 Les données de la campagne du 15 novembre (`mtp-dflash-fusion-results.json`

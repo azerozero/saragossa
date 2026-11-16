@@ -11,6 +11,8 @@
 //! prose mal classée coûte moins que perdre le gain du code. MTP n'est pris que
 //! si rien dans la requête ne ressemble à du code (docs/perf/spec-route.md).
 
+pub mod embed;
+
 /// Radicaux d'un mot de code, comparés en préfixe (`cod` couvre code, coder,
 /// codage ; `compil` couvre « erreur de compilation »).
 const CODE_STEMS: &[&str] = &[
@@ -158,11 +160,19 @@ pub fn prefers_dflash<R: AsRef<str>, S: AsRef<str>>(
     };
     let text = text.as_ref();
     let lower = text.to_lowercase();
-    text.trim().is_empty()
+    if text.trim().is_empty()
         || has_syntax_hint(&lower)
         || has_language_name(&lower)
-        || !is_latin(text)
         || has_word_hint(&lower)
+    {
+        return true;
+    }
+    // Classifieur opt-in : il remplace la règle « écriture latine » et peut
+    // donc envoyer aussi la prose non latine vers MTP.
+    match embed::router() {
+        Some(router) => !router.is_prose(text),
+        None => !is_latin(text),
+    }
 }
 
 /// Le greedy peut-il prendre DFlash ? Toujours si le routage est coupé

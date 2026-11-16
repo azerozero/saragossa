@@ -2119,6 +2119,13 @@ pub fn spec_route_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_SPEC_ROUTE", true))
 }
 
+/// Dossier local de `multilingual-e5-small` pour le routage par embeddings
+/// (`SARAGOSSA_RUST_SPEC_ROUTE_EMBED_DIR`, opt-in, jamais téléchargé) : le
+/// classifieur code/prose remplace la règle « écriture latine ».
+pub fn spec_route_embed_dir() -> Option<std::path::PathBuf> {
+    env_var_os("SARAGOSSA_RUST_SPEC_ROUTE_EMBED_DIR").map(std::path::PathBuf::from)
+}
+
 /// Route les requêtes échantillonnées (température > 0) vers le drafter DFlash
 /// quand il est configuré (`SARAGOSSA_RUST_DFLASH_DRAFT_DIR`), au lieu de la tête
 /// MTP : chaque ligne de vérification (chaîne ou arbre) est tirée sur le GPU par
