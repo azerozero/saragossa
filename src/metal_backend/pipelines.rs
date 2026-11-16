@@ -854,7 +854,12 @@ impl MetalExecutor {
         let dequant_u5_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u5_to_bf16_t_gs64")?;
         let dequant_u6_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u6_to_bf16_t_gs64")?;
         let dequant_u8_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u8_to_bf16_t_gs64")?;
-        let na_source = sources.na_gemm.as_ref();
+        let na_source = format!(
+            "{}{}",
+            super::flags::nax_source_prelude(),
+            sources.na_gemm.as_ref()
+        );
+        let na_source = na_source.as_str();
         let compile_na = |name: &str| compile_na_gemm_named(&device, na_source, name);
         let na_gemm_bf16 = compile_na_gemm(&device, na_source);
         let na_gemm_bf16_bn128 = compile_na("gemm_nax_bf16_bn128");
@@ -1146,6 +1151,7 @@ impl MetalExecutor {
             concat_buffers: Mutex::new(HashMap::new()),
             library: library.clone(),
             micro_library: Mutex::new(None),
+            micro_fast_library: Mutex::new(None),
             qmvt_pipelines: Mutex::new(HashMap::new()),
             preserve_weight_caches: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
