@@ -358,6 +358,7 @@ pub struct MetalExecutor {
     whisper_attn_decode_vec64_f32: ComputePipelineState,
     im2col_f32: ComputePipelineState,
     rms_norm_rope_heads_f32: ComputePipelineState,
+    rms_norm_mrope_heads_f32: ComputePipelineState,
     rms_norm_heads_no_scale_f32: ComputePipelineState,
     causal_attention_prefill_f32: ComputePipelineState,
     causal_attention_prefill_mid_f32: ComputePipelineState,
@@ -939,6 +940,8 @@ pub(crate) struct PrefillCaptures {
 pub(crate) enum PrefillInput<'a> {
     /// Flux résiduel déjà plongé `[rows, hidden]`.
     Hidden(&'a Tensor),
+    /// Embeddings fournis et positions par ligne, sans encodeur vision.
+    PositionedHidden(&'a Tensor, &'a [[usize; 3]]),
     /// Jetons plongés sur le GPU morceau par morceau : ni `[rows, hidden]` CPU
     /// ni sa copie GPU (2 × 5,4 Go à 256k sur le 27B). Réservé à un embedding
     /// dont le gather Metal est l'octet près celui du CPU.

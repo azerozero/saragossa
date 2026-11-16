@@ -49,6 +49,42 @@ class VisionFixtures(unittest.TestCase):
             total += len(tensors)
         self.assertEqual(total, 1296)
 
+    def test_provenance_records(self):
+        keys = {"transformers_source_sha256", "loaded_transformers_sources_sha256",
+                "runtime_source_sha256", "weight_sha256", "embedding_sha256"}
+
+        def check(value):
+            if isinstance(value, dict):
+                for key, records in value.items():
+                    if key in keys:
+                        self.assertIsInstance(records, list)
+                        self.assertEqual(len({r["path"] for r in records}), len(records))
+                        for record in records:
+                            self.assertEqual(set(record), {"path", "sha256"})
+                            self.assertIsInstance(record["path"], str)
+                            self.assertTrue(record["path"])
+                            self.assertRegex(record["sha256"], r"^[0-9a-f]{64}$")
+                        self.assertEqual(vision.hash_records(
+                            {r["path"]: r["sha256"] for r in records}), records)
+                    else:
+                        check(records)
+                if "transformers_source_sha256" in value:
+                    self.assertEqual(value["transformers_sha256"], vision.digest(
+                        json.dumps(value["transformers_source_sha256"], sort_keys=True).encode()))
+                    self.assertEqual(value["reference_script_sha256"],
+                                     vision.digest(Path(vision.__file__).read_bytes()))
+            elif isinstance(value, list):
+                for item in value:
+                    check(item)
+
+        for path in FIXTURES.rglob("*.json"):
+            with self.subTest(path=path.relative_to(FIXTURES)):
+                check(json.loads(path.read_bytes()))
+                # Le chemin, même nommé tokenization, ne partage pas la ligne du hash.
+                for line in path.read_text().splitlines():
+                    if '"path":' in line:
+                        self.assertNotIn('"sha256":', line)
+
     def test_images_and_patch_order(self):
         directory = FIXTURES / "images"
         images = json.loads((directory / "images.json").read_text())
@@ -127,7 +163,45 @@ class VisionFixtures(unittest.TestCase):
     def test_only_required_binary_payloads_are_stored(self):
         self.assertEqual(len(list((FIXTURES / "images").glob("*.bin"))), 3)
         self.assertEqual(len(list((FIXTURES / "tables").glob("*.bin"))), 6)
-        self.assertEqual(len(list(FIXTURES.rglob("*.bin"))), 21)
+        directory = FIXTURES / "Qwen3.8-27B-BF16"
+        calibration = json.loads((directory / "llm-calibration.json").read_bytes())
+        llm = {directory / p["file"] for c in calibration["cases"] for p in c["payloads"].values()}
+        self.assertEqual(len(llm), 12)
+        stored = set(FIXTURES.rglob("*.bin"))
+        self.assertTrue(llm <= stored)
+        self.assertEqual(len(stored - llm), 21)
+
+    def test_llm_calibration_is_frozen(self):
+        directory = FIXTURES / "Qwen3.8-27B-BF16"
+        calibration = json.loads((directory / "llm-calibration.json").read_bytes())
+        self.assertEqual(calibration["schema_version"], 1)
+        self.assertEqual(len(calibration["cases"]), 6)
+        self.assertEqual(calibration["environment"]["llm_script_sha256"],
+                         vision.digest(Path(__file__).with_name("vision_llm.py").read_bytes()))
+        self.assertEqual(calibration["mrope_inputs_sha256"],
+                         vision.digest((directory / "mrope-inputs.json").read_bytes()))
+        self.assertEqual(len(calibration["embedding_sha256"]), 3)
+        for entry in calibration["embedding_sha256"]:
+            self.assertEqual(entry["sha256"],
+                             vision.digest((directory / entry["path"]).read_bytes()))
+        for case in calibration["cases"]:
+            self.assertEqual(case["shape"][0], 17)
+            arrays = {}
+            for kind, payload in case["payloads"].items():
+                data = (directory / payload["file"]).read_bytes()
+                self.assertEqual(vision.digest(data), payload["sha256"])
+                arrays[kind] = np.frombuffer(data, dtype="<f4").reshape(case["shape"]).astype(np.float64)
+                self.assertTrue(np.isfinite(arrays[kind]).all())
+            error = arrays["bf16"] - arrays["f32"]
+            def softmax(x):
+                e = np.exp(x - x.max(axis=1, keepdims=True))
+                return e / e.sum(axis=1, keepdims=True)
+            measured = {"rms": np.sqrt((error * error).mean(axis=1)),
+                        "max_abs": np.abs(error).max(axis=1),
+                        "max_probability": np.abs(softmax(arrays["bf16"]) - softmax(arrays["f32"])).max(axis=1)}
+            for name, values in measured.items():
+                np.testing.assert_array_equal(values, case["noise"][name])
+                np.testing.assert_array_equal(values * 2, case["threshold"][name])
 
     def test_rejects_resize_and_unknown_profiles(self):
         for shape in ((255, 256, 3), (32, 32, 3), (2048, 2048, 3)):

@@ -1,4 +1,4 @@
-# Fixtures vision — étape 0
+# Fixtures vision — entrées et référence LLM
 
 Ces fichiers contiennent des **sorties et entrées synthétiques**, aucun poids.
 Le [contrat](../../../docs/vision-spec.md) précise les portes et limites.
@@ -14,15 +14,21 @@ Le [contrat](../../../docs/vision-spec.md) précise les portes et limites.
   stockées une seule fois. Leur rejeu est exact.
 - `mrope-inputs.json` : six préfixes par modèle (trois multi-images), spans
   d'insertion, positions Python exactes, delta signé et 16 tokens imposés.
+- `Qwen3.8-27B-BF16/llm-calibration.json` : capture Transformers f32/BF16
+  du vocabulaire entier, 17 états par prompt, bruit observé et seuils figés
+  à exactement 2× ce bruit. Les douze payloads `llm-*.bin` contiennent les
+  logits, sans poids. Le manifeste authentifie les embeddings, la
+  configuration, les 851 tenseurs LLM et les sources exécutées.
 
 Les `.bin` sont little-endian, contigus ; chaque JSON associé porte forme,
 dtype, taille et SHA256. Les indices d'interpolation sont avant permutation
 2×2 ; les embeddings sont après merger, dans l'ordre des placeholders.
 Le delta RoPE ne change pas les positions KV.
 
-Ces fixtures permettent de commencer l'oracle LLM de l'étape 3 sans encodeur
-Rust. Les logits, la calibration BF16 et les images redimensionnées ne sont
-pas encore qualifiés. Le SHA Git de Transformers n'est pas disponible dans le
-wheel ; ses fichiers sources sont empreintés, sans inventer de SHA amont.
+L'oracle LLM utilise les embeddings fournis, sans encodeur Rust. Sa
+[qualification](../../../docs/vision-llm.md) distingue la référence capturée
+et la comparaison du moteur. Les images redimensionnées restent hors de
+cette qualification. Le SHA Git de Transformers n'est pas disponible dans
+le wheel ; ses fichiers sources sont empreintés, sans inventer de SHA amont.
 
 Vérification sans poids : `"$REF_PYTHON" -I -B tools/goldens/test_vision.py`.

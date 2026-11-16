@@ -532,7 +532,7 @@ impl DecoderLayer {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let (prefill_seq, _) = x.as_matrix()?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if position_offset == 0 && !config.attn_output_gate {
+        if runtime.rope_positions().is_none() && position_offset == 0 && !config.attn_output_gate {
             if let (
                 Some(metal),
                 AttentionBlock::Full(attention),
@@ -641,7 +641,7 @@ impl DecoderLayer {
         // GPU-ifie le prefill full-attn (attention causale batchée + MoE shared rows),
         // sinon l'attention retombe sur le CPU O(seq²) (goulot prefill à l'échelle).
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if position_offset == 0 && config.attn_output_gate {
+        if runtime.rope_positions().is_none() && position_offset == 0 && config.attn_output_gate {
             if let (
                 Some(metal),
                 AttentionBlock::Full(attention),

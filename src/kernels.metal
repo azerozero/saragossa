@@ -9200,6 +9200,76 @@ kernel void rms_norm_rope_heads_f32(
     }
 }
 
+kernel void rms_norm_mrope_heads_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]],
+    constant float4& params [[buffer(4)]],
+    device const float* inv_freq [[buffer(5)]],
+    device const uint* positions [[buffer(6)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint seq = dims.x;
+    const uint heads = dims.y;
+    const uint head_dim = dims.z;
+    const uint rope_dims = dims.w;
+    const float eps = params.x;
+    const uint head = tile.x;
+    const uint pos = tile.y;
+    if (head >= heads || pos >= seq) {
+        return;
+    }
+
+    threadgroup float partial[256];
+    threadgroup float normalized[256];
+    const uint dim = heads * head_dim;
+    const uint start = pos * dim + head * head_dim;
+    float sumsq = 0.0f;
+    for (uint col = tid; col < head_dim; col += 256u) {
+        const float value = input[start + col];
+        sumsq += value * value;
+    }
+    partial[tid] = sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float inv_rms = rsqrt((partial[0] / float(head_dim)) + eps);
+    const uint pairs = rope_dims / 2u;
+    // Contrat hôte Qwen : 64 dimensions rotatives, partenaires à +32.
+    const uint pair_offset = uint(params.z) / 2u;
+    // input et out peuvent être le même buffer. Figer les deux partenaires
+    // avant toute écriture, y compris lorsqu'ils sont dans deux SIMD-groups.
+    normalized[tid] = input[start + tid] * inv_rms * weight[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint col = tid; col < head_dim; col += 256u) {
+        float value = normalized[col];
+        if (col < pairs || (col >= pair_offset && col < pair_offset + pairs)) {
+            // Les fréquences hôte partagent les arrondis f32 de la référence CPU.
+            const uint pair = (col < pair_offset) ? col : (col - pair_offset);
+            // Le binding est déjà décalé au premier rang du morceau.
+            const uint axis = (pair % 3u == 1u && pair < 33u) ? 1u :
+                ((pair % 3u == 2u && pair < 30u) ? 2u : 0u);
+            const float angle = float(positions[3u * pos + axis]) * inv_freq[pair];
+            const float c = precise::cos(angle);
+            const float s = precise::sin(angle);
+            const float first = normalized[pair];
+            const float second = normalized[pair + pair_offset];
+            // Fast-math peut contracter first*c - second*s en FMA ;
+            // cet écart est admis sous la porte CPU de 1e-5.
+            value = (col < pair_offset) ? (first * c - second * s) : (first * s + second * c);
+        }
+        out[start + col] = value;
+    }
+}
+
 kernel void rms_norm_heads_no_scale_f32(
     device const float* input [[buffer(0)]],
     device float* out [[buffer(1)]],

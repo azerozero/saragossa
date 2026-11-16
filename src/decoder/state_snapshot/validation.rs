@@ -152,6 +152,18 @@ impl Layer {
 
 impl Manifest {
     pub(super) fn validate(&self, model: &CausalDecoder, tokens: usize) -> Result<()> {
+        match &self.vision_positions {
+            Some(positions)
+                if !positions.media.is_empty()
+                    && positions.rows.len() == tokens
+                    && positions.delta_at(tokens)? == self.rope_delta => {}
+            None if self.rope_delta == 0 => {}
+            _ => {
+                return Err(invalid(
+                    "delta RoPE incompatible avec le contexte positionnel",
+                ))
+            }
+        }
         let mut budget = Budget::default();
         for (layer, definition) in self.layers.iter().zip(&model.layers) {
             match &definition.attention {
