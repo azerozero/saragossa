@@ -95,7 +95,8 @@ fn word_errors(reference: &[String], hypothesis: &[String]) -> usize {
 
 /// Client temps réel simulé : à chaque envoi, tout l'audio arrivé depuis le
 /// précédent part en un morceau, au plus tôt toutes les `chunk_s` secondes et
-/// jamais avant la fin du traitement précédent. Horloge virtuelle = durée
+/// jamais avant la fin du traitement précédent ; le dernier part dès la fin de
+/// l'audio. Horloge virtuelle = durée
 /// audio ; seules les durées de traitement sont mesurées.
 struct StreamRun {
     text: String,
@@ -139,7 +140,8 @@ fn run_stream(
             .push(done - available as f64 / SAMPLE_RATE);
         run.last_hypothesis = format!("{} {}", update.committed, update.partial);
         run.last_committed = update.committed;
-        clock = done.max(clock + chunk_s);
+        // La fin de parole (VAD) déclenche l'envoi final sans attendre le pas suivant.
+        clock = done.max((clock + chunk_s).min(duration));
     }
 }
 
