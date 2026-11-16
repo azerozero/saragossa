@@ -335,8 +335,9 @@ impl CausalDecoderPromptState {
         )
     }
 
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
-    pub(crate) fn final_state_for_test(&self) -> &Tensor {
+    /// État normé de la dernière position du prompt.
+    #[must_use]
+    pub fn final_state(&self) -> &Tensor {
         &self.final_state
     }
 

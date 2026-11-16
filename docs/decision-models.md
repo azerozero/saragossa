@@ -1,4 +1,4 @@
-# Modèles de décision Qwen3.5 (THX-02, d3-flash)
+# Modèles de décision Qwen3.5 (THX-02, d3-flash, d3-mini, H2O-Lightning)
 
 `saragossa::decision` expose le Decider joint de THX-02 (HAL-X-AI/THX-02,
 Apache-2.0) et le format `d3-code-readout-v1` de d3-flash (vllm-sr/d3-flash,
@@ -146,14 +146,112 @@ tenseurs `visual.*` ignorés, pas de tête de vocabulaire. Différences :
   `permutation_average` n'est pas pris en charge.
 
 Oracle : `tests/fixtures/decision/d3/`, 39 questions et prompts de 128, 512
-et 2048 tokens, tolérance figée 0,0184 (deux fois le bruit bf16 mesuré
-+ 1e-6).
+et 2048 tokens, tolérance figée 0,0184 (deux fois le bruit bf16 mesuré,
+plus 1e-6).
 
 ```sh
 SARAGOSSA_DECISION_D3_MODEL=DOSSIER cargo test --release --all-features \
   decision_d3_real_weight_oracle -- --ignored
 cargo run --release --example decision_bench -- DOSSIER tests/fixtures/decision/d3
 ```
+
+### d3-mini
+
+d3-mini (vllm-sr/d3-mini, Apache-2.0) publie le même format
+`d3-code-readout-v1` sur Qwen3.5-4B (hidden 2560, MLP 9216, deux shards,
+`tie_word_embeddings=true`, tête ignorée) : aucun code propre. Les 31 SHA-256
+de `MODEL_MANIFEST.json` sont vérifiés et ses fichiers Python identiques à
+ceux de d3-flash. Oracle : `tests/fixtures/decision/d3-mini/`, même corpus de
+39 questions et prompts de 128, 512 et 2048 tokens que d3-flash, tolérance
+figée 0,0133 (deux fois le bruit bf16 mesuré + 1e-6) ; écart mesuré 0,0041.
+Mesures (Apple M5 Max libre, charge 1 min sous 2 avant chaque série, ABBA,
+21 répétitions, p50) contre Torch MPS bf16 sur le même graphe : 47 contre
+72 ms à 128 tokens, 112 contre 193 ms à 512, 456 contre 781 ms à 2048.
+
+```sh
+SARAGOSSA_DECISION_D3_MINI_MODEL=DOSSIER cargo test --release --all-features \
+  decision_d3_mini_real_weight_oracle -- --ignored
+cargo run --release --example decision_bench -- DOSSIER tests/fixtures/decision/d3-mini
+```
+
+## Lecture « lettres » (H2O-Lightning-4B)
+
+`saragossa::decision::letters::LetterModel` lit un label par option (`A`,
+`B`…) dans les logits de la tête LM au dernier token du prompt. Seul
+H2O-Lightning-4B (h2oai/h2o-lightning-4b, Apache-2.0, Qwen3.5-4B) est rendu ;
+images, question `box` (génération guidée), sélection BM25 des longs états et
+relecture « DI » du shim ne sont pas pris en charge.
+
+- **Prompt** (`h2o_lightning_shim.Contract.question_prompt`, une séquence par
+  question) : système de `serve_config.json`, puis
+  `record: {état}\nquestion: {instructions}\noptions:\nA) nom: description…`,
+  tour assistant sans réflexion et préremplissage `Answer:`. État chaîne tel
+  quel, sinon JSON compact ; instructions non textuelles en
+  `json.dumps(indent=1)`, absentes : `Answer the question below.` ; `noul` lit
+  `true` en `A` et `false` en `B`. Mêmes neutralisations de tokens spéciaux
+  que d3.
+- **Tokenizer** : le modèle a été entraîné avec `Qwen2Tokenizer`, qui découpe
+  avec la regex Qwen2 et non celle de `tokenizer.json` (marques combinantes :
+  8 des 24 sondes de `tokenizer_contract.json` diffèrent). saragossa remplace
+  la regex et exige les 24 sondes au chargement.
+- **Lignes** : `label_rows.lightning` (safetensors `lightning-label-rows-1`,
+  `W` f32 `[255, 2560]`, un token « espace + lettre » (`␠A`, `␠B`…) par label, sans softcap). Ce ne
+  sont pas une tête dédiée mais les lignes de la tête liée aux embeddings
+  (égalité au bit vérifiée par la référence) ; la tête complète n'est pas
+  chargée.
+- **Étalonnage** : `softmax(z / T)` sur les labels demandés, T par type
+  (`choice` 0,75, `noul` 0,8, `score` 0,65, identiques dans les deux modes),
+  plancher oui/non 0 ; réponses au format du shim (`noul` = p(true), score
+  espéré et confiance max, confiance choice normalisée).
+- **Modes** : `"attention_mode": "bidirectional"` (défaut de
+  `two_way.default`, couches complètes non causales comme d3, 2048 tokens au
+  plus) ou `"causal"` (40 960 tokens au plus). Une question invalide refuse la
+  requête entière, sans troncature.
+
+Cache de préfixe, mode causal seulement (le KV non causal dépend du suffixe) :
+le préfixe de tokens commun aux questions est préfillé une fois ; chaque
+question prolonge une copie de l'état (KV et récurrence gated-delta, snapshot
+Metal). Les probabilités sont égales au bit à celles des prefills complets à
+deux conditions, mesurées : le prolongement passe par le prefill résident
+(au moins 32 tokens, `prefix_extend_resident_min_tokens` ; en dessous,
+l'extension en lignes diffère), et préfixe comme suffixes comptent au moins
+64 lignes (`DENSE_BF16_GEMM_MIN_BATCH` ; en dessous, les projections passent
+du GEMM bf16 au qmv : 63 lignes donnent 4,8e-3 d'écart sur le hidden, exact
+avec `SARAGOSSA_RUST_DENSE_BF16_GEMM=0`). Le préfixe partagé est donc borné à
+la plus courte question moins 64 tokens. Ni son alignement (préfixes de 3879
+à 7910 tokens) ni le découpage du prefill en morceaux (8000 tokens, deux
+morceaux de 4000) ne changent un bit. Sans prefill résident (CPU), pas de
+partage.
+
+Oracle : `tests/fixtures/decision/h2o/`, référence f32 Transformers (MPS) dans
+les deux modes sur 21 requêtes (corpus d3, sondes de démarrage du shim,
+instructions objet, hindi), prompts bidirectionnels de 128, 512 et 2048
+tokens, et 8 questions causales sur un état de 3986 à 4014 tokens ; égalité
+au bit du cache vérifiée sur ces 8 questions, sur un état de plus de 8000
+tokens et sur deux questions identiques (suffixe borné). La
+référence retrouve les réponses de `two_way.probe_reference` à 0,0012 près
+(seuil du shim 0,05). Tolérance figée 0,0215 (deux fois le bruit bf16 mesuré,
+plus 1e-6).
+
+Mesures (Apple M5 Max libre, charge 1 min sous 2 avant chaque série, ABBA,
+contre Torch MPS bf16 sur le même graphe, plafond GEMM MPS 58 TFLOP/s) :
+bidirectionnel p50 48 contre 72 ms à 128 tokens, 112 contre 193 ms à 512,
+453 contre 777 ms à 2048. Causal, 100 questions sur l'état de 4000 tokens :
+152 s sans cache (1,52 s par question ; MPS 173 s), 8,3 s avec (83 ms par
+question, ×18 ; MPS avec son propre cache 10,1 s), probabilités égales au bit
+dans les deux cas (335/335).
+
+```sh
+SARAGOSSA_DECISION_H2O_MODEL=DOSSIER cargo test --release --all-features \
+  decision_letters_h2o_real_weight_oracle -- --ignored
+cargo run --release --example letters_bench -- DOSSIER tests/fixtures/decision/h2o
+```
+
+Extension prévue : Sieve-31B (LoRA sur gemma-4-31B-it) lit les lignes `A`,
+`B`… de la tête à la position `Answer: (` à la température 8,5495, après le
+softcap final de Gemma ; il lui faudra son rendu, la fusion LoRA, l'extraction
+des lignes depuis la tête et ses propres oracles. La lecture au dernier token,
+les deux modes et le cache causal se réutilisent tels quels.
 
 openjev (27B) devra fournir ses propres oracles ; sa configuration et son
 protocole restent à vérifier avant tout support.
