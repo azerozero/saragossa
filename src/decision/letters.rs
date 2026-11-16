@@ -16,6 +16,8 @@ use crate::{CausalDecoder, InferError, Result, RustTokenizer, Tensor};
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
+const TOKENIZER_CONTRACT_SHA256: &str =
+    "7eb96aaea6b7dbb495f0840b42f18014ca5a697697305f76f39d46cae890ccb2";
 const LABEL_ROWS_FORMAT: &str = "lightning-label-rows-1";
 /// Regex de `tokenizer.json` (Qwen3.5) et celle de `Qwen2Tokenizer`, avec
 /// laquelle H2O a été entraîné : elles divergent sur les marques combinantes.
@@ -539,7 +541,23 @@ fn label_rows(path: &Path, labels: &[String]) -> Result<(Tensor, Vec<u32>)> {
 /// pas avec celle de `tokenizer.json`. Les sondes de `tokenizer_contract.json`
 /// doivent toutes passer.
 fn h2o_tokenizer(path: &Path) -> Result<RustTokenizer> {
-    let contract = read_json(&path.join("tokenizer_contract.json"))?;
+    let contract_path = path.join("tokenizer_contract.json");
+    let raw = std::fs::read(&contract_path).map_err(|source| InferError::Io {
+        path: contract_path.clone(),
+        source,
+    })?;
+    // Contrat publié avec H2O-Lightning (`TOKENIZER_CONTRACT_SHA256` du shim).
+    let digest: String = <sha2::Sha256 as sha2::Digest>::digest(&raw)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    if digest != TOKENIZER_CONTRACT_SHA256 {
+        return Err(invalid("tokenizer_contract.json différent de celui publié"));
+    }
+    let contract: Value = serde_json::from_slice(&raw).map_err(|source| InferError::Json {
+        path: contract_path,
+        source,
+    })?;
     if contract["actual_served_tokenizer_class"] != "Qwen2Tokenizer" {
         return Err(invalid("tokenizer servi Qwen2Tokenizer requis"));
     }
