@@ -12,7 +12,7 @@ git_tag_name = "v{{ version }}"
 changelog_update = true
 semver_check = false
 pr_labels = ["release"]
-# Filtre d'éligibilité, pas une cadence : release-ready décide de la fusion.
+# Filtre d'éligibilité : seuls ces commits déclenchent une release continue.
 release_commits = "^(feat|fix|refactor|perf)(\\([^)]+\\))?:"
 
 [[package]]
