@@ -90,6 +90,15 @@ def host_load():
                 compiler_cpu=sum(compilers))
 
 
+def wait_calm(seconds):
+    deadline = time.monotonic() + seconds
+    load = host_load()
+    while (load["load_average"][0] >= 2 or load["compiler_count"]) and time.monotonic() < deadline:
+        time.sleep(10)
+        load = host_load()
+    return load
+
+
 def model_manifest(directory):
     result = {}
     for path in sorted(directory.iterdir()):
@@ -146,6 +155,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=6)
     parser.add_argument("--ids", nargs="+")
+    parser.add_argument("--calm-wait", type=float, default=0,
+                        help="avant chaque passage, attendre au plus N s une charge 1 min < 2 sans compilateur")
     args = parser.parse_args()
     if args.repeats < 2 or args.repeats % 2:
         parser.error("repeats doit être pair et >= 2")
@@ -172,7 +183,7 @@ def main():
             for case in cases:
                 reference = None
                 for repeat in range(-1, args.repeats):
-                    load = host_load()
+                    load = wait_calm(args.calm_wait)
                     for mode in mode_order(repeat):
                         row = worker.run(case, mode, 256)
                         if reference is None:
