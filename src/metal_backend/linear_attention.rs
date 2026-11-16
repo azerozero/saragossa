@@ -3637,12 +3637,12 @@ impl MetalExecutor {
         Ok(snapshots)
     }
 
-    #[cfg(any(test, feature = "devtools"))]
     /// Compare deux états linear-attn déjà synchronisés côté GPU.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si les formes divergent ou si un readback échoue.
+    #[cfg(feature = "devtools")]
     pub(crate) fn diff_linear_attn_states(
         &self,
         left: &LinearAttentionMetalState,
@@ -3826,7 +3826,7 @@ impl MetalExecutor {
     ///
     /// Renvoie une erreur si une série n'est pas une série arbre complète, si le
     /// chemin est vide ou sort des captures, ou si l'encodage échoue.
-    #[cfg(any(feature = "devtools", test))]
+    #[cfg(feature = "devtools")]
     pub(crate) fn restore_linear_attn_tree(
         &self,
         layers: &[(&LinearAttentionMetalState, &[LinearAttentionMetalState])],
@@ -3922,7 +3922,7 @@ impl MetalExecutor {
     }
 }
 
-#[cfg(any(test, feature = "devtools"))]
+#[cfg(feature = "devtools")]
 fn diff_f32_slices(left: &[f32], right: &[f32]) -> Result<(f32, f32)> {
     if left.len() != right.len() {
         return Err(InferError::Dimension(format!(

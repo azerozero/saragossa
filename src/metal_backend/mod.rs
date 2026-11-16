@@ -132,14 +132,14 @@ pub(crate) mod tests;
 mod transfer;
 // Arbre de vérification DFlash : construit par la boucle DFlash (devtools).
 #[cfg_attr(
-    not(feature = "devtools"),
+    not(any(feature = "devtools", test)),
     expect(dead_code, reason = "arbre construit par la boucle DFlash (devtools)")
 )]
 mod verify_tree;
 #[cfg(feature = "stt")]
 mod whisper_encode;
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "tts", feature = "denoise")))]
 pub(crate) use self::barriers::command_buffer_gpu_ns;
 #[doc(hidden)]
 pub use self::barriers::dump_commit_components;
@@ -159,7 +159,7 @@ pub(crate) use self::lightbatch_duo::{
 };
 #[cfg(feature = "devtools")]
 pub(crate) use self::linear_attention::linear_tree_journal_refusal;
-#[cfg(test)]
+#[cfg(all(test, feature = "devtools"))]
 pub(crate) use self::linear_attention::{linear_tree_refusal, LinearTreeShape};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) use self::matmul::take_concat_profile;
@@ -664,7 +664,7 @@ pub(crate) struct MetalLinearAttnResidentDenseWeights {
     pub norm_weight: Buffer,
 }
 
-#[cfg(any(test, feature = "devtools"))]
+#[cfg(feature = "devtools")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LinearAttentionStateDiff {
     pub conv_max_abs: f32,

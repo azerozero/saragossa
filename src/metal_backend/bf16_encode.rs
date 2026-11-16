@@ -140,7 +140,7 @@ impl MetalExecutor {
     /// # Errors
     ///
     /// Renvoie une erreur si `rhs` n'est pas une matrice ou si Metal échoue.
-    #[cfg(any(feature = "stt", test))]
+    #[cfg(feature = "stt")]
     pub(crate) fn cached_rhs_t_bf16(&self, rhs: &Tensor) -> Result<Buffer> {
         let (n, k) = rhs.as_matrix()?;
         self.cached_rhs_t_bf16_matrix(rhs.data(), n, k, rhs.data().as_ptr() as usize)

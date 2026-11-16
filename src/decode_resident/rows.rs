@@ -836,7 +836,7 @@ impl DecodeResidentState {
     /// # Errors
     ///
     /// Renvoie une erreur si un kernel ne compile pas.
-    #[cfg(any(feature = "devtools", test))]
+    #[cfg(feature = "devtools")]
     pub(crate) fn warm_verify_tree_kernels(&self, head_dims: &[usize]) -> Result<()> {
         let tree = self.rows_kernels()?.tree_variant()?;
         if crate::runtime_flags::verify_rows_nax_enabled() {

@@ -114,6 +114,12 @@ fn run() -> CliResult<()> {
             "decide" => return decide_cli::run(raw_args.into_iter().skip(1)),
             #[cfg(feature = "denoise")]
             "enhance" => return voice_cli::run_enhance(raw_args.into_iter().skip(1)),
+            #[cfg(not(feature = "denoise"))]
+            "enhance" => {
+                return Err(cli_error(
+                    "débruitage absent : recompiler avec --features denoise",
+                ));
+            }
             "bench" => return doctor_bench::run_bench(raw_args.into_iter().skip(1)),
             #[cfg(feature = "serve")]
             "bench-serve" => return bench_serve::run(raw_args.into_iter().skip(1)),

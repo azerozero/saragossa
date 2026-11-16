@@ -7,19 +7,20 @@
 //!   réponse WAV par défaut, ou PCM s16le mono chunked avec `stream: true`.
 //!
 //! - `POST /v1/audio/enhance` (extension saragossa) : débruitage DeepFilterNet3,
-//!   `multipart/form-data` avec `file` = WAV, réponse WAV mono 48 kHz.
+//!   WAV/multipart en duplex, réponse WAV mono 48 kHz : voir [`super::enhance`].
 //!
 //! Les modèles sont opt-in (`--stt-model`, `--tts-model`) et chargés paresseusement
 //! au premier appel : sans configuration, la route renvoie une erreur 400 claire.
 
-#[cfg(any(feature = "tts", feature = "denoise"))]
+#[cfg(feature = "tts")]
 use std::io::Cursor;
+#[cfg(any(feature = "stt", feature = "tts"))]
 use std::io::Write;
 use std::path::PathBuf;
 
 #[cfg(all(test, feature = "tts"))]
 use hound::WavReader;
-#[cfg(any(feature = "tts", feature = "denoise"))]
+#[cfg(feature = "tts")]
 use hound::{SampleFormat, WavSpec, WavWriter};
 #[cfg(feature = "tts")]
 use serde::Deserialize;
@@ -28,8 +29,6 @@ use serde_json::json;
 
 #[cfg(feature = "tts")]
 use saragossa::tts::TTS_GENERATION_HARD_CAP;
-#[cfg(feature = "denoise")]
-use saragossa::wire_audio::extract_boundary;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[cfg(feature = "stt")]
 use saragossa::MetalExecutor;
@@ -39,7 +38,9 @@ use saragossa::{ForwardRuntime, WhisperModel};
 use saragossa::{TtsModel, TtsSynthesisOutput};
 
 use super::args::ServeArgs;
+#[cfg(any(feature = "stt", feature = "tts"))]
 use super::error::{ServeError, ServeResult};
+#[cfg(any(feature = "stt", feature = "tts"))]
 use super::http::write_headers;
 #[cfg(feature = "stt")]
 use crate::RuntimeKind;
@@ -67,8 +68,6 @@ pub(super) struct AudioState {
     tts: TtsSlot,
     #[cfg(feature = "denoise")]
     enhance_path: Option<PathBuf>,
-    #[cfg(feature = "denoise")]
-    enhancer: Option<saragossa::denoise::DeepFilterNet3>,
     /// Sessions STT à entrée incrémentale, indépendantes du modèle chargé.
     #[cfg(feature = "stt")]
     pub(super) stt_sessions: super::stt::SttSessions,
@@ -130,37 +129,14 @@ impl AudioState {
             },
             #[cfg(feature = "denoise")]
             enhance_path: args.enhance_model.clone(),
-            #[cfg(feature = "denoise")]
-            enhancer: None,
             #[cfg(feature = "stt")]
             stt_sessions: super::stt::SttSessions::default(),
         }
     }
 
-    /// Débruite un signal mono 48 kHz avec DeepFilterNet3 (CPU), chargé au premier appel.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si `--enhance-model` est absent ou si les poids sont invalides.
     #[cfg(feature = "denoise")]
-    pub(super) fn enhance(&mut self, samples: &[f32]) -> ServeResult<Vec<f32>> {
-        if self.enhancer.is_none() {
-            let path = self.enhance_path.clone().ok_or_else(|| {
-                ServeError::args(
-                    "endpoint enhance non configuré: relancez saragossa serve avec --enhance-model <dfn3.safetensors>",
-                )
-            })?;
-            eprintln!(
-                "saragossa serve loading enhance model path={}",
-                path.display()
-            );
-            self.enhancer = Some(saragossa::denoise::DeepFilterNet3::load(&path)?);
-        }
-        let model = self
-            .enhancer
-            .as_ref()
-            .ok_or_else(|| ServeError::args("modèle enhance absent après chargement"))?;
-        Ok(model.enhance(samples)?)
+    pub(super) fn enhance_path(&self) -> Option<PathBuf> {
+        self.enhance_path.clone()
     }
 
     /// Transcrit des échantillons mono 16 kHz avec le backend Whisper.
@@ -370,39 +346,6 @@ fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
         .min(TTS_GENERATION_HARD_CAP)
 }
 
-/// Sert `POST /v1/audio/enhance` : WAV quelconque en entrée, WAV mono 48 kHz débruité en sortie.
-#[cfg(feature = "denoise")]
-pub(super) fn handle_enhance<S: Write>(
-    stream: &mut S,
-    audio: &mut AudioState,
-    content_type: Option<&str>,
-    body: &[u8],
-) -> ServeResult<()> {
-    let content_type = content_type
-        .ok_or_else(|| ServeError::Http("Content-Type multipart/form-data requis".to_string()))?;
-    let boundary = extract_boundary(content_type).ok_or_else(|| {
-        ServeError::Http("boundary multipart absente du Content-Type".to_string())
-    })?;
-    let fields = parse_multipart(body, &boundary)?;
-    let file = fields
-        .iter()
-        .find(|field| field.name == "file")
-        .ok_or_else(|| ServeError::Http("champ multipart 'file' requis".to_string()))?;
-    let (mono, rate) =
-        saragossa::denoise::decode_wav(&file.data).map_err(|e| ServeError::Http(e.to_string()))?;
-    let rate48 = saragossa::denoise::SAMPLE_RATE;
-    let samples = saragossa::denoise::resample(&mono, rate, rate48)
-        .map_err(|e| ServeError::Http(e.to_string()))?;
-    let wav = mono_f32_to_wav(&audio.enhance(&samples)?, rate48)?;
-    write_headers(stream, 200, "OK", "audio/wav", Some(wav.len()), Vec::new())?;
-    stream
-        .write_all(&wav)
-        .map_err(|e| ServeError::io("écriture réponse WAV", e))?;
-    stream
-        .flush()
-        .map_err(|e| ServeError::io("flush réponse WAV", e))
-}
-
 /// Sert `POST /v1/audio/speech`.
 #[cfg(feature = "tts")]
 pub(super) fn handle_speech<S: Write>(
@@ -578,7 +521,7 @@ fn write_pcm_chunk<S: Write>(stream: &mut S, samples: &[f32]) -> std::io::Result
 }
 
 #[cfg(any(feature = "tts", feature = "denoise"))]
-fn pcm_i16(sample: f32) -> i16 {
+pub(super) fn pcm_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
 }
 
@@ -619,7 +562,7 @@ pub(super) fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()>
 // Les cibles fuzz et le serveur exécutent le même décodeur, sans copie.
 #[cfg(all(test, feature = "stt", feature = "tts"))]
 use saragossa::wire_audio::text_field;
-#[cfg(any(feature = "stt", feature = "denoise"))]
+#[cfg(feature = "stt")]
 use saragossa::wire_audio::MultipartField;
 #[cfg(all(test, feature = "stt", feature = "tts"))]
 use saragossa::wire_audio::MAX_WAV_SAMPLES;
@@ -630,7 +573,7 @@ fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult
         .map_err(|e| ServeError::Http(e.0))
 }
 
-#[cfg(any(feature = "stt", feature = "denoise"))]
+#[cfg(feature = "stt")]
 pub(super) fn parse_multipart(body: &[u8], boundary: &str) -> ServeResult<Vec<MultipartField>> {
     saragossa::wire_audio::parse_multipart(body, boundary).map_err(|e| ServeError::Http(e.0))
 }
@@ -641,7 +584,7 @@ pub(super) fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
 }
 
 /// Encode des échantillons mono f32 en WAV PCM i16 en mémoire.
-#[cfg(any(feature = "tts", feature = "denoise"))]
+#[cfg(feature = "tts")]
 fn mono_f32_to_wav(samples: &[f32], sample_rate: u32) -> ServeResult<Vec<u8>> {
     let spec = WavSpec {
         channels: 1,
@@ -1067,68 +1010,6 @@ mod tests {
         .expect_err("invariant: STT non configuré refusé");
 
         assert!(error.to_string().contains("STT non configuré"));
-    }
-
-    #[test]
-    #[cfg(feature = "denoise")]
-    fn enhance_without_model_returns_clear_error() {
-        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
-        let mut audio = AudioState::new(&args);
-        let mut stream = Cursor::new(Vec::new());
-        let wav = mono_f32_to_wav(&[0.1_f32; 1600], 16_000).expect("invariant: WAV");
-        let body = multipart_body("BND", &wav, None);
-
-        let error = handle_enhance(
-            &mut stream,
-            &mut audio,
-            Some("multipart/form-data; boundary=BND"),
-            &body,
-        )
-        .expect_err("invariant: enhance non configuré refusé");
-
-        assert!(error.to_string().contains("enhance non configuré"));
-        assert!(stream.get_ref().is_empty());
-    }
-
-    #[test]
-    #[cfg(feature = "denoise")]
-    fn enhance_rejects_invalid_audio_with_http_400_before_model_loading() {
-        for (rate, channels, samples, expected) in [
-            (0, 1, 8, "taux WAV"),
-            (8_000, 1, 8_000 * 300 + 1, "300 s"),
-            (8_000, 2, 2 * (8_000 * 300 + 1), "300 s"),
-        ] {
-            let wav = pcm_wav(rate, channels, 16, samples);
-            let body = multipart_body("BND", &wav, None);
-            let mut raw = format!(
-                "POST /v1/audio/enhance HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=BND\r\nContent-Length: {}\r\n\r\n", body.len()
-            ).into_bytes();
-            raw.extend_from_slice(&body);
-            let request = super::super::http::read_request(
-                &mut Cursor::new(raw),
-                std::time::Instant::now() + std::time::Duration::from_secs(30),
-            )
-            .unwrap()
-            .unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let args = ServeArgs::parse([
-                "--enhance-model".to_string(),
-                dir.path()
-                    .join("absent.safetensors")
-                    .to_string_lossy()
-                    .into_owned(),
-            ])
-            .unwrap();
-            let mut state = super::super::state::ServeState::new(&args);
-            let mut response = Vec::new();
-            let error =
-                super::super::http::handle_job(&mut response, &mut state, &request).unwrap_err();
-            assert!(matches!(error, ServeError::Http(_)), "{error}");
-            assert!(error.to_string().contains(expected), "{error}");
-            assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
-            assert!(String::from_utf8_lossy(&response).contains(expected));
-            assert!(state.audio_mut().enhancer.is_none());
-        }
     }
 
     #[test]

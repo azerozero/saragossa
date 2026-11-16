@@ -24,7 +24,7 @@
 //! - `SARAGOSSA_SERVE_MAX_INFLIGHT_BYTES` (256 Mio) : octets de corps lus ou
 //!   en file.
 //!
-//! Le parseur HTTP accepte uniquement les corps à `Content-Length`.
+//! Hors débruitage duplex (`enhance`), le parseur accepte les corps à `Content-Length`.
 //! `Transfer-Encoding` seul répond 501 ; avec `Content-Length`, ou un
 //! `Content-Length` répété ou non numérique, le cadrage ambigu répond 400.
 
@@ -42,6 +42,10 @@ mod dispatch;
 #[cfg(feature = "embed")]
 #[cfg(feature = "serve")]
 mod embeddings;
+#[cfg(all(feature = "serve", feature = "denoise"))]
+mod enhance;
+#[cfg(all(feature = "serve", feature = "denoise"))]
+mod enhance_body;
 pub(crate) mod error;
 #[cfg(feature = "serve")]
 mod flint_output;

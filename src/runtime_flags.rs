@@ -610,7 +610,7 @@ thread_local! {
 /// Force l'argmax GPU et les drafts lookup du MTP sur ce thread le temps de
 /// `run` (oracle O2 du repli `Skip` : vérification sans argmax GPU d'une
 /// proposition lookup multiligne).
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 pub(crate) fn with_mtp_skip_override<R>(lookup_drafts: usize, run: impl FnOnce() -> R) -> R {
     /// Rétablit les réglages précédents, panique comprise.
     struct Restore(Option<bool>, Option<usize>);
@@ -1111,7 +1111,7 @@ thread_local! {
 
 /// Exécute `run` avec `n` drafts de lookup greedy sur ce thread (bench A/B dans
 /// un même processus), puis rétablit la valeur précédente.
-#[cfg(test)]
+#[cfg(all(test, feature = "devtools"))]
 pub(crate) fn with_lookup_greedy_override<R>(drafts: usize, run: impl FnOnce() -> R) -> R {
     let previous = LOOKUP_GREEDY_OVERRIDE.with(|cell| cell.replace(Some(drafts)));
     let result = run();
@@ -1929,7 +1929,7 @@ thread_local! {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 pub(crate) fn with_tts_prefill_cache_for_test<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
     struct Reset(Option<bool>);
     impl Drop for Reset {
@@ -1964,7 +1964,7 @@ pub(super) fn prefix_extend_rows() -> usize {
 /// Seuil de bascule DFlash → MTP (`SARAGOSSA_RUST_DFLASH_SWITCH_MIN`, tokens
 /// acceptés par tour en moyenne) ; 0 = pas de bascule. Lu à chaque appel : le
 /// harnais d'acceptance le fait varier entre deux runs d'un même processus.
-#[cfg(any(feature = "devtools", test))]
+#[cfg(feature = "devtools")]
 pub(super) fn dflash_switch_min() -> f64 {
     crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SWITCH_MIN")
         .and_then(|value| value.trim().parse::<f64>().ok())
@@ -1974,7 +1974,7 @@ pub(super) fn dflash_switch_min() -> f64 {
 /// Attention fenêtrée du drafter DFlash en lignes (défaut) ;
 /// `SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS=0` rétablit la boucle naïve ligne par
 /// ligne, référence de dérive et de débit.
-#[cfg(any(feature = "devtools", test))]
+#[cfg(feature = "devtools")]
 pub(crate) fn dflash_windowed_rows() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS", true))
@@ -1984,7 +1984,7 @@ pub(crate) fn dflash_windowed_rows() -> bool {
 /// sont fenêtrées et leurs types complets. `SARAGOSSA_RUST_DFLASH_DRAFTER_BASE=0`
 /// conserve la capacité pleine et `skip_context`. Lu à chaque génération pour
 /// les comparaisons plein/base fixe dans les harnais d'identité.
-#[cfg(any(feature = "devtools", test))]
+#[cfg(feature = "devtools")]
 pub(crate) fn dflash_drafter_base() -> bool {
     env_flag("SARAGOSSA_RUST_DFLASH_DRAFTER_BASE", true)
 }
@@ -1995,7 +1995,7 @@ pub(crate) fn dflash_drafter_base() -> bool {
 /// absente) : défaut `DFLASH_TREE_DEFAULT_BUDGET` quand le modèle le supporte,
 /// chaîne sinon. Lu à chaque génération ; une valeur explicite invalide ou hors
 /// périmètre est refusée avant la boucle.
-#[cfg(any(feature = "devtools", test))]
+#[cfg(feature = "devtools")]
 pub(crate) fn dflash_tree_budget() -> Option<Result<usize, String>> {
     let value = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_TREE")?;
     // Une coquille ne doit pas faire mesurer la chaîne en croyant mesurer
@@ -2006,7 +2006,7 @@ pub(crate) fn dflash_tree_budget() -> Option<Result<usize, String>> {
 /// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE` : B = 8 garde les
 /// 9 lignes de la chaîne (même coût de vérification) et gagne +12 à +35 % de
 /// decode en pairwise (`docs/perf/mtp-pairwise.md`).
-#[cfg(any(feature = "devtools", test))]
+#[cfg(feature = "devtools")]
 pub(crate) const DFLASH_TREE_DEFAULT_BUDGET: usize = 8;
 
 /// Budget de l'arbre DFlash 2 par défaut en vérification stricte
@@ -2014,13 +2014,13 @@ pub(crate) const DFLASH_TREE_DEFAULT_BUDGET: usize = 8;
 /// exacts. Mesuré le 5 nov. 2026 (27B, ABBA, M5 Max, tok/s) : B = 3 strict
 /// 52,4-53,8 à 4k et 44,9-45,1 à 32k, contre 39,1-39,5 et 29,6-30,1 pour
 /// B = 8 strict en qmv-T, et 55,1-56,5 et 50,3-51,3 pour le défaut rapide.
-#[cfg(any(feature = "devtools", test))]
+#[cfg(feature = "devtools")]
 pub(crate) const DFLASH_TREE_STRICT_DEFAULT_BUDGET: usize = 3;
 
 /// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE` : B = 3 pour une
 /// requête greedy (`greedy`, température nulle) en mode strict, B = 8 sinon
 /// (échantillonné compris, que le mode strict ne touche pas).
-#[cfg(any(feature = "devtools", test))]
+#[cfg(feature = "devtools")]
 pub(crate) fn dflash_tree_default_budget(greedy: bool) -> usize {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     if greedy && verify_strict_enabled() {
@@ -2033,7 +2033,7 @@ pub(crate) fn dflash_tree_default_budget(greedy: bool) -> usize {
 
 /// Parse `SARAGOSSA_RUST_DFLASH_TREE` (entier, espaces ignorés) ; `None` si
 /// invalide.
-#[cfg(any(feature = "devtools", test))]
+#[cfg(feature = "devtools")]
 pub(crate) fn parse_dflash_tree_budget(value: &str) -> Option<usize> {
     value.trim().parse::<usize>().ok()
 }
@@ -2043,7 +2043,7 @@ pub(crate) fn parse_dflash_tree_budget(value: &str) -> Option<usize> {
 /// sélecteur, puis la séquence générée ; sert à estimer hors ligne une vérification
 /// en arbre. Chaque génération recrée le fichier (sous `serve`, la dernière requête
 /// gagne). Absent (défaut) : aucune trace, aucun calcul supplémentaire.
-#[cfg(any(feature = "devtools", test))]
+#[cfg(feature = "devtools")]
 pub(crate) fn dflash_tree_trace_path() -> Option<std::path::PathBuf> {
     crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_TREE_TRACE")
         .filter(|value| !value.trim().is_empty())
@@ -2199,6 +2199,32 @@ pub fn serve_max_connections() -> usize {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|max| *max > 0)
             .unwrap_or(64)
+    })
+}
+
+/// Flux DFN3 simultanés (`SARAGOSSA_ENHANCE_MAX_STREAMS`, défaut 2).
+/// Une admission refusée répond 503 sans lire le corps.
+pub fn enhance_max_streams() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        env_var("SARAGOSSA_ENHANCE_MAX_STREAMS")
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(2)
+    })
+}
+
+/// Inactivité maximale par lecture ou écriture DFN3, en secondes
+/// (`SARAGOSSA_ENHANCE_IDLE_TIMEOUT_SECS`, défaut 30). Aucun plafond de durée.
+pub fn enhance_idle_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        Duration::from_secs(
+            env_var("SARAGOSSA_ENHANCE_IDLE_TIMEOUT_SECS")
+                .and_then(|v| v.trim().parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(30),
+        )
     })
 }
 
@@ -2488,6 +2514,8 @@ pub(crate) fn environment_sha256() -> &'static str {
 /// Liste fermée (suffixes communs à SARAGOSSA_ et RETI_) ; les flags inconnus,
 /// le batching et la géométrie des blocs restent dans l'empreinte par prudence.
 const SNAPSHOT_OPERATIONAL_SERVE_FLAGS: &[&str] = &[
+    "ENHANCE_MAX_STREAMS",
+    "ENHANCE_IDLE_TIMEOUT_SECS",
     "SERVE_LOG_PROMPT_FINGERPRINT",
     "SERVE_LRU",
     "SERVE_MAX_CONNECTIONS",
@@ -3113,7 +3141,7 @@ thread_local! {
 }
 
 /// Force la sélection partielle du tirage TTS pendant `work` (oracles).
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 pub(crate) fn with_tts_sampler_partial_topk<T>(enabled: bool, work: impl FnOnce() -> T) -> T {
     let previous = TTS_SAMPLER_TOPK_OVERRIDE.with(|flag| flag.replace(Some(enabled)));
     let out = work();
@@ -3205,7 +3233,7 @@ thread_local! {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 pub(crate) fn with_tts_greedy_for_test<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
     struct Reset(Option<bool>);
     impl Drop for Reset {

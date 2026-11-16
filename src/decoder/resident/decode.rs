@@ -131,11 +131,7 @@ impl CausalDecoder {
     }
 
     /// Renvoie la dernière ligne du prefill AVANT la norme finale.
-    #[cfg(all(
-        target_os = "macos",
-        feature = "metal",
-        any(test, feature = "devtools")
-    ))]
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     pub(crate) fn resident_reference_start(
         &self,
         prompt: &[usize],
