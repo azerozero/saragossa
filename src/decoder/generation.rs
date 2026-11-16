@@ -1322,10 +1322,12 @@ impl CausalDecoder {
         )
     }
 
-    /// Comme `generate_greedy_mtp_streaming_with_options`, mais le drafter DFlash
-    /// chargé n'est pris que si `allow_dflash` : l'appelant route par classe de
-    /// prompt (`crate::spec_route::allows_dflash`), sinon la tête MTP sert la
-    /// requête. Les deux vérifieurs sont exacts : la suite greedy est la même.
+    /// Comme `generate_greedy_mtp_streaming_with_options`, mais en greedy
+    /// (température nulle) le drafter DFlash chargé n'est pris que si
+    /// `allow_dflash` : l'appelant route par classe de prompt
+    /// (`crate::spec_route::allows_dflash`), sinon la tête MTP sert la requête.
+    /// Les deux vérifieurs sont exacts : la suite greedy est la même.
+    /// L'échantillonné ignore `allow_dflash`.
     ///
     /// # Errors
     ///
@@ -1369,8 +1371,14 @@ impl CausalDecoder {
         // sampler GPU sait tirer ses paramètres, sinon il garde la tête MTP comme
         // les contraintes. Phase 7 pairwise : code +31 à +88 %, prose longue
         // +7 à +22 %, prose courte −13 à −27 % (docs/perf/mtp-pairwise.md).
+        // Le routage par classe de prompt ne vaut que pour le greedy (seul mesuré) :
+        // l'échantillonné garde DFlash quel que soit `allow_dflash`.
         #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-        if let Some(draft) = self.dflash.as_ref().filter(|_| allow_dflash) {
+        if let Some(draft) = self
+            .dflash
+            .as_ref()
+            .filter(|_| allow_dflash || options.temperature > f32::EPSILON)
+        {
             if super::resident::dflash::dflash_sampling_refusal(options).is_none()
                 && options.token_constraint.is_none()
             {
