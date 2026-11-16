@@ -1,3 +1,4 @@
+#![cfg(feature = "stt")]
 //! STT en flux sur poids réels : identité batch/flux et mesures sur FLEURS.
 //!
 //! Ignorés par défaut. `SARAGOSSA_WHISPER_DIR` désigne un snapshot Whisper HF

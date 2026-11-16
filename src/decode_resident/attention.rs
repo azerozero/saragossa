@@ -754,6 +754,7 @@ impl FullAttentionMetalState {
 
     /// Indique si norm+RoPE+append K/V fusionnés acceptent ce cache (f32 ou
     /// bf16) : sinon [`Self::encode_rope_qk_append_kv`] renvoie `false`.
+    #[cfg(any(feature = "tts", test))]
     pub(super) fn supports_fused_rope_append(&self) -> bool {
         !self.format.is_quantized()
     }
@@ -887,6 +888,7 @@ impl FullAttentionMetalState {
         unsafe_code,
         reason = "copie CPU de lignes d'un MTLBuffer StorageModeShared hors command buffer"
     )]
+    #[cfg(any(feature = "devtools", test))]
     pub(crate) fn compact_tree_rows(&mut self, first: usize, path: &[usize]) -> Result<()> {
         let valid = path.first() == Some(&0) && path.windows(2).all(|pair| pair[0] < pair[1]);
         let stored = self.stored_row(first, "compaction KV arbre")?;
@@ -2121,6 +2123,7 @@ impl FullAttentionMetalState {
         clippy::too_many_arguments,
         reason = "encodage Metal: sources Q/K/V + offsets + paramètres rms_norm+RoPE"
     )]
+    #[cfg(any(feature = "tts", test))]
     pub(crate) fn encode_rope_qk_append_kv(
         &mut self,
         encoder: &ComputeCommandEncoderRef,

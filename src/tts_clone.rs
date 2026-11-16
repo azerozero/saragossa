@@ -1,5 +1,7 @@
 //! Prétraitement clone Base/ICL pour Qwen3-TTS.
 
+pub use crate::audio_resample::resample;
+
 use crate::{InferError, Result, Tensor};
 use rustfft::{num_complex::Complex, FftPlanner};
 
@@ -20,26 +22,6 @@ const N_FREQS: usize = N_FFT / 2 + 1;
 pub fn load_wav_24k(bytes: &[u8]) -> Result<Vec<f32>> {
     let (mono, sample_rate) = decode_wav_mono(bytes)?;
     Ok(resample(&mono, sample_rate, 24_000))
-}
-
-/// Rééchantillonne un signal mono par polyphase rationnel.
-#[must_use]
-pub fn resample(samples: &[f32], from_hz: u32, to_hz: u32) -> Vec<f32> {
-    if from_hz == to_hz || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let g = gcd(from_hz, to_hz);
-    let up = (to_hz / g) as usize;
-    let down = (from_hz / g) as usize;
-    let max_rate = up.max(down);
-    let half_len = 10 * max_rate;
-    let numtaps = 2 * half_len + 1;
-    let cutoff = 1.0 / max_rate as f64;
-    let mut h = firwin_lowpass(numtaps, cutoff, 5.0);
-    for value in &mut h {
-        *value *= up as f64;
-    }
-    upfirdn(samples, &h, up, down, numtaps)
 }
 
 /// Calcule le log-mel speaker `[1, frames, 128]`.
@@ -121,81 +103,6 @@ fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     Ok((mono, spec.sample_rate))
 }
 
-fn upfirdn(samples: &[f32], h: &[f64], up: usize, down: usize, numtaps: usize) -> Vec<f32> {
-    let n_in = samples.len();
-    let n_out = n_in.checked_mul(up).map(|v| v.div_ceil(down)).unwrap_or(0);
-    let pad = (numtaps - 1) / 2;
-    let mut out = Vec::with_capacity(n_out);
-    for i in 0..n_out {
-        let center = i * down + pad;
-        let kstart = center % up;
-        let mut k = kstart;
-        let mut acc = 0.0_f64;
-        while k < numtaps && k <= center {
-            let j = center - k;
-            let sample_idx = j / up;
-            if sample_idx < n_in {
-                acc += h[k] * samples[sample_idx] as f64;
-            }
-            k += up;
-        }
-        out.push(acc as f32);
-    }
-    out
-}
-
-fn firwin_lowpass(numtaps: usize, cutoff: f64, beta: f64) -> Vec<f64> {
-    let win = kaiser_window(numtaps, beta);
-    let center = (numtaps - 1) as f64 / 2.0;
-    let mut h = (0..numtaps)
-        .map(|i| {
-            let m = i as f64 - center;
-            let arg = cutoff * m;
-            let sinc = if arg == 0.0 {
-                1.0
-            } else {
-                (std::f64::consts::PI * arg).sin() / (std::f64::consts::PI * arg)
-            };
-            cutoff * sinc * win[i]
-        })
-        .collect::<Vec<_>>();
-    let sum = h.iter().sum::<f64>();
-    if sum.abs() > 1.0e-12 {
-        for value in &mut h {
-            *value /= sum;
-        }
-    }
-    h
-}
-
-fn kaiser_window(n: usize, beta: f64) -> Vec<f64> {
-    if n == 1 {
-        return vec![1.0];
-    }
-    let denom = bessel_i0(beta);
-    let nm1 = (n - 1) as f64;
-    (0..n)
-        .map(|i| {
-            let r = 2.0 * i as f64 / nm1 - 1.0;
-            bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) / denom
-        })
-        .collect()
-}
-
-fn bessel_i0(x: f64) -> f64 {
-    let mut sum = 1.0_f64;
-    let mut term = 1.0_f64;
-    let half_x = x / 2.0;
-    for k in 1..50 {
-        term *= (half_x / k as f64) * (half_x / k as f64);
-        sum += term;
-        if term < 1.0e-12 * sum {
-            break;
-        }
-    }
-    sum
-}
-
 fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
     if pad == 0 || samples.len() < pad + 1 {
         return samples.to_vec();
@@ -265,14 +172,6 @@ fn mel_to_hz(mel: f32) -> f32 {
         min_log_hz * ((mel - min_log_mel) * logstep).exp()
     } else {
         f_sp * mel
-    }
-}
-
-fn gcd(a: u32, b: u32) -> u32 {
-    if b == 0 {
-        a
-    } else {
-        gcd(b, a % b)
     }
 }
 

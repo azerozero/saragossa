@@ -836,6 +836,7 @@ impl DecodeResidentState {
     /// # Errors
     ///
     /// Renvoie une erreur si un kernel ne compile pas.
+    #[cfg(any(feature = "devtools", test))]
     pub(crate) fn warm_verify_tree_kernels(&self, head_dims: &[usize]) -> Result<()> {
         let tree = self.rows_kernels()?.tree_variant()?;
         if crate::runtime_flags::verify_rows_nax_enabled() {
@@ -929,6 +930,7 @@ impl FullAttentionMetalState {
     /// La vérification en arbre (DFlash) passe uniquement par le chemin en
     /// lignes fusionné sur KV dense sans sinks : seuls ces kernels ont une
     /// variante masquée par ancêtres.
+    #[cfg(any(feature = "devtools", test))]
     pub(crate) fn verify_tree_supported(&self) -> bool {
         self.rows_fused_supported()
             && super::utils::full_rows_fused_enabled()

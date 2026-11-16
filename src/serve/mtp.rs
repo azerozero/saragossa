@@ -1,10 +1,16 @@
 //! Politique du decode MTP partagée par la CLI, `run` et `serve`.
 
+#[cfg(feature = "serve")]
 use std::time::Duration;
 
+#[cfg(feature = "serve")]
 use saragossa::{GenerationOutput, GenerationTimings, ModelAssets, SpeculativeOutput};
 
+#[cfg(feature = "serve")]
 use super::protocol::{ChatCompletionRequest, ResponseFormatMode};
+
+#[cfg(not(feature = "serve"))]
+use saragossa::ModelAssets;
 
 const MTP_DECODE_ENV: &str = "SARAGOSSA_RUST_MTP_DECODE";
 const MTP_MAX_DRAFT_ENV: &str = "SARAGOSSA_RUST_MTP_MAX_DRAFT";
@@ -64,6 +70,7 @@ pub(crate) fn supports_options(options: &saragossa::GenerationOptions, sampled: 
 }
 
 /// Indique si une requête doit emprunter le chemin MTP.
+#[cfg(feature = "serve")]
 pub(super) fn routes_request(
     request: &ChatCompletionRequest,
     response_format: ResponseFormatMode,
@@ -87,6 +94,7 @@ pub(crate) fn max_draft_tokens() -> usize {
 }
 
 /// Convertit les métriques spéculatives vers le contrat de métriques serveur.
+#[cfg(feature = "serve")]
 pub(super) fn into_generation_output(
     output: SpeculativeOutput,
     elapsed: Duration,
@@ -114,6 +122,7 @@ fn decode_enabled(value: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "serve")]
     fn request(json: &str) -> ChatCompletionRequest {
         serde_json::from_str(json).expect("invariant: requête test valide")
     }
@@ -222,6 +231,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "serve")]
     fn request_routing_follows_sampled_opt_in() {
         let sampled = request(r#"{"model":"m","messages":[],"temperature":0.7}"#);
         assert!(!routes_request(&sampled, ResponseFormatMode::Text, false));
@@ -279,6 +289,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "serve")]
     fn routing_accepts_only_unguided_greedy_requests() {
         let absent = request(r#"{"model":"m","messages":[]}"#);
         let zero = request(r#"{"model":"m","messages":[],"temperature":0}"#);

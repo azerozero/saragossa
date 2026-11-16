@@ -15,6 +15,7 @@ mod mtp;
 mod mtp_block;
 mod setup;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(feature = "tts")]
 pub(crate) mod tts_codebooks;
 mod types;
 mod verify;

@@ -3826,6 +3826,7 @@ impl MetalExecutor {
     ///
     /// Renvoie une erreur si une série n'est pas une série arbre complète, si le
     /// chemin est vide ou sort des captures, ou si l'encodage échoue.
+    #[cfg(any(feature = "devtools", test))]
     pub(crate) fn restore_linear_attn_tree(
         &self,
         layers: &[(&LinearAttentionMetalState, &[LinearAttentionMetalState])],

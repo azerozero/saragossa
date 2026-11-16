@@ -1026,6 +1026,7 @@ impl MetalExecutor {
 }
 
 /// Indique si `buffer` contient au moins `n` f32.
+#[cfg(any(feature = "tts", test))]
 fn f32_buffer_fits(buffer: &BufferRef, n: usize) -> bool {
     (n as u64)
         .checked_mul(4)
@@ -1038,6 +1039,7 @@ fn f32_buffer_fits(buffer: &BufferRef, n: usize) -> bool {
     clippy::type_complexity,
     reason = "vue locale des bindings du qmv aligné u6"
 )]
+#[cfg(any(feature = "tts", test))]
 fn aligned_u6_view(
     weight: &MetalLinearWeightBuffers,
     in_dim: usize,
@@ -1093,6 +1095,7 @@ fn aligned_u6_view(
 impl MetalExecutor {
     /// Indique si `weight` est u6 gs64 aligné en entrée `in_dim`, condition des
     /// qmv u6 fusionnés ci-dessous.
+    #[cfg(any(feature = "tts", test))]
     pub(crate) fn is_aligned_u6_weight(weight: &MetalLinearWeightBuffers, in_dim: usize) -> bool {
         matches!(aligned_u6_view(weight, in_dim), Ok(Some(_)))
     }
@@ -1111,6 +1114,7 @@ impl MetalExecutor {
         clippy::too_many_arguments,
         reason = "encodeur Metal: buffers liés et dimensions vérifiées"
     )]
+    #[cfg(any(feature = "tts", test))]
     pub(crate) fn encode_gate_up_swiglu_u6_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1167,6 +1171,7 @@ impl MetalExecutor {
         clippy::too_many_arguments,
         reason = "encodeur Metal: buffers liés et dimensions vérifiées"
     )]
+    #[cfg(any(feature = "tts", test))]
     pub(crate) fn encode_qmv_u6_residual_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,

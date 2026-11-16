@@ -68,6 +68,7 @@ mod linear_attention_encode;
 pub(super) use linear_attention_encode::LinearAttnBatchLayout;
 mod lm_head;
 mod matmul;
+#[cfg(feature = "decision")]
 pub(crate) use matmul::DENSE_BF16_GEMM_MIN_BATCH;
 mod matmul_align64;
 mod matmul_encode;
@@ -111,6 +112,7 @@ pub(crate) use self::matmul::with_concat_vram_fraction_override;
 pub(crate) use self::moe_na::moe_coop_tiled_trace_for_test;
 #[cfg(test)]
 pub(crate) use self::prefill::routed_coop_trace_for_test;
+#[cfg(feature = "decision")]
 pub(crate) use self::prefill::with_decision_segments;
 #[cfg(test)]
 pub(crate) use self::prefill::with_prefill_kv_layout_override;
@@ -121,6 +123,7 @@ mod profiling;
 pub(crate) mod rope;
 mod scratch;
 // Fondation du K/V sparse : seuls ses tests l'utilisent avant A2.
+mod bf16_encode;
 #[cfg_attr(not(test), expect(dead_code, reason = "branché en A2"))]
 mod sparse;
 #[cfg(test)]
@@ -133,6 +136,7 @@ mod transfer;
     expect(dead_code, reason = "arbre construit par la boucle DFlash (devtools)")
 )]
 mod verify_tree;
+#[cfg(feature = "stt")]
 mod whisper_encode;
 
 #[cfg(test)]
@@ -147,6 +151,7 @@ pub(crate) use self::byte_helpers::read_u16_buffer;
 pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
 pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at, write_u8_buffer};
 use self::core::*;
+#[cfg(any(feature = "devtools", test))]
 pub(crate) use self::eligibility::install_qmm_skinny_bf16_scope;
 pub(crate) use self::flags::resident_concurrent_enabled;
 pub(crate) use self::lightbatch_duo::{
@@ -158,7 +163,9 @@ pub(crate) use self::linear_attention::linear_tree_journal_refusal;
 pub(crate) use self::linear_attention::{linear_tree_refusal, LinearTreeShape};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) use self::matmul::take_concat_profile;
-pub(crate) use self::matmul::{whisper_bf16_gemm_enabled, whisper_decode_bf16_qmv_enabled};
+#[cfg(feature = "stt")]
+pub(crate) use self::matmul::whisper_bf16_gemm_enabled;
+pub(crate) use self::matmul::whisper_decode_bf16_qmv_enabled;
 use self::na_gemm::NA_GEMM_SRC;
 #[cfg(test)]
 use self::pipelines::KernelSources;
@@ -181,6 +188,7 @@ pub(crate) use self::verify_tree::{
 pub(crate) fn qmvt_dispatches_for_test() -> usize {
     matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get)
 }
+#[cfg(feature = "stt")]
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
     WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
@@ -219,6 +227,13 @@ fn affine_biases_offset(weight: &AffineQuantizedTensor) -> Result<NSUInteger> {
 
 /// Exécute les premiers kernels Metal du backend Rust expérimental.
 #[derive(Debug)]
+#[cfg_attr(
+    not(all(feature = "stt", feature = "tts")),
+    allow(
+        dead_code,
+        reason = "Les pipelines partagés gardent une initialisation uniforme entre builds"
+    )
+)]
 pub struct MetalExecutor {
     kernel_profile: crate::KernelProfile,
     rope_frequencies: rope::RopeFrequencyCache,

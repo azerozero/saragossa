@@ -18,8 +18,10 @@ use serde::Serialize;
 use super::anthropic::{
     anthropic_chat, handle_anthropic_messages, send_anthropic_error, AnthropicSse,
 };
+#[cfg(feature = "tts")]
 use super::audio::handle_speech;
 use super::dispatch::{self, Front};
+#[cfg(feature = "embed")]
 use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
 use super::flint_output::FlintEvent;
@@ -30,6 +32,7 @@ use super::protocol::{
 };
 use super::state::{ServeState, ServedCompletion};
 use super::streaming::{CompletionSink, CompletionStreamEvent};
+#[cfg(feature = "stt")]
 use super::stt::{
     handle_transcription, handle_transcription_stream, StreamChunkHeaders, STT_FINAL_HEADER,
     STT_LANGUAGE_HEADER, STT_SESSION_HEADER,
@@ -275,12 +278,14 @@ fn route_engine<S: Write>(
             Ok(()) => Ok(()),
             Err(error) => send_failure(stream, &error, true),
         },
+        #[cfg(feature = "stt")]
         ("POST", "/v1/audio/transcriptions") => handle_transcription(
             stream,
             state.audio_mut(),
             request.header("content-type"),
             &request.body,
         ),
+        #[cfg(feature = "stt")]
         ("POST", "/v1/audio/transcriptions/stream") => handle_transcription_stream(
             stream,
             state.audio_mut(),
@@ -293,10 +298,30 @@ fn route_engine<S: Write>(
             },
             &request.body,
         ),
+        #[cfg(feature = "tts")]
         ("POST", "/v1/audio/speech") => handle_speech(stream, state.audio_mut(), &request.body),
+        #[cfg(feature = "embed")]
         ("POST", "/v1/embeddings") => {
             handle_embeddings(stream, state.embeddings_mut(), &request.body)
         }
+        #[cfg(not(feature = "stt"))]
+        ("POST", "/v1/audio/transcriptions" | "/v1/audio/transcriptions/stream") => send_error(
+            stream,
+            501,
+            "modalité STT absente : recompiler avec --features stt",
+        ),
+        #[cfg(not(feature = "tts"))]
+        ("POST", "/v1/audio/speech") => send_error(
+            stream,
+            501,
+            "modalité TTS absente : recompiler avec --features tts",
+        ),
+        #[cfg(not(feature = "embed"))]
+        ("POST", "/v1/embeddings") => send_error(
+            stream,
+            501,
+            "modalité embeddings absente : recompiler avec --features embed",
+        ),
         _ => send_error(stream, 404, "endpoint inconnu"),
     }
 }
@@ -1431,6 +1456,37 @@ mod tests {
         drop(peer);
     }
 
+    #[test]
+    fn missing_modalities_return_501_before_parsing_body() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        for (enabled, route, feature) in [
+            (cfg!(feature = "stt"), "/v1/audio/transcriptions", "stt"),
+            (
+                cfg!(feature = "stt"),
+                "/v1/audio/transcriptions/stream",
+                "stt",
+            ),
+            (cfg!(feature = "tts"), "/v1/audio/speech", "tts"),
+            (cfg!(feature = "embed"), "/v1/embeddings", "embed"),
+        ] {
+            if enabled {
+                continue;
+            }
+            let mut wire = Vec::new();
+            handle_job(&mut wire, &mut state, &post(route, "invalid body"))
+                .expect("invariant: réponse 501 écrite");
+            let response = response_json(wire, 501);
+            let message = response["error"]["message"]
+                .as_str()
+                .expect("invariant: message d'erreur JSON");
+            assert!(
+                message.contains(&format!("--features {feature}")),
+                "{message}"
+            );
+        }
+    }
+
     fn response_json(bytes: Vec<u8>, status: u16) -> serde_json::Value {
         let response = String::from_utf8(bytes).expect("invariant: réponse UTF-8");
         assert!(
@@ -1595,6 +1651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tts")]
     fn audio_speech_route_without_model_returns_400() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut state = ServeState::new(&args);
@@ -1616,6 +1673,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "stt")]
     fn audio_transcription_route_without_model_returns_400() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut state = ServeState::new(&args);
@@ -1647,6 +1705,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embed")]
     fn embeddings_route_without_model_returns_400() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut state = ServeState::new(&args);
