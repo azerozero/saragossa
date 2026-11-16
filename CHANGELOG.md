@@ -7,6 +7,145 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/azerozero/saragossa/compare/v0.3.1...v0.3.2) - 2026-11-16
+
+### Added
+
+- *(vision)* valide les tenseurs et refuse les médias
+- *(loader)* fusionner un adaptateur LoRA PEFT au chargement
+- *(decision)* lecture de lettres H2O-Lightning, modes bidirectionnel et causal avec cache de préfixe exact
+- *(decision)* règles de lecture de runtime.plan par défaut pour THX-02
+- *(decision)* moyenne TTA sur les ordres d'options de THX-02
+- *(decision)* charge les modèles de décision sans tête de vocabulaire
+- *(decision)* prend en charge le format d3-code-readout-v1 de d3-flash
+- *(decision)* ajoute l'inférence des modèles de décision THX-02 en texte
+- *(quant)* charge les micro-échelles MLX sur CPU et Metal
+
+### Fixed
+
+- *(vision)* préserve le chargement texte des tours inconnues
+- *(loader)* refuser une échelle LoRA infinie en f32
+- *(loader)* refuser les dimensions LoRA nulles
+- *(loader)* identité SSD de l'adaptateur LoRA sur les octets lus
+- *(decision)* cache de préfixe borné au GEMM bf16 et au prolongement résident, cause mesurée
+- *(decision)* contrat du tokenizer H2O épinglé par son SHA-256
+- *(decision)* regex du tokenizer H2O lue par pointeur, sans indexation qui panique
+- *(tts)* vérifier les poids de la trame fusionnée avant d'encoder
+- *(tts)* garder le préfixe de l'état dans le repli streaming du codec
+- *(tts)* décoder le batch au préfixe GPU par lots de 64 trames
+- *(tts)* garder le préfixe codec CPU pour le glouton
+- *(decision)* borne de 64 questions à la validation, sans indexation
+- *(tts)* appliquer la politique QmmNaDequant TTS dans le prefill par embeddings
+- *(clippy)* lints de rustc 1.95 venus de main
+- *(decision)* refuser un format de décision inconnu
+- *(quant)* encoder les empreintes de l'exemple micro sans LowerHex
+- *(tts)* vérifier l'exactitude bf16 des tables et remonter l'erreur codec
+- *(quant)* adosse les poids micro à la mémoire unifiée sans copie
+- *(quant)* valide les entrées micro sans indexation paniquante
+- *(quant)* traite un override de couche sans mode comme affine
+- *(quant)* compare le vocabulaire KL avec des clés triées
+- *(quant)* mesure le KL micro sur les IDs fixes du protocole
+- *(quant)* masque les colonnes du GEMM micro hors multiple de 64
+- *(serve)* encoder l'empreinte du tokenizer sans LowerHex
+- *(deps)* adapter les empreintes SHA-256 à sha2 0.11
+- *(tts)* adapter l'ajout des tokens spéciaux à tokenizers 0.23
+- *(tts)* réserver l'instruction par défaut à VoiceDesign
+- *(release)* rendre le paquet visible de release-plz
+- *(serve)* utiliser Serena pour les voix inconnues
+- *(tts)* rétablir le mode glouton sans configuration
+- *(ci)* permet de taguer un commit de release précis au dispatch
+- *(quant)* conserve le repli des projections de modes mixtes
+- *(tts)* exposer la raison effective de fin de synthèse
+- *(tts)* échantillonner selon la configuration du modèle
+- *(tts)* insérer le locuteur CustomVoice demandé
+- *(ci)* attacher main avant release-plz release et permettre la relance manuelle
+- *(serve)* vérifie le préfixe émis en debug
+- *(serve)* réserve le diagnostic aux flux dégradés
+
+### Other
+
+- Merge pull request #219 from azerozero/dependabot/github_actions/release-plz/action-0.5.148
+- Merge pull request #218 from azerozero/dependabot/cargo/proptest-1.12.0
+- Merge pull request #228 from azerozero/feat/vision
+- Merge remote-tracking branch 'origin/main' into feat/lora-fusion
+- fusionne origin/main dans feat/vision
+- *(vision)* dédoublonne les fixtures et recalcule les patchs
+- *(loader)* base LoRA « non quantifiée », pas seulement bf16
+- *(loader)* chemin THX-02 du test LoRA par variable d'environnement
+- Merge pull request #216 from azerozero/feat/decision-letters
+- *(vision)* fige l’inventaire et les références Qwen
+- *(decision)* corriger les listes et le code inline signalés par markdownlint
+- *(tts)* profil codec sans indexation de HashMap
+- *(tts)* préciser les constantes de tuile et leurs limites
+- *(tts)* comparer tuiles et gather au bit sur poids synthétiques
+- *(deps)* bump release-plz/action from 0.5.131 to 0.5.148
+- *(deps)* bump proptest from 1.11.0 to 1.12.0
+- *(decision)* cache de préfixe au bit sur plusieurs morceaux et sur suffixe borné
+- *(decision)* tokens spéciaux et neutralisation partagés par les deux lecteurs
+- Merge remote-tracking branch 'origin/main' into feat/decision-letters
+- *(decision)* mesures d3-mini et H2O sous charge basse, cache de préfixe causal
+- *(tts)* convolutions du codec GPU en tuiles, conv2 et résiduel fusionnés
+- *(tts)* resserrer l'écart du préfixe codec GPU à un pas int16
+- *(decision)* oracle d3-mini sur poids réels, tolérance bf16 figée
+- Merge remote-tracking branch 'origin/main' into perf/tts-cp-fusion
+- Merge pull request #214 from azerozero/feat/decision-tta
+- Merge pull request #213 from azerozero/fix/tts-prefill-extend-identity
+- Merge remote-tracking branch 'origin/main' into feat/decision-tta
+- *(prefill)* oracle synthétique de l'empaquetage des décisions
+- *(decision)* exiger l'égalité au bit des lectures empaquetées
+- *(tts)* sélectionner les 64 premiers rangs du tirage sans tri complet
+- *(tts)* décoder le préfixe du codec sur GPU
+- *(tts)* encoder les couches du code predictor en 8 dispatches
+- *(tts)* compter les dispatches par site source et par phase
+- Merge pull request #212 from azerozero/feat/decision-d3
+- Merge pull request #211 from azerozero/perf/tts-frame-batch
+- Merge remote-tracking branch 'origin/main' into feat/decision-d3
+- *(decision)* parcourt le GEMM bf16 des décisions par tuiles N d'abord
+- Merge remote-tracking branch 'origin/main' into feat/quant-mxfp
+- Merge remote-tracking branch 'origin/main' into perf/tts-frame-batch
+- *(decision)* référence f32 d3-flash et tolérance bf16 figée
+- *(tts)* décoder le codec streaming en recouvrement des trames
+- *(tts)* enchaîner les 16 pas du code predictor dans un command buffer
+- *(tts)* profiler chaque trame par phase avec horodatage GPU
+- Merge remote-tracking branch 'origin/main' into feat/decision-models
+- *(decision)* documenter la neutralisation élargie des tokens spéciaux
+- *(quant)* décode l'échelle micro par bloc dans la tuile GEMM
+- *(quant)* décode l'échelle micro une fois par mot dans le QMV
+- Merge pull request #207 from azerozero/fix/tts-customvoice-sampling
+- Merge remote-tracking branch 'origin/main' into fix/tts-customvoice-sampling
+- Merge remote-tracking branch 'origin/main' into fix/deps-sha2-0.11-msrv
+- Merge pull request #189 from azerozero/dependabot/cargo/tokenizers-0.23.2
+- *(tts)* projeter les têtes échantillonnées dans le pas résident
+- Merge pull request #184 from azerozero/dependabot/cargo/metal-0.33.0
+- *(deps)* verrouiller sha2 0.11.0 pour conserver la MSRV 1.85
+- Merge pull request #206 from azerozero/test/qualimetrie
+- *(deps)* bump metal from 0.29.0 to 0.33.0
+- Merge pull request #204 from azerozero/fix/release-plz-dispatch-sha
+- Merge pull request #203 from azerozero/perf/serve-detok-incremental
+- Merge remote-tracking branch 'origin/main' into test/qualimetrie
+- *(ci)* partage le verrou GPU et tolère l'absence de CustomVoice
+- Merge remote-tracking branch 'origin/main' into fix/tts-customvoice-sampling
+- *(quant)* vérifie les produits E8M0 sous-normaux sur CPU
+- *(quant)* décrit les micro-échelles MLX et leur validation
+- *(quant)* ajoute les mesures corpus et vitesse locales
+- *(mutants)* contrôler les tirages et la conversion PCM
+- *(proptest)* versionner le journal des régressions
+- *(embeddings)* ajouter un oracle synthétique CPU et HTTP
+- Merge pull request #201 from azerozero/fix/release-plz-tag-branch
+- *(tts)* couvrir les options de voix et de graine
+- Merge remote-tracking branch 'origin/main' into perf/serve-detok-incremental
+- *(whisper)* couvrir les fenêtres longues et le silence
+- *(tests)* relier les contrats aux preuves de qualité
+- *(fuzz)* exercer les parseurs publics en nightly CPU
+- *(nightly)* exiger les modèles réels sous verrou GPU
+- *(e2e)* mesurer la durée audio et les erreurs de mots
+- *(serve)* reprend ByteLevel après une frontière stable
+- *(tokenizer)* couvre les added tokens ordinaires
+- *(deps)* bump sha2 from 0.10.9 to 0.11.1
+- Merge remote-tracking branch 'origin/main' into perf/serve-detok-incremental
+- *(deps)* bump tokenizers from 0.22.2 to 0.23.2
+- *(serve)* détokenise les flux ByteLevel de façon incrémentale
+
 ## [0.3.1](https://github.com/azerozero/saragossa/compare/v0.3.0...v0.3.1) - 2026-11-15
 
 ### Added

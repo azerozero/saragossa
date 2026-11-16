@@ -87,7 +87,9 @@ impl ModelAssets {
     }
 
     pub fn encode_prompt(&self, prompt: &str) -> Result<Vec<u32>> {
-        self.tokenizer.encode(prompt)
+        let ids = self.tokenizer.encode(prompt)?;
+        self.reject_media_tokens(&ids)?;
+        Ok(ids)
     }
 
     /// Encode un prompt brut en activant les tokens spéciaux (BOS) du modèle.
@@ -96,7 +98,22 @@ impl ModelAssets {
     ///
     /// Renvoie une erreur si le tokenizer rejette le prompt.
     pub fn encode_prompt_with_special(&self, prompt: &str) -> Result<Vec<u32>> {
-        self.tokenizer.encode_with_special_tokens(prompt)
+        let ids = self.tokenizer.encode_with_special_tokens(prompt)?;
+        self.reject_media_tokens(&ids)?;
+        Ok(ids)
+    }
+
+    fn reject_media_tokens(&self, ids: &[u32]) -> Result<()> {
+        for marker in ["<|image_pad|>", "<|video_pad|>"] {
+            if self
+                .tokenizer
+                .token_to_id(marker)
+                .is_some_and(|id| ids.contains(&id))
+            {
+                crate::qwen_loader::vision::require_implementation(&self.catalog)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn decode_tokens(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
@@ -295,6 +312,38 @@ mod tests {
     use crate::tokenizer::save_test_tokenizer;
     use safetensors::{serialize, Dtype, View};
     use std::borrow::Cow;
+
+    #[test]
+    fn refuses_image_and_video_placeholders_in_both_encoders() -> Result<()> {
+        let tmp = tempfile::tempdir().expect("invariant: tempdir");
+        let path = tmp.path().join("tokenizer.json");
+        save_test_tokenizer(&path);
+        let mut tokenizer = tokenizers::Tokenizer::from_file(&path)
+            .expect("invariant: tokenizer synthétique valide");
+        tokenizer
+            .add_special_tokens([
+                tokenizers::AddedToken::from("<|image_pad|>", true),
+                tokenizers::AddedToken::from("<|video_pad|>", true),
+            ])
+            .expect("invariant: marqueurs synthétiques valides");
+        tokenizer
+            .save(&path, false)
+            .expect("invariant: tokenizer sérialisable");
+        let assets = ModelAssets {
+            model_dir: tmp.path().into(),
+            config: crate::qwen_loader::test_fixtures::test_config(),
+            tokenizer: RustTokenizer::from_file(path)?,
+            catalog: WeightCatalog::from_shards(&[])?,
+            shards: Vec::new(),
+            mtp: Default::default(),
+        };
+        assert!(assets.encode_prompt("bonjour reti").is_ok());
+        for marker in ["<|image_pad|>", "<|video_pad|>"] {
+            assert!(assets.encode_prompt(marker).is_err());
+            assert!(assets.encode_prompt_with_special(marker).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn loads_local_assets_and_excludes_mtp_sidecars() {

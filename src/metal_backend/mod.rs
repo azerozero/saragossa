@@ -68,6 +68,7 @@ mod linear_attention_encode;
 pub(super) use linear_attention_encode::LinearAttnBatchLayout;
 mod lm_head;
 mod matmul;
+pub(crate) use matmul::DENSE_BF16_GEMM_MIN_BATCH;
 mod matmul_align64;
 mod matmul_encode;
 mod matmul_resident;
@@ -134,6 +135,8 @@ mod transfer;
 mod verify_tree;
 mod whisper_encode;
 
+#[cfg(test)]
+pub(crate) use self::barriers::command_buffer_gpu_ns;
 #[doc(hidden)]
 pub use self::barriers::dump_commit_components;
 pub(crate) use self::barriers::{

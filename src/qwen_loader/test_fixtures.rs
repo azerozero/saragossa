@@ -7,6 +7,7 @@ use std::borrow::Cow;
 pub(crate) fn test_config() -> ModelConfig {
     ModelConfig {
         model_type: "qwen3".to_string(),
+        vision_config: None,
         hidden_size: 2,
         num_hidden_layers: 1,
         num_attention_heads: 1,
