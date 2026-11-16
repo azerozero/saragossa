@@ -95,7 +95,9 @@ par l'article. Le temps de calcul s'ajoute à ces 40 ms.
 - `network.rs` : graphe DFN3 ;
 - `mod.rs` : `DeepFilterNet3::load`, `enhance` (hors ligne, sans retard,
   équivalent de `df.enhance(pad=True)`) et `DfStream::process_hop` (temps réel,
-  un hop de 10 ms à la fois).
+  un hop de 10 ms à la fois) ;
+- `stream.rs` : `DenoiseStream::new(&model)`, `push(&[f32])`, `finish()` ;
+- `wav.rs` et `resample.rs` : WAV et filtre polyphase incrémentaux.
 
 Le chargeur vérifie la forme de chaque poids, refuse un tenseur inconnu et
 contrôle que la banque ERB du checkpoint correspond aux largeurs de libDF.
@@ -109,11 +111,78 @@ python3 -I -B tools/voice/convert_dfn3.py \
 saragossa enhance --model dfn3.safetensors --input bruit.wav --output propre.wav
 ```
 
-L'entrée est rééchantillonnée à 48 kHz et la sortie reste à 48 kHz.
+### Débruitage continu
 
-`saragossa serve --enhance-model dfn3.safetensors` ajoute
-`POST /v1/audio/enhance` (multipart, champ `file`), qui renvoie un WAV mono
-48 kHz en PCM 16 bits.
+L'entrée est moyennée en mono puis rééchantillonnée à 48 kHz, avec le même
+filtre FIR polyphase que le batch. `DenoiseStream` conserve les états GRU,
+STFT, la phase et le hop partiel entre appels. `push` rend la sortie disponible ;
+`finish` compense le retard et rend exactement la fin du signal. Un second
+`finish` est vide ; `push` après fermeture renvoie une erreur. Le retard DFN3
+est de 30 ms plus le tamponnage d'un hop (jusqu'à 40 ms), auquel s'ajoute
+l'anticipation du FIR si la fréquence change.
+
+La limite de cinq minutes est supprimée. Les tampons internes ne dépendent
+pas de la durée ; le vecteur rendu par `push` dépend seulement du morceau fourni.
+`enhance` reste une commodité batch qui accumule sa sortie. Les poids sont
+partagés et chaque flux garde son propre état ; aucun découpage multi-cœur
+d'un même flux n'est effectué.
+
+La CLI lit 480 trames à la fois et écrit un WAV mono float32 48 kHz. `--input -`
+et `--output -` utilisent stdin/stdout. Sur une sortie seekable, elle réécrit
+les tailles à la fin et passe en RF64/ds64 au-delà de 4 Gio. Sur un pipe,
+les tailles RIFF/data valent `0xffffffff` (longueur inconnue, fin à EOF).
+L'entrée accepte ces flux, les fichiers RIFF/RF64 et le PCM 16/24/32 ou float32 ;
+les fréquences doivent rester entre 8 et 192 kHz.
+
+`saragossa serve --enhance-model dfn3.safetensors` expose
+`POST /v1/audio/enhance` en duplex :
+
+- corps WAV brut (`Content-Type: audio/wav`) ou multipart avec un champ `file` ;
+  les autres champs et les en-têtes multipart sont bornés ensemble à 64 Kio ;
+- cadrage `Content-Length` sans plafond de durée, ou `Transfer-Encoding: chunked` ;
+  leur combinaison, les doublons et les encodages ambigus sont refusés avec 400 ;
+- réponse WAV mono PCM 16 bits 48 kHz en HTTP chunked,
+  avec longueurs WAV inconnues. Le premier chunk contient l'en-tête WAV ; les
+  suivants contiennent les échantillons disponibles, avant la fin de l'envoi ;
+- en-tête WAV validé avant chargement des poids et avant le 200 : une fréquence
+  invalide renvoie 400. Une erreur après le 200 ferme la connexion sans chunk
+  terminal, pour rendre la troncature détectable ;
+- `SARAGOSSA_ENHANCE_IDLE_TIMEOUT_SECS` : inactivité maximale de chaque lecture
+  ou écriture socket, défaut 30 s ;
+- `SARAGOSSA_ENHANCE_MAX_STREAMS` : flux simultanés, défaut 2 ; le suivant reçoit
+  503 avant lecture du corps. La réservation est rendue à la fin ou sur erreur.
+
+Ces réglages sont centralisés dans `runtime_flags.rs`. Le plafond global
+`SARAGOSSA_SERVE_MAX_CONNECTIONS` s'applique aussi. L'authentification et la
+réservation RAII réutilisent la façade du serveur. Comme les sessions STT
+([documentation](stt-streaming.md)), l'admission précède la modification d'état
+et une erreur abandonne le flux. Les validateurs WAV sont partagés avec le STT.
+Le protocole STT par requêtes successives ne permet pas le duplex : DFN3 utilise
+un état lié à la connexion, sans identifiant ni éviction d'un flux actif.
+
+Il n'y a aucune file audio intermédiaire : chaque écriture doit réussir avant
+la lecture suivante. Les tampons de transport sont bornés (8 Kio par lecteur,
+préfixe HTTP d'au plus 1 Kio, fenêtre multipart d'au plus 74 octets), le WAV
+produit au plus 480 échantillons par lecture et le FIR conserve seulement son
+historique. Un client duplex doit lire la réponse pendant qu'il envoie ; un
+proxy doit désactiver le buffering de requête et de réponse pour préserver ce
+comportement. Les autres routes HTTP gardent leur cadrage existant.
+
+```bash
+curl --no-buffer -H 'Content-Type: audio/wav' \
+  -H "Authorization: Bearer $SARAGOSSA_API_KEY" \
+  -H 'Transfer-Encoding: chunked' --data-binary @bruit.wav \
+  http://localhost:8080/v1/audio/enhance > propre.wav
+```
+
+Les tests ordinaires, sans poids téléchargés, comparent au bit le modèle
+synthétique avec le batch historique (morceaux de 1, 7, 480, 4 800 et tailles
+pseudo-aléatoires), y compris les hops partiels. Le FIR a son oracle batch.
+Un test d'une heure synthétique utilise l'adaptateur de production avec un
+noyau de hop substitué : il contrôle le tampon fixe et la dette de sortie,
+sans prétendre mesurer une heure d'inférence DFN3. Les tests TCP vérifient
+l'émission avant la fin de l'envoi, les deux cadrages HTTP, multipart, le 400,
+le 503, la contre-pression et l'inactivité en lecture/écriture.
 
 ### Oracle
 

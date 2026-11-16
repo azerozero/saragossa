@@ -18,7 +18,7 @@ use serde::Serialize;
 use super::anthropic::{
     anthropic_chat, handle_anthropic_messages, send_anthropic_error, AnthropicSse,
 };
-use super::audio::{handle_enhance, handle_speech};
+use super::audio::handle_speech;
 use super::dispatch::{self, Front};
 use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
@@ -294,12 +294,6 @@ fn route_engine<S: Write>(
             &request.body,
         ),
         ("POST", "/v1/audio/speech") => handle_speech(stream, state.audio_mut(), &request.body),
-        ("POST", "/v1/audio/enhance") => handle_enhance(
-            stream,
-            state.audio_mut(),
-            request.header("content-type"),
-            &request.body,
-        ),
         ("POST", "/v1/embeddings") => {
             handle_embeddings(stream, state.embeddings_mut(), &request.body)
         }
@@ -801,12 +795,19 @@ pub(super) struct HttpRequest {
 }
 
 impl HttpRequest {
+    pub(super) fn is_enhance(&self) -> bool {
+        self.method == "POST" && self.route() == "/v1/audio/enhance"
+    }
+    pub(super) fn take_prefix(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.body)
+    }
+
     /// Chemin sans query string.
     pub(super) fn route(&self) -> &str {
         self.path.split('?').next().unwrap_or(self.path.as_str())
     }
 
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
         let target = name.to_ascii_lowercase();
         self.headers
             .iter()
@@ -868,8 +869,14 @@ pub(super) fn read_head<S: Read>(
     let header_text = str::from_utf8(header_bytes)
         .map_err(|e| ServeError::Http(format!("headers non UTF-8: {e}")))?;
     let (method, path, headers) = parse_headers(header_text)?;
-    let content_length = content_length(&headers)?;
-    if content_length > MAX_BODY_BYTES {
+    let enhance = method == "POST" && path.split('?').next() == Some("/v1/audio/enhance");
+    let chunked = enhance && enhance_chunked(&headers)?;
+    let content_length = if chunked {
+        0
+    } else {
+        content_length(&headers)?
+    };
+    if !enhance && content_length > MAX_BODY_BYTES {
         return Err(ServeError::BodyTooLarge {
             anthropic: is_anthropic_route(path.split('?').next().unwrap_or_default()),
         });
@@ -950,6 +957,26 @@ fn parse_headers(header_text: &str) -> ServeResult<ParsedHeaders> {
         ));
     }
     Ok((method, path, headers))
+}
+
+/// Le chunked n'est ouvert que pour enhance, sans ambiguïté avec Content-Length.
+fn enhance_chunked(headers: &[(String, String)]) -> ServeResult<bool> {
+    let encodings: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name == "transfer-encoding")
+        .collect();
+    if encodings.is_empty() {
+        return Ok(false);
+    }
+    if encodings.len() != 1
+        || !encodings[0].1.eq_ignore_ascii_case("chunked")
+        || headers.iter().any(|(name, _)| name == "content-length")
+    {
+        return Err(ServeError::Http(
+            "cadrage enhance ambigu ou Transfer-Encoding non supporté".into(),
+        ));
+    }
+    Ok(true)
 }
 
 /// Seul `Content-Length` cadre un corps. `Transfer-Encoding` est refusé :

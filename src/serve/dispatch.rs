@@ -37,11 +37,16 @@ use super::state::ServeState;
 pub(super) struct Front {
     pub(super) api_key: Option<String>,
     pub(super) model_ids: Vec<String>,
+    pub(super) enhance: super::enhance::EnhanceService,
 }
 
 impl Front {
     pub(super) fn new(api_key: Option<String>, model_ids: Vec<String>) -> Self {
-        Self { api_key, model_ids }
+        Self {
+            api_key,
+            model_ids,
+            enhance: super::enhance::EnhanceService::new(None),
+        }
     }
 }
 
@@ -148,7 +153,7 @@ impl<S: ServeStream> Dispatcher<S> {
 /// appelant, qui doit être celui qui a construit `state`.
 pub(super) fn serve<S, A>(
     state: &mut ServeState,
-    front: Front,
+    mut front: Front,
     read_timeout: Duration,
     accept: A,
 ) -> ServeResult<()>
@@ -156,6 +161,7 @@ where
     S: ServeStream,
     A: FnOnce(Dispatcher<S>) -> ServeResult<()> + Send + 'static,
 {
+    front.enhance = super::enhance::EnhanceService::new(state.audio_mut().enhance_path());
     let queue_depth = serve_queue_depth();
     let (jobs, queue) = sync_channel(queue_depth);
     let dispatcher = Dispatcher {
@@ -366,6 +372,12 @@ impl<S: ServeStream> Connection<S> {
         if let Some(result) = route_front(&mut stream, &self.front, &request) {
             return reply_on_error(&mut stream, result);
         }
+        if request.is_enhance() {
+            return self
+                .front
+                .enhance
+                .handle(&mut stream, &mut request, content_length);
+        }
         let Some(bytes) = Reservation::acquire(
             &self.inflight_bytes,
             content_length,
@@ -414,13 +426,13 @@ impl<S: ServeStream> Connection<S> {
 }
 
 /// Part réservée d'un compteur plafonné (connexions, octets), rendue au drop.
-struct Reservation {
+pub(super) struct Reservation {
     counter: Arc<AtomicUsize>,
     amount: usize,
 }
 
 impl Reservation {
-    fn acquire(counter: &Arc<AtomicUsize>, amount: usize, max: usize) -> Option<Self> {
+    pub(super) fn acquire(counter: &Arc<AtomicUsize>, amount: usize, max: usize) -> Option<Self> {
         // NOTE: boucle compare-exchange plutôt que `fetch_update`, déprécié au
         // profit de `try_update` absent de la MSRV 1.85.
         let mut count = counter.load(Ordering::Acquire);
