@@ -776,8 +776,8 @@ impl WhisperModel {
                     },
                 )?;
                 let text = decode_generated_tokens(&self.tokenizer, &generated)?;
-                // Le dernier token peut finir un caractère retenu jusque-là.
-                if let Some(delta) = deltas.update(&text) {
+                // Le reste retenu (blancs, `U+FFFD` final) part avec le dernier token.
+                if let Some(delta) = deltas.finish(&text) {
                     on_delta(&delta)?;
                 }
                 generated

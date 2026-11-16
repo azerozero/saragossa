@@ -86,6 +86,26 @@ impl TextDeltas {
         self.emitted = visible.to_string();
         Some(delta)
     }
+
+    /// Émet le reste du texte final, `U+FFFD` final compris : après le dernier
+    /// token, plus rien ne complétera le caractère, et la concaténation des
+    /// deltas doit égaler le texte rendu.
+    ///
+    /// Le décodage ByteLevel d'un préfixe ne change que par un `U+FFFD` final,
+    /// retenu par [`Self::update`] : le texte émis reste un préfixe du final.
+    pub(super) fn finish(&mut self, decoded: &str) -> Option<String> {
+        let visible = decoded.trim();
+        let rest = visible.strip_prefix(self.emitted.as_str())?;
+        if rest.is_empty() {
+            return None;
+        }
+        let mut delta = rest.to_string();
+        if self.emitted.is_empty() && self.separator {
+            delta.insert(0, ' ');
+        }
+        self.emitted = visible.to_string();
+        Some(delta)
+    }
 }
 
 /// État visible après un morceau audio.
@@ -291,6 +311,18 @@ mod tests {
         ];
         let out: String = steps.iter().filter_map(|s| deltas.update(s)).collect();
         assert_eq!(out, "Bonjour à tous.");
+        // Un texte final terminé par un octet invalide reste émis en entier.
+        let mut broken = TextDeltas::new(false);
+        let mut out: String = [" Ça", " Ça va \u{FFFD}"]
+            .iter()
+            .filter_map(|s| broken.update(s))
+            .collect();
+        assert_eq!(out, "Ça");
+        out.extend(broken.finish(" Ça va \u{FFFD}"));
+        assert_eq!(out, "Ça va \u{FFFD}");
+        assert_eq!(broken.finish(" Ça va \u{FFFD}"), None);
+        let mut sep = TextDeltas::new(true);
+        assert_eq!(sep.finish("\u{FFFD}").as_deref(), Some(" \u{FFFD}"));
         let mut next = TextDeltas::new(true);
         assert_eq!(next.update(" Suite").as_deref(), Some(" Suite"));
         assert_eq!(next.update(" Suite.").as_deref(), Some("."));
