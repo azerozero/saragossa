@@ -7119,3 +7119,118 @@ fn prefix_cache_purge_recovers_poisoned_mutex() -> Result<()> {
     }
     Ok(())
 }
+
+/// Alternance du routage par classe de prompt sur un même décodeur, cache de
+/// préfixe actif : DFlash (tour 1), MTP sur l'entrée DFlash (tour 2), DFlash
+/// sur l'entrée MTP (tour 3), sous 16k et au-delà. Chaque tour égale l'AR non
+/// caché ; le tour MTP reprend tout le tour 1 et le tour DFlash trouve une
+/// entrée avec captures et historique, donc aucun prefill complet. Requiert
+/// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` (sidecar MTP) et
+/// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`, routage et cache de préfixe actifs.
+#[test]
+#[ignore = "modèle réel + sidecar MTP + draft DFlash requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn spec_route_alternation_reuses_prefix_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none()
+        || !crate::runtime_flags::spec_route_enabled()
+        || !prefix_cache_enabled()
+    {
+        eprintln!("skip alternance : drafter absent, routage ou cache de préfixe coupé");
+        return Ok(());
+    }
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let mtp_path = assets
+        .mtp
+        .path
+        .clone()
+        .ok_or_else(|| InferError::Config("sidecar MTP requis".to_string()))?;
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_sidecar(&mtp_path)?
+        .with_dflash_draft_from_env(&assets.config)?;
+    let draft = model
+        .dflash_draft()
+        .ok_or_else(|| InferError::Config("drafter non chargé".to_string()))?
+        .clone();
+    let layer_ids = draft.info.target_layer_ids.clone();
+    let keep_rows =
+        super::resident::dflash::drafter_window(&draft.info.layer_types, draft.info.sliding_window)
+            .unwrap_or(usize::MAX);
+    let options = mtp_verifier_options(Vec::new());
+    let encode = |text: &str| -> Result<Vec<usize>> {
+        assets
+            .encode_prompt(text)?
+            .into_iter()
+            .map(|id| {
+                usize::try_from(id)
+                    .map_err(|_| InferError::Dimension(format!("token id hors plage: {id}")))
+            })
+            .collect()
+    };
+    let ar = |prompt: &[usize]| -> Result<Vec<usize>> {
+        Ok(model
+            .generate_greedy_timed_from_prompt_state_with_options(
+                model.prefill_prompt_state_uncached(prompt)?,
+                Duration::ZERO,
+                24,
+                &options,
+            )?
+            .tokens)
+    };
+    let filler =
+        "Le journal du port consigne chaque livraison, chaque incident et la relève du soir. ";
+    for (repeats, min_len, max_len) in [(8usize, 1, 16_383), (1_000, 16_384, usize::MAX)] {
+        model.clear_prefix_cache();
+        let p1 = mtp_verifier_prompt_ids(
+            &assets,
+            &format!(
+                "{}Écris une fonction Rust qui valide ce journal.",
+                filler.repeat(repeats)
+            ),
+        )?;
+        assert!(
+            (min_len..=max_len).contains(&p1.len()),
+            "longueur {}",
+            p1.len()
+        );
+        let turn1 = model.generate_greedy_mtp_routed(&p1, 24, &options, 2, true, |_| true)?;
+        assert_eq!(turn1.tokens, ar(&p1)?, "tour DFlash {}", p1.len());
+        let mut p2 = p1.clone();
+        p2.extend_from_slice(&turn1.tokens);
+        p2.extend(encode(
+            "<|im_end|>\n<|im_start|>user\nRaconte la journée en prose.<|im_end|>\n<|im_start|>assistant\n",
+        )?);
+        let turn2 = model.generate_greedy_mtp_routed(&p2, 24, &options, 2, false, |_| true)?;
+        assert_eq!(turn2.tokens, ar(&p2)?, "tour MTP {}", p2.len());
+        assert!(
+            turn2.stats.reused_prefix_tokens >= p1.len(),
+            "tour MTP sans reprise de l'entrée DFlash : {} sur {}",
+            turn2.stats.reused_prefix_tokens,
+            p1.len()
+        );
+        let mut p3 = p2.clone();
+        p3.extend_from_slice(&turn2.tokens);
+        p3.extend(encode(
+            "<|im_end|>\n<|im_start|>user\nÉcris maintenant le code complet.<|im_end|>\n<|im_start|>assistant\n",
+        )?);
+        // Le hit avec captures est ce que le tour DFlash lit en premier : s'il
+        // échoue, le tour 3 refait un prefill complet.
+        let hit = model.prefix_cache_get_with_captures(&p3, &layer_ids, keep_rows)?;
+        assert!(
+            hit.is_some(),
+            "tour DFlash sans entrée à captures : prefill complet ({})",
+            p3.len()
+        );
+        let turn3 = model.generate_greedy_mtp_routed(&p3, 24, &options, 2, true, |_| true)?;
+        assert_eq!(turn3.tokens, ar(&p3)?, "tour DFlash après MTP {}", p3.len());
+        eprintln!(
+            "alternance prompt={} : MTP reprend {} tokens, DFlash reprend l'entrée MTP",
+            p1.len(),
+            turn2.stats.reused_prefix_tokens
+        );
+    }
+    Ok(())
+}

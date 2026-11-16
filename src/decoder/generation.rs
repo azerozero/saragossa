@@ -4654,23 +4654,56 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
     ) -> Result<Option<((CausalDecoderCache, Tensor), usize)>> {
-        let Some((mut output, cached_len, _, _)) =
+        let Some((mut output, cached_len, _, captures)) =
             self.prefix_cache_hit(prompt, false, usize::MAX)?
         else {
             return Ok(None);
         };
         if cached_len < prompt.len() {
-            let (final_states, _) = self.forward_suffix_batched(
+            let keep = self.dflash_capture_window(captures.as_ref());
+            let (final_states, suffix_captures) = self.forward_suffix_batched(
                 &mut output.0,
                 &prompt[cached_len..],
-                None,
-                usize::MAX,
+                keep.as_ref().map(|(layers, _)| layers.as_slice()),
+                keep.as_ref().map_or(usize::MAX, |(_, rows)| *rows),
                 false,
             )?;
             output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
-            self.prefix_cache_put(prompt, &output, None, None)?;
+            let captures =
+                carry_captures(captures, suffix_captures, keep, cached_len, prompt.len())?;
+            self.prefix_cache_put(prompt, &output, None, captures.as_ref())?;
         }
         Ok(Some((output, cached_len)))
+    }
+
+    /// Couches et fenêtre des captures DFlash à prolonger quand un autre chemin
+    /// (MTP, AR) étend une entrée qui en porte. Sans elles, l'entrée prolongée
+    /// remplace celle du tour DFlash et le tour DFlash suivant repart d'un
+    /// prefill complet (alternance du routage par classe de prompt).
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    fn dflash_capture_window(
+        &self,
+        captures: Option<&PrefixCaptures>,
+    ) -> Option<(Vec<usize>, usize)> {
+        let draft = self.dflash.as_ref()?;
+        let captures =
+            captures.filter(|captures| captures.layer_ids == draft.info.target_layer_ids)?;
+        let window = super::resident::dflash::drafter_window(
+            &draft.info.layer_types,
+            draft.info.sliding_window,
+        );
+        Some((
+            captures.layer_ids.clone(),
+            window.unwrap_or(usize::MAX).max(1),
+        ))
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "metal", feature = "devtools")))]
+    fn dflash_capture_window(
+        &self,
+        _captures: Option<&PrefixCaptures>,
+    ) -> Option<(Vec<usize>, usize)> {
+        None
     }
 
     /// Variante DFlash de [`Self::prefix_cache_get`] : exige une entrée portant
@@ -4874,15 +4907,21 @@ impl CausalDecoder {
         prompt: &[usize],
         on_final_state: &mut dyn FnMut(&Tensor) -> Result<bool>,
     ) -> Result<Option<(CausalDecoderCache, Tensor, LayerKvCache, usize)>> {
-        let Some((mut output, cached_len, Some(mut history), _)) =
+        let Some((mut output, cached_len, Some(mut history), captures)) =
             self.prefix_cache_hit(prompt, true, usize::MAX)?
         else {
             return Ok(None);
         };
         if cached_len < prompt.len() {
             let suffix = &prompt[cached_len..];
-            let (final_states, _) =
-                self.forward_suffix_batched(&mut output.0, suffix, None, usize::MAX, true)?;
+            let keep = self.dflash_capture_window(captures.as_ref());
+            let (final_states, suffix_captures) = self.forward_suffix_batched(
+                &mut output.0,
+                suffix,
+                keep.as_ref().map(|(layers, _)| layers.as_slice()),
+                keep.as_ref().map_or(usize::MAX, |(_, rows)| *rows),
+                true,
+            )?;
             let final_state = Tensor::row(final_states.last_row()?.to_vec())?;
             if !on_final_state(&final_state)? {
                 return Ok(Some((
@@ -4894,7 +4933,9 @@ impl CausalDecoder {
             }
             self.extend_mtp_history_suffix(&output.1, &final_states, suffix, &mut history)?;
             output.1 = final_state;
-            self.prefix_cache_put(prompt, &output, Some(&history), None)?;
+            let captures =
+                carry_captures(captures, suffix_captures, keep, cached_len, prompt.len())?;
+            self.prefix_cache_put(prompt, &output, Some(&history), captures.as_ref())?;
         } else if !on_final_state(&output.1)? {
             history = LayerKvCache::default();
         }
@@ -4918,12 +4959,14 @@ impl CausalDecoder {
         self.seed_mtp_history_batched(&states, suffix, history)
     }
 
-    /// Vrai si la bascule DFlash → MTP est armée : son historique MTP committed
-    /// se sème depuis les états finaux de toutes les positions du prompt.
+    /// Vrai si le prefill DFlash doit semer l'historique MTP committed (depuis
+    /// les états finaux de toutes les positions du prompt) : bascule armée, ou
+    /// routage par classe de prompt, dont le tour MTP suivant prolonge alors
+    /// l'entrée DFlash au lieu de repartir d'un prefill complet.
     #[cfg(feature = "devtools")]
     fn dflash_switch_needs_history(&self) -> bool {
         self.mtp.is_some()
-            && dflash_switch_min() > 0.0
+            && (dflash_switch_min() > 0.0 || crate::runtime_flags::spec_route_enabled())
             && mtp_history_policy() == MtpHistoryPolicy::Committed
     }
 
@@ -6265,6 +6308,24 @@ fn concat_layer_captures(
         }
     }
     Tensor::from_vec(vec![expected_rows, output_cols], out)
+}
+
+/// Captures DFlash d'une entrée prolongées par celles de son suffixe ; `None`
+/// si l'une manque (entrée sans captures, aucun drafter chargé).
+fn carry_captures(
+    prefix: Option<PrefixCaptures>,
+    suffix: Option<PrefixCaptures>,
+    keep: Option<(Vec<usize>, usize)>,
+    cached_len: usize,
+    prompt_len: usize,
+) -> Result<Option<PrefixCaptures>> {
+    #[cfg(feature = "devtools")]
+    if let (Some(prefix), Some(suffix), Some((_, rows))) = (prefix, suffix, keep) {
+        return stitch_captures(prefix, suffix, cached_len, prompt_len, rows).map(Some);
+    }
+    #[cfg(not(feature = "devtools"))]
+    let _ = (prefix, suffix, keep, cached_len, prompt_len);
+    Ok(None)
 }
 
 /// Recolle des captures contiguës, ou garde le suffixe s'il couvre déjà la queue.
