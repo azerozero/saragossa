@@ -195,25 +195,31 @@ pub fn token_distribution_top_k_top_p(
         return Err(InferError::Config("top_p sampling invalide".to_string()));
     }
 
-    let mut indexed_probs: TokenDistribution = softmax(logits, temperature)
-        .into_iter()
-        .enumerate()
-        .collect();
-
-    if top_k == 0 || top_k >= logits.len() {
-        if top_p >= 1.0 {
-            // Distribution complète : le tri de tout le vocabulaire (248k sur
-            // Qwen3.5) ne sert qu'à la troncature nucleus. Ordre naturel des
-            // tokens, sans les probabilités nulles (exp sous-dépassé).
-            indexed_probs.retain(|(_, prob)| *prob > 0.0);
-            return normalize_distribution(indexed_probs, logits);
+    let probs = softmax(logits, temperature);
+    // Sur un petit vocabulaire (cb0 TTS : k = 50 sur 3072), les insertions du
+    // balayage coûtent plus que `select_nth` : mesuré 8,3 contre 11,8 µs.
+    let indexed_probs = if top_k > 0
+        && top_k.saturating_mul(256) <= logits.len()
+        && crate::runtime_flags::sampling_topk_scan_enabled()
+    {
+        top_k_by_rank(&probs, top_k)
+    } else {
+        let mut indexed_probs: TokenDistribution = probs.into_iter().enumerate().collect();
+        if top_k == 0 || top_k >= logits.len() {
+            if top_p >= 1.0 {
+                // Distribution complète : le tri de tout le vocabulaire (248k sur
+                // Qwen3.5) ne sert qu'à la troncature nucleus. Ordre naturel des
+                // tokens, sans les probabilités nulles (exp sous-dépassé).
+                indexed_probs.retain(|(_, prob)| *prob > 0.0);
+                return normalize_distribution(indexed_probs, logits);
+            }
+            return normalize_distribution(nucleus_prefix(indexed_probs, top_p), logits);
         }
-        return normalize_distribution(nucleus_prefix(indexed_probs, top_p), logits);
-    }
-
-    indexed_probs.select_nth_unstable_by(top_k - 1, by_rank);
-    indexed_probs.truncate(top_k);
-    indexed_probs.sort_by(by_rank);
+        indexed_probs.select_nth_unstable_by(top_k - 1, by_rank);
+        indexed_probs.truncate(top_k);
+        indexed_probs.sort_by(by_rank);
+        indexed_probs
+    };
 
     let top_sum = indexed_probs.iter().map(|(_, prob)| *prob).sum::<f32>();
     if top_sum <= f32::EPSILON {
@@ -435,6 +441,39 @@ pub fn lossless_speculative_sample_dense(
 /// Ordre total (probabilité décroissante, puis indice) : identique au tri
 /// stable par probabilité décroissante de la distribution énumérée, et sans
 /// ex aequo, donc une sélection partielle en rend exactement le préfixe.
+/// Clé entière croissante de `f32::total_cmp` : même ordre sur toutes les
+/// valeurs, NaN et zéros signés compris.
+fn total_cmp_key(value: f32) -> i32 {
+    let bits = value.to_bits() as i32;
+    bits ^ (((bits >> 31) as u32) >> 1) as i32
+}
+
+/// Les `k` premiers rangs de [`by_rank`] (probabilité décroissante, indice
+/// croissant), triés, en un balayage : un candidat n'entre que s'il bat le
+/// k-ième ; à clé égale, son indice plus grand le classe après. `by_rank`
+/// étant un ordre total strict, le résultat égale `select_nth` puis tri.
+fn top_k_by_rank(probs: &[f32], k: usize) -> TokenDistribution {
+    let mut top: TokenDistribution = Vec::with_capacity(k + 1);
+    let mut threshold = i32::MIN;
+    for (idx, &prob) in probs.iter().enumerate() {
+        if top.len() == k && total_cmp_key(prob) <= threshold {
+            continue;
+        }
+        let item = (idx, prob);
+        let pos = top.partition_point(|other| by_rank(other, &item).is_lt());
+        top.insert(pos, item);
+        if top.len() > k {
+            top.pop();
+        }
+        if top.len() == k {
+            threshold = top
+                .last()
+                .map_or(i32::MIN, |(_, prob)| total_cmp_key(*prob));
+        }
+    }
+    top
+}
+
 fn by_rank(
     (left_idx, left): &(usize, f32),
     (right_idx, right): &(usize, f32),
@@ -888,6 +927,81 @@ mod tests {
 
         assert!(!sample.accepted);
         assert_ne!(sample.token, 0);
+    }
+
+    /// Oracle au bit : balayage top-k contre `select_nth` puis tri, sur des
+    /// logits avec ex aequo, -inf, NaN, zéros signés et k hors vocabulaire.
+    #[test]
+    fn topk_scan_matches_select_nth_bitwise() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let bits = |dist: &Result<TokenDistribution>| match dist {
+            Ok(dist) => Ok(dist
+                .iter()
+                .map(|(i, p)| (*i, p.to_bits()))
+                .collect::<Vec<_>>()),
+            Err(error) => Err(error.to_string()),
+        };
+        for case in 0..600_usize {
+            let vocab = [1, 2, 7, 300, 4099, 13_000][case % 6];
+            let mut logits: Vec<f32> = (0..vocab)
+                .map(|_| {
+                    let raw = next();
+                    match case % 5 {
+                        // Ex aequo massifs.
+                        0 => (raw % 4) as f32,
+                        1 => (raw % 20_000) as f32 / 1000.0 - 10.0,
+                        // Croissant : chaque élément entre dans le top-k.
+                        2 => (raw % 3) as f32 * 1e-3,
+                        _ => (raw % 200) as f32 * 0.25 - 25.0,
+                    }
+                })
+                .collect();
+            if case % 5 == 2 {
+                for (i, value) in logits.iter_mut().enumerate() {
+                    *value += i as f32 * 1e-3;
+                }
+            }
+            for value in logits.iter_mut() {
+                match next() % 23 {
+                    0 => *value = f32::NEG_INFINITY,
+                    1 if case % 7 == 0 => *value = f32::NAN,
+                    2 => *value = -0.0,
+                    3 => *value = 0.0,
+                    _ => {}
+                }
+            }
+            if case % 11 == 0 {
+                logits
+                    .iter_mut()
+                    .for_each(|value| *value = f32::NEG_INFINITY);
+            }
+            let top_k = [1, 2, 20, 32, 50, vocab, vocab + 3][case / 6 % 7];
+            let temperature = [0.7, 1.0, 0.05, 2.5][case % 4];
+            let top_p = [0.95, 1.0, 0.5, 0.0001][case / 4 % 4];
+            let run = |scan: bool| {
+                crate::runtime_flags::with_sampling_topk_scan(scan, || {
+                    token_distribution_top_k_top_p(&logits, temperature, top_p, top_k)
+                })
+            };
+            let (scan, reference) = (run(true), run(false));
+            assert_eq!(bits(&scan), bits(&reference), "cas {case}");
+            for draw in 0..4_u64 {
+                let token = |scan: bool| {
+                    crate::runtime_flags::with_sampling_topk_scan(scan, || {
+                        let mut sampler = DeterministicSampler::new(draw ^ case as u64);
+                        sample_token_top_k_top_p(&logits, temperature, top_p, top_k, &mut sampler)
+                            .map_err(|error| error.to_string())
+                    })
+                };
+                assert_eq!(token(true), token(false), "cas {case} tirage {draw}");
+            }
+        }
     }
 }
 

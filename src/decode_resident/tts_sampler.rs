@@ -430,4 +430,56 @@ mod tests {
         }
         Ok(())
     }
+    /// Mesure GPU du tirage : 150 tirages (10 trames de 15 têtes) dans un
+    /// command buffer, top-64 partiel contre tri complet.
+    /// `cargo test --release --all-features tts_sampler_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "bench GPU, à lancer sous verrou"]
+    fn tts_sampler_bench() -> Result<()> {
+        let Some(state) = super::super::tests::try_state()? else {
+            return Ok(());
+        };
+        let logits = (0..2048_u32)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 8) % 20_000) as f32 / 1000.0 - 10.0)
+            .collect::<Vec<_>>();
+        let sample = TtsCodebookSample {
+            temperature: 0.9,
+            top_k: 50,
+            top_p: 1.0,
+        };
+        let input = super::super::tests::lease_with(&state, &logits)?;
+        let codes = state.scratch().lease(15, GpuElement::U32)?;
+        for partial in [true, false, true, false] {
+            let mut best = f64::MAX;
+            for _ in 0..20 {
+                let elapsed = crate::runtime_flags::with_tts_sampler_partial_topk(partial, || {
+                    let command_buffer = state.queue().new_command_buffer();
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    for draw in 0..150_usize {
+                        state.encode_tts_codebook_sample(
+                            encoder,
+                            input.tensor().buffer(),
+                            2048,
+                            codes.tensor().buffer(),
+                            draw % 15,
+                            None,
+                            sample,
+                            draw as u64,
+                        )?;
+                    }
+                    encoder.end_encoding();
+                    let started = std::time::Instant::now();
+                    crate::metal_backend::commit_and_wait(command_buffer)?;
+                    Ok::<_, InferError>(started.elapsed().as_secs_f64())
+                })?;
+                best = best.min(elapsed);
+            }
+            println!(
+                "tts_sampler partial={partial} us_par_tirage={:.2} us_par_trame={:.1}",
+                best * 1e6 / 150.0,
+                best * 1e6 / 10.0
+            );
+        }
+        Ok(())
+    }
 }

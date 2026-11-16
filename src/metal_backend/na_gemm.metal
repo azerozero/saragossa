@@ -5,6 +5,17 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 using namespace mpp;
+// Déroulement complet des pas de 16 sur K dans les GEMM tuilés NAX : le
+// compilateur ne le fait pas seul, et le GEMM u4 [1024, 5120] × [17408]ᵀ passe
+// de 50 à 57 TFLOP/s (de 43 à 55 sur le down_proj). Même suite d'opérations,
+// résultats égaux au bit. Kill-switch `SARAGOSSA_RUST_NAX_KK_UNROLL=0`, qui
+// définit la macro vide avant cette source. NOTE: seuls les GEMM à une tuile B
+// la portent (`gemm_nax_coop_qb_tiled_u4`, `micro_gemm_*`). Elle ralentit de
+// 20 à 28 % le gate+up fusionné et le bf16×3 (pression de registres, sonde
+// `nax_kk_unroll_probe`) ; u8, gs128, align64 et MoE groupés ne sont pas mesurés.
+#ifndef NAX_KK_UNROLL
+#define NAX_KK_UNROLL _Pragma("clang loop unroll(full)")
+#endif
 kernel void gemm_nax(device const bfloat* Ap [[buffer(0)]],
                      device const bfloat* Bp [[buffer(1)]],
                      device float* Cp         [[buffer(2)]],
@@ -546,6 +557,7 @@ kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
   for (uint k = 0; k < K; k += BK) {
     load_b_tile_quant_u4_gs64_vec(Ws, Bp, Bs, Bb, n0, k, N, K, lid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    NAX_KK_UNROLL
     for (uint kk = 0; kk < BK; kk += 16u) {
       metal::vec<bfloat,8> af0, af1, b0, b1;
       if (m0 + 32u <= M) {

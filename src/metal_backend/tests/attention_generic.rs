@@ -122,6 +122,7 @@ fn generic_attention_chunk(
         kv_rows,
         kv_capacity,
         mirror.then_some([k16.as_ref(), v16.as_ref()]),
+        true,
     )?;
     guard.end();
     commit_and_wait(cb)?;

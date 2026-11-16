@@ -24,7 +24,8 @@
 //!   en file.
 //!
 //! Le parseur HTTP accepte uniquement les corps à `Content-Length`.
-//! `Transfer-Encoding: chunked` n'est pas pris en charge.
+//! `Transfer-Encoding` seul répond 501 ; avec `Content-Length`, ou un
+//! `Content-Length` répété ou non numérique, le cadrage ambigu répond 400.
 
 mod anthropic;
 mod args;
@@ -41,6 +42,7 @@ mod protocol;
 mod responses;
 mod state;
 pub(crate) mod streaming;
+mod stt;
 mod tool_output;
 mod warmup;
 
