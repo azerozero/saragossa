@@ -12,12 +12,13 @@
 //! rang ou d'alpha par module, tenseurs autres que `lora_A`/`lora_B`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rayon::prelude::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::decoder::ReadSource;
 use crate::error::{InferError, Result};
 use crate::tensor::Tensor;
 
@@ -34,7 +35,8 @@ fn invalid(message: impl Into<String>) -> InferError {
 pub struct LoraAdapter {
     /// Modules par nom de poids de base (`<module>.weight`, nommage du checkpoint).
     modules: HashMap<String, LoraModule>,
-    paths: [PathBuf; 2],
+    /// Identité des octets lus, pour les instantanés d'état.
+    sources: [ReadSource; 2],
     sha256: String,
 }
 
@@ -57,18 +59,18 @@ impl LoraAdapter {
         let dir = dir.as_ref();
         let config_path = dir.join(CONFIG_FILE);
         let weights_path = dir.join(WEIGHTS_FILE);
-        let config_bytes = read(&config_path)?;
+        let (config_bytes, config_source) = read(&config_path)?;
         let config: Value = serde_json::from_slice(&config_bytes)
             .map_err(|e| invalid(format!("{CONFIG_FILE} illisible : {e}")))?;
         let (rank, scale) = validate_config(&config)?;
-        let weight_bytes = read(&weights_path)?;
+        let (weight_bytes, weight_source) = read(&weights_path)?;
         let modules = parse_modules(&weight_bytes, rank, scale)?;
         let mut hasher = Sha256::new();
         hasher.update(&config_bytes);
         hasher.update(&weight_bytes);
         Ok(Self {
             modules,
-            paths: [config_path, weights_path],
+            sources: [config_source, weight_source],
             sha256: crate::hex(hasher.finalize()),
         })
     }
@@ -83,9 +85,9 @@ impl LoraAdapter {
         self.modules.len()
     }
 
-    /// Fichiers lus, pour l'identité des instantanés d'état.
-    pub(crate) fn paths(&self) -> &[PathBuf] {
-        &self.paths
+    /// Identité des fichiers tels qu'ils ont été lus, pour les instantanés.
+    pub(crate) fn sources(&self) -> &[ReadSource] {
+        &self.sources
     }
 
     pub(crate) fn module(&self, base_weight: &str) -> Option<&LoraModule> {
@@ -148,11 +150,16 @@ impl LoraModule {
     }
 }
 
-fn read(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).map_err(|source| InferError::Io {
+/// Lit `path` en entier et rend son identité, calculée sur ces mêmes octets.
+fn read(path: &Path) -> Result<(Vec<u8>, ReadSource)> {
+    let io = |source| InferError::Io {
         path: path.to_path_buf(),
         source,
-    })
+    };
+    let before = std::fs::metadata(path).map_err(io)?;
+    let bytes = std::fs::read(path).map_err(io)?;
+    let source = ReadSource::new(path, &before, &bytes);
+    Ok((bytes, source))
 }
 
 /// Valide la configuration PEFT et rend `(r, échelle)`.

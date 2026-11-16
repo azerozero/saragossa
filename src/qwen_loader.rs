@@ -392,11 +392,13 @@ fn load_from_shards_with_context(
     catalog: &WeightCatalog,
     context: &DecoderLoadContext<'_>,
 ) -> Result<CausalDecoder> {
-    // NOTE: les fichiers de l'adaptateur entrent dans l'identité des
-    // instantanés : un état calculé sur la base ne sert pas au modèle fusionné.
-    let lora_paths = context.lora.map_or(&[][..], LoraAdapter::paths);
-    let sources = crate::decoder::SnapshotSources::capture(
-        shards.iter().chain(lora_paths).map(PathBuf::as_path),
+    // NOTE: l'adaptateur entre dans l'identité des instantanés, un état de la
+    // base ne servant pas au modèle fusionné. Son empreinte porte sur les octets
+    // lus et fusionnés par `LoraAdapter::load`, jamais sur une relecture.
+    let lora_sources = context.lora.map_or(&[][..], LoraAdapter::sources);
+    let sources = crate::decoder::SnapshotSources::capture_with_read(
+        shards.iter().map(PathBuf::as_path),
+        lora_sources,
     );
     validate_supported_config(config, catalog)?;
     let prefixes = QwenPrefixes::detect(catalog);
