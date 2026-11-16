@@ -231,7 +231,15 @@ fn validate_config(config: &Value) -> Result<(usize, f32)> {
     } else {
         rank as f64
     };
-    Ok((rank, (alpha / denominator) as f32))
+    // NOTE: un alpha fini peut déborder en f32 (1e300) : l'échelle multiplie
+    // chaque poids fusionné, elle doit rester finie.
+    let scale = (alpha / denominator) as f32;
+    if !scale.is_finite() {
+        return Err(invalid(format!(
+            "échelle lora_alpha / r non finie en f32 ({alpha})"
+        )));
+    }
+    Ok((rank, scale))
 }
 
 /// Associe chaque paire `lora_A`/`lora_B` au poids de base qu'elle corrige.
@@ -423,6 +431,7 @@ pub(crate) mod tests {
             ("rank_pattern", serde_json::json!({"q_proj": 8})),
             ("alpha_pattern", serde_json::json!({"q_proj": 8})),
             ("peft_type", Value::from("IA3")),
+            ("lora_alpha", Value::from(1e300)),
         ] {
             let mut config = lora_config(1, 1.0);
             config[key] = value;
