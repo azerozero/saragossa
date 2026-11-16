@@ -91,7 +91,10 @@ impl CodecGpu {
         pool.release(input);
         let blocks = self.upsample_rates.len();
         for block in 1..=blocks {
-            let stride = self.upsample_rates[block - 1];
+            let stride = *self
+                .upsample_rates
+                .get(block - 1)
+                .ok_or_else(|| InferError::Config(format!("profil: bloc {block} absent")))?;
             let snaked = self.profile_snake(
                 &mut rec,
                 &mut pool,
@@ -101,7 +104,10 @@ impl CodecGpu {
             )?;
             pool.release(cur);
             let name = format!("decoder.decoder.{block}.block.1.conv");
-            let conv = &self.transposes[&name];
+            let conv = self
+                .transposes
+                .get(&name)
+                .ok_or_else(|| InferError::MissingWeight(format!("profil transpose {name}")))?;
             let (out, ns) = self.timed(|encoder| {
                 self.transpose_stream(state, encoder, &mut pool, &snaked, &name, stride)
             })?;
@@ -221,7 +227,10 @@ impl CodecGpu {
         residual: Option<&GpuNlc>,
         label: &str,
     ) -> Result<GpuNlc> {
-        let conv = &self.convs[name];
+        let conv = self
+            .convs
+            .get(name)
+            .ok_or_else(|| InferError::MissingWeight(format!("profil conv {name}")))?;
         let (out, ns) = self.timed(|encoder| {
             self.conv_stream(state, encoder, pool, x, name, dilation, nopad, residual)
         })?;
