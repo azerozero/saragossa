@@ -12,6 +12,7 @@ use super::{
     calibrated_readout, describe, invalid, load_headless, neutralize, read_json, special_tokens,
     truthy,
 };
+use crate::tokenizer::QWEN35_REGEX;
 use crate::{CausalDecoder, InferError, Result, RustTokenizer, Tensor};
 use serde_json::{json, Map, Value};
 use std::path::Path;
@@ -19,10 +20,9 @@ use std::path::Path;
 const TOKENIZER_CONTRACT_SHA256: &str =
     "7eb96aaea6b7dbb495f0840b42f18014ca5a697697305f76f39d46cae890ccb2";
 const LABEL_ROWS_FORMAT: &str = "lightning-label-rows-1";
-/// Regex de `tokenizer.json` (Qwen3.5) et celle de `Qwen2Tokenizer`, avec
-/// laquelle H2O a été entraîné : elles divergent sur les marques combinantes.
-const QWEN35_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-const QWEN2_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// Regex de `Qwen2Tokenizer`, avec laquelle H2O et d3 ont été entraînés ;
+/// elle diverge de [`QWEN35_REGEX`] sur les marques combinantes.
+pub(crate) const QWEN2_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 /// Le chemin de décision non causal est validé jusqu'à 2048 tokens.
 const MAX_BIDIRECTIONAL_TOKENS: usize = 2048;
 /// `MAX_LEN` du `serve.sh` H2O (état de 32 000 tokens plus la question).

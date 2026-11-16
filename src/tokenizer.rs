@@ -42,6 +42,9 @@ impl RustTokenizer {
                 let config: serde_json::Value = serde_json::from_str(&text).ok()?;
                 config["chat_template"].as_str().map(str::to_owned)
             });
+        if let Some(message) = foreign_regex_warning(path, &inner) {
+            warn_once(path, &message);
+        }
         Ok(Self {
             path: path.to_path_buf(),
             qwen_profile: template
@@ -180,6 +183,64 @@ impl RustTokenizer {
     }
 }
 
+/// Regex du pré-tokenizer de `tokenizer.json` des Qwen3.5, 3.6 et 3.8.
+pub(crate) const QWEN35_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+/// `model_type` des familles livrées avec [`QWEN35_REGEX`].
+const QWEN35_MODEL_TYPES: &[&str] = &[
+    "qwen3_5",
+    "qwen3_5_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "qwen4_exp",
+    "qwen4_exp_text",
+];
+
+/// Avertissement si un Qwen3.5/3.6/3.8 porte une autre regex, typiquement
+/// celle de `Qwen2Tokenizer` réécrite par un `save_pretrained` de
+/// transformers 5.x : les marques combinantes (dévanagari, arabe vocalisé,
+/// thaï) sont alors découpées autrement qu'à l'entraînement. Les modèles de
+/// décision qui veulent la regex Qwen2 passent par
+/// [`RustTokenizer::from_json`] et ne sont pas concernés.
+fn foreign_regex_warning(path: &Path, inner: &Tokenizer) -> Option<String> {
+    let config = std::fs::read_to_string(path.with_file_name("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&config).ok()?;
+    if !QWEN35_MODEL_TYPES.contains(&config["model_type"].as_str()?) {
+        return None;
+    }
+    let pre = serde_json::to_value(inner.get_pre_tokenizer()).ok()?;
+    let found = first_regex(&pre);
+    (found != Some(QWEN35_REGEX)).then(|| {
+        format!(
+            "avertissement : {} porte la regex de pré-tokenizer {}, pas celle de Qwen3.5 \
+             attendue pour ce modèle : {QWEN35_REGEX} ; recopier le tokenizer.json d'origine",
+            path.display(),
+            found.unwrap_or("(aucune)")
+        )
+    })
+}
+
+fn first_regex(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::Object(map) => map
+            .get("pattern")
+            .and_then(|p| p["Regex"].as_str())
+            .or_else(|| map.values().find_map(first_regex)),
+        serde_json::Value::Array(items) => items.iter().find_map(first_regex),
+        _ => None,
+    }
+}
+
+fn warn_once(path: &Path, message: &str) {
+    static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !warned.iter().any(|p| p == path) {
+        warned.push(path.to_path_buf());
+        eprintln!("{message}");
+    }
+}
+
 fn byte_fallback_token(token: &str) -> Option<u8> {
     let hex = token.strip_prefix("<0x")?.strip_suffix('>')?;
     if hex.len() != 2 {
@@ -272,6 +333,45 @@ mod tests {
             "bonjour reti"
         );
         assert_eq!(tokenizer.token_to_id("bonjour"), Some(1));
+    }
+
+    #[test]
+    fn warns_on_foreign_qwen35_regex_only() {
+        use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+        use tokenizers::SplitDelimiterBehavior;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("tokenizer.json");
+        save_test_tokenizer(&path);
+        let mut inner = Tokenizer::from_file(&path).expect("tokenizer");
+        let warning = |inner: &Tokenizer, model_type: &str| {
+            std::fs::write(
+                tmp.path().join("config.json"),
+                format!(r#"{{"model_type":"{model_type}"}}"#),
+            )
+            .expect("config");
+            foreign_regex_warning(&path, inner)
+        };
+        // Sans regex (Whitespace) ou avec celle de Qwen2 : avertissement.
+        assert!(warning(&inner, "qwen3_5").is_some());
+        let qwen2 = crate::decision::letters::QWEN2_REGEX;
+        for (regex, warns) in [(qwen2, true), (QWEN35_REGEX, false)] {
+            let split = Split::new(
+                SplitPattern::Regex(regex.into()),
+                SplitDelimiterBehavior::Isolated,
+                false,
+            )
+            .expect("split");
+            inner.with_pre_tokenizer(Some(split));
+            let message = warning(&inner, "qwen3_5_moe");
+            assert_eq!(message.is_some(), warns, "{regex}");
+            if let Some(message) = message {
+                assert!(message.contains("tokenizer.json") && message.contains(QWEN35_REGEX));
+            }
+            // Autre famille : jamais d'avertissement.
+            assert!(warning(&inner, "qwen3").is_none());
+        }
+        std::fs::remove_file(tmp.path().join("config.json")).expect("remove");
+        assert!(foreign_regex_warning(&path, &inner).is_none());
     }
 
     #[test]
