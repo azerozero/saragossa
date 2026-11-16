@@ -3048,6 +3048,16 @@ pub(crate) fn tts_codec_gpu_prefix_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CODEC_GPU_PREFIX", true))
 }
 
+/// Convolutions du codec TTS GPU en tuiles (im2col implicite en mémoire
+/// threadgroup, conv2 + raccord résiduel fusionnés) au lieu du kernel gather
+/// un thread par sortie. Même ordre d'accumulation par sortie : PCM identique
+/// au bit (`codec_gpu_tiled_conv_matches_gather`). Défaut ON ;
+/// `SARAGOSSA_TTS_CODEC_CONV_TILED=0` rétablit le kernel gather.
+pub(crate) fn tts_codec_conv_tiled_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CODEC_CONV_TILED", true))
+}
+
 /// Tirage TTS GPU : sélection partielle exacte des 64 premiers rangs (tri
 /// par blocs de 64 puis fusions) au lieu du tri bitonique complet, quand
 /// `top_k <= 64`. Mêmes rangs au bit près. Défaut ON ;

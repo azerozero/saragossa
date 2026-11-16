@@ -1,0 +1,7 @@
+{
+  "measured_bf16_max_abs": 0.010743796825408936,
+  "bidirectional_bf16_max_abs": 0.009023934602737427,
+  "causal_bf16_max_abs": 0.010743796825408936,
+  "max_abs_probability": 0.021488593650817872,
+  "rule": "2 * measured bf16 max absolute probability error (both modes, corpus, 128/512/2048 two-way, 8 one-way reads of the 4000-token cache state) + 1e-6; fixed before Rust comparison"
+}

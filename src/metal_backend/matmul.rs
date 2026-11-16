@@ -1499,7 +1499,7 @@ impl MetalExecutor {
 /// spéculative), le qmv garde son résultat par ligne indépendant du batch, ce
 /// qui préserve l'identité vérification/AR ; au-dessus (prefill), relire le
 /// poids par ligne bornait le débit à ~20 tok/s sur un 27B BF16.
-const DENSE_BF16_GEMM_MIN_BATCH: usize = 64;
+pub(crate) const DENSE_BF16_GEMM_MIN_BATCH: usize = 64;
 
 fn can_use_dense_bf16_gemm(batch: usize, in_dim: usize, out_dim: usize) -> bool {
     batch >= DENSE_BF16_GEMM_MIN_BATCH
