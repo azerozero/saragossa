@@ -118,14 +118,20 @@ pub fn smart_resize(height: u32, width: u32, profile: ImageProfile) -> Result<(u
         return Err(invalid("ratio supérieur à 200"));
     }
     let (min_pixels, max_pixels) = profile.pixel_bounds();
+    let area = u128::from(height) * u128::from(width);
     let mut resized_h = (h / 32.0).round_ties_even() * 32.0;
     let mut resized_w = (w / 32.0).round_ties_even() * 32.0;
     if resized_h * resized_w > f64::from(max_pixels) {
-        let beta = (h * w / f64::from(max_pixels)).sqrt();
+        // Python divise le produit entier exact : convertir l'aire d'abord
+        // introduirait un double arrondi. Avec ces budgets, le quotient et
+        // le reste sont représentables exactement en f64.
+        let maximum = u128::from(max_pixels);
+        let ratio = (area / maximum) as f64 + (area % maximum) as f64 / f64::from(max_pixels);
+        let beta = ratio.sqrt();
         resized_h = ((h / beta / 32.0).floor() * 32.0).max(32.0);
         resized_w = ((w / beta / 32.0).floor() * 32.0).max(32.0);
     } else if resized_h * resized_w < f64::from(min_pixels) {
-        let beta = (f64::from(min_pixels) / (h * w)).sqrt();
+        let beta = (f64::from(min_pixels) / area as f64).sqrt();
         resized_h = (h * beta / 32.0).ceil() * 32.0;
         resized_w = (w * beta / 32.0).ceil() * 32.0;
     }
@@ -172,6 +178,17 @@ mod tests {
             assert_eq!(smart_resize(1280, 1280, profile)?, (1280, 1280));
             assert_eq!(smart_resize(1312, 1312, profile)?, (1280, 1280));
             assert_eq!(smart_resize(6000, 3000, profile)?, (1792, 896));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vision_resize_preserves_python_integer_area_division() -> Result<()> {
+        for profile in [ImageProfile::Thx02, ImageProfile::D3Flash] {
+            assert_eq!(
+                smart_resize(1_946_413_361, 1_946_413_361, profile)?,
+                (1280, 1280)
+            );
         }
         Ok(())
     }
