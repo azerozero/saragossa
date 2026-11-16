@@ -181,7 +181,7 @@ fn run() -> CliResult<()> {
         );
     // Charger avant la chauffe ; l'oracle explicite conserve son erreur sans tête.
     #[cfg(feature = "devtools")]
-    let load_mtp = mtp_active || saragossa::devtools::mtp_acceptance_enabled();
+    let load_mtp = saragossa::devtools::mtp_acceptance_enabled() || mtp_active;
     #[cfg(not(feature = "devtools"))]
     let load_mtp = mtp_active;
     if load_mtp {
