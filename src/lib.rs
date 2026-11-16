@@ -134,6 +134,7 @@ pub use tts::{
 };
 pub use whisper::{
     log_mel_spectrogram, WhisperConfig, WhisperDecoder, WhisperEncoder, WhisperModel,
+    WhisperSegment, WhisperStream, WhisperStreamUpdate, WhisperTranscript,
 };
 pub mod decision;
 

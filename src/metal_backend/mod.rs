@@ -184,6 +184,7 @@ pub(crate) fn qmvt_dispatches_for_test() -> usize {
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
     WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
+    WhisperStepEmit, WhisperStepOutput,
 };
 
 fn ensure_valid_top_k(top_k: usize, expert_count: usize) -> Result<()> {
