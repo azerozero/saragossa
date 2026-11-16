@@ -1,6 +1,7 @@
 /// Oracle au bit du balayage top-k contre le chemin historique (kill-switch) :
-/// mêmes tokens sur des lignes avec ex aequo, zéros signés, -inf, +inf, NaN,
-/// -FLT_MAX, dernier bloc de 256 plus court que `top_k` et softcap. Le chemin réellement
+/// mêmes tokens sur des lignes avec ex aequo, zéros signés gagnants, -inf,
+/// +inf, NaN, -FLT_MAX, dernier bloc de 256 plus court que `top_k`, softcap,
+/// k = vocabulaire et plus de 32 groupes à fusionner. Le chemin réellement
 /// exécuté est vérifié par ligne : balayage si les logits (après softcap) sont
 /// réguliers, repli historique sinon, et une part significative des lignes
 /// doit tirer par le balayage.
@@ -21,7 +22,8 @@ fn sampler_topk_scan_matches_reference_bitwise() -> Result<()> {
     let rows = 3_usize;
     let (mut total_rows, mut scanned_rows, mut fallback_rows) = (0_usize, 0_usize, 0_usize);
     for case in 0..180_usize {
-        let vocab = [300, 8192, 8193, 20_005, 248_320, 40, 257][case % 7];
+        // 300 000 logits : 37 groupes de 8192, fusion au-delà des 32 voies.
+        let vocab = [300, 8192, 8193, 20_005, 248_320, 40, 257, 20, 300_000][case % 9];
         let mut logits: Vec<f32> = (0..vocab * rows)
             .map(|_| {
                 let raw = next();
@@ -29,7 +31,8 @@ fn sampler_topk_scan_matches_reference_bitwise() -> Result<()> {
                     0 => (raw % 5) as f32,
                     1 => (raw % 20_000) as f32 / 1000.0 - 10.0,
                     2 => (raw % 64) as f32 * 0.5 - 16.0,
-                    3 => (raw % 50) as f32 * 0.3 - 7.0,
+                    // Zéros signés en tête : le maximum est ±0.
+                    3 => [-0.0, 0.0, -1.0, -2.5][(raw % 4) as usize],
                     _ => ((raw % 1000) as f32 / 125.0 - 4.0) * 3.0,
                 }
             })
@@ -55,7 +58,12 @@ fn sampler_topk_scan_matches_reference_bitwise() -> Result<()> {
                 logits[vocab + vocab / 2] = f32::INFINITY;
             }
         }
-        let top_k = [1, 2, 20, 32, 7][case / 7 % 5].min(vocab);
+        // k = vocabulaire une fois sur six.
+        let top_k = if case % 6 == 5 {
+            vocab.min(crate::metal_backend::MAX_SAMPLER_TOP_K)
+        } else {
+            [1, 2, 20, 32, 7][case / 9 % 5].min(vocab)
+        };
         let temperature = [0.7, 1.0, 0.05, 2.5][case % 4];
         let top_p = [0.95, 1.0, 0.5, 0.0001][case / 4 % 4];
         let softcap = (case % 7 == 0).then_some(30.0);
