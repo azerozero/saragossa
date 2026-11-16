@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "checkpoint": "Qwen3.6-35B-A3B-4bit",
+  "environment": {
+    "versions": {
+      "torch": "2.12.0",
+      "transformers": "5.8.1",
+      "numpy": "2.2.6",
+      "safetensors": "0.5.3",
+      "torchvision": null,
+      "tokenizers": "0.22.2",
+      "pillow": "12.2.0"
+    },
+    "transformers_source_sha256": {
+      "models/qwen3_5/modeling_qwen3_5.py": "641da34484f6b9769e28615c680cc4e3202afbf5bdbf1da7d56d5a3d678918c7",
+      "models/qwen3_5/configuration_qwen3_5.py": "e2ca3e05c3f3e7ed2c4f452043bc33640c67a24799adb054ba24fab6badfbd8c",
+      "models/qwen2_vl/image_processing_qwen2_vl.py": "f19497685281402691f0049a0ab5be8085f92fb5c37adfcc680e4ccd17863a77",
+      "models/qwen3_vl/processing_qwen3_vl.py": "b51f77d783b4a88d503bf9198828d46f71e3ead3833da2631748188b159253ba",
+      "models/qwen3_vl/video_processing_qwen3_vl.py": "1ca916fbb1531bf3c2ef4bf862ecb790f88c084ba99f27e324ff491a5b7abc67",
+      "image_processing_backends.py": "88ca316e2e804ccea2b0d6fb5971e2a4bc5765d89a114e902698b0b1909e34e1"
+    },
+    "transformers_sha256": "7ad6164777f7781930200df36f70b40dbbc9e5c037899702413d624f2f5895ee",
+    "transformers_git_sha": null,
+    "git_sha_note": "wheel installé sans métadonnée Git ; SHA256 des sources exécutées",
+    "python": "3.13.15",
+    "reference_script_sha256": "6499c24071766f53c9cad4052c4696e551aff4f955a1d267e20a07a117e55cb9"
+  },
+  "vision_payload_sha256": "4113381ee4b7b8a5b1f31e03a39c863abb9c5a076031533d7a707acf67d42c59",
+  "dtype": "f32",
+  "weights_source_dtype": "BF16",
+  "device": "cpu",
+  "attention": "eager",
+  "resize": false,
+  "preprocessing": "no-resize port of transformers 5.8.1 fused normalize",
+  "bf16_logit_calibration": "pending stage 3; never inferred from embedding noise",
+  "cases": [
+    {
+      "image": "square",
+      "rgb_sha256": "e6058d8d925cf0dda84f5453b95757abd175a946b69e129cc902f74bbae18fa6",
+      "grid_thw": [
+        [
+          1,
+          16,
+          16
+        ]
+      ],
+      "placeholder_count": 64,
+      "payloads": {
+        "embeddings": {
+          "file": "square-embeddings.bin",
+          "dtype": "float32",
+          "shape": [
+            64,
+            2048
+          ],
+          "sha256": "9fe43422de6f89cee4f524cbd0cb9c6762184114e3eda56b76eace5728061d9a",
+          "size_bytes": 524288
+        },
+        "interpolation_indices": {
+          "file": "square-indices.bin",
+          "dtype": "int64",
+          "shape": [
+            4,
+            256
+          ],
+          "sha256": "9d2ecbfd9affeaa83eee181d67ced6d6a7941c45c087d232712ddaf1d22aec69",
+          "size_bytes": 8192
+        },
+        "interpolation_weights": {
+          "file": "square-weights.bin",
+          "dtype": "float32",
+          "shape": [
+            4,
+            256
+          ],
+          "sha256": "c5afa33dd9507fb62aeeeebb5b7240c8eda04e6c4d49aaaf62e596d4653dd0af",
+          "size_bytes": 4096
+        }
+      }
+    },
+    {
+      "image": "landscape",
+      "rgb_sha256": "77d0e2e1b042a7b3c1f548d3037f0b945552e799ad50173e4703cdd40fe9ae42",
+      "grid_thw": [
+        [
+          1,
+          14,
+          20
+        ]
+      ],
+      "placeholder_count": 70,
+      "payloads": {
+        "embeddings": {
+          "file": "landscape-embeddings.bin",
+          "dtype": "float32",
+          "shape": [
+            70,
+            2048
+          ],
+          "sha256": "cd456c6ccdb67db0f0dc06cc163fa00c1d76bd2cbd156de0d89c3e7fa0190c43",
+          "size_bytes": 573440
+        },
+        "interpolation_indices": {
+          "file": "landscape-indices.bin",
+          "dtype": "int64",
+          "shape": [
+            4,
+            280
+          ],
+          "sha256": "f9b5886ef85f86d7f316d45fad957b59837cc2f40ea52ee31e3308abc3cde8b2",
+          "size_bytes": 8960
+        },
+        "interpolation_weights": {
+          "file": "landscape-weights.bin",
+          "dtype": "float32",
+          "shape": [
+            4,
+            280
+          ],
+          "sha256": "a431beb92d5e6c6b345ff9827f686e56f4a44329a109631d6182d9d03ab8098d",
+          "size_bytes": 4480
+        }
+      }
+    },
+    {
+      "image": "portrait",
+      "rgb_sha256": "aa357904a53ae36d01c1964f3f2d1e16008b280a91cbf86034a5a09c5521aab1",
+      "grid_thw": [
+        [
+          1,
+          20,
+          14
+        ]
+      ],
+      "placeholder_count": 70,
+      "payloads": {
+        "embeddings": {
+          "file": "portrait-embeddings.bin",
+          "dtype": "float32",
+          "shape": [
+            70,
+            2048
+          ],
+          "sha256": "164f204add879c650668b354a099afc8c160f27fd783a83dea3432c3aae56a32",
+          "size_bytes": 573440
+        },
+        "interpolation_indices": {
+          "file": "portrait-indices.bin",
+          "dtype": "int64",
+          "shape": [
+            4,
+            280
+          ],
+          "sha256": "f6d39037bc46630e83fece0be45c116538e54e95617e08a02a25b9dfdf1d71d3",
+          "size_bytes": 8960
+        },
+        "interpolation_weights": {
+          "file": "portrait-weights.bin",
+          "dtype": "float32",
+          "shape": [
+            4,
+            280
+          ],
+          "sha256": "bf17772a31acb21f75ec6e6727b72b6f3649bd3170d6ce45455463c3e80501c9",
+          "size_bytes": 4480
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,95 @@
+[
+  {
+    "image": "square",
+    "grid_thw": [
+      [
+        1,
+        16,
+        16
+      ]
+    ],
+    "rgb": {
+      "file": "square-rgb.bin",
+      "dtype": "uint8",
+      "shape": [
+        256,
+        256,
+        3
+      ],
+      "sha256": "e6058d8d925cf0dda84f5453b95757abd175a946b69e129cc902f74bbae18fa6",
+      "size_bytes": 196608
+    },
+    "patches": {
+      "file": "square-patches.bin",
+      "dtype": "float32",
+      "shape": [
+        256,
+        1536
+      ],
+      "sha256": "a51f1a6bd7e8b48b238f8e1f634416fd15833b8b5f9cdab13245bb92cc449f0d",
+      "size_bytes": 1572864
+    }
+  },
+  {
+    "image": "landscape",
+    "grid_thw": [
+      [
+        1,
+        14,
+        20
+      ]
+    ],
+    "rgb": {
+      "file": "landscape-rgb.bin",
+      "dtype": "uint8",
+      "shape": [
+        224,
+        320,
+        3
+      ],
+      "sha256": "77d0e2e1b042a7b3c1f548d3037f0b945552e799ad50173e4703cdd40fe9ae42",
+      "size_bytes": 215040
+    },
+    "patches": {
+      "file": "landscape-patches.bin",
+      "dtype": "float32",
+      "shape": [
+        280,
+        1536
+      ],
+      "sha256": "0ccfe70815ad977050d910a09ea6b32c7eda877596f326ec30c4b49b14601899",
+      "size_bytes": 1720320
+    }
+  },
+  {
+    "image": "portrait",
+    "grid_thw": [
+      [
+        1,
+        20,
+        14
+      ]
+    ],
+    "rgb": {
+      "file": "portrait-rgb.bin",
+      "dtype": "uint8",
+      "shape": [
+        320,
+        224,
+        3
+      ],
+      "sha256": "aa357904a53ae36d01c1964f3f2d1e16008b280a91cbf86034a5a09c5521aab1",
+      "size_bytes": 215040
+    },
+    "patches": {
+      "file": "portrait-patches.bin",
+      "dtype": "float32",
+      "shape": [
+        280,
+        1536
+      ],
+      "sha256": "7dde5f0c711b6c9f9bfa426c16a50ba18f3ddc010952fede60ae9e063d5d8eca",
+      "size_bytes": 1720320
+    }
+  }
+]
