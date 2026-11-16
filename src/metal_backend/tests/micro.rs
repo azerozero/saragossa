@@ -323,6 +323,68 @@ fn micro_bandwidth_and_gemm_probe() -> Result<()> {
     Ok(())
 }
 
+/// Bits égaux, ou NaN des deux côtés : les payloads NaN ne sont pas comparés.
+fn same_bits(a: &[f32], b: &[f32]) -> Option<usize> {
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x.to_bits() != y.to_bits() && !(x.is_nan() && y.is_nan()))
+}
+
+/// MLP micro fusionné, compilé en fast-math, contre le chemin séparé sur les
+/// 256 octets d'échelle de gate et up (sous-normaux, débordements, NaN).
+#[test]
+#[ignore = "oracle MLP micro : nécessite Metal, lancer sous verrou GPU"]
+fn micro_fused_mlp_all_scale_bytes_bit_exact() -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    let (hidden, inter, m) = (256_usize, 128_usize, 16_usize);
+    for mode in [MicroMode::Mxfp4, MicroMode::Nvfp4, MicroMode::Mxfp8] {
+        let extreme = |seed: usize| -> Result<MicroQuantizedTensor> {
+            let base = weight(mode, inter, hidden)?;
+            let scales = (0..inter * hidden / mode.group_size())
+                .map(|i| ((i * 37 + seed) % 256) as u8)
+                .collect();
+            MicroQuantizedTensor::new([inter, hidden], base.packed().to_vec(), scales, mode)
+        };
+        let (g, u) = (
+            metal.resolve_micro(&extreme(0)?)?,
+            metal.resolve_micro(&extreme(11)?)?,
+        );
+        let d = metal.resolve_micro(&weight(mode, hidden, inter)?)?;
+        let [gate, up, down] =
+            [g.clone(), u.clone(), d.clone()].map(MetalLinearWeightBuffers::MicroScaled);
+        assert!(metal.fused_dense_mlp_supported(m, hidden, &gate, &up, &down, inter));
+        let x: Vec<f32> = (0..m * hidden)
+            .map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * 0.37)
+            .collect();
+        let lhs = metal.upload_f32_buffer(&x, "micro_mlp_x_lhs")?;
+        let fused = metal.new_f32_buffer(m * hidden, "micro_mlp_x_fused")?;
+        let gate_out = metal.new_f32_buffer(m * inter, "micro_mlp_x_gate")?;
+        let up_out = metal.new_f32_buffer(m * inter, "micro_mlp_x_up")?;
+        let h = metal.new_f32_buffer(m * inter, "micro_mlp_x_h")?;
+        let split = metal.new_f32_buffer(m * hidden, "micro_mlp_x_split")?;
+        let cb = metal.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        metal.encode_fused_dense_mlp(enc, &lhs, m, hidden, &gate, &up, &down, inter, &fused)?;
+        metal.encode_micro(enc, &lhs, &gate_out, m, hidden, &g)?;
+        metal.encode_micro(enc, &lhs, &up_out, m, hidden, &u)?;
+        metal.encode_swiglu(enc, &mut Vec::new(), &gate_out, &up_out, &h, m * inter)?;
+        metal.encode_micro(enc, &h, &split, m, inter, &d)?;
+        enc.end_encoding();
+        commit_and_wait(cb)?;
+        let (fused, split) = (
+            read_f32_buffer(&fused, m * hidden)?,
+            read_f32_buffer(&split, m * hidden)?,
+        );
+        assert_eq!(
+            same_bits(&fused, &split),
+            None,
+            "{} échelles extrêmes",
+            mode.name()
+        );
+    }
+    Ok(())
+}
+
 /// Sonde du déroulement `NAX_KK_UNROLL` kernel par kernel, aux formes du 27B :
 /// même source compilée avec et sans la macro.
 #[test]
