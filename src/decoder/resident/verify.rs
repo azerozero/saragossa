@@ -164,10 +164,12 @@ impl CausalDecoder {
             None
         };
 
+        let rope_position = cache.current_pos()?;
         let CausalDecoderCache {
             layers,
             position: cache_position,
             resident,
+            ..
         } = cache;
         let Some(arena) = resident.as_mut() else {
             return Ok(None);
@@ -284,7 +286,7 @@ impl CausalDecoder {
                         .resident
                         .resident_windowed_full_attn_layer_dims(
                             hidden,
-                            *cache_position,
+                            rope_position,
                             eps,
                             theta,
                         )?;
@@ -610,7 +612,7 @@ impl CausalDecoder {
         for (token_pos, input) in token_inputs.iter().enumerate() {
             let mut current = input.buffer();
             let mut other = arena.hidden_b.buffer();
-            let position = *cache_position + token_pos;
+            let position = rope_position + token_pos;
             for (index, layer) in self.layers.iter().enumerate() {
                 let layer_cache = &mut layers[index];
                 if self.plan.layers[index].resident_full {

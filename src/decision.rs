@@ -112,7 +112,18 @@ impl DecisionModel {
             .map_err(|e| invalid(e.to_string()))?;
         let ids: Vec<u32> = serde_json::from_value(decision["token_ids"].clone())
             .map_err(|e| invalid(e.to_string()))?;
-        let tokenizer = RustTokenizer::from_file(path.join("tokenizer.json"))?;
+        let tokenizer = if d3 {
+            // Runtime officiel d3 : transformers 5.17, donc `Qwen2Tokenizer`
+            // et sa regex, pas celle de `tokenizer.json`.
+            if read_json(&path.join("tokenizer_config.json"))?["tokenizer_class"]
+                != "Qwen2Tokenizer"
+            {
+                return Err(invalid("tokenizer d3 Qwen2Tokenizer requis"));
+            }
+            letters::qwen2_tokenizer(path)?
+        } else {
+            RustTokenizer::from_file(path.join("tokenizer.json"))?
+        };
         if codes.len() != 255 || ids.len() != codes.len() {
             return Err(invalid("255 codes et token_ids requis"));
         }
@@ -135,63 +146,16 @@ impl DecisionModel {
             }
             Some(id as usize)
         };
-        let tokenizer_json = read_json(&path.join("tokenizer.json"))?;
-        let mut escapes: Vec<String> = tokenizer_json["added_tokens"]
-            .as_array()
-            .ok_or_else(|| invalid("tokens spéciaux absents"))?
-            .iter()
-            .filter(|v| v["special"] == true)
-            .filter_map(|v| v["content"].as_str().map(str::to_owned))
-            .collect();
-        if marker_id.is_some() {
-            escapes.push(MARKER.into());
-        }
-        escapes.sort_by_key(|v| std::cmp::Reverse(v.len()));
-        escapes.dedup();
-        let top = read_json(&path.join("config.json"))?;
-        // THX enveloppe le backbone, d3 publie directement la config Qwen3_5Model.
-        let backbone = top.get("backbone_config").unwrap_or(&top);
-        if backbone["model_type"] != "qwen3_5" {
-            return Err(invalid("backbone qwen3_5 requis"));
-        }
-        let raw: crate::config::RawModelConfig =
-            serde_json::from_value(backbone.clone()).map_err(|e| invalid(e.to_string()))?;
-        let config = raw.resolve()?;
+        let extra: &[&str] = if marker_id.is_some() { &[MARKER] } else { &[] };
+        let escapes = special_tokens(path, extra)?;
+        let (decoder, hidden_size) = load_headless(path, &tokenizer, metal)?;
         let readout =
             crate::safetensor::load_float_tensor(path.join("readout.safetensors"), "weight")?;
-        if readout.shape() != [codes.len(), config.hidden_size]
+        if readout.shape() != [codes.len(), hidden_size]
             || readout.data().iter().any(|x| !x.is_finite())
         {
             return Err(invalid("readout non fini ou de forme incompatible"));
         }
-        let shards = shard_paths(path)?;
-        let assets = ModelAssets {
-            model_dir: path.into(),
-            config,
-            tokenizer: tokenizer.clone(),
-            catalog: WeightCatalog::from_shards(&shards)?,
-            shards,
-            mtp: Default::default(),
-        };
-        // Sans tête de vocabulaire : le readout la remplace (Qwen3_5Model n'en
-        // a pas, THX la lierait aux embeddings).
-        let decoder = crate::runtime_flags::with_decision_headless(|| -> Result<CausalDecoder> {
-            Ok(if metal {
-                #[cfg(all(target_os = "macos", feature = "metal"))]
-                {
-                    let executor =
-                        crate::runtime_flags::with_decision_noncausal(crate::MetalExecutor::new)?;
-                    crate::qwen_loader::load_causal_decoder_for_metal(&assets, &executor)?
-                        .with_metal_executor(executor)?
-                }
-                #[cfg(not(all(target_os = "macos", feature = "metal")))]
-                {
-                    return Err(invalid("Metal indisponible sur cette plateforme"));
-                }
-            } else {
-                crate::load_causal_decoder(&assets)?
-            })
-        })?;
         Ok(Self {
             decoder,
             tokenizer,
@@ -204,11 +168,7 @@ impl DecisionModel {
     }
 
     fn escape(&self, value: &Value) -> String {
-        let mut text = describe(value);
-        for token in &self.escapes {
-            text = text.replace(token, &token.replace('<', "＜").replace('>', "＞"));
-        }
-        text
+        neutralize(&describe(value), &self.escapes)
     }
 
     /// Encode une requête `{state, questions}` dans l'ordre reçu : une
@@ -517,6 +477,80 @@ impl DecisionModel {
             json!({"answers":answers,"usage":{"input_tokens":tokens,"output_tokens":0,"sequences":sequences}}),
         )
     }
+}
+
+/// `added_tokens` spéciaux de `tokenizer.json` plus `extra`, du plus long au
+/// plus court pour que [`neutralize`] remplace d'abord les plus longs.
+fn special_tokens(path: &Path, extra: &[&str]) -> Result<Vec<String>> {
+    let tokenizer_json = read_json(&path.join("tokenizer.json"))?;
+    let mut escapes: Vec<String> = tokenizer_json["added_tokens"]
+        .as_array()
+        .ok_or_else(|| invalid("tokens spéciaux absents"))?
+        .iter()
+        .filter(|v| v["special"] == true)
+        .filter_map(|v| v["content"].as_str().map(str::to_owned))
+        .chain(extra.iter().map(|&t| t.to_owned()))
+        .collect();
+    escapes.sort_by_key(|v| std::cmp::Reverse(v.len()));
+    escapes.dedup();
+    Ok(escapes)
+}
+
+/// Les tokens spéciaux du contenu deviennent des chevrons pleine largeur :
+/// le contenu reste une donnée et ne peut pas ouvrir de tour.
+fn neutralize(text: &str, escapes: &[String]) -> String {
+    let mut text = text.to_owned();
+    for token in escapes {
+        text = text.replace(token, &token.replace('<', "＜").replace('>', "＞"));
+    }
+    text
+}
+
+/// Backbone Qwen3.5 texte sans tête de vocabulaire, remplacée par le readout
+/// ou les lignes de labels (Qwen3_5Model n'en a pas, THX la lierait aux
+/// embeddings) ; renvoie aussi la largeur cachée.
+fn load_headless(
+    path: &Path,
+    tokenizer: &RustTokenizer,
+    metal: bool,
+) -> Result<(CausalDecoder, usize)> {
+    let top = read_json(&path.join("config.json"))?;
+    // THX enveloppe le backbone, d3 publie directement la config Qwen3_5Model.
+    let backbone = top.get("backbone_config").unwrap_or(&top);
+    if backbone["model_type"] != "qwen3_5" {
+        return Err(invalid("backbone qwen3_5 requis"));
+    }
+    let raw: crate::config::RawModelConfig =
+        serde_json::from_value(backbone.clone()).map_err(|e| invalid(e.to_string()))?;
+    let config = raw.resolve()?;
+    let hidden_size = config.hidden_size;
+    let shards = shard_paths(path)?;
+    let assets = ModelAssets {
+        model_dir: path.into(),
+        config,
+        tokenizer: tokenizer.clone(),
+        catalog: WeightCatalog::from_shards(&shards)?,
+        shards,
+        mtp: Default::default(),
+    };
+    let decoder = crate::runtime_flags::with_decision_headless(|| -> Result<CausalDecoder> {
+        Ok(if metal {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            {
+                let executor =
+                    crate::runtime_flags::with_decision_noncausal(crate::MetalExecutor::new)?;
+                crate::qwen_loader::load_causal_decoder_for_metal(&assets, &executor)?
+                    .with_metal_executor(executor)?
+            }
+            #[cfg(not(all(target_os = "macos", feature = "metal")))]
+            {
+                return Err(invalid("Metal indisponible sur cette plateforme"));
+            }
+        } else {
+            crate::load_causal_decoder(&assets)?
+        })
+    })?;
+    Ok((decoder, hidden_size))
 }
 
 fn shard_paths(path: &Path) -> Result<Vec<std::path::PathBuf>> {
@@ -900,6 +934,8 @@ fn format_answer(question: &Value, p: &[f64], d3: bool) -> Result<Value> {
         json!({"type":"score","probabilities":probabilities,"legend":legend,"score":score,"confidence":confidence}),
     )
 }
+
+pub mod letters;
 
 #[cfg(test)]
 mod tests;

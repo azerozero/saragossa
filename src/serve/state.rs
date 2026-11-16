@@ -709,11 +709,12 @@ impl LoadedModel {
             // snapshots par blocs de serve pour ces seules requêtes greedy
             // non guidées ; le chemin AR reste strictement inchangé.
             let mut text_stop = TextStop::new(&self.assets, stop_texts, max_tokens);
-            let output = self.decoder.generate_greedy_mtp_streaming_with_options(
+            let output = self.decoder.generate_greedy_mtp_routed(
                 prompt_tokens_ids,
                 max_tokens,
                 options,
                 mtp::max_draft_tokens(),
+                request.allows_dflash(),
                 |token| text_stop.push(token),
             )?;
             text_stop.finish()?;
@@ -820,11 +821,12 @@ impl LoadedModel {
             // du décodeur et by-passe les snapshots serve v1. Le callback observe
             // uniquement les tokens committés, puis le detokenizer existant garde
             // l'exacte même politique de stops et de texte visible.
-            let output = self.decoder.generate_greedy_mtp_streaming_with_options(
+            let output = self.decoder.generate_greedy_mtp_routed(
                 prompt_tokens_ids,
                 max_tokens,
                 options,
                 mtp::max_draft_tokens(),
+                request.allows_dflash(),
                 |token| {
                     if stream_error.is_some() {
                         return false;
@@ -1348,7 +1350,7 @@ impl LoadedModel {
         if reused_prefix_tokens < full_block_tokens {
             let hash = tokens[..full_block_tokens]
                 .chunks_exact(block_tokens)
-                .fold(root, BlockHash::chain);
+                .fold(root, |hash, block| hash.chain(block, &[]));
             self.decoder
                 .persist_prompt(&tokens[..full_block_tokens], &state)?;
             self.remember_prefix_block(root, hash, full_block_tokens, &state, memory_guard)?;
@@ -1372,7 +1374,7 @@ impl LoadedModel {
         if boundary == tokens.len() {
             let hash = tokens
                 .chunks_exact(self.prefix_cache.block_tokens())
-                .fold(root, BlockHash::chain);
+                .fold(root, |hash, block| hash.chain(block, &[]));
             self.remember_prefix_block(root, hash, boundary, &state, memory_guard)?;
         }
         // Une frontière prolongée sera mémorisée une seule fois par l'appelant.

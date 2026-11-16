@@ -2435,7 +2435,7 @@ fn attn_gate_then_qmv_bitwise_matches_fused_gated_o_proj() -> Result<()> {
 #[test]
 fn gpu_position_templates_follow_ctrl_and_clamp_to_host_bound() -> Result<()> {
     use super::gpu_position::{gpu_position_params_cpu, gpu_position_templates};
-    let templates = gpu_position_templates(4, 2, 128, 64, 6, 2)?;
+    let templates = gpu_position_templates(4, 2, 128, 64, 6, 2, 0)?;
     assert_eq!(templates.len(), 8);
     let blocks = |len| super::utils::sdpa_2pass_blocks(len) as u32;
     // ctrl = 5 : ligne r rotée à 5+r, SDPA sur 5+r+1 lignes.
@@ -2688,6 +2688,7 @@ fn run_gpu_position_case(
         &[u32::try_from(prefix + 1).map_err(|_| InferError::Dimension("P".into()))?],
     )?;
     let position = GpuPosition {
+        rope_delta: 0,
         ctrl: ctrl.tensor().buffer(),
         slot: 1,
         max_position: prefix + 1,
@@ -2740,7 +2741,8 @@ fn run_gpu_position_case(
         0.0,
     );
 
-    let templates = gpu_position_templates(POS_Q, POS_KV, POS_HD, POS_ROPE, prefix + 1, POS_ROWS)?;
+    let templates =
+        gpu_position_templates(POS_Q, POS_KV, POS_HD, POS_ROPE, prefix + 1, POS_ROWS, 0)?;
     let expected = gpu_position_params_cpu(
         &templates,
         u32::try_from(prefix + 1).map_err(|_| InferError::Dimension("P".into()))?,

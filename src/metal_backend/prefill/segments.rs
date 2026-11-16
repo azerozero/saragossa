@@ -96,6 +96,7 @@ impl MetalExecutor {
                 q_dim,
                 layer_index,
                 false,
+                None,
             )?;
             self.run_resident_prefill_section(context, "segment_output", |encoder, _| {
                 self.encode_copy_with_offsets(encoder, &output, 0, &packed, offset, floats)
