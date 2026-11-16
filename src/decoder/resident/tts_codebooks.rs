@@ -152,6 +152,31 @@ impl CausalDecoder {
         }))
     }
 
+    /// Fait encoder les pas embedding de `cache` (talker TTS) par la couche
+    /// fusionnée à 8 dispatches, identique au bit au chemin général. Renvoie
+    /// `false` sans rien changer si une couche sort du périmètre, sans arène
+    /// résidente ou sans Metal.
+    ///
+    /// NOTE: le QKV concaténé est une copie des poids (≈ 190 Mo en u6 sur le
+    /// talker 1.7B), libérée avec l'arène.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une forme est incohérente ou si un upload échoue.
+    pub(crate) fn enable_tts_fused_layers(&self, cache: &mut CausalDecoderCache) -> Result<bool> {
+        let Some(metal) = self.forward_runtime().metal_executor() else {
+            return Ok(false);
+        };
+        let Some(arena) = cache.resident.as_mut() else {
+            return Ok(false);
+        };
+        if self.plan.layers.iter().any(|layer| !layer.resident_full) {
+            return Ok(false);
+        }
+        arena.tts_fused_qkv = self.resolve_tts_cp_fused_qkv(metal)?;
+        Ok(arena.tts_fused_qkv.is_some())
+    }
+
     /// QKV concaténé de chaque couche si toutes relèvent de la couche TTS
     /// fusionnée : Qwen3 sans gate de sortie, sans sinks ni norme de V, MLP
     /// dense et projections u6 gs64 alignées. `None` sinon.
@@ -438,7 +463,7 @@ impl CausalDecoder {
         clippy::too_many_arguments,
         reason = "routage résident: état couche + arena + ping-pong + encoder"
     )]
-    fn encode_tts_cp_fused_layer(
+    pub(in crate::decoder) fn encode_tts_cp_fused_layer(
         &self,
         metal: &crate::metal_backend::MetalExecutor,
         arena: &ResidentArena,

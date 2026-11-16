@@ -3000,6 +3000,15 @@ pub(crate) fn tts_cp_fused_kernels_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CP_FUSED_KERNELS", true))
 }
 
+/// Couches du talker TTS dans la même couche fusionnée à 8 dispatches que le
+/// code predictor (QKV concaténé copié une fois, ~190 Mo en u6 sur le 1.7B).
+/// Sorties identiques au bit au chemin général. Défaut ON ;
+/// `SARAGOSSA_TTS_TALKER_FUSED_KERNELS=0` rétablit les 16 dispatches par couche.
+pub(crate) fn tts_talker_fused_kernels_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_TALKER_FUSED_KERNELS", true))
+}
+
 /// Codec TTS streaming sur un thread dédié, en recouvrement de la génération
 /// des trames suivantes ; les lots en attente sont fusionnés quand le codec
 /// prend du retard. Défaut ON ; `SARAGOSSA_TTS_CODEC_OVERLAP=0` rétablit le

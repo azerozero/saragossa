@@ -775,18 +775,35 @@ impl CausalDecoder {
                 let dims = self.plan.layers[index]
                     .resident
                     .resident_windowed_full_attn_layer_dims(hidden, position, eps, theta)?;
-                self.encode_resident_full_layer(
-                    metal,
-                    arena,
-                    layer_cache,
-                    layer,
-                    index,
-                    encoder,
-                    &mut owned,
-                    dims,
-                    current.buffer(),
-                    other.buffer(),
-                )?;
+                let fused = match arena.tts_fused_qkv.as_ref().and_then(|qkv| qkv.get(index)) {
+                    Some(qkv_proj) => self.encode_tts_cp_fused_layer(
+                        metal,
+                        arena,
+                        layer_cache,
+                        index,
+                        qkv_proj,
+                        encoder,
+                        &mut owned,
+                        dims,
+                        current.buffer(),
+                        other.buffer(),
+                    )?,
+                    None => false,
+                };
+                if !fused {
+                    self.encode_resident_full_layer(
+                        metal,
+                        arena,
+                        layer_cache,
+                        layer,
+                        index,
+                        encoder,
+                        &mut owned,
+                        dims,
+                        current.buffer(),
+                        other.buffer(),
+                    )?;
+                }
             } else {
                 let Some((la_spec, key_dim, value_dim, conv_dim)) = linear_dims else {
                     return Err(InferError::Config(
