@@ -12,6 +12,7 @@ mod hf_cache;
 mod hf_resolve;
 mod run_repl;
 mod serve;
+mod voice_cli;
 
 use std::env;
 use std::error::Error;
@@ -110,6 +111,7 @@ fn run() -> CliResult<()> {
             "doctor" => return doctor_bench::run_doctor(raw_args.into_iter().skip(1)),
             #[cfg(feature = "decision")]
             "decide" => return decide_cli::run(raw_args.into_iter().skip(1)),
+            "enhance" => return voice_cli::run_enhance(raw_args.into_iter().skip(1)),
             "bench" => return doctor_bench::run_bench(raw_args.into_iter().skip(1)),
             #[cfg(feature = "serve")]
             "bench-serve" => return bench_serve::run(raw_args.into_iter().skip(1)),
@@ -924,6 +926,7 @@ fn help_text() -> String {
     let commands = [
         Some("doctor"),
         Some("bench"),
+        Some("enhance"),
         cfg!(feature = "serve").then_some("serve"),
         cfg!(feature = "serve").then_some("bench-serve"),
         cfg!(feature = "decision").then_some("decide"),

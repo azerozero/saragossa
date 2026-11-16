@@ -21,7 +21,7 @@ const N_FREQS: usize = N_FFT / 2 + 1;
 /// Renvoie une erreur si le WAV est invalide ou si le format est unsupported.
 pub fn load_wav_24k(bytes: &[u8]) -> Result<Vec<f32>> {
     let (mono, sample_rate) = decode_wav_mono(bytes)?;
-    Ok(resample(&mono, sample_rate, 24_000))
+    resample(&mono, sample_rate, 24_000)
 }
 
 /// Calcule le log-mel speaker `[1, frames, 128]`.
@@ -67,11 +67,22 @@ pub fn log_mel_24k(samples: &[f32]) -> Result<Tensor> {
     Tensor::from_vec(vec![1, n_frames, N_MELS], mel_out)
 }
 
-fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+/// Décode un WAV PCM entier ou flottant en mono f32 (moyenne des canaux) et renvoie sa fréquence.
+///
+/// # Errors
+///
+/// Renvoie une erreur si le WAV est invalide ou si son format n'est pas supporté.
+pub fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))
         .map_err(|err| InferError::Config(format!("parse WAV clone: {err}")))?;
     let spec = reader.spec();
-    let channels = spec.channels.max(1) as usize;
+    crate::wire_audio::validate_wav_limits(
+        spec.sample_rate,
+        spec.channels,
+        u64::from(reader.len()),
+    )
+    .map_err(InferError::Audio)?;
+    let channels = usize::from(spec.channels);
     let interleaved = match spec.sample_format {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
@@ -180,15 +191,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zero_rates_return_typed_errors_even_for_empty_audio() {
+        for samples in [&[][..], &[0.25][..]] {
+            for (from, to) in [(0, 24_000), (24_000, 0), (0, 0)] {
+                assert!(matches!(
+                    resample(samples, from, to),
+                    Err(InferError::Audio(_))
+                ));
+            }
+        }
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(
+                &mut cursor,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 24_000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            writer.write_sample(1_i16).unwrap();
+            writer.finalize().unwrap();
+        }
+        let mut wav = cursor.into_inner();
+        wav[24..32].fill(0);
+        assert!(matches!(decode_wav_mono(&wav), Err(InferError::Audio(_))));
+        assert!(matches!(load_wav_24k(&wav), Err(InferError::Audio(_))));
+    }
+
+    #[test]
     fn resample_preserves_same_rate() {
         let samples = vec![0.1, -0.2, 0.3, 0.4];
-        assert_eq!(resample(&samples, 24_000, 24_000), samples);
+        assert_eq!(resample(&samples, 24_000, 24_000).unwrap(), samples);
     }
 
     #[test]
     fn resample_32k_to_24k_has_expected_length() {
         let samples = vec![0.0_f32; 32_000];
-        let out = resample(&samples, 32_000, 24_000);
+        let out = resample(&samples, 32_000, 24_000).unwrap();
         assert_eq!(out.len(), (samples.len() * 3).div_ceil(4));
     }
 

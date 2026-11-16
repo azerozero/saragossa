@@ -33,6 +33,8 @@ pub(super) struct ServeArgs {
     pub(super) tts_model: Option<PathBuf>,
     /// Répertoire du modèle d'embeddings e5-small exposé sur `/v1/embeddings`.
     pub(super) embed_model: Option<PathBuf>,
+    /// Poids DeepFilterNet3 (`dfn3.safetensors`) exposés sur `/v1/audio/enhance`.
+    pub(super) enhance_model: Option<PathBuf>,
     /// Backend d'inférence.
     pub(super) backend: RuntimeKind,
     /// Charge tous les modèles au démarrage.
@@ -67,6 +69,7 @@ impl ServeArgs {
         let mut stt_model = None;
         let mut tts_model = None;
         let mut embed_model = None;
+        let mut enhance_model = None;
         let mut backend = RuntimeKind::default_backend();
         let mut preload = false;
         let mut read_timeout = Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS);
@@ -124,6 +127,9 @@ impl ServeArgs {
                     require_feature("--embed-model", "embed", cfg!(feature = "embed"))?;
                     embed_model = Some(next_value(&mut iter, "--embed-model")?.into());
                 }
+                "--enhance-model" => {
+                    enhance_model = Some(next_value(&mut iter, "--enhance-model")?.into());
+                }
                 "--backend" | "--runtime" => {
                     backend = RuntimeKind::parse(&next_value(&mut iter, "--backend")?)
                         .map_err(|e| ServeError::args(e.to_string()))?;
@@ -164,6 +170,7 @@ impl ServeArgs {
             stt_model,
             tts_model,
             embed_model,
+            enhance_model,
             backend,
             preload,
             read_timeout,
@@ -203,9 +210,19 @@ pub(super) fn help_text() -> String {
             "--embed-model",
             "e5-small on /v1/embeddings",
         ),
+        (
+            true,
+            "--enhance-model",
+            "DeepFilterNet3 denoising on /v1/audio/enhance",
+        ),
     ] {
         if enabled {
-            modality_options.push_str(&format!("[{flag} DIR] "));
+            let value = if flag == "--enhance-model" {
+                "FILE"
+            } else {
+                "DIR"
+            };
+            modality_options.push_str(&format!("[{flag} {value}] "));
             modality_help.push_str(&format!(
                 "{flag} enables {description} (opt-in, lazy-loaded).\n"
             ));
@@ -231,7 +248,7 @@ pub(super) fn help_text() -> String {
          or {API_KEY_ENV}.\n\
          Endpoints: GET /v1/models, POST /v1/chat/completions, \\
          POST /v1/audio/transcriptions, POST /v1/audio/transcriptions/stream, \
-         POST /v1/audio/speech, POST /v1/embeddings"
+         POST /v1/audio/speech, POST /v1/audio/enhance, POST /v1/embeddings"
     )
 }
 
