@@ -18,7 +18,7 @@ use serde::Serialize;
 use super::anthropic::{
     anthropic_chat, handle_anthropic_messages, send_anthropic_error, AnthropicSse,
 };
-use super::audio::{handle_speech, handle_transcription};
+use super::audio::handle_speech;
 use super::dispatch::{self, Front};
 use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
@@ -30,6 +30,10 @@ use super::protocol::{
 };
 use super::state::{ServeState, ServedCompletion};
 use super::streaming::{CompletionSink, CompletionStreamEvent};
+use super::stt::{
+    handle_transcription, handle_transcription_stream, StreamChunkHeaders, STT_FINAL_HEADER,
+    STT_LANGUAGE_HEADER, STT_SESSION_HEADER,
+};
 use super::tool_output::ToolOutputParser;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -275,6 +279,18 @@ fn route_engine<S: Write>(
             stream,
             state.audio_mut(),
             request.header("content-type"),
+            &request.body,
+        ),
+        ("POST", "/v1/audio/transcriptions/stream") => handle_transcription_stream(
+            stream,
+            state.audio_mut(),
+            &StreamChunkHeaders {
+                session: request.header(STT_SESSION_HEADER),
+                is_final: request
+                    .header(STT_FINAL_HEADER)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+                language: request.header(STT_LANGUAGE_HEADER),
+            },
             &request.body,
         ),
         ("POST", "/v1/audio/speech") => handle_speech(stream, state.audio_mut(), &request.body),

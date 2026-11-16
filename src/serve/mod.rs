@@ -41,6 +41,7 @@ mod protocol;
 mod responses;
 mod state;
 pub(crate) mod streaming;
+mod stt;
 mod tool_output;
 mod warmup;
 
