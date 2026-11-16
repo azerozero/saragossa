@@ -1047,6 +1047,7 @@ impl MetalExecutor {
         state: &LinearAttentionMetalState,
         spec: LinearAttentionStepSpec,
         dims: LinearAttnResidentDims,
+        allow_nax: bool,
     ) -> Result<()> {
         ensure_biasless(weights.in_proj_qkv, "linear_attn.in_proj_qkv")?;
         ensure_biasless(weights.in_proj_z, "linear_attn.in_proj_z")?;
@@ -1365,7 +1366,8 @@ impl MetalExecutor {
                     rows,
                     spec,
                 )?;
-            } else if !state.ssm_bf16
+            } else if allow_nax
+                && !state.ssm_bf16
                 && self.encode_gated_delta_nax(
                     encoder,
                     &conv_out_buffer,

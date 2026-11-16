@@ -44,6 +44,7 @@ pub use state_snapshot::persistent::{
 };
 pub(crate) use state_snapshot::SnapshotSources;
 mod tts_prefill;
+mod vision;
 #[cfg(test)]
 pub(crate) use attention_ops::{
     attention_probs_in_place, gemma_global_attention_prefill_oracle, GemmaGlobalAttentionOracleSpec,
@@ -547,6 +548,8 @@ struct MtpLayer {
 pub struct CausalDecoderCache {
     layers: Vec<LayerKvCache>,
     position: usize,
+    rope_delta: i64,
+    vision_positions: Option<crate::vision::prompt::VisionPositions>,
     // Arène du decode résident COMPLET (1c) : ping-pong hidden + buffer u32 du
     // token + pool/queue/pipelines. Liée à la session → jamais clonée (cf. infra).
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -561,6 +564,8 @@ impl Clone for CausalDecoderCache {
         Self {
             layers: self.layers.clone(),
             position: self.position,
+            rope_delta: self.rope_delta,
+            vision_positions: self.vision_positions.clone(),
             #[cfg(all(target_os = "macos", feature = "metal"))]
             resident: None,
         }
@@ -1044,7 +1049,12 @@ impl CausalDecoderCache {
                     .saturating_add(layer.values.capacity_bytes_unseen(seen))
                     .saturating_add(layer.linear.estimated_cpu_bytes())
             })
-            .sum()
+            .sum::<usize>()
+            .saturating_add(
+                self.vision_positions
+                    .as_ref()
+                    .map_or(0, |p| p.estimated_bytes()),
+            )
     }
 
     #[cfg(test)]
@@ -2227,7 +2237,7 @@ impl CausalDecoder {
                 self.layers.len()
             )));
         }
-        let position = cache.position;
+        let position = cache.current_pos()?;
         let runtime = self.forward_runtime();
         let mut hidden = input_embed.clone();
         for (layer_index, layer) in self.layers.iter().enumerate() {
@@ -2485,6 +2495,8 @@ impl CausalDecoder {
             }
         }
         cache.position = 0;
+        cache.rope_delta = 0;
+        cache.vision_positions = None;
         Ok(())
     }
 
@@ -2909,6 +2921,8 @@ impl CausalDecoder {
         CausalDecoderCache {
             layers: vec![LayerKvCache::default(); self.layers.len()],
             position: 0,
+            rope_delta: 0,
+            vision_positions: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             resident: None,
         }

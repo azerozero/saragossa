@@ -17,6 +17,11 @@ full-attention appliquent M-RoPE : axes entrelacés [11,11,10], θ=10⁷,
 64 dimensions rotées dans une tête de 256, partenaires rotate-half.
 Les positions du texte sont identiques sur les trois axes. Le chemin Metal
 charge le tableau une fois et lie la tranche correspondant à chaque morceau.
+Le prefill vision conserve Q/K/V en f32, utilise Steel f32 pour les morceaux
+et la récurrence linéaire séquentielle. Ces choix gardent la précision du
+chemin per-op sous les seuils figés ; les sélecteurs NAX du texte restent
+inchangés. Le miroir et le stockage KV BF16 du prefill sont exclus pour cette
+entrée interne.
 
 Le cache conserve un compteur de tokens KV et un delta RoPE signé séparés.
 `current_pos()` vérifie `tokens + delta` ; le decode utilise cette position
@@ -65,9 +70,16 @@ cargo test --release --all-features vision_llm_logits_against_frozen_transformer
   -- --ignored --nocapture
 ```
 
-L’A/B synthétique ne qualifie pas les sidecars réels. Les chemins médias
-MTP/DFlash restent fermés jusqu’à leur A/B sur les checkpoints concernés ;
-le prototype MTP à contrôle GPU refuse explicitement les caches vision.
+L’A/B réel Qwen3.6 compare 16 tokens AR, MTP et DFlash sur les cas 0 et 3
+(une image puis plusieurs images). Les propositions naturelles et imposées
+couvrent acceptation complète, rejet initial et rejet après acceptation
+partielle ; les suites de tokens sont identiques. Cette qualification porte
+sur les draft/verifiers ordinaires de l’entrée interne. Le prototype MTP à
+contrôle GPU refuse toujours explicitement les caches vision ; son chemin
+fusionné exige une qualification séparée. Le transport média reste fermé.
 Le test `vision_decode_ab_real_sidecars` utilise `SARAGOSSA_QWEN36_MOE_DIR`,
 `SARAGOSSA_RUST_DFLASH_DRAFT_DIR` et, si la détection standard ne trouve pas
 la tête, `SARAGOSSA_RUST_MTP_SIDECAR`.
+
+Les résultats et la réserve sur l'oracle texte f32 préexistant sont consignés
+dans le [rapport de qualification de l'étape 3](vision-stage3.md).

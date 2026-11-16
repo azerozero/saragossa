@@ -134,20 +134,20 @@ Lever l'interdiction MTP/DFlash dès l'étape 3 après test A/B **avec image**,
 acceptation, rejet et rollback ; il n'est pas nécessaire d'attendre l'étape 5.
 Qualifier séparément lots, annulation, éviction et réutilisation des slots.
 
-## Cache et instantanés à porter
+## Cache et instantanés
 
-`BlockHash::chain` hache actuellement seulement les ids de tokens. Injecter
-dans sa chaîne le hash du **contenu du média et des paramètres de traitement**
-au bloc où commence `<|image_pad|>`. Inclure aussi ordre, grilles, timestamps,
-versions et identité des poids vision. Deux images différentes avec les mêmes
-placeholders doivent provoquer un cache miss ; image identique, un hit valide.
+`BlockHash::chain` accepte le hash du **contenu du média et des paramètres
+de traitement** au bloc où commence `<|image_pad|>`. Le producteur inclut
+ordre, grilles, timestamps, versions et identité des poids vision. Deux images
+différentes avec les mêmes placeholders provoquent un cache miss ; une image
+identique permet un hit à une frontière sûre.
 
-Ajouter `rope_delta` au manifeste d'instantané ; passer le format SSD **v4 à
-v5** lors de l'implémentation. Conserver KV et états récurrents, et les positions
-par ligne nécessaires au prefill. Tester reprise avant/après bloc image ;
-interdire initialement les frontières internes. Pour THX/d3 non causaux,
+Le manifeste d'instantané **v5** conserve `rope_delta`, les positions par ligne,
+les KV et les états récurrents. La reprise avant/après un bloc image est testée ;
+les frontières internes sont refusées. Pour THX/d3 non causaux,
 mettre en cache les embeddings vision, pas un préfixe KV causal.
-Cette étape ne change pas encore le format SSD ni les clés du cache.
+Le [chemin LLM interne](vision-llm.md) est découplé du ViT ; le transport
+média reste fermé.
 
 ## Vidéo et décision
 
