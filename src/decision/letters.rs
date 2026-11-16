@@ -545,10 +545,10 @@ fn h2o_tokenizer(path: &Path) -> Result<RustTokenizer> {
     }
     let file = path.join("tokenizer.json");
     let mut spec = read_json(&file)?;
-    let regex = &mut spec["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"];
-    if regex != QWEN35_REGEX {
-        return Err(invalid("pré-tokenizer Qwen3.5 attendu dans tokenizer.json"));
-    }
+    let regex = spec
+        .pointer_mut("/pre_tokenizer/pretokenizers/0/pattern/Regex")
+        .filter(|regex| *regex == QWEN35_REGEX)
+        .ok_or_else(|| invalid("pré-tokenizer Qwen3.5 attendu dans tokenizer.json"))?;
     *regex = json!(QWEN2_REGEX);
     let tokenizer = RustTokenizer::from_json(&file, &spec.to_string())?;
     let probes = contract["probes"]
