@@ -115,6 +115,18 @@ const MAX_STOP_SEQUENCES: usize = 16;
 const MAX_STOP_BYTES: usize = 1024;
 
 impl ChatCompletionRequest {
+    /// Le routage spéculatif laisse-t-il DFlash servir la requête ? Lit toute
+    /// la conversation et les outils (`saragossa::spec_route::allows_dflash`),
+    /// rien quand le routage est coupé.
+    pub(super) fn allows_dflash(&self) -> bool {
+        saragossa::spec_route::allows_dflash(
+            self.messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.content_text())),
+            self.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+        )
+    }
+
     /// Désérialise sans exposer le diagnostic serde, qui peut citer une valeur.
     /// Le JSON brut reste utilisé sur le chemin valide (ordre des outils).
     pub(super) fn parse(body: &[u8]) -> ServeResult<Self> {

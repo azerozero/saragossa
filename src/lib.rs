@@ -42,6 +42,7 @@ pub mod runtime_flags;
 pub mod runtime_preset;
 pub mod safetensor;
 pub mod sampling;
+pub mod spec_route;
 #[doc(hidden)]
 pub mod sse;
 pub mod tensor;
