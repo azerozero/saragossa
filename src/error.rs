@@ -15,6 +15,10 @@ pub enum InferError {
     /// Signale un mode de quantification inconnu, sans repli affine implicite.
     #[error("mode de quantification non supporté: {0}")]
     UnsupportedQuantization(String),
+    /// Signale une entrée audio invalide avant traitement.
+    #[error(transparent)]
+    Audio(crate::wire_audio::AudioParseError),
+
     /// Signale une forme de tenseur invalide.
     #[error("forme tensor invalide: {0}")]
     Shape(String),
