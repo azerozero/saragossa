@@ -54,7 +54,12 @@ class VisionFixtures(unittest.TestCase):
         images = json.loads((directory / "images.json").read_text())
         generated = dict(vision.synthetic_images())
         for case in images:
-            rgb, patches = load(directory, case["rgb"]), load(directory, case["patches"])
+            rgb = load(directory, case["rgb"])
+            patches, grid = vision.patches_without_resize(rgb)
+            _, metadata = vision.encode_tensor(patches)
+            self.assertEqual(metadata, case["patches"])
+            self.assertEqual(grid.tolist(), case["grid_thw"])
+            patches = patches.numpy()
             np.testing.assert_array_equal(rgb, generated[case["image"]])
             h, w, _ = rgb.shape
             self.assertEqual(case["grid_thw"], [[1, h // 16, w // 16]])
@@ -87,6 +92,10 @@ class VisionFixtures(unittest.TestCase):
                 embeddings = payloads["embeddings"]
                 self.assertEqual(embeddings.shape, (h * w // 4, model["vision_config"]["out_hidden_size"]))
                 indices, weights = payloads["interpolation_indices"], payloads["interpolation_weights"]
+                for key, suffix in (("interpolation_indices", "indices"),
+                                    ("interpolation_weights", "weights")):
+                    self.assertEqual(case["payloads"][key]["file"],
+                                     f"../tables/{case['image']}-{suffix}.bin")
                 self.assertEqual(indices.shape, (4, h * w))
                 self.assertEqual(weights.shape, indices.shape)
                 self.assertTrue(np.all((indices >= 0) & (indices < 2304)))
@@ -114,6 +123,11 @@ class VisionFixtures(unittest.TestCase):
                     self.assertEqual(prefix["mm_token_type_ids"][start:start + length], [1] * length)
                     self.assertEqual(len(set(ids[start:start + length])), 1)
                     self.assertTrue((directory / span["embedding_file"]).is_file())
+
+    def test_only_required_binary_payloads_are_stored(self):
+        self.assertEqual(len(list((FIXTURES / "images").glob("*.bin"))), 3)
+        self.assertEqual(len(list((FIXTURES / "tables").glob("*.bin"))), 6)
+        self.assertEqual(len(list(FIXTURES.rglob("*.bin"))), 21)
 
     def test_rejects_resize_and_unknown_profiles(self):
         for shape in ((255, 256, 3), (32, 32, 3), (2048, 2048, 3)):

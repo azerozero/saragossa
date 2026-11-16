@@ -23,12 +23,15 @@ de poids ont été lus uniquement ; aucun code de checkpoint n'a été exécuté
 
 Trois images synthétiques sans resize produisent 12 embeddings f32, les tables
 d'interpolation Python exactes et six préfixes M-RoPE par modèle, dont trois
-multi-images, avec 16 pas imposés. Deltas signés : −56 à −120. Les 42 payloads
-binaires ont été vérifiés octet par octet dans l'index Git.
+multi-images, avec 16 pas imposés. Deltas signés : −56 à −120. Les 21 payloads
+binaires conservés ont été vérifiés octet par octet dans l'index Git.
+Les patchs sont recalculés depuis les RGB avec contrôle de leur SHA256 ; les
+six tables d'interpolation sont partagées entre les quatre checkpoints.
+Ce dédoublonnage retire 5 131 008 octets sans changer les autres goldens.
 
 | Contrôle | Résultat |
 |---|---|
-| Python, images/patchs/embeddings/tables/positions | 4 tests réussis, code 0 |
+| Python, images/patchs/embeddings/tables/positions | 5 tests réussis, code 0 |
 | Nouveaux tests Rust en release | 9 tests réussis, code 0 |
 | `cargo fmt --all -- --check` | code 0 |
 | `cargo clippy --all-targets --all-features -- -D warnings` | code 0 |

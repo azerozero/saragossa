@@ -5,10 +5,13 @@ Le [contrat](../../../docs/vision-spec.md) précise les portes et limites.
 
 - `manifest.json` : 1 296 tenseurs vision identifiés sur quatre checkpoints,
   SHA256 des payloads, formes, layouts, processeurs, versions et sources.
-- `images/` : trois images RGB uint8 déterministes, leurs patchs f32 et grilles.
+- `images/` : trois images RGB uint8 déterministes et leurs grilles. Les patchs
+  f32 sont recalculés depuis les RGB ; leurs formes et SHA256 restent vérifiés.
 - Chaque répertoire de checkpoint contient trois embeddings f32 issus de vrais
-  poids BF16 promus, et les tables d'interpolation int64/f32 capturées depuis
-  `fast_pos_embed_interpolate`, dont le rejeu est exact.
+  poids BF16 promus.
+- `tables/` : tables d'interpolation int64/f32 capturées depuis
+  `fast_pos_embed_interpolate`, identiques entre les quatre checkpoints et
+  stockées une seule fois. Leur rejeu est exact.
 - `mrope-inputs.json` : six préfixes par modèle (trois multi-images), spans
   d'insertion, positions Python exactes, delta signé et 16 tokens imposés.
 

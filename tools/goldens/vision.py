@@ -230,7 +230,7 @@ def patches_without_resize(rgb):
     return patches.reshape(h * w // 256, 1536), torch.tensor([[1, h // 16, w // 16]])
 
 
-def save_tensor(directory, name, value):
+def encode_tensor(value):
     import torch
 
     value = value.detach().cpu().contiguous()
@@ -239,9 +239,27 @@ def save_tensor(directory, name, value):
     array = value.numpy()
     array = array.astype(array.dtype.newbyteorder("<"), copy=False)
     payload = array.tobytes()
-    (directory / f"{name}.bin").write_bytes(payload)
-    return {"file": f"{name}.bin", "dtype": str(array.dtype), "shape": list(array.shape),
-            "sha256": digest(payload), "size_bytes": len(payload)}
+    return payload, {"dtype": str(array.dtype), "shape": list(array.shape),
+                     "sha256": digest(payload), "size_bytes": len(payload)}
+
+
+def save_tensor(directory, name, value, shared=False):
+    payload, metadata = encode_tensor(value)
+    path = directory / f"{name}.bin"
+    if shared and path.exists():
+        if path.read_bytes() != payload:
+            raise ValueError(f"table partagée différente : {path.name}")
+    else:
+        path.write_bytes(payload)
+    return {"file": path.name, **metadata}
+
+
+def save_table(output, name, value):
+    directory = output / "tables"
+    directory.mkdir(exist_ok=True)
+    metadata = save_tensor(directory, name, value, shared=True)
+    metadata["file"] = "../tables/" + metadata["file"]
+    return metadata
 
 
 def interpolation_tables(model, grid):
@@ -316,8 +334,8 @@ def capture(path, manifest, output):
             if not torch.isfinite(result).all():
                 raise ValueError("embeddings non finis")
             payloads = {"embeddings": save_tensor(directory, label + "-embeddings", result),
-                        "interpolation_indices": save_tensor(directory, label + "-indices", tables["idx_tensor"]),
-                        "interpolation_weights": save_tensor(directory, label + "-weights", tables["weight_tensor"])}
+                        "interpolation_indices": save_table(output, label + "-indices", tables["idx_tensor"]),
+                        "interpolation_weights": save_table(output, label + "-weights", tables["weight_tensor"])}
             records.append({"image": label, "rgb_sha256": digest(rgb.tobytes()), "grid_thw": grid.tolist(),
                             "placeholder_count": result.shape[0], "payloads": payloads})
             print(f"{path.name}/{label}: {list(result.shape)}", flush=True)
@@ -408,7 +426,7 @@ def main():
             patches, grid = patches_without_resize(rgb)
             images.append({"image": label, "grid_thw": grid.tolist(),
                            "rgb": save_tensor(shared, label + "-rgb", torch.from_numpy(rgb)),
-                           "patches": save_tensor(shared, label + "-patches", patches)})
+                           "patches": encode_tensor(patches)[1]})
         write_json(shared / "images.json", images)
         for item in manifest["checkpoints"]:
             if args.model is None or item["checkpoint"] == args.model:

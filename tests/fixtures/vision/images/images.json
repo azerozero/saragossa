@@ -20,7 +20,6 @@
       "size_bytes": 196608
     },
     "patches": {
-      "file": "square-patches.bin",
       "dtype": "float32",
       "shape": [
         256,
@@ -51,7 +50,6 @@
       "size_bytes": 215040
     },
     "patches": {
-      "file": "landscape-patches.bin",
       "dtype": "float32",
       "shape": [
         280,
@@ -82,7 +80,6 @@
       "size_bytes": 215040
     },
     "patches": {
-      "file": "portrait-patches.bin",
       "dtype": "float32",
       "shape": [
         280,

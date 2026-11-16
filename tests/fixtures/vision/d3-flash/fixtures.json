@@ -23,7 +23,7 @@
     "transformers_git_sha": null,
     "git_sha_note": "wheel installé sans métadonnée Git ; SHA256 des sources exécutées",
     "python": "3.13.15",
-    "reference_script_sha256": "6499c24071766f53c9cad4052c4696e551aff4f955a1d267e20a07a117e55cb9"
+    "reference_script_sha256": "0f4bf215be8e32979c3e3c8a93989a71fd4f98cd522a9eac9bf0c0ee98eda29a"
   },
   "vision_payload_sha256": "caa4b2e19759cc7d130e19779bd42e1eb4a403114e34edc3973014c42744e756",
   "dtype": "f32",
@@ -57,7 +57,7 @@
           "size_bytes": 1048576
         },
         "interpolation_indices": {
-          "file": "square-indices.bin",
+          "file": "../tables/square-indices.bin",
           "dtype": "int64",
           "shape": [
             4,
@@ -67,7 +67,7 @@
           "size_bytes": 8192
         },
         "interpolation_weights": {
-          "file": "square-weights.bin",
+          "file": "../tables/square-weights.bin",
           "dtype": "float32",
           "shape": [
             4,
@@ -101,7 +101,7 @@
           "size_bytes": 1146880
         },
         "interpolation_indices": {
-          "file": "landscape-indices.bin",
+          "file": "../tables/landscape-indices.bin",
           "dtype": "int64",
           "shape": [
             4,
@@ -111,7 +111,7 @@
           "size_bytes": 8960
         },
         "interpolation_weights": {
-          "file": "landscape-weights.bin",
+          "file": "../tables/landscape-weights.bin",
           "dtype": "float32",
           "shape": [
             4,
@@ -145,7 +145,7 @@
           "size_bytes": 1146880
         },
         "interpolation_indices": {
-          "file": "portrait-indices.bin",
+          "file": "../tables/portrait-indices.bin",
           "dtype": "int64",
           "shape": [
             4,
@@ -155,7 +155,7 @@
           "size_bytes": 8960
         },
         "interpolation_weights": {
-          "file": "portrait-weights.bin",
+          "file": "../tables/portrait-weights.bin",
           "dtype": "float32",
           "shape": [
             4,

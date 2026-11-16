@@ -22,7 +22,7 @@
     "transformers_git_sha": null,
     "git_sha_note": "wheel installé sans métadonnée Git ; SHA256 des sources exécutées",
     "python": "3.13.15",
-    "reference_script_sha256": "6499c24071766f53c9cad4052c4696e551aff4f955a1d267e20a07a117e55cb9"
+    "reference_script_sha256": "0f4bf215be8e32979c3e3c8a93989a71fd4f98cd522a9eac9bf0c0ee98eda29a"
   },
   "checkpoints": [
     {
