@@ -108,6 +108,29 @@ impl AudioState {
         self.with_stt(|model, runtime| Ok(model.transcribe(samples, lang, runtime)?.0))
     }
 
+    /// Comme [`Self::with_stt`], en prêtant aussi les sessions incrémentales.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le modèle STT n'est pas configuré, ou celle de `use_model`.
+    pub(super) fn with_stt_sessions<T>(
+        &mut self,
+        use_model: impl FnOnce(
+            &WhisperModel,
+            ForwardRuntime<'_>,
+            &mut super::stt::SttSessions,
+        ) -> ServeResult<T>,
+    ) -> ServeResult<T> {
+        self.ensure_stt_loaded()?;
+        let runtime = self.stt.forward_runtime(self.backend);
+        let model = self
+            .stt
+            .model
+            .as_ref()
+            .ok_or_else(|| ServeError::args("modèle STT absent après chargement"))?;
+        use_model(model, runtime, &mut self.stt_sessions)
+    }
+
     /// Charge Whisper si besoin, puis prête le modèle et son runtime.
     ///
     /// # Errors

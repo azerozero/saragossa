@@ -24,7 +24,10 @@ mod streaming;
 mod timestamps;
 
 pub use decoder::{WhisperDecoder, WhisperModel};
-pub use streaming::{WhisperStream, WhisperStreamUpdate};
+pub use streaming::{
+    StreamLimit, WhisperStream, WhisperStreamUpdate, MAX_CHUNK_SAMPLES, MAX_SESSION_CHUNKS,
+    MAX_SESSION_INFERENCES, MAX_SESSION_SAMPLES, MIN_PARTIAL_SAMPLES,
+};
 pub use timestamps::{WhisperSegment, WhisperTranscript};
 
 use crate::{

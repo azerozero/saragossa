@@ -90,14 +90,24 @@ réutilisée sans nouveau calcul.
 
 ### Limites
 
+Les refus d'admission répondent 400 avant toute inférence et laissent la
+session intacte.
+
+- Morceau d'au plus 30 s (960 000 octets), refusé avant copie.
+- Au plus 30 min d'audio, 18 000 morceaux et 7 328 inférences par session.
+- Un morceau vide, ou qui n'apporte pas 250 ms d'audio depuis la dernière
+  hypothèse, renvoie le dernier état sans inférence.
+- La fenêtre garde au plus deux fenêtres de capacité (60 s de f32, 3,8 Mo)
+  après chaque fermeture ; le texte des fenêtres closes est borné par la
+  durée maximale.
 - Au plus 8 sessions ; ouvrir la neuvième évince la moins récemment utilisée.
-  Une session garde au plus 30 s + 10 ms de PCM.
+  Une session inactive depuis 5 min est fermée.
 - Une erreur d'inférence abandonne la session : le client en rouvre une.
+  Une écriture de réponse échouée (client parti) la conserve, déjà avancée.
 - Les identifiants sont séquentiels et protégés seulement par le bearer.
 - L'identité avec le batch vaut pour le même PCM : un client qui quantifie en
   s16 doit comparer au batch du WAV s16, comme le fait reti.
-- Le client règle la cadence. Un envoi toutes les 0,5 à 1 s convient :
-  un morceau coûte environ une transcription batch de la fenêtre.
+- Le client règle la cadence : un envoi toutes les 0,5 à 1 s convient.
 
 ## Tests et mesures
 
