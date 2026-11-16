@@ -343,7 +343,6 @@ Les GEMM (512 ↔ 2 048, 1 024 → 512) représentent plus de 80 % des MAC et
 peuvent réutiliser les matmuls f32/bf16 de `metal_backend`. Estimation : 5 à
 8 jours, avec un oracle couche par couche contre `moss_ref.py`.
 
-
 ## RE-USE (NVIDIA-NemotronLabs-RE-USE)
 
 ### Spécification
@@ -393,4 +392,3 @@ Pas de référence exécutée : le code dépend de `mamba_ssm` (noyaux CUDA), ab
 sur macOS. Un oracle demanderait d'abord un scan Mamba de référence en PyTorch
 pur. Estimation du port : 6 à 10 jours (scan bidirectionnel GPU, convs 2D
 denses, InstanceNorm, sous-pixel, iSTFT).
-
