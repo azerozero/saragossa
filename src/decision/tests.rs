@@ -104,9 +104,17 @@ fn real_weight_oracle(env: &str, fixtures: &str, frozen: f64) -> Result<f64> {
         .ok_or_else(|| invalid("tolérance bf16 mesurée requise"))?;
     // Seuil établi sur la référence avant la première comparaison Rust.
     assert!((tolerance - frozen).abs() < 1e-12);
-    let records = reference["records"]
+    let mut records = reference["records"]
         .as_array()
-        .ok_or_else(|| invalid("référence vide"))?;
+        .ok_or_else(|| invalid("référence vide"))?
+        .clone();
+    // Sondes à marques combinantes (dévanagari, arabe vocalisé), générées à
+    // part : elles discriminent la regex Qwen2 de celle de Qwen3.5.
+    let marks = root.join("reference-marks.json");
+    if marks.exists() {
+        records.extend(read_json(&marks)?["records"].as_array().cloned().unwrap());
+    }
+    let records = &records;
     let mut maximum = 0.0_f64;
     let mut compare = |actual: &[Vec<f32>], expected: &Value| {
         let expected: Vec<Vec<f32>> = serde_json::from_value(expected.clone()).unwrap();

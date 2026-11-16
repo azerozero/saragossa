@@ -112,7 +112,18 @@ impl DecisionModel {
             .map_err(|e| invalid(e.to_string()))?;
         let ids: Vec<u32> = serde_json::from_value(decision["token_ids"].clone())
             .map_err(|e| invalid(e.to_string()))?;
-        let tokenizer = RustTokenizer::from_file(path.join("tokenizer.json"))?;
+        let tokenizer = if d3 {
+            // Runtime officiel d3 : transformers 5.17, donc `Qwen2Tokenizer`
+            // et sa regex, pas celle de `tokenizer.json`.
+            if read_json(&path.join("tokenizer_config.json"))?["tokenizer_class"]
+                != "Qwen2Tokenizer"
+            {
+                return Err(invalid("tokenizer d3 Qwen2Tokenizer requis"));
+            }
+            letters::qwen2_tokenizer(path)?
+        } else {
+            RustTokenizer::from_file(path.join("tokenizer.json"))?
+        };
         if codes.len() != 255 || ids.len() != codes.len() {
             return Err(invalid("255 codes et token_ids requis"));
         }
