@@ -1,6 +1,7 @@
 //! Encodage et décodage des tokens via tokenizers.
 
 use crate::{InferError, Result};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
@@ -237,7 +238,8 @@ fn warn_once(path: &Path, message: &str) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !warned.iter().any(|p| p == path) {
         warned.push(path.to_path_buf());
-        eprintln!("{message}");
+        // NOTE: Un stderr fermé ou plein ne doit pas faire échouer le chargement.
+        let _ = writeln!(std::io::stderr(), "{message}");
     }
 }
 
