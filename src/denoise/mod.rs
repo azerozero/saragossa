@@ -32,6 +32,48 @@ const CONV_LOOKAHEAD: usize = 2;
 /// Anticipation du filtre profond (`df_lookahead`), en trames.
 const DF_LOOKAHEAD: usize = 2;
 
+/// Durée maximale d'un traitement hors ligne (cinq minutes).
+pub const MAX_DURATION_SECS: u64 = 300;
+/// Borne de la sortie mono rééchantillonnée à 48 kHz.
+pub const MAX_AUDIO_SAMPLES: usize = MAX_DURATION_SECS as usize * SAMPLE_RATE as usize;
+
+/// Vérifie la durée et la taille à 48 kHz sans allouer de tampon audio.
+///
+/// # Errors
+///
+/// Refuse les fréquences invalides, les débordements et les signaux trop longs.
+pub fn validate_input_length(samples: u64, rate: u32) -> crate::wire_audio::Result<usize> {
+    use crate::wire_audio::{validate_wav_limits, AudioParseError};
+    validate_wav_limits(rate, 1, 0)?;
+    if samples > MAX_DURATION_SECS * u64::from(rate) {
+        return Err(AudioParseError(format!(
+            "audio enhance dépasse la durée maximale de {MAX_DURATION_SECS} s (5 min)"
+        )));
+    }
+    let output = samples
+        .checked_mul(u64::from(SAMPLE_RATE))
+        .map(|n| n.div_ceil(u64::from(rate)))
+        .filter(|&n| n <= MAX_AUDIO_SAMPLES as u64)
+        .ok_or_else(|| {
+            AudioParseError(format!(
+                "audio enhance dépasse {MAX_AUDIO_SAMPLES} échantillons rééchantillonnés"
+            ))
+        })?;
+    Ok(output as usize)
+}
+
+/// Décode un WAV pour le débruitage, en bornant les tailles avant le décodage.
+///
+/// # Errors
+///
+/// Refuse les WAV invalides ou dont la durée ou la taille rééchantillonnée dépasse les limites.
+pub fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    crate::wire_audio::wav_to_mono_validated(bytes, |samples, rate| {
+        validate_input_length(samples, rate).map(|_| ())
+    })
+    .map_err(|e| InferError::Config(e.0))
+}
+
 /// Modèle DeepFilterNet3 chargé.
 pub struct DeepFilterNet3 {
     net: Network,
@@ -80,11 +122,14 @@ impl DeepFilterNet3 {
     ///
     /// # Errors
     ///
-    /// N'échoue pas aujourd'hui ; la signature réserve les erreurs de flux.
+    /// Refuse les signaux de plus de cinq minutes avant toute allocation audio.
     pub fn enhance(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        validate_input_length(audio.len() as u64, SAMPLE_RATE)
+            .map_err(|e| InferError::Config(e.0))?;
+        let padded_len = (audio.len() + FFT_SIZE).div_ceil(HOP_SIZE) * HOP_SIZE;
         let mut stream = self.stream();
         let mut padded = audio.to_vec();
-        padded.resize(audio.len() + FFT_SIZE, 0.0);
+        padded.resize(padded_len, 0.0);
         let frames = padded.len() / HOP_SIZE;
         let mut out = Vec::with_capacity((frames + CONV_LOOKAHEAD) * HOP_SIZE);
         let mut hop = [0.0_f32; HOP_SIZE];

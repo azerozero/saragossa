@@ -349,7 +349,7 @@ pub(super) fn handle_enhance<S: Write>(
         .find(|field| field.name == "file")
         .ok_or_else(|| ServeError::Http("champ multipart 'file' requis".to_string()))?;
     let (mono, rate) =
-        saragossa::wire_audio::wav_to_mono(&file.data).map_err(|e| ServeError::Http(e.0))?;
+        saragossa::denoise::decode_wav(&file.data).map_err(|e| ServeError::Http(e.to_string()))?;
     let rate48 = saragossa::denoise::SAMPLE_RATE;
     let samples = saragossa::tts_clone::resample(&mono, rate, rate48);
     let wav = mono_f32_to_wav(&audio.enhance(&samples)?, rate48)?;
