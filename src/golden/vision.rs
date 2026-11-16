@@ -93,7 +93,7 @@ fn read_payload(root: &Path, payload: &Payload) -> TestResult<Vec<f32>> {
     assert_eq!(bytes.len() % 4, 0);
     Ok(bytes
         .chunks_exact(4)
-        .map(|v| f32::from_le_bytes(v.try_into().expect("four bytes")))
+        .map(|v| f32::from_le_bytes(v.try_into().expect("invariant: four bytes")))
         .collect())
 }
 fn validate(case: &CalibratedCase) {
@@ -234,7 +234,7 @@ fn vision_llm_logits_against_frozen_transformers() -> TestResult {
                 let bytes = std::fs::read(root().join(&span.embedding_file))?;
                 let values: Vec<_> = bytes
                     .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().expect("four bytes")))
+                    .map(|b| f32::from_le_bytes(b.try_into().expect("invariant: four bytes")))
                     .collect();
                 Ok(Tensor::from_vec(
                     vec![span.length, values.len() / span.length],
