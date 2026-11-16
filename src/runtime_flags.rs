@@ -3174,6 +3174,11 @@ pub(crate) fn tts_compact_talker_embedding_enabled() -> bool {
     env_flag("SARAGOSSA_TTS_COMPACT_TALKER_EMBEDDING", true)
 }
 
+/// Ne charge pas les poids d'encodage audio dans le décodeur de synthèse.
+pub(crate) fn tts_codec_decoder_only_enabled() -> bool {
+    env_flag("SARAGOSSA_TTS_CODEC_DECODER_ONLY", true)
+}
+
 /// Force le décodage glouton TTS historique pour les oracles.
 #[must_use]
 pub fn tts_greedy_enabled() -> bool {

@@ -97,7 +97,14 @@ impl TtsCodec {
         let mut cluster = HashMap::new();
         let mut embsum = HashMap::new();
 
+        let decoder_only = crate::runtime_flags::tts_codec_decoder_only_enabled();
+
         for name in payload.names() {
+            // L'encodeur Mimi de clonage possède son propre chargeur. La synthèse
+            // ne lit aucun poids `encoder.*` de ce checkpoint partagé.
+            if decoder_only && name.starts_with("encoder.") {
+                continue;
+            }
             if let Some(base) = name.strip_suffix("._codebook.cluster_usage") {
                 cluster.insert(
                     format!("{base}.codebook"),
