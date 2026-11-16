@@ -18,7 +18,7 @@ use serde::Serialize;
 use super::anthropic::{
     anthropic_chat, handle_anthropic_messages, send_anthropic_error, AnthropicSse,
 };
-use super::audio::{handle_speech, handle_transcription};
+use super::audio::{handle_enhance, handle_speech, handle_transcription};
 use super::dispatch::{self, Front};
 use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
@@ -278,6 +278,12 @@ fn route_engine<S: Write>(
             &request.body,
         ),
         ("POST", "/v1/audio/speech") => handle_speech(stream, state.audio_mut(), &request.body),
+        ("POST", "/v1/audio/enhance") => handle_enhance(
+            stream,
+            state.audio_mut(),
+            request.header("content-type"),
+            &request.body,
+        ),
         ("POST", "/v1/embeddings") => {
             handle_embeddings(stream, state.embeddings_mut(), &request.body)
         }

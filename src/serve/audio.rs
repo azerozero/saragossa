@@ -7,6 +7,9 @@
 //! - `POST /v1/audio/speech` : TTS Qwen3, requête JSON `{"model", "input", "voice"?}`,
 //!   réponse WAV par défaut, ou PCM s16le mono chunked avec `stream: true`.
 //!
+//! - `POST /v1/audio/enhance` (extension saragossa) : débruitage DeepFilterNet3,
+//!   `multipart/form-data` avec `file` = WAV, réponse WAV mono 48 kHz.
+//!
 //! Les modèles sont opt-in (`--stt-model`, `--tts-model`) et chargés paresseusement
 //! au premier appel : sans configuration, la route renvoie une erreur 400 claire.
 
@@ -43,6 +46,8 @@ pub(super) struct AudioState {
     backend: RuntimeKind,
     stt: SttSlot,
     tts: TtsSlot,
+    enhance_path: Option<PathBuf>,
+    enhancer: Option<saragossa::denoise::DeepFilterNet3>,
 }
 
 struct SttSlot {
@@ -93,7 +98,34 @@ impl AudioState {
                 path: args.tts_model.clone(),
                 model: None,
             },
+            enhance_path: args.enhance_model.clone(),
+            enhancer: None,
         }
+    }
+
+    /// Débruite un signal mono 48 kHz avec DeepFilterNet3 (CPU), chargé au premier appel.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si `--enhance-model` est absent ou si les poids sont invalides.
+    pub(super) fn enhance(&mut self, samples: &[f32]) -> ServeResult<Vec<f32>> {
+        if self.enhancer.is_none() {
+            let path = self.enhance_path.clone().ok_or_else(|| {
+                ServeError::args(
+                    "endpoint enhance non configuré: relancez saragossa serve avec --enhance-model <dfn3.safetensors>",
+                )
+            })?;
+            eprintln!(
+                "saragossa serve loading enhance model path={}",
+                path.display()
+            );
+            self.enhancer = Some(saragossa::denoise::DeepFilterNet3::load(&path)?);
+        }
+        let model = self
+            .enhancer
+            .as_ref()
+            .ok_or_else(|| ServeError::args("modèle enhance absent après chargement"))?;
+        Ok(model.enhance(samples)?)
     }
 
     /// Transcrit des échantillons mono 16 kHz avec le backend Whisper.
@@ -286,6 +318,37 @@ pub(super) fn handle_transcription<S: Write>(
         return send_text(stream, &text);
     }
     send_json(stream, 200, &json!({ "text": text }), Vec::new())
+}
+
+/// Sert `POST /v1/audio/enhance` : WAV quelconque en entrée, WAV mono 48 kHz débruité en sortie.
+pub(super) fn handle_enhance<S: Write>(
+    stream: &mut S,
+    audio: &mut AudioState,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> ServeResult<()> {
+    let content_type = content_type
+        .ok_or_else(|| ServeError::Http("Content-Type multipart/form-data requis".to_string()))?;
+    let boundary = extract_boundary(content_type).ok_or_else(|| {
+        ServeError::Http("boundary multipart absente du Content-Type".to_string())
+    })?;
+    let fields = parse_multipart(body, &boundary)?;
+    let file = fields
+        .iter()
+        .find(|field| field.name == "file")
+        .ok_or_else(|| ServeError::Http("champ multipart 'file' requis".to_string()))?;
+    let (mono, rate) =
+        saragossa::wire_audio::wav_to_mono(&file.data).map_err(|e| ServeError::Http(e.0))?;
+    let rate48 = saragossa::denoise::SAMPLE_RATE;
+    let samples = saragossa::tts_clone::resample(&mono, rate, rate48);
+    let wav = mono_f32_to_wav(&audio.enhance(&samples)?, rate48)?;
+    write_headers(stream, 200, "OK", "audio/wav", Some(wav.len()), Vec::new())?;
+    stream
+        .write_all(&wav)
+        .map_err(|e| ServeError::io("écriture réponse WAV", e))?;
+    stream
+        .flush()
+        .map_err(|e| ServeError::io("flush réponse WAV", e))
 }
 
 /// Sert `POST /v1/audio/speech`.
@@ -935,6 +998,36 @@ mod tests {
         .expect_err("invariant: STT non configuré refusé");
 
         assert!(error.to_string().contains("STT non configuré"));
+    }
+
+    #[test]
+    fn enhance_without_model_returns_clear_error() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut audio = AudioState::new(&args);
+        let mut stream = Cursor::new(Vec::new());
+        let wav = mono_f32_to_wav(&[0.1_f32; 1600], 16_000).expect("invariant: WAV");
+        let body = multipart_body("BND", &wav, None);
+
+        let error = handle_enhance(
+            &mut stream,
+            &mut audio,
+            Some("multipart/form-data; boundary=BND"),
+            &body,
+        )
+        .expect_err("invariant: enhance non configuré refusé");
+
+        assert!(error.to_string().contains("enhance non configuré"));
+        assert!(stream.get_ref().is_empty());
+    }
+
+    #[test]
+    fn enhance_model_flag_is_parsed() {
+        let args = ServeArgs::parse([
+            "--enhance-model".to_string(),
+            "dfn3.safetensors".to_string(),
+        ])
+        .expect("invariant: args valides");
+        assert_eq!(args.enhance_model, Some(PathBuf::from("dfn3.safetensors")));
     }
 
     #[test]

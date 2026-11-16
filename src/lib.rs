@@ -15,6 +15,7 @@ pub mod config;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) mod decode_resident;
 pub mod decoder;
+pub mod denoise;
 #[cfg(feature = "devtools")]
 pub mod devtools;
 pub mod embedding;

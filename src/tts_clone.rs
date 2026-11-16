@@ -85,7 +85,12 @@ pub fn log_mel_24k(samples: &[f32]) -> Result<Tensor> {
     Tensor::from_vec(vec![1, n_frames, N_MELS], mel_out)
 }
 
-fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+/// Décode un WAV PCM entier ou flottant en mono f32 (moyenne des canaux) et renvoie sa fréquence.
+///
+/// # Errors
+///
+/// Renvoie une erreur si le WAV est invalide ou si son format n'est pas supporté.
+pub fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))
         .map_err(|err| InferError::Config(format!("parse WAV clone: {err}")))?;
     let spec = reader.spec();
