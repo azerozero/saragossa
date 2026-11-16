@@ -3046,6 +3046,37 @@ pub(crate) fn with_tts_sampler_partial_topk<T>(enabled: bool, work: impl FnOnce(
     out
 }
 
+/// Sampler GPU top-k/top-p : balayage simdgroup (`sample_topk_scan_*`, 8192
+/// logits par threadgroup, fusion en une simdgroup) au lieu des 20 réductions
+/// par bloc de 256 et de la fusion sérielle. Même top-k trié, donc même
+/// token ; un logit NaN, infini ou égal à -FLT_MAX rend la main aux kernels
+/// historiques sur le GPU. Défaut ON ; `SARAGOSSA_SAMPLER_TOPK_SCAN=0`
+/// rétablit le chemin historique.
+pub(crate) fn sampler_topk_scan_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = SAMPLER_TOPK_SCAN_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_SAMPLER_TOPK_SCAN", true))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAMPLER_TOPK_SCAN_OVERRIDE: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Force le balayage du sampler GPU top-k pendant `work` (oracles).
+#[cfg(test)]
+pub(crate) fn with_sampler_topk_scan<T>(enabled: bool, work: impl FnOnce() -> T) -> T {
+    let previous = SAMPLER_TOPK_SCAN_OVERRIDE.with(|flag| flag.replace(Some(enabled)));
+    let out = work();
+    SAMPLER_TOPK_SCAN_OVERRIDE.with(|flag| flag.set(previous));
+    out
+}
+
 /// Tirage CPU top-k : sélection des `k` premiers rangs en un balayage des
 /// probabilités (seuil sur la clé `total_cmp` du k-ième) au lieu de
 /// `select_nth_unstable` sur 248k couples. `by_rank` est un ordre total strict :

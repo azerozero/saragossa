@@ -842,6 +842,10 @@ impl MetalExecutor {
         let sample_gumbel_blocks_f32 = pipeline(&library, &device, "sample_gumbel_blocks_f32")?;
         let sample_topk_blocks_f32 = pipeline(&library, &device, "sample_topk_blocks_f32")?;
         let sample_topk_finalize_f32 = pipeline(&library, &device, "sample_topk_finalize_f32")?;
+        let sample_topk_scan_blocks_f32 =
+            pipeline(&library, &device, "sample_topk_scan_blocks_f32")?;
+        let sample_topk_scan_finalize_f32 =
+            pipeline(&library, &device, "sample_topk_scan_finalize_f32")?;
         let argmax_blocks_f32 = pipeline(&library, &device, "argmax_blocks_f32")?;
         let argmax_finalize_f32 = pipeline(&library, &device, "argmax_finalize_f32")?;
         let talker_greedy_argmax_f32 = pipeline(&library, &device, "talker_greedy_argmax_f32")?;
@@ -1092,6 +1096,8 @@ impl MetalExecutor {
             sample_gumbel_blocks_f32,
             sample_topk_blocks_f32,
             sample_topk_finalize_f32,
+            sample_topk_scan_blocks_f32,
+            sample_topk_scan_finalize_f32,
             argmax_blocks_f32,
             argmax_finalize_f32,
             talker_greedy_argmax_f32,
