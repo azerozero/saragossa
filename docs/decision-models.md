@@ -164,9 +164,9 @@ de `MODEL_MANIFEST.json` sont vérifiés et ses fichiers Python identiques à
 ceux de d3-flash. Oracle : `tests/fixtures/decision/d3-mini/`, même corpus de
 39 questions et prompts de 128, 512 et 2048 tokens que d3-flash, tolérance
 figée 0,0133 (deux fois le bruit bf16 mesuré + 1e-6) ; écart mesuré 0,0041.
-Mesure provisoire (machine utilisée, ABBA, 21 répétitions, p50) contre Torch
-MPS bf16 sur le même graphe : 52 contre 86 ms à 128 tokens, 125 contre 205 ms
-à 512, 543 contre 966 ms à 2048.
+Mesures (Apple M5 Max libre, charge 1 min sous 2 avant chaque série, ABBA,
+21 répétitions, p50) contre Torch MPS bf16 sur le même graphe : 47 contre
+72 ms à 128 tokens, 112 contre 193 ms à 512, 456 contre 781 ms à 2048.
 
 ```sh
 SARAGOSSA_DECISION_D3_MINI_MODEL=DOSSIER cargo test --release --all-features \
@@ -223,6 +223,14 @@ tokens, et 8 questions causales sur un état de 3986 à 4014 tokens. La
 référence retrouve les réponses de `two_way.probe_reference` à 0,0012 près
 (seuil du shim 0,05). Tolérance figée 0,0215 (deux fois le bruit bf16 mesuré,
 + 1e-6).
+
+Mesures (Apple M5 Max libre, charge 1 min sous 2 avant chaque série, ABBA,
+contre Torch MPS bf16 sur le même graphe, plafond GEMM MPS 58 TFLOP/s) :
+bidirectionnel p50 48 contre 72 ms à 128 tokens, 112 contre 193 ms à 512,
+453 contre 777 ms à 2048. Causal, 100 questions sur l'état de 4000 tokens :
+152 s sans cache (1,52 s par question ; MPS 173 s), 8,3 s avec (83 ms par
+question, ×18 ; MPS avec son propre cache 10,1 s), probabilités égales au bit
+dans les deux cas (335/335).
 
 ```sh
 SARAGOSSA_DECISION_H2O_MODEL=DOSSIER cargo test --release --all-features \
