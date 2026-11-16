@@ -4209,8 +4209,8 @@ impl CausalDecoder {
             }
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
-        if let Some((cache, final_state, history)) =
-            self.prefill_resident_with_mtp_history(prompt)?
+        if let Some((cache, final_state, _, history)) =
+            self.prefill_resident_with_mtp_history(prompt, &[], usize::MAX)?
         {
             if !on_final_state(&final_state)? {
                 return Ok((cache, final_state, LayerKvCache::default(), 0));
@@ -4572,68 +4572,30 @@ impl CausalDecoder {
 
     /// Le semis consomme chaque hidden avant réutilisation du scratch. Les
     /// snapshots de préfixe partagent le K/V figé, comme celui du tronc.
+    /// Avec `layer_ids` non vide (prefill DFlash), rend aussi les captures de
+    /// ces couches bornées à `keep_rows`, sans relire ni normer les états de
+    /// toutes les positions.
     #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[expect(
+        clippy::type_complexity,
+        reason = "cache, état final, captures facultatives et historique MTP"
+    )]
     fn prefill_resident_with_mtp_history(
-        &self,
-        prompt: &[usize],
-    ) -> Result<Option<(CausalDecoderCache, Tensor, LayerKvCache)>> {
-        if prompt.len() < 2
-            || !prefill_resident_enabled()
-            || !mtp_prefill_resident_enabled()
-            || !crate::runtime_flags::mtp_seed_gpu_enabled()
-            || !crate::runtime_flags::prefill_kv_shared_enabled()
-        {
-            return Ok(None);
-        }
-        let (Some(head), Some(metal)) =
-            (self.mtp.as_ref(), self.forward_runtime().metal_executor())
-        else {
-            return Ok(None);
-        };
-        let Some((weights, spec)) = self.mtp_seed_parameters(head, prompt.len() - 1)? else {
-            return Ok(None);
-        };
-        let mut seed = crate::metal_backend::MtpPrefillSeed::new(
-            metal,
-            weights,
-            spec,
-            &self.final_norm,
-            &prompt[1..],
-            SEED_CHUNK,
-            super::mtp_history::bf16_capacity(),
-        )?;
-        let Some((cache, hidden, _)) = self.prefill_resident_cache_hidden_captures_and_mtp(
-            prompt,
-            &[],
-            usize::MAX,
-            true,
-            crate::runtime_flags::prefill_resident_chunk_tokens(),
-            Some(&mut seed),
-        )?
-        else {
-            return Ok(None);
-        };
-        let history = self.mtp_history_from_seed(head, seed, &spec)?;
-        let state = rms_norm(
-            &hidden.into_tensor(spec.hidden_dim)?,
-            &self.final_norm,
-            self.config.rms_eps,
-        )?;
-        Ok(Some((cache, state, history)))
-    }
-
-    /// Comme [`Self::prefill_resident_with_mtp_history`], avec les captures des
-    /// couches cibles DFlash bornées à `keep_rows` : le prefill DFlash sème
-    /// l'historique MTP sans relire ni normer les états de toutes les positions.
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-    fn prefill_resident_with_captures_and_mtp_history(
         &self,
         prompt: &[usize],
         layer_ids: &[usize],
         keep_rows: usize,
-    ) -> Result<Option<(CausalDecoderCache, Tensor, PrefixCaptures, LayerKvCache)>> {
+    ) -> Result<
+        Option<(
+            CausalDecoderCache,
+            Tensor,
+            Option<PrefixCaptures>,
+            LayerKvCache,
+        )>,
+    > {
         if prompt.len() < 2
             || !prefill_resident_enabled()
+            || !mtp_prefill_resident_enabled()
             || !crate::runtime_flags::mtp_seed_gpu_enabled()
             || !crate::runtime_flags::prefill_kv_shared_enabled()
         {
@@ -4657,17 +4619,26 @@ impl CausalDecoder {
             SEED_CHUNK,
             super::mtp_history::bf16_capacity(),
         )?;
-        let Some((cache, hidden, Some(captures))) = self
-            .prefill_resident_cache_hidden_captures_and_mtp(
-                prompt,
-                layer_ids,
-                keep_rows.max(1),
-                true,
-                crate::runtime_flags::prefill_resident_chunk_tokens(),
-                Some(&mut seed),
-            )?
+        let Some((cache, hidden, captures)) = self.prefill_resident_cache_hidden_captures_and_mtp(
+            prompt,
+            layer_ids,
+            keep_rows.max(1),
+            true,
+            crate::runtime_flags::prefill_resident_chunk_tokens(),
+            Some(&mut seed),
+        )?
         else {
             return Ok(None);
+        };
+        let captures = match captures {
+            Some(captures) if !layer_ids.is_empty() => Some(PrefixCaptures::tail(
+                layer_ids,
+                captures.from,
+                captures.hidden,
+                keep_rows,
+            )?),
+            None if !layer_ids.is_empty() => return Ok(None),
+            _ => None,
         };
         let history = self.mtp_history_from_seed(head, seed, &spec)?;
         let state = rms_norm(
@@ -4675,7 +4646,6 @@ impl CausalDecoder {
             &self.final_norm,
             self.config.rms_eps,
         )?;
-        let captures = PrefixCaptures::tail(layer_ids, captures.from, captures.hidden, keep_rows)?;
         Ok(Some((cache, state, captures, history)))
     }
 
@@ -4945,17 +4915,22 @@ impl CausalDecoder {
         // prefill à 32k (16 novembre).
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let fused = if needs_history {
-            self.prefill_resident_with_captures_and_mtp_history(prompt, layer_ids, keep_rows)?
+            self.prefill_resident_with_mtp_history(prompt, layer_ids, keep_rows)?
         } else {
             None
         };
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
-        let fused: Option<(CausalDecoderCache, Tensor, PrefixCaptures, LayerKvCache)> = None;
+        let fused: Option<(
+            CausalDecoderCache,
+            Tensor,
+            Option<PrefixCaptures>,
+            LayerKvCache,
+        )> = None;
         let (state, captures, mtp_history) = match fused {
-            Some((cache, final_state, captures, history)) => {
+            Some((cache, final_state, Some(captures), history)) => {
                 ((cache, final_state), captures, Some(history))
             }
-            None => {
+            _ => {
                 let (cache, final_states, PrefixCaptures { from, hidden, .. }) = self
                     .prefill_cache_state_with_layer_capture_all(
                         prompt,
