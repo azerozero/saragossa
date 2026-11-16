@@ -34,6 +34,8 @@ mod prefix;
 #[cfg(test)]
 mod profile;
 #[cfg(test)]
+mod tests;
+#[cfg(test)]
 pub(crate) use profile::KernelTime;
 
 const CODEC_KERNELS: &str = r#"
@@ -478,6 +480,22 @@ impl CodecGpu {
     /// Renvoie une erreur si Metal est indisponible, si la compilation échoue ou
     /// si un poids attendu est absent / mal formé.
     pub(crate) fn new(weights: &HashMap<String, Tensor>, cfg: &TtsDecoderConfig) -> Result<Self> {
+        let upsample_rates = cfg
+            .upsample_rates
+            .iter()
+            .map(|rate| usize::try_from(*rate))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| InferError::Config("upsample_rate codec négatif".to_string()))?;
+        let mut gpu = Self::without_weights(upsample_rates)?;
+        gpu.register_weights(weights)?;
+        if crate::runtime_flags::tts_codec_gpu_prefix_enabled() {
+            gpu.register_prefix(weights, cfg)?;
+        }
+        Ok(gpu)
+    }
+
+    /// Device, file et pipelines compilés, sans aucun poids enregistré.
+    fn without_weights(upsample_rates: Vec<usize>) -> Result<Self> {
         let device = Device::system_default()
             .ok_or_else(|| InferError::Metal("aucun device Metal pour le codec".to_string()))?;
         let queue = device.new_command_queue();
@@ -489,15 +507,7 @@ impl CodecGpu {
         let tail_pipeline = compile(&device, "codec_tail_rows_f32")?;
         let tiled_pipeline = compile(&device, "codec_conv_tiled_f32")?;
         let tiled_small_pipeline = compile(&device, "codec_conv_tiled_small_f32")?;
-
-        let upsample_rates = cfg
-            .upsample_rates
-            .iter()
-            .map(|rate| usize::try_from(*rate))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|_| InferError::Config("upsample_rate codec négatif".to_string()))?;
-
-        let mut gpu = Self {
+        Ok(Self {
             device,
             queue,
             conv_pipeline,
@@ -514,12 +524,7 @@ impl CodecGpu {
             snakes: HashMap::new(),
             upsample_rates,
             prefix: None,
-        };
-        gpu.register_weights(weights)?;
-        if crate::runtime_flags::tts_codec_gpu_prefix_enabled() {
-            gpu.register_prefix(weights, cfg)?;
-        }
-        Ok(gpu)
+        })
     }
 
     /// Enregistre (réorganise + téléverse) les poids de toute la section résidente.
@@ -1234,6 +1239,13 @@ impl CodecGpu {
             && conv.inner % TILE_K == 0
     }
 
+    /// Moins de 2 threadgroups par cœur en tuiles de 64 lignes : tuiles de 16
+    /// lignes, quatre fois plus nombreuses (même accumulation par sortie).
+    fn tiled_small(&self, conv: &GpuConv, rows: usize, phases: usize) -> bool {
+        let col_tiles = (conv.out_dim / TILE_N) as u64 * phases as u64;
+        col_tiles * ceil_div(rows as u64, TILE_M) < TILE_SMALL_BELOW
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "dispatch Metal: buffers liés et grille de la tuile"
@@ -1249,11 +1261,7 @@ impl CodecGpu {
         rows: usize,
         phases: usize,
     ) {
-        // Moins de 2 threadgroups par cœur en tuiles de 64 lignes : tuiles de
-        // 16 lignes, quatre fois plus nombreuses (même accumulation par sortie).
-        let col_tiles = (conv.out_dim / TILE_N) as u64 * phases as u64;
-        let small = col_tiles * ceil_div(rows as u64, TILE_M) < TILE_SMALL_BELOW;
-        let (pipeline, tile_m) = if small {
+        let (pipeline, tile_m) = if self.tiled_small(conv, rows, phases) {
             (&self.tiled_small_pipeline, TILE_M / 4)
         } else {
             (&self.tiled_pipeline, TILE_M)
