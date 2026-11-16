@@ -7141,9 +7141,9 @@ fn prefix_cache_purge_recovers_poisoned_mutex() -> Result<()> {
 /// Alternance du routage par classe de prompt sur un même décodeur, cache de
 /// préfixe actif : DFlash (tour 1), MTP sur l'entrée DFlash (tour 2), DFlash
 /// sur l'entrée MTP (tour 3), sous 16k et au-delà. Chaque tour égale l'AR non
-/// caché ; le tour MTP reprend tout le tour 1 (en historique frais : l'entrée
-/// DFlash n'en porte pas) et le tour DFlash trouve une entrée avec captures,
-/// donc aucun prefill complet. Requiert
+/// caché ; le tour MTP reprend tout le tour 1 avec l'historique MTP semé par
+/// le prefill DFlash et le tour DFlash trouve une entrée avec captures, donc
+/// aucun prefill complet. Requiert
 /// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` (sidecar MTP) et
 /// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`, routage et cache de préfixe actifs.
 #[test]
