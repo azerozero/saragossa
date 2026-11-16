@@ -714,7 +714,7 @@ impl LoadedModel {
                 max_tokens,
                 options,
                 mtp::max_draft_tokens(),
-                saragossa::spec_route::allows_dflash(&request.last_user_text()),
+                request.allows_dflash(),
                 |token| text_stop.push(token),
             )?;
             text_stop.finish()?;
@@ -826,7 +826,7 @@ impl LoadedModel {
                 max_tokens,
                 options,
                 mtp::max_draft_tokens(),
-                saragossa::spec_route::allows_dflash(&request.last_user_text()),
+                request.allows_dflash(),
                 |token| {
                     if stream_error.is_some() {
                         return false;

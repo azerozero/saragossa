@@ -5,97 +5,211 @@
 //! par tour (DFlash +18 à +36 % sur MTP), la prose 2,7-3,9, sous le point
 //! mort d'environ 4 tokens (MTP +4 à +28 % sur DFlash). La bascule par
 //! acceptance observée paie le départ DFlash lent (verdict A du 19 octobre) :
-//! la décision se prend donc avant le prefill, sur la consigne.
+//! la décision se prend donc avant le prefill, sur la conversation.
+//!
+//! Règle prudente : DFlash reste le choix par défaut, perdre un peu sur une
+//! prose mal classée coûte moins que perdre le gain du code. MTP n'est pris que
+//! si rien dans la requête ne ressemble à du code (docs/perf/spec-route.md).
 
-/// Mots qui annoncent une réponse en code. Comparés à des mots entiers en
-/// minuscules ; `implement`/`implément` et `program` valent aussi en préfixe.
-const CODE_WORDS: &[&str] = &[
-    "code",
-    "python",
-    "rust",
-    "typescript",
-    "javascript",
-    "java",
-    "kotlin",
-    "swift",
-    "golang",
-    "sql",
-    "bash",
-    "shell",
-    "html",
-    "css",
-    "php",
-    "ruby",
-    "haskell",
+/// Radicaux d'un mot de code, comparés en préfixe (`cod` couvre code, coder,
+/// codage ; `compil` couvre « erreur de compilation »).
+const CODE_STEMS: &[&str] = &[
+    "cod",
     "fonction",
     "function",
     "script",
     "regex",
     "refactor",
-    "refactorise",
+    "program",
+    "implement",
+    "implément",
+    "algorith",
+    "sql",
+    "compil",
+    "debug",
+    "débog",
 ];
 
-/// Mots qui, juste avant un marqueur, l'annulent (« sans code », « no code »).
+/// Langages, formats et frameworks, comparés en mots entiers.
+const CODE_WORDS: &[&str] = &[
+    "python",
+    "rust",
+    "typescript",
+    "javascript",
+    "js",
+    "ts",
+    "java",
+    "kotlin",
+    "swift",
+    "go",
+    "golang",
+    "c",
+    "c#",
+    "c++",
+    "cpp",
+    "lua",
+    "perl",
+    "scala",
+    "zig",
+    "dart",
+    "r",
+    "julia",
+    "ocaml",
+    "elixir",
+    "erlang",
+    "haskell",
+    "ruby",
+    "php",
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "shell",
+    "powershell",
+    "awk",
+    "sed",
+    "jq",
+    "html",
+    "css",
+    "xml",
+    "yaml",
+    "yml",
+    "json",
+    "toml",
+    "dockerfile",
+    "docker",
+    "makefile",
+    "cmake",
+    "terraform",
+    "latex",
+    "tex",
+    "react",
+    "vue",
+    "angular",
+    "svelte",
+    "django",
+    "flask",
+    "rails",
+    "swiftui",
+    "node",
+    "nodejs",
+    "wasm",
+    "cuda",
+    "api",
+    "bug",
+    "git",
+];
+
+/// Fragments de syntaxe qui trahissent un code collé sans clôture.
+const CODE_SYNTAX: &[&str] = &[
+    "`", "{", "}", "==", "!=", "=>", "->", "::", "()", "[]", "</", "/>", "&&", "||", "+=", ";\n",
+    "#include", "#!/",
+];
+
+/// Mots qui, dans les deux mots précédents, annulent un marqueur (« sans code »).
 const NEGATIONS: &[&str] = &["sans", "no", "without", "pas", "aucun"];
 
-/// Formules qui excluent le code quel que soit le reste de la consigne.
+/// Formules qui excluent les mots de code (pas la syntaxe d'un code collé).
 const PROSE_ONLY: &[&str] = &["uniquement de la prose", "only prose", "prose only"];
 
-/// Longueur maximale (en caractères) de la consigne examinée, prise en fin de
-/// texte : sur un contexte long, seule la demande finale décrit la réponse.
-const TAIL_CHARS: usize = 400;
-
-/// Vrai si la consigne demande du code : DFlash y gagne, MTP partout ailleurs.
+/// Vrai si la requête doit passer par DFlash.
 ///
-/// Seul le dernier paragraphe compte, borné à ses 400 derniers caractères :
-/// un dossier technique à résumer contient du code sans en demander.
-// ponytail: liste de mots fixe ; un cas mixte (prose avec court exemple) part
-// en DFlash. Passer à un signal sur la sortie si la mesure le justifie.
-pub fn prompt_prefers_dflash(text: &str) -> bool {
-    let paragraph = text
-        .trim_end()
-        .rsplit("\n\n")
-        .find(|part| !part.trim().is_empty())
-        .unwrap_or("");
-    let start = paragraph
-        .char_indices()
-        .rev()
-        .nth(TAIL_CHARS - 1)
-        .map_or(0, |(index, _)| index);
-    let tail = paragraph[start..].to_lowercase();
-    if PROSE_ONLY.iter().any(|phrase| tail.contains(phrase)) {
-        return false;
-    }
-    if tail.contains("```") || tail.contains("c++") {
+/// `messages` donne `(rôle, texte)` pour toute la conversation, dans l'ordre.
+/// MTP n'est choisi que si : pas d'outils, aucune clôture ```` ``` ```` dans la
+/// conversation (assistant compris), un dernier message utilisateur en écriture
+/// latine et sans indice de code, lu en entier.
+pub fn prefers_dflash<R: AsRef<str>, S: AsRef<str>>(
+    messages: impl IntoIterator<Item = (R, S)>,
+    has_tools: bool,
+) -> bool {
+    if has_tools {
         return true;
     }
-    let words: Vec<&str> = tail
-        .split(|c: char| !(c.is_alphanumeric() || c == '#'))
-        .filter(|word| !word.is_empty())
-        .collect();
-    words.iter().enumerate().any(|(index, word)| {
-        let marker = CODE_WORDS.contains(word)
-            || word.starts_with("implement")
-            || word.starts_with("implément")
-            || word.starts_with("program");
+    let mut last_user = None;
+    for (role, text) in messages {
+        if text.as_ref().contains("```") {
+            return true;
+        }
+        if role.as_ref() == "user" {
+            last_user = Some(text);
+        }
+    }
+    let Some(text) = last_user else {
+        return true;
+    };
+    let text = text.as_ref();
+    text.trim().is_empty() || !is_latin(text) || has_code_hint(text)
+}
+
+/// Le greedy peut-il prendre DFlash ? Toujours si le routage est coupé
+/// (`SARAGOSSA_RUST_SPEC_ROUTE=0`), sans lire la conversation.
+pub fn allows_dflash<R: AsRef<str>, S: AsRef<str>>(
+    messages: impl IntoIterator<Item = (R, S)>,
+    has_tools: bool,
+) -> bool {
+    !crate::runtime_flags::spec_route_enabled() || prefers_dflash(messages, has_tools)
+}
+
+/// Toutes les lettres sont latines (ASCII, Latin-1, Latin étendu A/B et
+/// additionnel) ; chiffres, ponctuation et emoji ne comptent pas.
+fn is_latin(text: &str) -> bool {
+    text.chars().filter(|c| c.is_alphabetic()).all(|c| {
+        c.is_ascii_alphabetic()
+            || matches!(c, 'ª' | 'º' | '\u{00C0}'..='\u{024F}' | '\u{1E00}'..='\u{1EFF}')
+    })
+}
+
+fn has_code_hint(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    if CODE_SYNTAX.iter().any(|fragment| lower.contains(fragment))
+        || lower
+            .lines()
+            .any(|line| line.starts_with("    ") || line.starts_with('\t'))
+        || lower
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[1] == b'(' && pair[0].is_ascii_alphanumeric())
+    {
+        return true;
+    }
+    if PROSE_ONLY.iter().any(|phrase| lower.contains(phrase)) {
+        return false;
+    }
+    // Un mot suivi d'une apostrophe est une élision (« c'est », « l'API ») : il
+    // ne compte pas comme mot entier, ses radicaux restent testés.
+    let mut words: Vec<(&str, bool)> = Vec::new();
+    let mut start = None;
+    for (index, c) in lower.char_indices() {
+        if c.is_alphanumeric() || c == '#' || c == '+' {
+            start.get_or_insert(index);
+            continue;
+        }
+        if let Some(begin) = start.take() {
+            words.push((&lower[begin..index], matches!(c, '\'' | '’')));
+        }
+    }
+    if let Some(begin) = start {
+        words.push((&lower[begin..], false));
+    }
+    words.iter().enumerate().any(|(index, &(word, elided))| {
+        let marker = (!elided && CODE_WORDS.contains(&word))
+            || CODE_STEMS.iter().any(|stem| word.starts_with(stem));
         let negated = words[index.saturating_sub(2)..index]
             .iter()
-            .any(|previous| NEGATIONS.contains(previous));
+            .any(|(previous, _)| NEGATIONS.contains(previous));
         marker && !negated
     })
 }
 
-/// Le greedy peut-il prendre DFlash pour `text` ? Toujours sans l'opt-in
-/// `SARAGOSSA_RUST_SPEC_ROUTE=1` ; avec, seulement si la consigne demande du code.
-pub fn allows_dflash(text: &str) -> bool {
-    !crate::runtime_flags::spec_route_enabled() || prompt_prefers_dflash(text)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::prompt_prefers_dflash;
+    use super::prefers_dflash;
 
-    /// Corpus des campagnes : classe de la sortie observée, pas du prompt.
+    fn user(text: &str) -> bool {
+        prefers_dflash([("user", text)], false)
+    }
+
+    /// Corpus des campagnes : la prose part en MTP, le code et l'ambigu en DFlash.
     #[test]
     fn corpus_classes() {
         let code = [
@@ -103,22 +217,49 @@ mod tests {
             "Écris en Rust un cache LRU générique de capacité fixe, avec les méthodes get et put. Donne le code complet puis explique les invariants.",
             "Implement a TypeScript async retry function with exponential backoff, jitter, a maximum attempt count and AbortSignal support. Include usage examples.",
             "Le journal décrit les opérations.\nLe contexte précédent décrit un journal de port. Écris un programme Python complet qui valide des événements JSON contenant numero, source et charge, détecte les doublons et résume les erreurs.",
-            "Voici un fichier Python.\n\n```python\ndef valider(x):\n    return x\n```\n\nRéécris ce fichier intégralement, sans rien omettre, en renommant la fonction `valider` en `verifier_journal` partout où elle apparaît. Ne change rien d'autre.",
+            "Voici un fichier Python.\n\n```python\ndef valider(x):\n    return x\n```\n\nRéécris ce fichier intégralement en renommant la fonction.",
             "Écris une fonction Python de tri fusion avec une explication.",
+            "Explique la différence entre un processus et un thread sous Linux, avec un court exemple en Python.",
+            "Voici un dossier technique.\n\n```rust\nfn main() {}\n```\n\nRésume ce dossier en cinq points, une phrase par point.",
+            "",
         ];
         let prose = [
             "Explique en français comment les marées influencent la vie dans un port breton. Écris un texte suivi, accessible et concret, sans code.",
             "Write a short story about a lighthouse keeper who receives an unexpected letter during a winter storm. Use vivid prose and dialogue.",
             "Compare les avantages et les difficultés du travail à distance pour une petite équipe. Rédige une analyse nuancée en plusieurs paragraphes avec des exemples concrets.",
-            "À partir du journal précédent, rédige un récit en français sur une journée dans ce port, depuis les premières livraisons jusqu’à la relève du soir. Utilise uniquement de la prose.",
-            "Voici un dossier technique.\n\n```rust\nfn main() {}\n```\n\nRésume ce dossier en cinq points, une phrase par point.",
-            "",
+            "Le journal décrit les opérations quotidiennes du port.\nÀ partir du journal précédent, rédige un récit en français sur une journée dans ce port, depuis les premières livraisons jusqu’à la relève du soir. Utilise uniquement de la prose.",
+            "C'est l'hiver : raconte l'arrivée d'un bateau au port, depuis le quai.",
         ];
         for text in code {
-            assert!(prompt_prefers_dflash(text), "code attendu : {text}");
+            assert!(user(text), "DFlash attendu : {text}");
         }
         for text in prose {
-            assert!(!prompt_prefers_dflash(text), "prose attendue : {text}");
+            assert!(!user(text), "MTP attendu : {text}");
         }
+    }
+
+    /// Cas hors corpus de la relecture : chacun doit rester en DFlash.
+    #[test]
+    fn ambiguous_requests_keep_dflash() {
+        assert!(user("Écris une fonction de tri fusion.\n\nMerci !"));
+        assert!(user("Que fait ceci ?\n\nfor i in range(10):\n    print(i)"));
+        assert!(user("corrige l'erreur de compilation"));
+        assert!(user("用Python写一个排序函数"));
+        assert!(user("Écris une classe en C# pour gérer un panier."));
+        assert!(user(
+            "Résume en prose uniquement : x = f(y); z = g(x);\nreturn z;"
+        ));
+        assert!(prefers_dflash([("user", "Raconte une histoire.")], true));
+        assert!(prefers_dflash(
+            [
+                ("user", "Raconte une histoire."),
+                ("assistant", "Voici :```sh\necho fin\n```"),
+                ("user", "Merci, une autre histoire."),
+            ],
+            false,
+        ));
+        assert!(prefers_dflash::<&str, &str>([], false));
+        // Prix de la prudence : « vue » (Vue.js) envoie aussi cette prose en DFlash.
+        assert!(user("Décris la vue depuis le phare."));
     }
 }

@@ -286,12 +286,13 @@ impl ChatTurnGenerator for ReplModel {
                     &self.options,
                     crate::serve::mtp::max_draft_tokens(),
                     saragossa::spec_route::allows_dflash(
-                        history
-                            .iter()
-                            .rev()
-                            .find(|message| message.role == "user")
-                            .and_then(|message| message.content.as_deref())
-                            .unwrap_or(""),
+                        history.iter().map(|message| {
+                            (
+                                message.role.as_str(),
+                                message.content.as_deref().unwrap_or(""),
+                            )
+                        }),
+                        false,
                     ),
                     on_token,
                 )?

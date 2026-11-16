@@ -415,7 +415,7 @@ fn run() -> CliResult<()> {
             args.max_tokens,
             &options,
             max_draft,
-            saragossa::spec_route::allows_dflash(prompt),
+            saragossa::spec_route::allows_dflash([("user", prompt)], false),
             |_| true,
         )?;
         let loop_duration = spec.loop_duration;

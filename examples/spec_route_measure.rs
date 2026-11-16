@@ -7,7 +7,7 @@
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use saragossa::{
-        load_causal_decoder_for_metal, spec_route::prompt_prefers_dflash, GenerationOptions,
+        load_causal_decoder_for_metal, spec_route::prefers_dflash, GenerationOptions,
         KernelProfile, MetalExecutor, ModelAssets, SpeculativeOutput, SpeculativeStats,
     };
     use serde::Deserialize;
@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "ar" => None,
             "mtp" => Some(false),
             "dflash" => Some(true),
-            "route" => Some(prompt_prefers_dflash(&user_text)),
+            "route" => Some(prefers_dflash([("user", user_text.as_str())], false)),
             _ => return Err("mode inconnu".into()),
         };
         let output = match routed {

@@ -115,15 +115,16 @@ const MAX_STOP_SEQUENCES: usize = 16;
 const MAX_STOP_BYTES: usize = 1024;
 
 impl ChatCompletionRequest {
-    /// Texte du dernier message utilisateur, vide s'il n'y en a pas : c'est la
-    /// consigne que lit le routage spéculatif (`saragossa::spec_route`).
-    pub(super) fn last_user_text(&self) -> String {
-        self.messages
-            .iter()
-            .rev()
-            .find(|message| message.role == "user")
-            .map(WireMessage::content_text)
-            .unwrap_or_default()
+    /// Le routage spéculatif laisse-t-il DFlash servir la requête ? Lit toute
+    /// la conversation et les outils (`saragossa::spec_route::allows_dflash`),
+    /// rien quand le routage est coupé.
+    pub(super) fn allows_dflash(&self) -> bool {
+        saragossa::spec_route::allows_dflash(
+            self.messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.content_text())),
+            self.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+        )
     }
 
     /// Désérialise sans exposer le diagnostic serde, qui peut citer une valeur.
