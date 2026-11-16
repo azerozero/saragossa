@@ -128,7 +128,13 @@ impl LoraModule {
         let [outputs, rank_b] = *self.b.shape() else {
             return Err(invalid(format!("{name} : lora_B n'est pas 2D")));
         };
-        if shape != [outputs, inputs] || rank != rank_b || weight.len() != outputs * inputs {
+        if shape != [outputs, inputs]
+            || rank != rank_b
+            || rank == 0
+            || inputs == 0
+            || outputs == 0
+            || weight.len() != outputs * inputs
+        {
             return Err(invalid(format!(
                 "{name} : base {shape:?} incompatible avec A [{rank}, {inputs}] et B [{outputs}, {rank_b}]"
             )));
@@ -264,11 +270,16 @@ fn parse_modules(bytes: &[u8], rank: usize, scale: f32) -> Result<HashMap<String
             let (Some(a), Some(b)) = (a, b) else {
                 return Err(invalid(format!("{name} : paire lora_A/lora_B incomplète")));
             };
-            let shapes_ok =
-                matches!((a.shape(), b.shape()), ([ra, _], [_, rb]) if *ra == rank && *rb == rank);
+            // NOTE: une dimension nulle ferait paniquer le découpage en lignes
+            // de la fusion ; elle n'a pas de sens pour une matrice ciblée.
+            let shapes_ok = matches!(
+                (a.shape(), b.shape()),
+                ([ra, inputs], [outputs, rb])
+                    if *ra == rank && *rb == rank && *inputs > 0 && *outputs > 0
+            );
             if !shapes_ok {
                 return Err(invalid(format!(
-                    "{name} : rang attendu {rank}, A {:?}, B {:?}",
+                    "{name} : rang {rank} et dimensions non nulles attendus, A {:?}, B {:?}",
                     a.shape(),
                     b.shape()
                 )));
@@ -420,6 +431,28 @@ pub(crate) mod tests {
                 "{key} aurait dû être refusé"
             );
         }
+    }
+
+    #[test]
+    fn zero_dimensions_are_refused_without_panic() {
+        for (a_shape, b_shape) in [(vec![1, 0], vec![2, 1]), (vec![1, 2], vec![0, 1])] {
+            let dir = tempfile::tempdir().expect("invariant: répertoire temporaire");
+            let a = vec![1.0; a_shape.iter().product()];
+            let b = vec![1.0; b_shape.iter().product()];
+            write_adapter(
+                dir.path(),
+                &lora_config(1, 1.0),
+                &[("model.layers.0.self_attn.q_proj", a, a_shape, b, b_shape)],
+            );
+            let error = LoraAdapter::load(dir.path()).expect_err("dimension nulle refusée");
+            assert!(matches!(error, InferError::Config(_)), "{error}");
+        }
+        let module = LoraModule {
+            a: Tensor::from_vec(vec![1, 0], Vec::new()).expect("invariant: A vide"),
+            b: Tensor::from_vec(vec![0, 1], Vec::new()).expect("invariant: B vide"),
+            scale: 1.0,
+        };
+        assert!(module.merge_into("w", &[0, 0], &mut []).is_err());
     }
 
     #[test]
