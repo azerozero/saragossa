@@ -29,6 +29,7 @@ struct Manifest {
     fixtures: Vec<Fixture>,
     filter_probes: Vec<Fixture>,
     smart_resize: Vec<ResizeCase>,
+    normalized_sha256: String,
 }
 
 fn profile(name: &str) -> ImageProfile {
@@ -79,6 +80,73 @@ fn sha256(data: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn normalized_levels() -> Vec<f32> {
+    let data = std::fs::read(directory().join("normalized-f32.bin")).unwrap();
+    assert_eq!(data.len(), 256 * 4);
+    assert_eq!(sha256(&data), manifest().normalized_sha256);
+    data.chunks_exact(4)
+        .map(|bytes| {
+            f32::from_le_bytes(bytes.try_into().expect("invariant: chunk de quatre octets"))
+        })
+        .collect()
+}
+
+#[test]
+fn vision_normalization_matches_all_python_levels_and_repeats_afterward() -> Result<()> {
+    let pixels: Vec<u8> = (0..=255)
+        .flat_map(|value| [value, 255 - value, 127])
+        .collect();
+    let image = RgbImage::from_rgb8(16, 16, pixels)?;
+    let actual = image.normalize_and_repeat()?;
+    assert_eq!(actual.shape(), [2, 3, 16, 16]);
+    let frame_len = 3 * 16 * 16;
+    assert_eq!(&actual.pixels()[..frame_len], &actual.pixels()[frame_len..]);
+    let levels = normalized_levels();
+    let mut max_error = 0_f32;
+    for (position, rgb) in image.pixels().chunks_exact(3).enumerate() {
+        for c in 0..3 {
+            let value = actual.pixels()[c * 256 + position];
+            max_error = max_error.max((value - levels[rgb[c] as usize]).abs());
+            let mathematical = (f64::from(rgb[c]) / 255.0 - 0.5) / 0.5;
+            assert!((f64::from(value) - mathematical).abs() <= 1e-6);
+        }
+    }
+    eprintln!("normalisation 256 niveaux: max_abs={max_error:e}");
+    assert!(max_error <= 1e-6);
+    Ok(())
+}
+
+#[test]
+fn vision_normalized_no_resize_fixtures_pass_f32_gate() -> Result<()> {
+    let levels = normalized_levels();
+    let mut count = 0;
+    for fixture in manifest().fixtures {
+        if fixture.resized != [fixture.height, fixture.width] {
+            continue;
+        }
+        count += 1;
+        let source = synthetic(&fixture);
+        let image = source.resized(profile(&fixture.profile))?;
+        let actual = image.normalize_and_repeat()?;
+        let rgb = golden(&fixture);
+        let plane = (fixture.height * fixture.width) as usize;
+        let mut max_error = 0_f32;
+        for t in 0..2 {
+            for (position, pixel) in rgb.chunks_exact(3).enumerate() {
+                for c in 0..3 {
+                    let value = actual.pixels()[(t * 3 + c) * plane + position];
+                    assert!(value.is_finite());
+                    max_error = max_error.max((value - levels[pixel[c] as usize]).abs());
+                }
+            }
+        }
+        eprintln!("{} normalisé: max_abs={max_error:e}", fixture.name);
+        assert!(max_error <= 1e-6, "{}", fixture.name);
+    }
+    assert_eq!(count, 5);
+    Ok(())
 }
 
 #[test]

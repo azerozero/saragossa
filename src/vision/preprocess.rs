@@ -2,7 +2,10 @@
 
 use crate::{InferError, Result};
 
+mod normalize;
 mod resize;
+
+pub use normalize::TemporalImage;
 
 /// Image RGB uint8 contiguë, dans l'ordre [H,W,C], sans padding.
 #[derive(Debug)]
@@ -44,6 +47,11 @@ impl RgbImage {
     pub fn resized(&self, profile: ImageProfile) -> Result<Self> {
         let (height, width) = smart_resize(self.height, self.width, profile)?;
         resize::bicubic(self, height, width)
+    }
+
+    /// Normalise les canaux RGB en f32 puis répète l'image sur T=2.
+    pub fn normalize_and_repeat(&self) -> Result<TemporalImage> {
+        normalize::normalize_and_repeat(self)
     }
 }
 
