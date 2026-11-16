@@ -1,10 +1,34 @@
 # Routage spéculatif par classe de prompt
 
-Opt-in `SARAGOSSA_RUST_SPEC_ROUTE=1`, avec un drafter DFlash chargé
-(`SARAGOSSA_RUST_DFLASH_DRAFT_DIR`). Le greedy et l'échantillonné non contraints
-de `serve`, `run` et de la CLI passent par DFlash seulement si la dernière
-consigne de l'utilisateur demande du code (`spec_route::prompt_prefers_dflash`).
-Le reste garde la tête MTP. Sans le flag, rien ne change : DFlash sert tout.
+Actif par défaut dès qu'un drafter DFlash est chargé
+(`SARAGOSSA_RUST_DFLASH_DRAFT_DIR`), coupé par `SARAGOSSA_RUST_SPEC_ROUTE=0`.
+Sur `serve`, `run` et la CLI, le greedy non contraint ne passe par la tête MTP
+que si la requête est nettement de la prose (`spec_route::prefers_dflash`) ;
+tout le reste, et tout l'échantillonné, garde DFlash.
+
+Règle prudente, retenue après relecture : en cas de doute, DFlash. MTP exige
+à la fois
+
+- aucun outil déclaré dans la requête ;
+- aucune clôture ```` ``` ```` dans toute la conversation, messages assistant
+  compris ;
+- un dernier message utilisateur non vide, en écriture latine, sans syntaxe de
+  code (accolades, `==`, `=>`, `def `, `fn `, `ident(`, indentation,
+  `SELECT … FROM`…), sans nom de langage ou de format (ASCII, bornes non
+  alphanumériques, donc aussi au milieu d'un texte CJK) et sans radical de mot
+  de code (`cod`, `fonction`, `program`, `compil`…), lu en entier. La négation
+  proche (« sans code ») et « uniquement de la prose » n'annulent que les
+  radicaux.
+
+Le prix de cette prudence est payé en prose : un « vue » ou un « go » suffit à
+garder DFlash, et toute prose non latine reste en DFlash.
+
+Alternance dans une conversation : quand MTP (ou l'AR) prolonge une entrée du
+cache de préfixe qui porte des captures DFlash, il prolonge aussi ces captures,
+et le prefill DFlash sème l'historique MTP quand le routage est actif. Un tour
+MTP reprend donc l'entrée du tour DFlash, et le tour DFlash suivant reprend
+l'entrée MTP, sans prefill complet (oracle
+`spec_route_alternation_reuses_prefix_real_model`, sous et au-delà de 16k).
 
 ## Pourquoi DFlash perd en prose
 
@@ -139,11 +163,10 @@ Les résumés, la charge relevée et les empreintes de chaque série sont dans
 
 ## Décision de défaut
 
-Le défaut n'est pas modifié : le flag reste opt-in. Le critère (±2 % du meilleur
-sur chaque classe, aucune régression sur le code) est rempli sur les onze cas,
-courts et à 32k. Activer le
-routage par défaut quand un drafter est chargé demande l'arbitrage du
-mainteneur.
+Le critère (±2 % du meilleur sur chaque classe, aucune régression sur le code)
+est rempli sur les onze cas, courts et à 32k. Le mainteneur a validé
+l'activation par défaut après relecture ; kill-switch
+`SARAGOSSA_RUST_SPEC_ROUTE=0`.
 
 Limites de l'heuristique : sa liste de mots est fixe et le budget mesuré est de
 256 tokens. Sur une prose longue (500 tokens et plus), DFlash a parfois
