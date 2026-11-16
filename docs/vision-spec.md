@@ -1,8 +1,10 @@
 # Vision Qwen : contrat de portage, étape 0
 
 Base : `bdc2dadc3cbc6351d23aa4ec672beb9ebd5e8580`. La vision n'est pas
-implémentée dans le moteur. Ce document fige les poids, la référence et les
-portes nécessaires au portage ; il ne déclare aucune parité Rust vision.
+implémentée de bout en bout dans le moteur. Ce document fige les poids, la
+référence et les portes nécessaires au portage. Le [prétraitement CPU
+image](vision-preprocess.md) est disponible sur entrée RGB déjà décodée ;
+il ne constitue pas une parité de l'encodeur ViT Rust.
 
 ## Inventaire vérifié
 
@@ -185,7 +187,9 @@ L'environnement ne contient pas torchvision. Les trois images déterministes
 256×256, 224×320 et 320×224 ne nécessitent aucun resize. La normalisation
 fusionnée et la permutation du processeur sont reproduites explicitement ;
 les tests contrôlent les pixels, la duplication temporelle et l'ordre des
-patchs indépendamment. **Aucune porte de resize n'a été exécutée.**
+patchs indépendamment. Cette capture initiale n'exécute aucune porte de resize.
+Les fixtures du [prétraitement CPU](vision-preprocess.md) ajoutent séparément
+la référence PIL et les portes de resize de l'étape 1.
 
 Les 12 embeddings sont calculés par le modèle vision installé, avec les vrais
 poids BF16 promus f32 et chargés un par un ; aucun LLM complet, aucun code

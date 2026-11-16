@@ -3,9 +3,11 @@
 use crate::{InferError, Result};
 
 mod normalize;
+mod patches;
 mod resize;
 
 pub use normalize::TemporalImage;
+pub use patches::{preprocess, PreprocessedImage};
 
 /// Image RGB uint8 contiguë, dans l'ordre [H,W,C], sans padding.
 #[derive(Debug)]
@@ -132,6 +134,9 @@ pub fn smart_resize(height: u32, width: u32, profile: ImageProfile) -> Result<(u
 
 #[cfg(test)]
 mod fixtures;
+
+#[cfg(test)]
+mod patch_tests;
 
 #[cfg(test)]
 mod tests {

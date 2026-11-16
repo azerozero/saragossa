@@ -15,6 +15,10 @@ struct Fixture {
     resized: [u32; 2],
     file: String,
     sha256: String,
+    #[serde(default)]
+    grid_thw: [usize; 3],
+    #[serde(default)]
+    patches_sha256: String,
 }
 
 #[derive(Deserialize)]
@@ -215,4 +219,54 @@ fn vision_rgb_rejects_malformed_buffers() {
         assert!(RgbImage::from_rgb8(h, w, vec![0; bytes]).is_err());
     }
     assert!(allocate::<f32>(usize::MAX).is_err());
+}
+
+#[test]
+fn vision_preprocess_matches_python_patch_order_and_numeric_gates() -> Result<()> {
+    let levels = normalized_levels();
+    for fixture in manifest().fixtures {
+        let actual = preprocess(&synthetic(&fixture), profile(&fixture.profile))?;
+        assert_eq!(actual.grid_thw, fixture.grid_thw, "{}", fixture.name);
+        let rgb = golden(&fixture);
+        assert_eq!(actual.pixel_values.len(), rgb.len() * 2);
+        let width = fixture.resized[1] as usize;
+        let mut expected_hash = Sha256::new();
+        let mut max_f32_error = 0_f32;
+        let mut max_uint8_error = 0_u8;
+        // Parcours inverse de la matrice aplatie ; le SHA final valide ce
+        // décodage des indices contre la permutation indépendante PyTorch.
+        for (index, &value) in actual.pixel_values.iter().enumerate() {
+            assert!(value.is_finite());
+            let patch = index / 1536;
+            let offset = index % 1536;
+            let block = patch / 4;
+            let y = block / (width / 32) * 32 + patch / 2 % 2 * 16 + offset / 16 % 16;
+            let x = block % (width / 32) * 32 + patch % 2 * 16 + offset % 16;
+            let c = offset / 512;
+            let byte = rgb[(y * width + x) * 3 + c];
+            let expected = levels[byte as usize];
+            expected_hash.update(expected.to_le_bytes());
+            max_f32_error = max_f32_error.max((value - expected).abs());
+            let restored = ((value + 1.0) * 127.5).round().clamp(0.0, 255.0) as u8;
+            max_uint8_error = max_uint8_error.max(restored.abs_diff(byte));
+        }
+        let hash: String = expected_hash
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hash, fixture.patches_sha256,
+            "{}: ordre des patchs",
+            fixture.name
+        );
+        if fixture.resized == [fixture.height, fixture.width] {
+            eprintln!("{} patchs: max_abs_f32={max_f32_error:e}", fixture.name);
+            assert!(max_f32_error <= 1e-6, "{}", fixture.name);
+        } else {
+            eprintln!("{} patchs: max_abs_uint8={max_uint8_error}", fixture.name);
+            assert!(max_uint8_error <= 1, "{}", fixture.name);
+        }
+    }
+    Ok(())
 }
