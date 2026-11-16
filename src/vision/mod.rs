@@ -1,3 +1,4 @@
-//! Entrée interne pour les embeddings exportés, sans encodeur ni transport média.
+//! Prétraitement CPU Qwen et entrée interne pour les embeddings exportés.
 
+pub mod preprocess;
 pub(crate) mod prompt;
