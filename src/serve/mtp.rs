@@ -4,12 +4,11 @@
 use std::time::Duration;
 
 #[cfg(feature = "serve")]
-use saragossa::{GenerationOutput, GenerationTimings, ModelAssets, SpeculativeOutput};
+use saragossa::{GenerationOutput, GenerationTimings, SpeculativeOutput};
 
 #[cfg(feature = "serve")]
 use super::protocol::{ChatCompletionRequest, ResponseFormatMode};
 
-#[cfg(not(feature = "serve"))]
 use saragossa::ModelAssets;
 
 const MTP_DECODE_ENV: &str = "SARAGOSSA_RUST_MTP_DECODE";

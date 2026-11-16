@@ -35,7 +35,9 @@ Le fichier peut étendre un unique preset ; ses valeurs remplacent celles du
 preset. Le défaut reste celui de la famille du modèle, puis le défaut général.
 Pour préserver la compatibilité, l'alias historique `RETI_*` reste une variable
 d'environnement, après le nom canonique `SARAGOSSA_*` et avant le fichier.
-Une variable explicite invalide est une erreur, jamais un repli silencieux.
+Refuser une variable explicite invalide serait une rupture du comportement
+actuel, qui retombe sur le défaut. Cette décision reste à prendre lors de
+l'étape 2 ; le refus n'est pas un comportement acquis.
 Les options de requête (température, top-p, budget de tokens) conservent leur
 contrat actuel ; `--profile` choisit un fichier, sans créer une seconde priorité
 concurrente pour les mêmes réglages.

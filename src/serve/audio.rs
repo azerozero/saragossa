@@ -9,19 +9,18 @@
 //! Les modèles sont opt-in (`--stt-model`, `--tts-model`) et chargés paresseusement
 //! au premier appel : sans configuration, la route renvoie une erreur 400 claire.
 
-#[cfg(not(feature = "tts"))]
-use std::io::Write;
 #[cfg(feature = "tts")]
-use std::io::{Cursor, Write};
+use std::io::Cursor;
+use std::io::Write;
 use std::path::PathBuf;
 
-#[cfg(all(test, feature = "stt", feature = "tts"))]
+#[cfg(all(test, feature = "tts"))]
 use hound::WavReader;
 #[cfg(feature = "tts")]
 use hound::{SampleFormat, WavSpec, WavWriter};
 #[cfg(feature = "tts")]
 use serde::Deserialize;
-#[cfg(all(test, feature = "stt", feature = "tts"))]
+#[cfg(all(test, feature = "tts"))]
 use serde_json::json;
 
 #[cfg(feature = "tts")]
@@ -595,7 +594,7 @@ fn mono_f32_to_wav(samples: &[f32], sample_rate: u32) -> ServeResult<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
-#[cfg(all(test, feature = "stt", feature = "tts"))]
+#[cfg(all(test, feature = "tts"))]
 fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -1026,8 +1025,8 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "stt", feature = "tts"))]
+#[cfg(all(test, feature = "tts"))]
 mod stream_tests;
 
-#[cfg(all(test, feature = "stt", feature = "tts"))]
+#[cfg(all(test, feature = "tts"))]
 mod mutation_tests;
