@@ -946,10 +946,37 @@ fn parse_headers(header_text: &str) -> ServeResult<ParsedHeaders> {
     Ok((method, path, headers))
 }
 
+/// Seul `Content-Length` cadre un corps. `Transfer-Encoding` est refusé :
+/// seul, il n'est pas lu (501) ; avec `Content-Length`, ou un `Content-Length`
+/// répété ou non numérique, le cadrage est ambigu (400) — c'est la porte du
+/// request smuggling derrière un proxy.
 fn content_length(headers: &[(String, String)]) -> ServeResult<usize> {
-    let Some((_, value)) = headers.iter().find(|(name, _)| name == "content-length") else {
+    let mut lengths = headers
+        .iter()
+        .filter(|(name, _)| name == "content-length")
+        .map(|(_, value)| value);
+    let length = lengths.next();
+    let ambiguous = |why: &str| ServeError::Http(format!("cadrage HTTP ambigu: {why}"));
+    if lengths.next().is_some() {
+        return Err(ambiguous("Content-Length répété"));
+    }
+    if headers.iter().any(|(name, _)| name == "transfer-encoding") {
+        return Err(match length {
+            Some(_) => ambiguous("Transfer-Encoding et Content-Length"),
+            None => ServeError::NotImplemented(
+                "Transfer-Encoding (chunked) non pris en charge: envoyer Content-Length"
+                    .to_string(),
+            ),
+        });
+    }
+    let Some(value) = length else {
         return Ok(0);
     };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ServeError::Http(format!(
+            "Content-Length invalide: {value:?}"
+        )));
+    }
     value
         .parse::<usize>()
         .map_err(|e| ServeError::Http(format!("Content-Length invalide: {e}")))
@@ -1142,6 +1169,36 @@ mod tests {
             .expect_err("invariant: client au goutte-à-goutte coupé à la deadline");
 
         assert!(error.to_string().contains("délai"));
+    }
+
+    #[test]
+    fn rejects_chunked_and_ambiguous_framing() {
+        for (headers, status) in [
+            ("Transfer-Encoding: chunked\r\n", "501"),
+            ("Transfer-Encoding: chunked\r\nContent-Length: 2\r\n", "400"),
+            (
+                "Content-Length: 2\r\nTransfer-Encoding: identity\r\n",
+                "400",
+            ),
+            ("Content-Length: 2\r\nContent-Length: 2\r\n", "400"),
+            ("Content-Length: 2\r\nContent-Length: 3\r\n", "400"),
+            ("Content-Length: +2\r\n", "400"),
+            ("Content-Length: 2, 2\r\n", "400"),
+            ("Content-Length: \r\n", "400"),
+        ] {
+            let raw = format!(
+                "POST /v1/audio/transcriptions/stream HTTP/1.1\r\n{headers}\r\n2\r\n{{}}\r\n0\r\n\r\n"
+            );
+            let error = read_request(&mut Cursor::new(raw.into_bytes()), far_deadline())
+                .expect_err("invariant: cadrage refusé");
+            let mut response = Vec::new();
+            let _ = send_failure(&mut response, &error, false);
+            let response = String::from_utf8_lossy(&response);
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{headers}: {response}"
+            );
+        }
     }
 
     #[test]
