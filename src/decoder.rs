@@ -42,7 +42,7 @@ pub(crate) use state_snapshot::persistent::enabled as persistent_prefix_enabled;
 pub use state_snapshot::persistent::{
     configure_prefix_disk_cache, flush_prefix_disk_cache, PrefixDiskSession,
 };
-pub(crate) use state_snapshot::SnapshotSources;
+pub(crate) use state_snapshot::{ReadSource, SnapshotSources};
 mod tts_prefill;
 #[cfg(test)]
 pub(crate) use attention_ops::{

@@ -94,6 +94,31 @@ impl SnapshotSources {
         ))
     }
 
+    /// Comme [`Self::capture`], suivi des sources déjà lues en mémoire
+    /// (`read`), dont l'empreinte vient des octets effectivement consommés.
+    pub(crate) fn capture_with_read<'a>(
+        paths: impl IntoIterator<Item = &'a Path>,
+        read: &[ReadSource],
+    ) -> Self {
+        let mut sources = Self::capture(paths);
+        if let Some(Ok(list)) = &mut sources.0 {
+            for source in read {
+                match &source.0 {
+                    Some(Ok(source)) => list.push(source.clone()),
+                    Some(Err(error)) => {
+                        sources.0 = Some(Err(error.clone()));
+                        break;
+                    }
+                    None => {
+                        sources.0 = Some(Err("identité d'une source lue absente".into()));
+                        break;
+                    }
+                }
+            }
+        }
+        sources
+    }
+
     fn verified(&self) -> Result<&[Source]> {
         snapshot_calculations_complete()?;
         let sources = self
@@ -128,6 +153,23 @@ impl SnapshotSources {
                 None => self.0 = Some(Err("identité du sidecar absente".into())),
             }
         }
+    }
+}
+
+/// Identité d'un fichier lu entièrement en mémoire, prise au moment de la
+/// lecture. Vide quand aucun instantané n'est actif : rien n'est haché.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReadSource(Option<std::result::Result<Source, String>>);
+
+impl ReadSource {
+    /// `before` est la métadonnée prise avant de lire `bytes` depuis `path`.
+    pub(crate) fn new(path: &Path, before: &std::fs::Metadata, bytes: &[u8]) -> Self {
+        if crate::runtime_flags::state_snapshot_dir().is_none() && !persistent::enabled() {
+            return Self::default();
+        }
+        Self(Some(
+            Source::from_read(path, before, bytes).map_err(|e| e.to_string()),
+        ))
     }
 }
 

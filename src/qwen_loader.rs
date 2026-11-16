@@ -110,6 +110,8 @@ use crate::safetensor::FP8_SCALE_BLOCK;
 struct DecoderLoadContext<'a> {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     metal: Option<&'a crate::MetalExecutor>,
+    /// Adaptateur LoRA à fusionner dans les poids ciblés, cf. [`lora`].
+    lora: Option<&'a LoraAdapter>,
     marker: std::marker::PhantomData<&'a ()>,
 }
 
@@ -118,6 +120,7 @@ impl DecoderLoadContext<'_> {
         Self {
             #[cfg(all(target_os = "macos", feature = "metal"))]
             metal: None,
+            lora: None,
             marker: std::marker::PhantomData,
         }
     }
@@ -126,15 +129,27 @@ impl DecoderLoadContext<'_> {
     fn metal(executor: &crate::MetalExecutor) -> DecoderLoadContext<'_> {
         DecoderLoadContext {
             metal: Some(executor),
+            lora: None,
             marker: std::marker::PhantomData,
         }
     }
 }
 
+impl<'a> DecoderLoadContext<'a> {
+    fn with_lora(self, lora: &'a LoraAdapter) -> Self {
+        Self {
+            lora: Some(lora),
+            ..self
+        }
+    }
+}
+
+pub mod lora;
 mod quantized;
 pub mod qwen4_exp;
 mod shape_validation;
 
+pub use self::lora::LoraAdapter;
 #[cfg(test)]
 use self::quantized::apply_fp8_scales;
 use self::quantized::{
@@ -196,6 +211,45 @@ pub fn load_causal_decoder_for_metal(
         &assets.shards,
         &assets.catalog,
         executor,
+    )
+}
+
+/// Charge un décodeur CPU en fusionnant `lora` dans les poids qu'il cible.
+///
+/// # Errors
+///
+/// Renvoie une erreur si un module de l'adaptateur ne correspond à aucun poids
+/// de base non quantifié de même forme, ou si le chargement échoue.
+pub fn load_causal_decoder_with_lora(
+    assets: &ModelAssets,
+    lora: &LoraAdapter,
+) -> Result<CausalDecoder> {
+    load_from_shards_with_context(
+        &assets.config,
+        &assets.shards,
+        &assets.catalog,
+        &DecoderLoadContext::cpu().with_lora(lora),
+    )
+}
+
+/// Charge un décodeur Metal en fusionnant `lora` dans les poids qu'il cible.
+/// La base doit être non quantifiée (BF16, F16 ou F32). Une base BF16 garde
+/// son stockage single-copy bf16 après fusion ; F16 et F32 restent en f32.
+///
+/// # Errors
+///
+/// Mêmes erreurs que [`load_causal_decoder_with_lora`], plus l'allocation Metal.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub fn load_causal_decoder_for_metal_with_lora(
+    assets: &ModelAssets,
+    executor: &crate::MetalExecutor,
+    lora: &LoraAdapter,
+) -> Result<CausalDecoder> {
+    load_from_shards_with_context(
+        &assets.config,
+        &assets.shards,
+        &assets.catalog,
+        &DecoderLoadContext::metal(executor).with_lora(lora),
     )
 }
 
@@ -330,10 +384,26 @@ pub fn load_causal_decoder_from_shards(
     shards: &[PathBuf],
     catalog: &WeightCatalog,
 ) -> Result<CausalDecoder> {
-    let sources = crate::decoder::SnapshotSources::capture(shards.iter().map(PathBuf::as_path));
+    load_from_shards_with_context(config, shards, catalog, &DecoderLoadContext::cpu())
+}
+
+fn load_from_shards_with_context(
+    config: &ModelConfig,
+    shards: &[PathBuf],
+    catalog: &WeightCatalog,
+    context: &DecoderLoadContext<'_>,
+) -> Result<CausalDecoder> {
+    // NOTE: l'adaptateur entre dans l'identité des instantanés, un état de la
+    // base ne servant pas au modèle fusionné. Son empreinte porte sur les octets
+    // lus et fusionnés par `LoraAdapter::load`, jamais sur une relecture.
+    let lora_sources = context.lora.map_or(&[][..], LoraAdapter::sources);
+    let sources = crate::decoder::SnapshotSources::capture_with_read(
+        shards.iter().map(PathBuf::as_path),
+        lora_sources,
+    );
     validate_supported_config(config, catalog)?;
     let prefixes = QwenPrefixes::detect(catalog);
-    let tensors = load_decoder_tensors(config, shards, catalog, &prefixes)?;
+    let tensors = load_decoder_tensors_with_context(config, shards, catalog, &prefixes, context)?;
     validate_decoder_shapes(config, &tensors)?;
     Ok(CausalDecoder::from_decoder_tensors(tensors, config.into())?.with_snapshot_sources(sources))
 }
@@ -345,16 +415,15 @@ fn load_causal_decoder_from_shards_for_metal(
     catalog: &WeightCatalog,
     executor: &crate::MetalExecutor,
 ) -> Result<CausalDecoder> {
-    let sources = crate::decoder::SnapshotSources::capture(shards.iter().map(PathBuf::as_path));
-    validate_supported_config(config, catalog)?;
     // NOTE: Un modèle hors chemins per-op (flint, cf.
     // `CausalDecoderConfig::metal_unsupported_reason`) se charge quand même :
     // son prefill reste CPU et seul le decode résident complet emploie Metal.
-    let prefixes = QwenPrefixes::detect(catalog);
-    let context = DecoderLoadContext::metal(executor);
-    let tensors = load_decoder_tensors_with_context(config, shards, catalog, &prefixes, &context)?;
-    validate_decoder_shapes(config, &tensors)?;
-    Ok(CausalDecoder::from_decoder_tensors(tensors, config.into())?.with_snapshot_sources(sources))
+    load_from_shards_with_context(
+        config,
+        shards,
+        catalog,
+        &DecoderLoadContext::metal(executor),
+    )
 }
 
 /// Charge un décodeur causal depuis des shards sous garde mémoire.
@@ -800,6 +869,7 @@ impl ShardTensorEntry {
     }
 }
 
+#[cfg(test)]
 fn load_decoder_tensors(
     config: &ModelConfig,
     shards: &[PathBuf],
@@ -826,6 +896,9 @@ fn load_decoder_tensors_with_context(
     let headers = read_shard_headers(shards)?;
     let entries = index_shard_entries(&headers)?;
     validate_no_orphan_tensors(config, &specs, &entries)?;
+    if let Some(lora) = context.lora {
+        validate_lora_targets(lora, &specs, &entries)?;
+    }
     let mut out = HashMap::new();
 
     for spec in &specs {
@@ -854,6 +927,35 @@ fn load_decoder_tensors_with_context(
     bake_gemma_norm_offset(config, &mut out);
     bake_qwen35_norm_offset(config, &mut out);
     Ok(out)
+}
+
+/// Vérifie avant toute lecture que chaque module LoRA corrige un poids de base
+/// chargé, 2D et non quantifié (BF16, F16 ou F32). Un module sans cible serait ignoré en silence.
+fn validate_lora_targets(
+    lora: &LoraAdapter,
+    specs: &[TensorSpec],
+    entries: &HashMap<String, TensorEntryRef>,
+) -> Result<()> {
+    for name in lora.module_names() {
+        let entry = specs
+            .iter()
+            .any(|spec| spec.source == name)
+            .then(|| entries.get(name))
+            .flatten()
+            .ok_or_else(|| {
+                InferError::Config(format!("LoRA : {name} absent des poids chargés de la base"))
+            })?;
+        let dense = matches!(entry.entry.dtype, Dtype::BF16 | Dtype::F16 | Dtype::F32);
+        if !dense || entry.entry.shape.len() != 2 {
+            return Err(InferError::Config(format!(
+                "LoRA : {name} doit être une matrice de base non quantifiée (BF16, F16 \
+                 ou F32), reçu {:?} {:?} ; la fusion sur une base quantifiée n'est pas \
+                 prise en charge",
+                entry.entry.dtype, entry.entry.shape
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Les checkpoints HF Qwen3.5 stockent les RMSNorm comme `1 + weight`.
@@ -1224,6 +1326,8 @@ pub(crate) mod flint_tests;
 pub(crate) mod gemma4_test_fixtures;
 #[cfg(test)]
 mod gemma4_tests;
+#[cfg(test)]
+mod lora_tests;
 #[cfg(test)]
 mod qwen35_sanitize_tests;
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
