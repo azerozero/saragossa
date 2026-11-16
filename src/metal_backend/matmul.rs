@@ -125,6 +125,20 @@ pub(crate) fn whisper_bf16_gemm_enabled() -> bool {
     })
 }
 
+/// Projections d'attention du decode Whisper (q, k, v, o, cross q et o) sur les
+/// poids bf16 du QMV decode. Opt-in `SARAGOSSA_STT_DEC_ATTN_BF16=1` : l'arrondi
+/// bf16 des poids change les logits ; défaut OFF (f32, inchangé).
+pub(crate) fn whisper_decode_attn_bf16_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        whisper_decode_bf16_qmv_enabled()
+            && matches!(
+                crate::runtime_flags::env_var("SARAGOSSA_STT_DEC_ATTN_BF16").as_deref(),
+                Some("1" | "true" | "on" | "yes")
+            )
+    })
+}
+
 /// Active le QMV decode Whisper avec poids bf16 row-major pour les projections
 /// M=1 où le microbench montre un gain. `SARAGOSSA_STT_F32=1` force le chemin f32.
 pub(crate) fn whisper_decode_bf16_qmv_enabled() -> bool {
@@ -432,6 +446,22 @@ impl MetalExecutor {
         out_dim: usize,
         in_dim: usize,
     ) -> Result<()> {
+        self.encode_dense_qmv_rhs_bf16_at(encoder, lhs, rhs_bf16, out, 0, batch, out_dim, in_dim)
+    }
+
+    /// [`Self::encode_dense_qmv_rhs_bf16`] avec un décalage d'écriture (append KV).
+    #[expect(clippy::too_many_arguments, reason = "qmv bas niveau (dims + buffers)")]
+    pub(crate) fn encode_dense_qmv_rhs_bf16_at(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs: &BufferRef,
+        rhs_bf16: &BufferRef,
+        out: &BufferRef,
+        out_offset_bytes: u64,
+        batch: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
         let dims = [
             checked_u32(batch, "bf16 qmv batch")?,
             checked_u32(out_dim, "bf16 qmv out_dim")?,
@@ -440,7 +470,7 @@ impl MetalExecutor {
         encoder.set_compute_pipeline_state(&self.dense_qmv_rhs_bf16_f32);
         encoder.set_buffer(0, Some(lhs), 0);
         encoder.set_buffer(1, Some(rhs_bf16), 0);
-        encoder.set_buffer(2, Some(out), 0);
+        encoder.set_buffer(2, Some(out), out_offset_bytes);
         encoder.set_bytes(
             3,
             std::mem::size_of::<[u32; 3]>() as u64,

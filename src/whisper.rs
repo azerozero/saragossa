@@ -535,6 +535,37 @@ impl WhisperEncoder {
         Ok(encoded)
     }
 
+    /// Comme [`Self::encode_samples`], features laissées sur le GPU pour le KV
+    /// cross du décodeur résident. `None` si un repli per-op (conv ou encodeur)
+    /// est demandé : l'appelant reprend alors le chemin hôte.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn encode_samples_resident(
+        &self,
+        samples: &[f32],
+        metal: &crate::MetalExecutor,
+    ) -> Result<Option<crate::metal_backend::WhisperResidentMatrix>> {
+        if crate::runtime_flags::env_var_os("SARAGOSSA_STT_CONV_PEROP").is_some()
+            || crate::runtime_flags::env_var_os("SARAGOSSA_STT_ENCODER_PEROP").is_some()
+        {
+            return Ok(None);
+        }
+        let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
+        let t_mel = std::time::Instant::now();
+        let mel = self.log_mel_spectrogram(samples)?;
+        if timing {
+            eprintln!("[stt] mel: {} us", t_mel.elapsed().as_micros());
+        }
+        let t_enc = std::time::Instant::now();
+        let nlc = transpose_mel_to_nlc(&mel)?;
+        let conv = self.build_conv_weights(metal)?;
+        let enc = self.build_resident(metal)?;
+        let features = metal.encode_whisper_features_resident(&nlc, &conv, &enc)?;
+        if timing {
+            eprintln!("[stt] encode résident: {} us", t_enc.elapsed().as_micros());
+        }
+        Ok(Some(features))
+    }
+
     /// Calcule le log-mel Whisper `[num_mel_bins, 3000]` depuis du PCM mono
     /// 16 kHz. Le signal est pad/tronqué à 30 secondes comme l'implémentation
     /// Whisper de référence.

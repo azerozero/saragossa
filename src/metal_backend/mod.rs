@@ -155,7 +155,9 @@ pub(crate) use self::linear_attention::linear_tree_journal_refusal;
 pub(crate) use self::linear_attention::{linear_tree_refusal, LinearTreeShape};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) use self::matmul::take_concat_profile;
-pub(crate) use self::matmul::{whisper_bf16_gemm_enabled, whisper_decode_bf16_qmv_enabled};
+pub(crate) use self::matmul::{
+    whisper_bf16_gemm_enabled, whisper_decode_attn_bf16_enabled, whisper_decode_bf16_qmv_enabled,
+};
 use self::na_gemm::NA_GEMM_SRC;
 #[cfg(test)]
 use self::pipelines::KernelSources;
@@ -180,7 +182,8 @@ pub(crate) fn qmvt_dispatches_for_test() -> usize {
 }
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
-    WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
+    WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentMatrix, WhisperResidentNorm,
+    WhisperResidentProj,
 };
 
 fn ensure_valid_top_k(top_k: usize, expert_count: usize) -> Result<()> {

@@ -60,6 +60,15 @@ struct ResidentDecode<'a> {
     kv: crate::metal_backend::WhisperDecodeKv,
 }
 
+/// Features encodeur : tenseur hôte, ou buffer resté sur le GPU depuis
+/// l'encodeur résident ([`super::WhisperEncoder::encode_samples_resident`]).
+#[derive(Clone, Copy)]
+enum AudioFeatures<'a> {
+    Host(&'a Tensor),
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    Resident(&'a crate::metal_backend::WhisperResidentMatrix),
+}
+
 enum DecodeStep {
     Advanced,
     Logits(Tensor),
@@ -149,6 +158,23 @@ impl WhisperDecoder {
         eot_token: u32,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Vec<u32>> {
+        self.generate_greedy_from(
+            AudioFeatures::Host(audio_features),
+            prompt_tokens,
+            max_new_tokens,
+            eot_token,
+            runtime,
+        )
+    }
+
+    fn generate_greedy_from(
+        &self,
+        features: AudioFeatures<'_>,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        eot_token: u32,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<Vec<u32>> {
         if prompt_tokens.is_empty() {
             return Err(InferError::Config("préfixe Whisper vide".to_string()));
         }
@@ -161,11 +187,15 @@ impl WhisperDecoder {
             {
                 let t_kv = std::time::Instant::now();
                 let dec = self.build_resident_decoder(metal)?;
-                let kv = metal.build_whisper_decode_kv_resident(
-                    audio_features,
-                    &dec,
-                    self.config.max_target_positions,
-                )?;
+                let capacity = self.config.max_target_positions;
+                let kv = match features {
+                    AudioFeatures::Host(audio_features) => {
+                        metal.build_whisper_decode_kv_resident(audio_features, &dec, capacity)?
+                    }
+                    AudioFeatures::Resident(matrix) => {
+                        metal.build_whisper_decode_kv_from_resident(matrix, &dec, capacity)?
+                    }
+                };
                 if crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some() {
                     eprintln!("[dec] kv cross: {} us", t_kv.elapsed().as_micros());
                 }
@@ -176,10 +206,17 @@ impl WhisperDecoder {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let mut resident: Option<()> = None;
 
-        let cross = if resident.is_none() {
-            self.precompute_cross_kv(audio_features, runtime)?
-        } else {
-            Vec::new()
+        let cross = match (resident.is_none(), features) {
+            (true, AudioFeatures::Host(audio_features)) => {
+                self.precompute_cross_kv(audio_features, runtime)?
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            (true, AudioFeatures::Resident(_)) => {
+                return Err(InferError::Config(
+                    "features Whisper résidentes sans décodeur résident".to_string(),
+                ));
+            }
+            (false, _) => Vec::new(),
         };
         let mut self_kv: Vec<LayerSelfKv> = (0..self.layers.len())
             .map(|_| LayerSelfKv::new(self.config.d_model))
@@ -591,6 +628,19 @@ impl WhisperModel {
         runtime: ForwardRuntime<'_>,
     ) -> Result<(String, String)> {
         let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
+        // Features gardées sur le GPU jusqu'au KV cross (identiques au bit :
+        // seules des copies f32 disparaissent). `SARAGOSSA_STT_FEATURES_HOST=1`
+        // rétablit le readback ; les replis per-op le rétablissent aussi.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(metal) = runtime.metal_executor() {
+            if crate::runtime_flags::env_var_os("SARAGOSSA_STT_FEATURES_HOST").is_none()
+                && crate::runtime_flags::env_var_os("SARAGOSSA_STT_DECODER_PEROP").is_none()
+            {
+                if let Some(features) = self.encoder.encode_samples_resident(samples, metal)? {
+                    return self.transcribe_from(AudioFeatures::Resident(&features), lang, runtime);
+                }
+            }
+        }
         let t_enc = std::time::Instant::now();
         let audio_features = self.encoder.encode_samples(samples, runtime)?;
         if timing {
@@ -613,6 +663,15 @@ impl WhisperModel {
         lang: &str,
         runtime: ForwardRuntime<'_>,
     ) -> Result<(String, String)> {
+        self.transcribe_from(AudioFeatures::Host(audio_features), lang, runtime)
+    }
+
+    fn transcribe_from(
+        &self,
+        features: AudioFeatures<'_>,
+        lang: &str,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<(String, String)> {
         let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
         let mut prompt = Vec::with_capacity(4);
         prompt.push(self.sot_token);
@@ -624,8 +683,8 @@ impl WhisperModel {
 
         let t_dec = std::time::Instant::now();
 
-        let generated = self.decoder.generate_greedy(
-            audio_features,
+        let generated = self.decoder.generate_greedy_from(
+            features,
             &prompt,
             self.decoder.config.max_target_positions.min(448),
             self.eot_token,
