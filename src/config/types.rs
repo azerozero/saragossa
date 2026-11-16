@@ -7,6 +7,10 @@ pub struct ModelConfig {
     /// Indique le type de modèle déclaré.
     #[serde(default)]
     pub model_type: String,
+    /// Configuration vision conservée pour la validation des poids Qwen.
+    /// Les autres familles gardent leur propre contrat multimodal.
+    #[serde(default)]
+    pub vision_config: Option<serde_json::Value>,
     /// Définit la dimension cachée principale.
     pub hidden_size: usize,
     /// Définit le nombre de couches du décodeur.

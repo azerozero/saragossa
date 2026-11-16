@@ -135,6 +135,8 @@ mod transfer;
 mod verify_tree;
 mod whisper_encode;
 
+#[cfg(test)]
+pub(crate) use self::barriers::command_buffer_gpu_ns;
 #[doc(hidden)]
 pub use self::barriers::dump_commit_components;
 pub(crate) use self::barriers::{

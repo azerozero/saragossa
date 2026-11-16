@@ -506,6 +506,7 @@ impl CodecGpu {
             1,
             false,
             0,
+            None,
         )?;
         let projected_rest = self.conv_with_start(
             encoder,
@@ -515,12 +516,22 @@ impl CodecGpu {
             1,
             false,
             0,
+            None,
         )?;
         let mut hidden = self.add(encoder, pool, &projected_first, &projected_rest)?;
         pool.release(projected_first);
         pool.release(projected_rest);
         hidden = self.swap(pool, hidden, |pool, x| {
-            self.conv_stream(state, encoder, pool, x, "decoder.pre_conv.conv", 1, false)
+            self.conv_stream(
+                state,
+                encoder,
+                pool,
+                x,
+                "decoder.pre_conv.conv",
+                1,
+                false,
+                None,
+            )
         })?;
         hidden = self.swap(pool, hidden, |pool, x| {
             self.pre_transformer(prefix, state, encoder, pool, x)
@@ -545,6 +556,7 @@ impl CodecGpu {
                 &format!("{block}.dwconv.conv"),
                 1,
                 false,
+                None,
             )?;
             let normed = self.layer_norm(prefix, encoder, pool, &h, &block)?;
             pool.release(h);
@@ -855,7 +867,7 @@ impl CodecGpu {
         x: &GpuNlc,
         prefix: &str,
     ) -> Result<GpuNlc> {
-        self.conv_with_start(encoder, pool, x, prefix, 1, false, 0)
+        self.conv_with_start(encoder, pool, x, prefix, 1, false, 0, None)
     }
 
     fn rms_norm(
