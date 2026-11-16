@@ -84,7 +84,7 @@ impl TtsModel {
             &mut |_| Ok(()),
         )?;
         let codes = generated.codes;
-        let samples = self.decode_codes_for_mode(&codes)?;
+        let samples = self.decode_codes_for_mode(&codes, true)?;
         Ok(TtsSynthesisOutput {
             frame_limit_reached: generated.stop_reason == TtsStopReason::Cap,
             stop_reason: generated.stop_reason,
@@ -104,6 +104,7 @@ impl TtsModel {
             return self.synthesize_greedy(text, max_frames);
         }
         let effective_max_frames = self.default_frame_cap(text, max_frames)?;
+        let exact = self.default_sample_params().is_none();
         let generated = if let Some(params) = self.default_sample_params() {
             self.generate_codes_clone_sampled_trace(
                 text,
@@ -122,7 +123,7 @@ impl TtsModel {
             )?
         };
         let codes = generated.codes;
-        let samples = self.decode_codes_for_mode(&codes)?;
+        let samples = self.decode_codes_for_mode(&codes, exact)?;
         Ok(TtsSynthesisOutput {
             frame_limit_reached: generated.stop_reason == TtsStopReason::Cap,
             stop_reason: generated.stop_reason,
@@ -166,6 +167,7 @@ impl TtsModel {
                     )
                 },
                 on_audio,
+                false,
             );
         }
         self.synthesize_greedy_streaming(text, effective_max_frames, on_audio)
@@ -202,6 +204,7 @@ impl TtsModel {
                 )
             },
             on_audio,
+            true,
         )
     }
 
@@ -213,16 +216,18 @@ impl TtsModel {
         }
     }
 
+    /// `exact` : préfixe codec CPU, PCM historique au bit près (glouton).
     fn synthesize_streaming_from_frames<F, G>(
         &self,
         generate_codes: G,
         on_audio: F,
+        exact: bool,
     ) -> Result<TtsSynthesisOutput>
     where
         F: FnMut(&[f32]) -> Result<()>,
         G: FnOnce(&mut dyn FnMut(&[Vec<i32>]) -> Result<()>) -> Result<GeneratedCodes>,
     {
-        let mut decode_state = self.new_stream_decode_state();
+        let mut decode_state = self.new_stream_decode_state(exact);
         let fixed_lots = uses_fixed_lots(&decode_state);
         let decode =
             |codes: &[Vec<i32>]| self.decode_codes_for_mode_streaming(&mut decode_state, codes);
@@ -246,19 +251,32 @@ impl TtsModel {
         )
     }
 
-    pub(super) fn decode_codes_for_mode(&self, codes: &[Vec<i32>]) -> Result<Vec<f32>> {
+    /// Décode `codes` (préfixe de référence du clone compris). `exact` garde le
+    /// préfixe codec CPU, au PCM historique près au bit (glouton, goldens).
+    pub(super) fn decode_codes_for_mode(
+        &self,
+        codes: &[Vec<i32>],
+        exact: bool,
+    ) -> Result<Vec<f32>> {
+        let decode = |codes: &[Vec<i32>]| {
+            if exact {
+                self.codec.decode_codes_exact(codes)
+            } else {
+                self.codec.decode_codes(codes)
+            }
+        };
         let Some(ctx) = self.clone_ctx.as_ref() else {
-            return self.codec.decode_codes(codes);
+            return decode(codes);
         };
         if codes.is_empty() {
             return Ok(Vec::new());
         }
         if ctx.mode.is_xvec_only() {
-            return self.codec.decode_codes(codes);
+            return decode(codes);
         }
         let mut prefixed = ctx.ref_codes.clone();
         prefixed.extend_from_slice(codes);
-        let mut samples = self.codec.decode_codes(&prefixed)?;
+        let mut samples = decode(&prefixed)?;
         let skip = ctx
             .ref_codes
             .len()
@@ -274,11 +292,12 @@ impl TtsModel {
         Ok(samples)
     }
 
-    fn new_stream_decode_state(&self) -> TtsStreamDecodeState {
+    fn new_stream_decode_state(&self, exact: bool) -> TtsStreamDecodeState {
         match self.clone_ctx.as_ref() {
             Some(ctx) if !ctx.mode.is_xvec_only() => {
-                TtsStreamDecodeState::FullPrefixDelta { emitted: 0 }
+                TtsStreamDecodeState::FullPrefixDelta { emitted: 0, exact }
             }
+            _ if exact => TtsStreamDecodeState::Incremental(self.codec.new_stream_state_exact()),
             _ => TtsStreamDecodeState::Incremental(self.codec.new_stream_state()),
         }
     }
@@ -292,8 +311,8 @@ impl TtsModel {
             TtsStreamDecodeState::Incremental(codec_state) => {
                 self.codec.decode_codes_streaming(codec_state, codes)
             }
-            TtsStreamDecodeState::FullPrefixDelta { emitted } => {
-                let pcm = self.decode_codes_for_mode(codes)?;
+            TtsStreamDecodeState::FullPrefixDelta { emitted, exact } => {
+                let pcm = self.decode_codes_for_mode(codes, *exact)?;
                 if pcm.len() < *emitted {
                     return Err(InferError::Dimension(format!(
                         "streaming TTS PCM régressif: {} < {}",

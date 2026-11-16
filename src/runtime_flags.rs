@@ -2991,6 +2991,15 @@ pub(crate) fn tts_cp_fused_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CP_FUSED", true))
 }
 
+/// Couches du code predictor en 8 dispatches dans la trame fusionnée (QKV
+/// concaténé, norm+RoPE de Q et K avec append K/V, gate+up+SwiGLU et
+/// down+résiduel u6). Sorties identiques au bit au chemin général. Défaut ON ;
+/// `SARAGOSSA_TTS_CP_FUSED_KERNELS=0` rétablit les 16 dispatches par couche.
+pub(crate) fn tts_cp_fused_kernels_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CP_FUSED_KERNELS", true))
+}
+
 /// Codec TTS streaming sur un thread dédié, en recouvrement de la génération
 /// des trames suivantes ; les lots en attente sont fusionnés quand le codec
 /// prend du retard. Défaut ON ; `SARAGOSSA_TTS_CODEC_OVERLAP=0` rétablit le
@@ -2998,6 +3007,43 @@ pub(crate) fn tts_cp_fused_enabled() -> bool {
 pub(crate) fn tts_codec_overlap_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CODEC_OVERLAP", true))
+}
+
+/// Préfixe du codec TTS (projections RVQ, `pre_conv`, `pre_transformer`,
+/// upsampling) sur GPU, dans le command buffer de la section `decoder.decoder`.
+/// Le CPU ne garde que la somme des embeddings RVQ. Écart au préfixe CPU mesuré
+/// par `codec_gpu_prefix_matches_cpu_prefix`. Défaut ON ;
+/// `SARAGOSSA_TTS_CODEC_GPU_PREFIX=0` rétablit le préfixe CPU (oracle).
+pub(crate) fn tts_codec_gpu_prefix_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CODEC_GPU_PREFIX", true))
+}
+
+/// Tirage TTS GPU : sélection partielle exacte des 64 premiers rangs (tri
+/// par blocs de 64 puis fusions) au lieu du tri bitonique complet, quand
+/// `top_k <= 64`. Mêmes rangs au bit près. Défaut ON ;
+/// `SARAGOSSA_TTS_SAMPLER_TOPK=0` rétablit le tri complet.
+pub(crate) fn tts_sampler_partial_topk_enabled() -> bool {
+    if let Some(enabled) = TTS_SAMPLER_TOPK_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_SAMPLER_TOPK", true))
+}
+
+thread_local! {
+    static TTS_SAMPLER_TOPK_OVERRIDE: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Force la sélection partielle du tirage TTS pendant `work` (oracles).
+#[cfg(test)]
+pub(crate) fn with_tts_sampler_partial_topk<T>(enabled: bool, work: impl FnOnce() -> T) -> T {
+    let previous = TTS_SAMPLER_TOPK_OVERRIDE.with(|flag| flag.replace(Some(enabled)));
+    let out = work();
+    TTS_SAMPLER_TOPK_OVERRIDE.with(|flag| flag.set(previous));
+    out
 }
 
 /// Force le décodage glouton TTS historique pour les oracles.

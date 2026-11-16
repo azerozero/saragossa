@@ -18,7 +18,8 @@ fn fake_batch(codes: &[Vec<i32>]) -> Vec<f32> {
 #[test]
 fn prefix_fallbacks_keep_doubling() {
     assert!(!uses_fixed_lots(&TtsStreamDecodeState::FullPrefixDelta {
-        emitted: 0
+        emitted: 0,
+        exact: false
     }));
     assert!(!uses_fixed_lots(&TtsStreamDecodeState::Incremental(
         TtsCodecStreamState::default(),

@@ -1270,6 +1270,145 @@ kernel void affine_qmv_fast_aligned_u6_gs64_f32(
     }
 }
 
+// Quatre lignes du qmv aligné u5/u6 réduites, pour les épilogues fusionnés
+// du code predictor TTS. Même boucle et mêmes associations que
+// `affine_qmv_aligned_u56` : chaque ligne vaut au bit près celle du qmv seul.
+template <uint bits, uint values>
+static inline void affine_qmv_aligned_u56_rows4(
+    device const float* lhs, device const uint* packed,
+    device const bfloat* scales, device const bfloat* biases,
+    uint4 dims, uint row_base, uint simd_lid, uint batch, thread float* reduced
+) {
+    #pragma METAL fp contract(off)
+    const uint row_bytes = dims.z * 4u;
+    const device uchar* ws = (const device uchar*)packed +
+        row_base * row_bytes + simd_lid * bits * (values / 8u);
+    const device float* x = lhs + batch * dims.y + simd_lid * values;
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint k = 0u; k < dims.y; k += values * 32u) {
+        float xt[values];
+        float sum = 0.0f;
+        #pragma unroll
+        for (uint i = 0u; i < values / 4u; ++i) {
+            const float4 v = float4(*((const device packed_float4*)(x + 4u * i)));
+            xt[4u * i] = v.x;
+            xt[4u * i + 1u] = v.y;
+            xt[4u * i + 2u] = v.z;
+            xt[4u * i + 3u] = v.w;
+            sum += v.x + v.y + v.z + v.w;
+        }
+        #pragma unroll
+        for (uint row = 0u; row < 4u; ++row) {
+            uint words[6];
+            if (values == 32u) {
+                const device uint* w = (const device uint*)(ws + row * row_bytes);
+                const uint4 v = uint4(*((const device packed_uint4*)w));
+                words[0] = v.x; words[1] = v.y; words[2] = v.z; words[3] = v.w;
+                words[4] = w[4];
+                if (bits == 6u) words[5] = w[5];
+            } else {
+                const device ushort* w = (const device ushort*)(ws + row * row_bytes);
+                const ushort4 v = ushort4(*((const device packed_ushort4*)w));
+                words[0] = v.x; words[1] = v.y; words[2] = v.z; words[3] = v.w;
+                words[4] = w[4];
+                if (bits == 6u) words[5] = w[5];
+            }
+            const uint affine = (row_base + row) * dims.w + k / 64u + simd_lid / (64u / values);
+            float scale = 0.0f, bias = 0.0f;
+            if ((simd_lid % (64u / values)) == 0u) {
+                scale = float(scales[affine]);
+                bias = float(biases[affine]);
+            }
+            scale = simd_shuffle(scale, simd_lid & ~(64u / values - 1u));
+            bias = simd_shuffle(bias, simd_lid & ~(64u / values - 1u));
+            float accum = 0.0f;
+            #pragma unroll
+            for (uint i = 0u; i < values; ++i) {
+                const uint word = i * bits / values;
+                const uint shift = i * bits % values;
+                uint q = uint(words[word]) >> shift;
+                if (shift + bits > values) q |= uint(words[word + 1u]) << (values - shift);
+                accum = fma(xt[i], float(q & ((1u << bits) - 1u)), accum);
+            }
+            result[row] = fma(scale, accum, fma(sum, bias, result[row]));
+        }
+        ws += 32u * bits * (values / 8u);
+        x += values * 32u;
+    }
+    #pragma unroll
+    for (uint row = 0u; row < 4u; ++row) {
+        reduced[row] = simd_sum(result[row]);
+    }
+}
+
+// gate + up + SwiGLU en un dispatch (u6 gs64, lignes alignées) : les deux qmv
+// sont ceux de `affine_qmv_fast_aligned_u6_gs64_f32` et l'activation reprend
+// `swiglu_f32` à l'identique.
+kernel void affine_gate_up_swiglu_aligned_u6_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* gate_packed [[buffer(1)]],
+    device const bfloat* gate_scales [[buffer(2)]],
+    device const bfloat* gate_biases [[buffer(3)]],
+    device const uint* up_packed [[buffer(4)]],
+    device const bfloat* up_scales [[buffer(5)]],
+    device const bfloat* up_biases [[buffer(6)]],
+    device float* out [[buffer(7)]],
+    constant uint4& dims [[buffer(8)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint row_base = tile.y * 8u + simd_gid * 4u;
+    float gate[4];
+    float up[4];
+    if (dims.y % 1024u == 0u) {
+        affine_qmv_aligned_u56_rows4<6u, 32u>(lhs, gate_packed, gate_scales, gate_biases, dims, row_base, simd_lid, tile.x, gate);
+        affine_qmv_aligned_u56_rows4<6u, 32u>(lhs, up_packed, up_scales, up_biases, dims, row_base, simd_lid, tile.x, up);
+    } else {
+        affine_qmv_aligned_u56_rows4<6u, 16u>(lhs, gate_packed, gate_scales, gate_biases, dims, row_base, simd_lid, tile.x, gate);
+        affine_qmv_aligned_u56_rows4<6u, 16u>(lhs, up_packed, up_scales, up_biases, dims, row_base, simd_lid, tile.x, up);
+    }
+    if (simd_lid == 0u) {
+        #pragma unroll
+        for (uint row = 0u; row < 4u; ++row) {
+            const float g = gate[row];
+            out[tile.x * dims.x + row_base + row] = (g / (1.0f + exp(-g))) * up[row];
+        }
+    }
+}
+
+// qmv u6 gs64 aligné suivi de l'addition résiduelle : même somme que
+// `weighted_sum_add_topk_f32` avec un score unique de 1.
+kernel void affine_qmv_residual_aligned_u6_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device const float* residual [[buffer(4)]],
+    device float* out [[buffer(5)]],
+    constant uint4& dims [[buffer(6)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint row_base = tile.y * 8u + simd_gid * 4u;
+    float reduced[4];
+    if (dims.y % 1024u == 0u) {
+        affine_qmv_aligned_u56_rows4<6u, 32u>(lhs, packed, scales, biases, dims, row_base, simd_lid, tile.x, reduced);
+    } else {
+        affine_qmv_aligned_u56_rows4<6u, 16u>(lhs, packed, scales, biases, dims, row_base, simd_lid, tile.x, reduced);
+    }
+    if (simd_lid == 0u) {
+        #pragma unroll
+        for (uint row = 0u; row < 4u; ++row) {
+            const uint index = tile.x * dims.x + row_base + row;
+            float acc = residual[index];
+            acc += reduced[row] * 1.0f;
+            out[index] = acc;
+        }
+    }
+}
+
 // Porté depuis reti, crates/saragossa/src/kernels.metal (même auteur).
 // QMM u6 gs64 : variante BATCHÉE du qmv u6. Le qmv traite une ligne d'entrée par
 // dispatch, donc un prefill de N lignes relit N fois tous les poids — sur le

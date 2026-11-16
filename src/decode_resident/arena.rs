@@ -342,12 +342,14 @@ impl DecodeResidentState {
             compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_bf16")?;
         let copy_at_bf16_to_f32_kernel =
             compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_bf16_to_f32")?;
-        let rope_append_kv_kernels: [ComputePipelineState; 2] = compile_kernels(
+        let rope_append_kv_kernels: [ComputePipelineState; 4] = compile_kernels(
             &device,
             ROPE_DECODE_COPY_KERNELS,
             &[
                 "rms_norm_rope_append_kv_f32",
                 "rms_norm_rope_append_kv_bf16",
+                "rms_norm_rope_qk_append_kv_f32",
+                "rms_norm_rope_qk_append_kv_bf16",
             ],
             true,
         )?
