@@ -146,8 +146,8 @@ tenseurs `visual.*` ignorés, pas de tête de vocabulaire. Différences :
   `permutation_average` n'est pas pris en charge.
 
 Oracle : `tests/fixtures/decision/d3/`, 39 questions et prompts de 128, 512
-et 2048 tokens, tolérance figée 0,0184 (deux fois le bruit bf16 mesuré
-+ 1e-6).
+et 2048 tokens, tolérance figée 0,0184 (deux fois le bruit bf16 mesuré,
+plus 1e-6).
 
 ```sh
 SARAGOSSA_DECISION_D3_MODEL=DOSSIER cargo test --release --all-features \
@@ -195,7 +195,7 @@ relecture « DI » du shim ne sont pas pris en charge.
   8 des 24 sondes de `tokenizer_contract.json` diffèrent). saragossa remplace
   la regex et exige les 24 sondes au chargement.
 - **Lignes** : `label_rows.lightning` (safetensors `lightning-label-rows-1`,
-  `W` f32 `[255, 2560]`, un token ` A`, ` B`… par label, sans softcap). Ce ne
+  `W` f32 `[255, 2560]`, un token « espace + lettre » (`␠A`, `␠B`…) par label, sans softcap). Ce ne
   sont pas une tête dédiée mais les lignes de la tête liée aux embeddings
   (égalité au bit vérifiée par la référence) ; la tête complète n'est pas
   chargée.
@@ -231,7 +231,7 @@ au bit du cache vérifiée sur ces 8 questions, sur un état de plus de 8000
 tokens et sur deux questions identiques (suffixe borné). La
 référence retrouve les réponses de `two_way.probe_reference` à 0,0012 près
 (seuil du shim 0,05). Tolérance figée 0,0215 (deux fois le bruit bf16 mesuré,
-+ 1e-6).
+plus 1e-6).
 
 Mesures (Apple M5 Max libre, charge 1 min sous 2 avant chaque série, ABBA,
 contre Torch MPS bf16 sur le même graphe, plafond GEMM MPS 58 TFLOP/s) :
