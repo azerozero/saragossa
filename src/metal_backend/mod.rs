@@ -68,6 +68,7 @@ mod linear_attention_encode;
 pub(super) use linear_attention_encode::LinearAttnBatchLayout;
 mod lm_head;
 mod matmul;
+pub(crate) use matmul::DENSE_BF16_GEMM_MIN_BATCH;
 mod matmul_align64;
 mod matmul_encode;
 mod matmul_resident;
@@ -134,6 +135,8 @@ mod transfer;
 mod verify_tree;
 mod whisper_encode;
 
+#[cfg(test)]
+pub(crate) use self::barriers::command_buffer_gpu_ns;
 #[doc(hidden)]
 pub use self::barriers::dump_commit_components;
 pub(crate) use self::barriers::{
@@ -181,6 +184,7 @@ pub(crate) fn qmvt_dispatches_for_test() -> usize {
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
     WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
+    WhisperStepEmit, WhisperStepOutput,
 };
 
 fn ensure_valid_top_k(top_k: usize, expert_count: usize) -> Result<()> {
@@ -354,6 +358,7 @@ pub struct MetalExecutor {
     whisper_attn_decode_vec64_f32: ComputePipelineState,
     im2col_f32: ComputePipelineState,
     rms_norm_rope_heads_f32: ComputePipelineState,
+    rms_norm_mrope_heads_f32: ComputePipelineState,
     rms_norm_heads_no_scale_f32: ComputePipelineState,
     causal_attention_prefill_f32: ComputePipelineState,
     causal_attention_prefill_mid_f32: ComputePipelineState,
@@ -937,6 +942,8 @@ pub(crate) struct PrefillCaptures {
 pub(crate) enum PrefillInput<'a> {
     /// Flux résiduel déjà plongé `[rows, hidden]`.
     Hidden(&'a Tensor),
+    /// Embeddings fournis et positions par ligne, sans encodeur vision.
+    PositionedHidden(&'a Tensor, &'a [[usize; 3]]),
     /// Jetons plongés sur le GPU morceau par morceau : ni `[rows, hidden]` CPU
     /// ni sa copie GPU (2 × 5,4 Go à 256k sur le 27B). Réservé à un embedding
     /// dont le gather Metal est l'octet près celui du CPU.

@@ -1348,7 +1348,7 @@ impl LoadedModel {
         if reused_prefix_tokens < full_block_tokens {
             let hash = tokens[..full_block_tokens]
                 .chunks_exact(block_tokens)
-                .fold(root, BlockHash::chain);
+                .fold(root, |hash, block| hash.chain(block, &[]));
             self.decoder
                 .persist_prompt(&tokens[..full_block_tokens], &state)?;
             self.remember_prefix_block(root, hash, full_block_tokens, &state, memory_guard)?;
@@ -1372,7 +1372,7 @@ impl LoadedModel {
         if boundary == tokens.len() {
             let hash = tokens
                 .chunks_exact(self.prefix_cache.block_tokens())
-                .fold(root, BlockHash::chain);
+                .fold(root, |hash, block| hash.chain(block, &[]));
             self.remember_prefix_block(root, hash, boundary, &state, memory_guard)?;
         }
         // Une frontière prolongée sera mémorisée une seule fois par l'appelant.

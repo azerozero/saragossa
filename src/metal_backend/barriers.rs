@@ -35,7 +35,7 @@ pub(crate) fn suspend_dispatch_barrier_scope() -> DispatchBarrierScopeGuard {
     unsafe_code,
     reason = "metal-rs 0.33 n'expose pas GPUStartTime ni GPUEndTime"
 )]
-fn command_buffer_gpu_ns(command_buffer: &metal::CommandBufferRef) -> u64 {
+pub(crate) fn command_buffer_gpu_ns(command_buffer: &metal::CommandBufferRef) -> u64 {
     type TimeGetter = unsafe extern "C" fn(*mut Object, Sel) -> f64;
     static START: OnceLock<Sel> = OnceLock::new();
     static END: OnceLock<Sel> = OnceLock::new();

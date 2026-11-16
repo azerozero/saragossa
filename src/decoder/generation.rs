@@ -433,7 +433,7 @@ impl CausalDecoder {
                 self.layers.len()
             )));
         }
-        let position = cache.position;
+        let position = cache.current_pos()?;
         let runtime = self.forward_runtime();
         let mut hidden = self.embed_scaled(&[token_id])?;
         #[cfg(feature = "devtools")]
@@ -483,7 +483,7 @@ impl CausalDecoder {
         )? {
             return Ok(output.states);
         }
-        let position_offset = cache.position;
+        let position_offset = cache.current_pos()?;
         let runtime = self.forward_runtime();
         let mut hidden = self.embed_scaled(token_ids)?;
         for (layer_index, layer) in self.layers.iter().enumerate() {
@@ -1162,6 +1162,8 @@ impl CausalDecoder {
             )));
         }
         cache.position = snapshot.cpu.position;
+        cache.rope_delta = snapshot.cpu.rope_delta;
+        cache.vision_positions = snapshot.cpu.vision_positions.clone();
         for (layer, snap_layer) in cache.layers.iter_mut().zip(snapshot.cpu.layers.iter()) {
             layer.keys = snap_layer.keys.clone();
             layer.values = snap_layer.values.clone();
@@ -3461,7 +3463,7 @@ impl CausalDecoder {
                 return Ok((output.states, target_hidden));
             }
         }
-        let position_offset = cache.position;
+        let position_offset = cache.current_pos()?;
         let runtime = self.forward_runtime();
         let mut hidden = self.embed_scaled(token_ids)?;
         let (seq, hidden_dim) = hidden.as_matrix()?;
@@ -3844,6 +3846,9 @@ impl CausalDecoder {
         keep_rows: usize,
         last_row_only: bool,
     ) -> Result<Option<(Tensor, Option<PrefixCaptures>)>> {
+        if cache.vision_positions.is_some() {
+            return Ok(None);
+        }
         let start = cache.position;
         // Le seuil départage le prefill résident et l'extension en lignes,
         // que flint n'a pas : son repli est le forward CPU (~0,6 s par token).
@@ -4557,6 +4562,7 @@ impl CausalDecoder {
             true,
             crate::runtime_flags::prefill_resident_chunk_tokens(),
             Some(&mut seed),
+            None,
         )?
         else {
             return Ok(None);
@@ -5371,7 +5377,7 @@ impl CausalDecoder {
         let mut cache = self.empty_cache();
         let mut last_hidden = None;
         for chunk in prompt.chunks(chunk_size) {
-            let position_offset = cache.position;
+            let position_offset = cache.current_pos()?;
             let mut hidden = self.embed_scaled(chunk)?;
             #[cfg(feature = "devtools")]
             crate::devtools::layer_dump::record("embeddings", &hidden)?;
@@ -5690,11 +5696,16 @@ impl CausalDecoder {
             last_row_only,
             chunk_tokens,
             None,
+            None,
         )
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn prefill_resident_cache_hidden_captures_and_mtp(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "prefill interne : captures, semis MTP et positions fournies indépendants"
+    )]
+    pub(super) fn prefill_resident_cache_hidden_captures_and_mtp(
         &self,
         prompt: &[usize],
         capture_layer_ids: &[usize],
@@ -5702,6 +5713,7 @@ impl CausalDecoder {
         last_row_only: bool,
         chunk_tokens: usize,
         mtp_seed: Option<&mut crate::metal_backend::MtpPrefillSeed<'_>>,
+        supplied: Option<(&Tensor, &[[usize; 3]])>,
     ) -> Result<
         Option<(
             CausalDecoderCache,
@@ -5739,7 +5751,11 @@ impl CausalDecoder {
         else {
             return self.resident_prefill_ineligible("spec d'attention hors contrat");
         };
-        let hidden = self.prefill_hidden(prompt)?;
+        let hidden = if supplied.is_none() {
+            self.prefill_hidden(prompt)?
+        } else {
+            None
+        };
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let Some(prefill_layer) = layer.prefill_moe_layer(&self.config, spec) else {
@@ -5748,7 +5764,12 @@ impl CausalDecoder {
             layers.push(prefill_layer);
         }
         match metal.qwen_moe_prefill_resident_with_mtp(
-            self.prefill_input(prompt, hidden.as_ref()),
+            supplied.map_or_else(
+                || self.prefill_input(prompt, hidden.as_ref()),
+                |(hidden, positions)| {
+                    crate::metal_backend::PrefillInput::PositionedHidden(hidden, positions)
+                },
+            ),
             &layers,
             spec,
             self.config.max_position_embeddings,
@@ -5806,7 +5827,9 @@ impl CausalDecoder {
             }
             // Une erreur résidente Gemma 4 ou flint ne doit pas masquer un
             // kernel cassé derrière un prefill CPU beaucoup plus lent.
-            Err(error) if resident_only || self.config.is_gemma4 => Err(error),
+            Err(error) if resident_only || self.config.is_gemma4 || supplied.is_some() => {
+                Err(error)
+            }
             Err(error) => {
                 if trace_prefill_enabled() {
                     eprintln!("prefill résident fallback: {error}");
@@ -6356,3 +6379,6 @@ fn record_prefix_extend(suffix: usize, resident: bool) {
         }
     });
 }
+#[cfg(all(test, feature = "devtools"))]
+#[path = "vision/ab_tests.rs"]
+mod vision_ab_tests;

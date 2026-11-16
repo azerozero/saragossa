@@ -11,6 +11,13 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct BlockHash([u8; 32]);
 
+/// Identité déjà calculée sur le contenu et les paramètres, span absolu.
+pub(super) struct BlockMedia {
+    pub start: usize,
+    pub end: usize,
+    pub hash: [u8; 32],
+}
+
 impl BlockHash {
     /// Renvoie la racine du chaînage.
     #[must_use]
@@ -34,11 +41,20 @@ impl BlockHash {
 
     /// Calcule le hash chaîné du bloc suivant.
     #[must_use]
-    pub(super) fn chain(self, tokens: &[usize]) -> Self {
+    pub(super) fn chain(self, tokens: &[usize], media: &[(usize, [u8; 32])]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(self.0);
         for token in tokens {
             hasher.update((*token as u64).to_le_bytes());
+        }
+        if !media.is_empty() {
+            hasher.update(b"saragossa-media-block-v1\0");
+            hasher.update((tokens.len() as u64).to_le_bytes());
+            hasher.update((media.len() as u64).to_le_bytes());
+            for (offset, hash) in media {
+                hasher.update((*offset as u64).to_le_bytes());
+                hasher.update(hash);
+            }
         }
         let digest = hasher.finalize();
         let mut hash = [0_u8; 32];
@@ -130,15 +146,43 @@ impl BlockAwarePrefixCache {
         root: BlockHash,
         tokens: &[usize],
     ) -> Option<PrefixBlockHit> {
+        self.match_prefix_with_media(root, tokens, &[])
+    }
+
+    pub(super) fn match_prefix_with_media(
+        &mut self,
+        root: BlockHash,
+        tokens: &[usize],
+        media: &[BlockMedia],
+    ) -> Option<PrefixBlockHit> {
         if self.capacity == 0 {
             return None;
+        }
+        let mut end = 0;
+        for item in media {
+            if item.start < end || item.end <= item.start || item.end > tokens.len() {
+                return None;
+            }
+            end = item.end;
         }
         let mut previous = root;
         let mut best = None;
         for (index, block) in tokens.chunks_exact(self.block_tokens).enumerate() {
-            let hash = previous.chain(block);
+            let start = index * self.block_tokens;
+            let identities: Vec<_> = media
+                .iter()
+                .filter(|m| start <= m.start && m.start < start + block.len())
+                .map(|m| (m.start - start, m.hash))
+                .collect();
+            let hash = previous.chain(block, &identities);
             previous = hash;
             let expected_tokens = (index + 1).saturating_mul(self.block_tokens);
+            if media
+                .iter()
+                .any(|m| m.start < expected_tokens && expected_tokens < m.end)
+            {
+                continue;
+            }
             if let Some(entry_index) = self.entries.iter().position(|entry| {
                 entry.session == root && entry.hash == hash && entry.tokens == expected_tokens
             }) {
@@ -321,10 +365,23 @@ mod tests {
     }
 
     #[test]
+    fn media_content_and_parameters_invalidate_only_from_the_image_block() {
+        let root = BlockHash::root();
+        let before = root.chain(&[1, 2], &[]);
+        let image = before.chain(&[9, 9], &[(0, [1; 32])]);
+        let other = before.chain(&[9, 9], &[(0, [2; 32])]);
+        assert_eq!(image, before.chain(&[9, 9], &[(0, [1; 32])]));
+        assert_ne!(image, other);
+        assert_ne!(image, before.chain(&[9, 9], &[(1, [1; 32])]));
+        assert_ne!(image.chain(&[3, 4], &[]), other.chain(&[3, 4], &[]));
+        assert_ne!(image, before.chain(&[9, 9], &[]));
+    }
+
+    #[test]
     fn chained_hash_depends_on_previous_block() {
-        let first = BlockHash::root().chain(&[1, 2]);
-        let left = first.chain(&[3, 4]);
-        let right = BlockHash::root().chain(&[3, 4]);
+        let first = BlockHash::root().chain(&[1, 2], &[]);
+        let left = first.chain(&[3, 4], &[]);
+        let right = BlockHash::root().chain(&[3, 4], &[]);
 
         assert_ne!(left, right);
     }
@@ -345,8 +402,60 @@ mod tests {
 
         assert_eq!(BlockHash::for_session(None), BlockHash::root());
         assert_eq!(
-            BlockHash::for_session(None).chain(&tokens),
-            BlockHash::root().chain(&tokens)
+            BlockHash::for_session(None).chain(&tokens, &[]),
+            BlockHash::root().chain(&tokens, &[])
+        );
+    }
+
+    #[test]
+    fn media_cache_hits_only_at_safe_boundaries_with_identical_content() {
+        let mut cache = BlockAwarePrefixCache::new(2, 8);
+        let root = BlockHash::root();
+        let tokens = [0, 1, 2, 2, 2, 2];
+        let before = root.chain(&tokens[..2], &[]);
+        let inside = before.chain(&tokens[2..4], &[(0, [1; 32])]);
+        let after = inside.chain(&tokens[4..], &[]);
+        for (hash, count) in [(before, 2), (inside, 4), (after, 6)] {
+            cache.insert(
+                root,
+                hash,
+                count,
+                test_state(count),
+                CausalDecoderPromptMetalSnapshot::default(),
+            );
+        }
+        let same = [BlockMedia {
+            start: 2,
+            end: 6,
+            hash: [1; 32],
+        }];
+        let changed = [BlockMedia {
+            start: 2,
+            end: 6,
+            hash: [2; 32],
+        }];
+        assert_eq!(
+            cache
+                .match_prefix_with_media(root, &tokens, &same)
+                .unwrap()
+                .tokens,
+            6
+        );
+        assert_eq!(
+            cache
+                .match_prefix_with_media(root, &tokens, &changed)
+                .unwrap()
+                .tokens,
+            2
+        );
+        // Retirer la frontière finale : le hit intérieur à l'image est refusé.
+        cache.entries.retain(|entry| entry.tokens != 6);
+        assert_eq!(
+            cache
+                .match_prefix_with_media(root, &tokens, &same)
+                .unwrap()
+                .tokens,
+            2
         );
     }
 
@@ -354,8 +463,8 @@ mod tests {
     fn prefix_cache_matches_longest_chain() {
         let mut cache = BlockAwarePrefixCache::new(2, 8);
         let root = BlockHash::root();
-        let first = root.chain(&[1, 2]);
-        let second = first.chain(&[3, 4]);
+        let first = root.chain(&[1, 2], &[]);
+        let second = first.chain(&[3, 4], &[]);
         cache.insert(
             root,
             first,
@@ -382,8 +491,8 @@ mod tests {
     #[test]
     fn prefix_cache_removes_superseded_block() {
         let root = BlockHash::root();
-        let first = root.chain(&[1, 2]);
-        let second = first.chain(&[3, 4]);
+        let first = root.chain(&[1, 2], &[]);
+        let second = first.chain(&[3, 4], &[]);
         // Retrait des blocs supplantés : seuls ceux de la session qui tiennent
         // l'ancien K/V sans rien partager avec l'état vivant partent.
         let mut other = BlockAwarePrefixCache::new(2, 8);
@@ -391,7 +500,7 @@ mod tests {
         let (old, live) = (test_state(2), test_state(4));
         for (session, hash, tokens, state) in [
             (root, first, 2, old.clone()),
-            (other_root, other_root.chain(&[1, 2]), 2, old.clone()),
+            (other_root, other_root.chain(&[1, 2], &[]), 2, old.clone()),
             (root, second, 4, live.clone()),
         ] {
             other.insert(
@@ -425,9 +534,9 @@ mod tests {
     fn prefix_cache_evicts_lru_block() {
         let mut cache = BlockAwarePrefixCache::new(1, 2);
         let root = BlockHash::root();
-        let first = root.chain(&[1]);
-        let second = first.chain(&[2]);
-        let third = second.chain(&[3]);
+        let first = root.chain(&[1], &[]);
+        let second = first.chain(&[2], &[]);
+        let third = second.chain(&[3], &[]);
         cache.insert(
             root,
             first,
@@ -463,9 +572,9 @@ mod tests {
         let mut cache = BlockAwarePrefixCache::new(1, 2);
         let alpha = BlockHash::for_session(Some("agent-a"));
         let beta = BlockHash::for_session(Some("agent-b"));
-        let beta_first = beta.chain(&[9]);
-        let alpha_first = alpha.chain(&[1]);
-        let alpha_second = alpha_first.chain(&[2]);
+        let beta_first = beta.chain(&[9], &[]);
+        let alpha_first = alpha.chain(&[1], &[]);
+        let alpha_second = alpha_first.chain(&[2], &[]);
         cache.insert(
             beta,
             beta_first,
@@ -504,9 +613,9 @@ mod tests {
         let mut cache = BlockAwarePrefixCache::with_blocks_per_session(1, 2, 1);
         let alpha = BlockHash::for_session(Some("agent-a"));
         let beta = BlockHash::for_session(Some("agent-b"));
-        let beta_first = beta.chain(&[9]);
-        let alpha_first = alpha.chain(&[1]);
-        let alpha_second = alpha_first.chain(&[2]);
+        let beta_first = beta.chain(&[9], &[]);
+        let alpha_first = alpha.chain(&[1], &[]);
+        let alpha_second = alpha_first.chain(&[2], &[]);
         cache.insert(
             beta,
             beta_first,
@@ -549,8 +658,8 @@ mod tests {
         let mut cache = BlockAwarePrefixCache::new(2, 8);
         let alpha = BlockHash::for_session(Some("agent-a"));
         let beta = BlockHash::for_session(Some("agent-b"));
-        let first = alpha.chain(&[1, 2]);
-        let second = first.chain(&[3, 4]);
+        let first = alpha.chain(&[1, 2], &[]);
+        let second = first.chain(&[3, 4], &[]);
         cache.insert(
             alpha,
             first,
@@ -566,7 +675,7 @@ mod tests {
             CausalDecoderPromptMetalSnapshot::default(),
         );
 
-        assert_ne!(first, beta.chain(&[1, 2]));
+        assert_ne!(first, beta.chain(&[1, 2], &[]));
         assert!(cache.match_prefix(beta, &[1, 2, 3, 4]).is_none());
         assert_eq!(
             cache
@@ -580,7 +689,7 @@ mod tests {
     fn prefix_cache_matches_deepest_sparse_boundary() {
         let mut cache = BlockAwarePrefixCache::new(2, 8);
         let root = BlockHash::root();
-        let second = root.chain(&[1, 2]).chain(&[3, 4]);
+        let second = root.chain(&[1, 2], &[]).chain(&[3, 4], &[]);
         cache.insert(
             root,
             second,
@@ -606,7 +715,7 @@ mod tests {
         let root = BlockHash::root();
         let mut hash = root;
         for tokens in 1..=4 {
-            hash = hash.chain(&[tokens]);
+            hash = hash.chain(&[tokens], &[]);
             cache.insert(
                 root,
                 hash,

@@ -419,6 +419,46 @@ impl TtsCodec {
         Ok(hidden)
     }
 
+    /// Bascule les convolutions GPU en tuiles (oracles).
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn set_gpu_conv_tiled(&mut self, enabled: bool) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_conv_tiled(enabled);
+        }
+    }
+
+    /// Profil par kernel de la section GPU streaming : préfixe CPU, lots de
+    /// `lot` trames, le premier lot (contextes vides) écarté. Renvoie aussi la
+    /// durée GPU d'un command buffer unique par lot, sur un second état.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn profile_gpu_tail(
+        &self,
+        codes: &[Vec<i32>],
+        lot: usize,
+    ) -> Result<(Vec<crate::tts_codec_gpu::KernelTime>, f64, usize)> {
+        let gpu = self
+            .gpu
+            .as_ref()
+            .ok_or_else(|| InferError::Metal("profil: codec GPU absent".to_string()))?;
+        let hidden = self.decode_prefix(codes)?;
+        let rows = hidden.time / codes.len().max(1);
+        let chunk = lot * rows * hidden.channels;
+        let mut split = gpu.new_stream();
+        let mut whole = gpu.new_stream();
+        let (mut kernels, mut single_ns, mut frames) = (Vec::new(), 0.0, 0);
+        for (index, part) in hidden.data.chunks(chunk).enumerate() {
+            let time = part.len() / hidden.channels;
+            let rec = gpu.profile_tail_stream(&mut split, time, hidden.channels, part)?;
+            let ns = gpu.time_tail_stream(&mut whole, time, hidden.channels, part)?;
+            if index > 0 {
+                kernels.extend(rec);
+                single_ns += ns;
+                frames += time / rows;
+            }
+        }
+        Ok((kernels, single_ns, frames))
+    }
+
     /// Décode entièrement sur CPU (oracle de parité, contourne le forward GPU).
     #[cfg(test)]
     pub(crate) fn decode_codes_cpu(&self, generated: &[Vec<i32>]) -> Result<Vec<f32>> {

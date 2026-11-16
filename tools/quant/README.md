@@ -11,6 +11,7 @@ fabriquer des poids, pas à les exécuter.
 | `test_allocation.py` | Tests de la logique d'allocation, sans dépendance à MLX |
 | `convert_ls.py` | Re-quantifie en affine gs64 (4 ou 8 bits, selon le template) par moindres carrés depuis les poids BF16, sans changer le format (+1,7 % de perplexité contre +2,9 % en min-max sur le 27B, sans données de calibration) |
 | `opt_quant.py` | Ajustement d'échelle et de biais par groupe utilisé par `convert_ls.py` |
+| `tokenizer_sidecar.py` | Recopie `tokenizer.json` de la source à l'identique et refuse une regex de pré-tokenizer réécrite par transformers (`test_tokenizer_sidecar.py`) |
 | `chat_kl.py` | KL en régime chat contre les poids officiels bf16 (référence transformers, candidat mlx-lm) |
 
 ## Méthode

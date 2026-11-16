@@ -1247,6 +1247,7 @@ mod tests {
     fn target_config() -> ModelConfig {
         ModelConfig {
             model_type: "qwen3_5_moe".to_string(),
+            vision_config: None,
             hidden_size: 2048,
             num_hidden_layers: 40,
             num_attention_heads: 16,
