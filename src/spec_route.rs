@@ -102,8 +102,27 @@ const CODE_WORDS: &[&str] = &[
 
 /// Fragments de syntaxe qui trahissent un code collé sans clôture.
 const CODE_SYNTAX: &[&str] = &[
-    "`", "{", "}", "==", "!=", "=>", "->", "::", "()", "[]", "</", "/>", "&&", "||", "+=", ";\n",
-    "#include", "#!/",
+    "`",
+    "{",
+    "}",
+    "==",
+    "!=",
+    "=>",
+    "->",
+    "::",
+    "()",
+    "[]",
+    "</",
+    "/>",
+    "&&",
+    "||",
+    "+=",
+    ";\n",
+    "#include",
+    "#!/",
+    "def ",
+    "fn ",
+    "function(",
 ];
 
 /// Mots qui, dans les deux mots précédents, annulent un marqueur (« sans code »).
@@ -138,7 +157,12 @@ pub fn prefers_dflash<R: AsRef<str>, S: AsRef<str>>(
         return true;
     };
     let text = text.as_ref();
-    text.trim().is_empty() || !is_latin(text) || has_code_hint(text)
+    let lower = text.to_lowercase();
+    text.trim().is_empty()
+        || has_syntax_hint(&lower)
+        || has_language_name(&lower)
+        || !is_latin(text)
+        || has_word_hint(&lower)
 }
 
 /// Le greedy peut-il prendre DFlash ? Toujours si le routage est coupé
@@ -153,15 +177,20 @@ pub fn allows_dflash<R: AsRef<str>, S: AsRef<str>>(
 /// Toutes les lettres sont latines (ASCII, Latin-1, Latin étendu A/B et
 /// additionnel) ; chiffres, ponctuation et emoji ne comptent pas.
 fn is_latin(text: &str) -> bool {
-    text.chars().filter(|c| c.is_alphabetic()).all(|c| {
-        c.is_ascii_alphabetic()
-            || matches!(c, 'ª' | 'º' | '\u{00C0}'..='\u{024F}' | '\u{1E00}'..='\u{1EFF}')
-    })
+    text.chars()
+        .filter(|c| c.is_alphabetic())
+        .all(is_latin_letter)
 }
 
-fn has_code_hint(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    if CODE_SYNTAX.iter().any(|fragment| lower.contains(fragment))
+/// Chiffre ASCII ou lettre latine ; vrai aussi pour un non-alphabétique ASCII.
+fn is_latin_letter(c: char) -> bool {
+    c.is_ascii() || matches!(c, 'ª' | 'º' | '\u{00C0}'..='\u{024F}' | '\u{1E00}'..='\u{1EFF}')
+}
+
+/// Syntaxe de code cherchée en sous-chaînes, quelle que soit la langue : le
+/// CJK et le coréen n'ont pas d'espaces entre les mots.
+fn has_syntax_hint(lower: &str) -> bool {
+    CODE_SYNTAX.iter().any(|fragment| lower.contains(fragment))
         || lower
             .lines()
             .any(|line| line.starts_with("    ") || line.starts_with('\t'))
@@ -169,35 +198,43 @@ fn has_code_hint(text: &str) -> bool {
             .as_bytes()
             .windows(2)
             .any(|pair| pair[1] == b'(' && pair[0].is_ascii_alphanumeric())
-    {
-        return true;
-    }
+        || lower
+            .find("select ")
+            .is_some_and(|at| lower[at..].contains(" from "))
+}
+
+/// Nom de langage ou de format en ASCII, borné par des caractères qui ne sont
+/// ni alphanumériques ASCII ni `#`/`+`, ni suivi d'une apostrophe d'élision
+/// (« c'est » n'est pas du C). « 用python写 » et « Pythonで » comptent.
+fn has_language_name(lower: &str) -> bool {
+    // Une lettre latine (accentuée comprise) prolonge le mot : « rédige » ne
+    // contient pas le langage R. Le CJK, le cyrillique, etc. le bornent.
+    let joins = |c: char| (c.is_alphanumeric() && is_latin_letter(c)) || c == '#' || c == '+';
+    CODE_WORDS.iter().any(|name| {
+        lower.match_indices(name).any(|(at, _)| {
+            let rest = &lower[at + name.len()..];
+            !lower[..at].chars().next_back().is_some_and(joins)
+                && !rest.chars().next().is_some_and(joins)
+                && !rest.starts_with(['\'', '’'])
+        })
+    })
+}
+
+/// Radicaux de mots de code (écriture latine), annulables par une négation
+/// proche ou une formule « uniquement de la prose ».
+fn has_word_hint(lower: &str) -> bool {
     if PROSE_ONLY.iter().any(|phrase| lower.contains(phrase)) {
         return false;
     }
-    // Un mot suivi d'une apostrophe est une élision (« c'est », « l'API ») : il
-    // ne compte pas comme mot entier, ses radicaux restent testés.
-    let mut words: Vec<(&str, bool)> = Vec::new();
-    let mut start = None;
-    for (index, c) in lower.char_indices() {
-        if c.is_alphanumeric() || c == '#' || c == '+' {
-            start.get_or_insert(index);
-            continue;
-        }
-        if let Some(begin) = start.take() {
-            words.push((&lower[begin..index], matches!(c, '\'' | '’')));
-        }
-    }
-    if let Some(begin) = start {
-        words.push((&lower[begin..], false));
-    }
-    words.iter().enumerate().any(|(index, &(word, elided))| {
-        let marker = (!elided && CODE_WORDS.contains(&word))
-            || CODE_STEMS.iter().any(|stem| word.starts_with(stem));
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.iter().enumerate().any(|(index, word)| {
         let negated = words[index.saturating_sub(2)..index]
             .iter()
-            .any(|(previous, _)| NEGATIONS.contains(previous));
-        marker && !negated
+            .any(|previous| NEGATIONS.contains(previous));
+        CODE_STEMS.iter().any(|stem| word.starts_with(stem)) && !negated
     })
 }
 
@@ -234,6 +271,54 @@ mod tests {
             assert!(user(text), "DFlash attendu : {text}");
         }
         for text in prose {
+            assert!(!user(text), "MTP attendu : {text}");
+        }
+    }
+
+    /// Indices de code hors écriture latine, cherchés en sous-chaînes : le
+    /// classifieur doit les voir même si la règle « écriture latine » tombe.
+    #[test]
+    fn multilingual_code_hints() {
+        use super::{has_language_name, has_syntax_hint};
+        let code = [
+            "用python写一个函数",
+            "Pythonで関数を書いて",
+            "Python으로 함수 작성",
+            "напиши функцию на Rust",
+            "اكتب دالة بلغة JavaScript",
+            "写一个 SQL 查询：select name from users",
+            "このコードを説明して：def main():",
+            "escribe una función en Go",
+            "schreibe ein Skript in Bash",
+        ];
+        for text in code {
+            let lower = text.to_lowercase();
+            assert!(
+                has_language_name(&lower) || has_syntax_hint(&lower),
+                "indice attendu : {text}"
+            );
+            assert!(user(text), "DFlash attendu : {text}");
+        }
+        // Prose non latine : DFlash tant que la règle « écriture latine » tient.
+        for text in [
+            "写一个关于灯塔的短篇故事",
+            "灯台守の物語を書いて",
+            "등대지기에 관한 이야기를 써 줘",
+            "Напиши рассказ о смотрителе маяка",
+            "اكتب قصة عن حارس المنارة",
+        ] {
+            let lower = text.to_lowercase();
+            assert!(
+                !has_language_name(&lower) && !has_syntax_hint(&lower),
+                "{text}"
+            );
+            assert!(user(text), "DFlash attendu (écriture non latine) : {text}");
+        }
+        // Prose latine (es, de) sans indice : MTP.
+        for text in [
+            "Escribe un cuento corto sobre un faro en invierno.",
+            "Schreibe eine kurze Geschichte über einen Leuchtturm im Winter.",
+        ] {
             assert!(!user(text), "MTP attendu : {text}");
         }
     }
