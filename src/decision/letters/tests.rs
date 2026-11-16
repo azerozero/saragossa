@@ -92,6 +92,10 @@ fn letter_answers_and_modes_follow_shim() -> Result<()> {
     assert!(AttentionMode::parse(Some(&json!(1)), one).is_err());
     assert_eq!(common_prefix(&[&[1, 2, 3], &[1, 2, 4]]), 2);
     assert_eq!(common_prefix(&[&[1, 2], &[1, 2, 3]]), 1);
+    let (a, b): (Vec<usize>, Vec<usize>) = ((0..200).collect(), (0..190).chain([7]).collect());
+    assert_eq!(bounded_prefix(&[&a, &b], 64), 127);
+    assert_eq!(bounded_prefix(&[&a, &a], 64), 136);
+    assert_eq!(bounded_prefix(&[&a[..100], &a[..100]], 64), 0);
     assert!(Calibration::parse(&json!({"choice":1,"noul":1}), &json!(0)).is_err());
     assert!(Calibration::parse(&json!(1), &json!(0.4)).is_err());
     assert_eq!(
@@ -211,6 +215,40 @@ fn decision_letters_h2o_real_weight_oracle() -> Result<()> {
         equal, total,
         "cache de préfixe : écart {gap} avec les prefills complets"
     );
+    // Plusieurs morceaux de prefill (état > 4096 tokens), puis deux questions
+    // identiques : préfixe commun borné pour garder 64 lignes de suffixe.
+    let mut long = request.clone();
+    let state = cache["request"]["state"].as_str().expect("invariant: état");
+    long["state"] = json!(format!("{state}\n{state}"));
+    long["questions"] = json!(cache["request"]["questions"]
+        .as_object()
+        .expect("invariant: questions")
+        .iter()
+        .take(3)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<Map<_, _>>());
+    let mut twins = request.clone();
+    let first = &cache["request"]["questions"]["q000"];
+    twins["questions"] = json!({"a": first, "b": first});
+    for (name, request, minimum) in [("long", &long, 4097), ("twins", &twins, 64)] {
+        let reads = model.encode(request)?;
+        let tokens: Vec<&[usize]> = reads.iter().map(|r| &r.tokens[..]).collect();
+        let shared = model.exact_prefix(&tokens);
+        let shortest = tokens.iter().map(|t| t.len()).min().unwrap_or(0);
+        assert!(
+            shared >= minimum && shortest - shared >= 64,
+            "{name} : préfixe {shared}"
+        );
+        let a = model.probabilities(&reads, AttentionMode::Causal, true)?;
+        let b = model.probabilities(&reads, AttentionMode::Causal, false)?;
+        let bits = |p: &[Vec<f32>]| p.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&a),
+            bits(&b),
+            "{name} : cache de préfixe différent au bit"
+        );
+        eprintln!("letters h2o {name}: prefix {shared}, tokens {shortest}, bit-equal");
+    }
     Ok(())
 }
 
