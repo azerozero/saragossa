@@ -3169,6 +3169,11 @@ pub(crate) fn with_sampling_topk_scan<T>(enabled: bool, work: impl FnOnce() -> T
     out
 }
 
+/// Évite la copie CPU et l'upload de la table texte inutilisée par le talker.
+pub(crate) fn tts_compact_talker_embedding_enabled() -> bool {
+    env_flag("SARAGOSSA_TTS_COMPACT_TALKER_EMBEDDING", true)
+}
+
 /// Force le décodage glouton TTS historique pour les oracles.
 #[must_use]
 pub fn tts_greedy_enabled() -> bool {

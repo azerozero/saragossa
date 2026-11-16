@@ -70,7 +70,17 @@ impl TtsModel {
 
         tensors.insert(
             "embed_tokens.weight".to_string(),
-            DecoderTensor::Dense(text_embedding.clone()),
+            // Le talker reçoit exclusivement des embeddings déjà projetés par
+            // `text_embed` : cette table n'est jamais consultée. L'arène générique
+            // l'upload néanmoins ; une seule ligne évite les deux copies du
+            // vocabulaire complet, comme pour le code predictor ci-dessous.
+            DecoderTensor::Dense(
+                if crate::runtime_flags::tts_compact_talker_embedding_enabled() {
+                    Tensor::zeros(vec![1, text_embedding.as_matrix()?.1])?
+                } else {
+                    text_embedding.clone()
+                },
+            ),
         );
         tensors.insert(
             "norm.weight".to_string(),
