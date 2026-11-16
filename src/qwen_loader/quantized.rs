@@ -258,7 +258,7 @@ fn expect_entry_shape(name: &str, entry: &ShardTensorEntry, expected: &[usize]) 
     Ok(())
 }
 
-fn read_entry_bytes(shard: &ShardHeader, entry: &ShardTensorEntry) -> Result<Vec<u8>> {
+pub(super) fn read_entry_bytes(shard: &ShardHeader, entry: &ShardTensorEntry) -> Result<Vec<u8>> {
     let len = entry.payload_len("poids")?;
     let offset = shard
         .data_start
@@ -295,6 +295,9 @@ pub(super) fn tensor_from_entry(
     let shard = headers
         .get(entry_ref.shard_index)
         .ok_or_else(|| InferError::Shape("index shard invalide".to_string()))?;
+    if let Some(module) = context.lora.and_then(|lora| lora.module(&spec.source)) {
+        return lora_merged_tensor(spec, entry, shard, module, context);
+    }
     if let Some(packed) = packed_u32_entry(entry, &spec.source)? {
         return quantized_tensor_from_entry(
             config, spec, &packed, shard, headers, entries, context,
@@ -323,6 +326,38 @@ pub(super) fn tensor_from_entry(
         tensor = apply_fp8_weight_scale_inv(spec, tensor, headers, entries)?;
     }
     Ok(DecoderTensor::Dense(tensor))
+}
+
+/// Lit un poids de base dense, y ajoute `s·B·A` en f32, puis le range comme le
+/// chemin sans LoRA : bf16 single-copy sous Metal pour une base BF16, f32 pour
+/// une base F16 ou F32 et sur CPU.
+/// La cible a été validée par `validate_lora_targets` (2D, non quantifiée).
+fn lora_merged_tensor(
+    spec: &TensorSpec,
+    entry: &ShardTensorEntry,
+    shard: &ShardHeader,
+    module: &super::lora::LoraModule,
+    context: &DecoderLoadContext<'_>,
+) -> Result<DecoderTensor> {
+    let bytes = read_entry_bytes(shard, entry)?;
+    let mut weight = crate::safetensor::bytes_to_dense_f32(&bytes, entry.dtype, &spec.source)?;
+    drop(bytes);
+    module.merge_into(&spec.source, &entry.shape, &mut weight)?;
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if entry.dtype == Dtype::BF16 && crate::runtime_flags::single_copy_weights_enabled() {
+        if let Some(metal) = context.metal {
+            let buffer = metal.weight_buffer_from_f32_as_bf16(&weight)?;
+            return Ok(DecoderTensor::LinearWeight(LinearWeight::DenseBf16(
+                crate::DenseBf16Tensor::new(&entry.shape, buffer)?,
+            )));
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let _ = context;
+    Ok(DecoderTensor::Dense(Tensor::from_vec(
+        entry.shape.clone(),
+        weight,
+    )?))
 }
 
 pub(super) fn quantized_tensor_from_entry(

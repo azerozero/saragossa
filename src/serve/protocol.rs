@@ -181,6 +181,14 @@ impl ChatCompletionRequest {
     /// budget plafonné, format de sortie et stop sequences bornées. Rend le
     /// budget effectif.
     pub(super) fn validate(&self, max_tokens_cap: usize) -> ServeResult<usize> {
+        for message in &self.messages {
+            if message.content.as_ref().is_some_and(contains_vision_media) {
+                return Err(ServeError::InvalidParameter {
+                    param: "messages.content",
+                    message: "vision non implémentée : les images et vidéos sont refusées",
+                });
+            }
+        }
         if self
             .logit_bias
             .as_ref()
@@ -568,6 +576,23 @@ fn text_part(value: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .map(ToString::to_string),
         _ => None,
+    }
+}
+
+fn contains_vision_media(value: &Value) -> bool {
+    match value {
+        Value::Array(parts) => parts.iter().any(contains_vision_media),
+        Value::Object(part) => {
+            matches!(
+                part.get("type").and_then(Value::as_str),
+                Some("image" | "image_url" | "input_image" | "video" | "video_url" | "input_video")
+            ) || ["image_url", "video_url"]
+                .iter()
+                .any(|key| part.contains_key(*key))
+                || part.get("text").is_some_and(contains_vision_media)
+        }
+        Value::String(text) => text.contains("<|image_pad|>") || text.contains("<|video_pad|>"),
+        _ => false,
     }
 }
 
@@ -973,6 +998,43 @@ fn response_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_media_before_loading_or_flattening_content() {
+        for kind in [
+            "image",
+            "image_url",
+            "input_image",
+            "video",
+            "video_url",
+            "input_video",
+        ] {
+            let value = serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "décris"}, {"type": kind}
+                ]}]
+            });
+            let request: ChatCompletionRequest =
+                serde_json::from_value(value).expect("invariant: requête synthétique valide");
+            assert!(request.validate(512).is_err());
+        }
+    }
+
+    #[test]
+    fn refuses_media_markers_in_text_content() {
+        for content in [
+            serde_json::json!("<|image_pad|>"),
+            serde_json::json!([
+                {"type": "text", "text": "<|video_pad|>"}
+            ]),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": content}]
+            }))
+            .expect("invariant: requête synthétique valide");
+            assert!(request.validate(512).is_err());
+        }
+    }
 
     #[test]
     fn stream_ids_are_unique_across_threads() {

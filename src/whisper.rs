@@ -13,11 +13,22 @@
 //! sans EOT, toute la transcription échoue explicitement : sans timestamps,
 //! une reprise sur le texte partiel ne permettrait pas de garantir l'absence
 //! de mots perdus. Le frontend log-mel seul conserve sa fenêtre fixe de 30 s.
+//!
+//! [`WhisperModel::transcribe_verbose`] décode les mêmes fenêtres avec les
+//! tokens `<|t.tt|>` ; [`WhisperModel::transcribe_with_deltas`] émet le texte
+//! token par token ; [`WhisperStream`] accepte le PCM par morceaux.
 
 mod decoder;
 mod segments;
+mod streaming;
+mod timestamps;
 
 pub use decoder::{WhisperDecoder, WhisperModel};
+pub use streaming::{
+    StreamLimit, WhisperStream, WhisperStreamUpdate, MAX_CHUNK_SAMPLES, MAX_SESSION_CHUNKS,
+    MAX_SESSION_INFERENCES, MAX_SESSION_SAMPLES, MIN_PARTIAL_SAMPLES,
+};
+pub use timestamps::{WhisperSegment, WhisperTranscript};
 
 use crate::{
     gelu, layer_norm, load_float_tensors, ForwardRuntime, InferError, Linear, Result, Tensor,

@@ -9200,6 +9200,76 @@ kernel void rms_norm_rope_heads_f32(
     }
 }
 
+kernel void rms_norm_mrope_heads_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint4& dims [[buffer(3)]],
+    constant float4& params [[buffer(4)]],
+    device const float* inv_freq [[buffer(5)]],
+    device const uint* positions [[buffer(6)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint seq = dims.x;
+    const uint heads = dims.y;
+    const uint head_dim = dims.z;
+    const uint rope_dims = dims.w;
+    const float eps = params.x;
+    const uint head = tile.x;
+    const uint pos = tile.y;
+    if (head >= heads || pos >= seq) {
+        return;
+    }
+
+    threadgroup float partial[256];
+    threadgroup float normalized[256];
+    const uint dim = heads * head_dim;
+    const uint start = pos * dim + head * head_dim;
+    float sumsq = 0.0f;
+    for (uint col = tid; col < head_dim; col += 256u) {
+        const float value = input[start + col];
+        sumsq += value * value;
+    }
+    partial[tid] = sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float inv_rms = rsqrt((partial[0] / float(head_dim)) + eps);
+    const uint pairs = rope_dims / 2u;
+    // Contrat hôte Qwen : 64 dimensions rotatives, partenaires à +32.
+    const uint pair_offset = uint(params.z) / 2u;
+    // input et out peuvent être le même buffer. Figer les deux partenaires
+    // avant toute écriture, y compris lorsqu'ils sont dans deux SIMD-groups.
+    normalized[tid] = input[start + tid] * inv_rms * weight[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint col = tid; col < head_dim; col += 256u) {
+        float value = normalized[col];
+        if (col < pairs || (col >= pair_offset && col < pair_offset + pairs)) {
+            // Les fréquences hôte partagent les arrondis f32 de la référence CPU.
+            const uint pair = (col < pair_offset) ? col : (col - pair_offset);
+            // Le binding est déjà décalé au premier rang du morceau.
+            const uint axis = (pair % 3u == 1u && pair < 33u) ? 1u :
+                ((pair % 3u == 2u && pair < 30u) ? 2u : 0u);
+            const float angle = float(positions[3u * pos + axis]) * inv_freq[pair];
+            const float c = precise::cos(angle);
+            const float s = precise::sin(angle);
+            const float first = normalized[pair];
+            const float second = normalized[pair + pair_offset];
+            // Fast-math peut contracter first*c - second*s en FMA ;
+            // cet écart est admis sous la porte CPU de 1e-5.
+            value = (col < pair_offset) ? (first * c - second * s) : (first * s + second * c);
+        }
+        out[start + col] = value;
+    }
+}
+
 kernel void rms_norm_heads_no_scale_f32(
     device const float* input [[buffer(0)]],
     device float* out [[buffer(1)]],
@@ -11179,9 +11249,14 @@ kernel void sample_topk_blocks_f32(
     device uint* partial_indices [[buffer(2)]],
     constant uint2& dims [[buffer(3)]],
     constant float& softcap [[buffer(4)]],
+    constant uint& run [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint group [[threadgroup_position_in_grid]]
 ) {
+    // Repli de `sample_topk_scan_*` : 0 quand le balayage a déjà tiré.
+    if (run == 0u) {
+        return;
+    }
     const uint count = dims.x;
     const uint topk = dims.y;
     threadgroup float values[256];
@@ -11231,8 +11306,12 @@ kernel void sample_topk_finalize_f32(
     constant uint2& dims [[buffer(3)]],
     constant float2& params [[buffer(4)]],
     constant ulong& rng_state [[buffer(5)]],
+    constant uint& run [[buffer(6)]],
     uint tid [[thread_index_in_threadgroup]]
 ) {
+    if (run == 0u) {
+        return;
+    }
     const uint count = dims.x;
     const uint topk = dims.y;
     const float temperature = max(params.x, 0.0001f);
@@ -11306,6 +11385,221 @@ kernel void sample_topk_finalize_f32(
     }
 
     if (tid == 0u) {
+        const float max_value = merged_partial_values[0];
+        float probs[32];
+        float denom = 0.0f;
+        for (uint slot = 0u; slot < topk; ++slot) {
+            const float value = exp((merged_partial_values[slot] - max_value) / temperature);
+            probs[slot] = value;
+            denom += value;
+        }
+        denom = max(denom, 1.0e-20f);
+
+        float kept_sum = 0.0f;
+        float cumulative = 0.0f;
+        uint kept = 0u;
+        for (uint slot = 0u; slot < topk; ++slot) {
+            kept = slot + 1u;
+            kept_sum += probs[slot];
+            cumulative += probs[slot] / denom;
+            if (slot > 0u && top_p < 1.0f && cumulative >= top_p) {
+                break;
+            }
+        }
+
+        const float roll = splitmix_unit_f32(rng_state) * max(kept_sum, 1.0e-20f);
+        float acc = 0.0f;
+        uint chosen = merged_partial_indices[0];
+        for (uint slot = 0u; slot < kept; ++slot) {
+            acc += probs[slot];
+            if (roll <= acc) {
+                chosen = merged_partial_indices[slot];
+                break;
+            }
+        }
+        out_index[0] = chosen;
+    }
+}
+
+// Sélection top-k par balayage simdgroup, même résultat que
+// `sample_topk_blocks_f32` + `sample_topk_finalize_f32` quand chaque logit
+// (après softcap) est fini et > -FLT_MAX : `topk_better` est alors un ordre
+// strict total, et le top-k global trié est unique. Sinon (NaN, ±inf,
+// -FLT_MAX), un drapeau rend la main au chemin historique, dont les
+// sentinelles -FLT_MAX et les comparaisons NaN fixent le résultat.
+// Tests en bits : fast-math peut supposer l'absence de NaN et d'infinis.
+static inline bool sample_scan_irregular(float value) {
+    const uint bits = as_type<uint>(value);
+    return (bits & 0x7fffffffu) >= 0x7f800000u || bits == 0xff7fffffu;
+}
+
+// Meilleur couple de la simdgroup selon `topk_better`, valeur exacte du
+// gagnant (zéro signé compris) et sa voie.
+static inline void sample_scan_pick(
+    float value, uint index, uint lane,
+    thread float& win_value, thread uint& win_index, thread uint& win_lane
+) {
+    const float best = simd_max(value);
+    win_index = simd_min(value == best ? index : 0xffffffffu);
+    win_lane = simd_min((value == best && index == win_index) ? lane : 32u);
+    win_value = simd_shuffle(value, ushort(min(win_lane, 31u)));
+}
+
+// 1024 threads, 8 logits chacun : top-k trié par simdgroup (256 logits),
+// puis fusion des 32 listes dans la simdgroup 0. Sortie : `topk` couples
+// par groupe, un drapeau d'irrégularité par simdgroup.
+kernel void sample_topk_scan_blocks_f32(
+    device const float* logits [[buffer(0)]],
+    device float* out_values [[buffer(1)]],
+    device uint* out_indices [[buffer(2)]],
+    device uint* flags [[buffer(3)]],
+    constant uint2& dims [[buffer(4)]],
+    constant float& softcap [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]
+) {
+    const uint count = dims.x;
+    const uint topk = dims.y;
+    const uint lane = tid % 32u;
+    const uint simd = tid / 32u;
+    threadgroup float lists_v[32u * 32u];
+    threadgroup uint lists_i[32u * 32u];
+
+    float v[8];
+    uint ix[8];
+    bool irregular = false;
+    const uint base = group * 8192u + simd * 256u + lane;
+    for (uint j = 0u; j < 8u; ++j) {
+        const uint idx = base + j * 32u;
+        v[j] = -3.402823466e38f;
+        ix[j] = 0xffffffffu;
+        if (idx < count) {
+            const float value = sample_softcap_f32(logits[idx], softcap);
+            irregular = irregular || sample_scan_irregular(value);
+            v[j] = value;
+            ix[j] = idx;
+        }
+    }
+    irregular = simd_any(irregular);
+    if (lane == 0u) {
+        flags[group * 32u + simd] = irregular ? 1u : 0u;
+    }
+
+    for (uint slot = 0u; slot < topk; ++slot) {
+        float bv = v[0];
+        uint bi = ix[0];
+        for (uint j = 1u; j < 8u; ++j) {
+            if (topk_better(v[j], ix[j], bv, bi)) {
+                bv = v[j];
+                bi = ix[j];
+            }
+        }
+        float wv;
+        uint wi;
+        uint wl;
+        sample_scan_pick(bv, bi, lane, wv, wi, wl);
+        if (lane == wl) {
+            for (uint j = 0u; j < 8u; ++j) {
+                if (ix[j] == wi) {
+                    v[j] = -3.402823466e38f;
+                    ix[j] = 0xffffffffu;
+                }
+            }
+        }
+        if (lane == 0u) {
+            lists_v[simd * 32u + slot] = wv;
+            lists_i[simd * 32u + slot] = wi;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd != 0u) {
+        return;
+    }
+    uint head = 0u;
+    for (uint slot = 0u; slot < topk; ++slot) {
+        const float bv = head < topk ? lists_v[lane * 32u + head] : -3.402823466e38f;
+        const uint bi = head < topk ? lists_i[lane * 32u + head] : 0xffffffffu;
+        float wv;
+        uint wi;
+        uint wl;
+        sample_scan_pick(bv, bi, lane, wv, wi, wl);
+        if (lane == wl) {
+            head += 1u;
+        }
+        if (lane == 0u) {
+            out_values[group * topk + slot] = wv;
+            out_indices[group * topk + slot] = wi;
+        }
+    }
+}
+
+// Une simdgroup : fusion des listes de groupes puis tirage, même queue que
+// `sample_topk_finalize_f32`. `run_fallback[0]` vaut 1 si un logit est
+// irrégulier : le tirage revient alors aux kernels historiques.
+kernel void sample_topk_scan_finalize_f32(
+    device const float* group_values [[buffer(0)]],
+    device const uint* group_indices [[buffer(1)]],
+    device const uint* flags [[buffer(2)]],
+    device uint* out_index [[buffer(3)]],
+    device uint* run_fallback [[buffer(4)]],
+    constant uint2& dims [[buffer(5)]],
+    constant float2& params [[buffer(6)]],
+    constant ulong& rng_state [[buffer(7)]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    const uint groups = dims.x;
+    const uint topk = dims.y;
+    const float temperature = max(params.x, 0.0001f);
+    const float top_p = params.y;
+    threadgroup float merged_partial_values[32];
+    threadgroup uint merged_partial_indices[32];
+    threadgroup uint heads[1024];
+
+    bool irregular = false;
+    for (uint f = lane; f < groups * 32u; f += 32u) {
+        irregular = irregular || flags[f] != 0u;
+    }
+    irregular = simd_any(irregular);
+    if (lane == 0u) {
+        run_fallback[0] = irregular ? 1u : 0u;
+    }
+    if (irregular) {
+        return;
+    }
+    for (uint list = lane; list < groups; list += 32u) {
+        heads[list] = 0u;
+    }
+    for (uint slot = 0u; slot < topk; ++slot) {
+        float bv = -3.402823466e38f;
+        uint bi = 0xffffffffu;
+        uint bl = 0u;
+        for (uint list = lane; list < groups; list += 32u) {
+            const uint head = heads[list];
+            if (head < topk) {
+                const float value = group_values[list * topk + head];
+                const uint index = group_indices[list * topk + head];
+                if (topk_better(value, index, bv, bi)) {
+                    bv = value;
+                    bi = index;
+                    bl = list;
+                }
+            }
+        }
+        float wv;
+        uint wi;
+        uint wl;
+        sample_scan_pick(bv, bi, lane, wv, wi, wl);
+        if (lane == wl) {
+            heads[bl] += 1u;
+        }
+        if (lane == 0u) {
+            merged_partial_values[slot] = wv;
+            merged_partial_indices[slot] = wi;
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0u) {
         const float max_value = merged_partial_values[0];
         float probs[32];
         float denom = 0.0f;
