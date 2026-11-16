@@ -150,3 +150,18 @@ fn tiled_convolutions_match_gather_bitwise() -> Result<()> {
     );
     Ok(())
 }
+
+/// Les constantes `TILE_*` décrivent la source Metal : `CT_BN`, `CT_BK`, les
+/// deux instanciations TM et les 128 threads de la disposition `tid`.
+#[test]
+fn tile_constants_match_metal_source() {
+    assert!(CODEC_KERNELS.contains(&format!("#define CT_BN {TILE_N}u")));
+    assert!(CODEC_KERNELS.contains(&format!("#define CT_BK {TILE_K}u")));
+    assert!(CODEC_KERNELS.contains(&format!(
+        "CODEC_CONV_TILED_KERNEL(codec_conv_tiled_f32, {}u)",
+        TILE_M / 16
+    )));
+    assert!(CODEC_KERNELS.contains("CODEC_CONV_TILED_KERNEL(codec_conv_tiled_small_f32, 1u)"));
+    assert_eq!(TILE_THREADS, 128);
+    assert!(CODEC_KERNELS.contains("tid + 128u * e"));
+}

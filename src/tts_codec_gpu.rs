@@ -126,7 +126,9 @@ kernel void codec_transpose1d_f32(
 // Chaque sortie garde l'accumulation du kernel gather (biais d'abord pour la conv,
 // à la fin pour la transposée ; prises puis canaux dans l'ordre croissant) : une
 // ligne hors bornes charge 0 au lieu d'être sautée, ce qui laisse l'accumulateur
-// inchangé tant qu'il n'est pas un zéro signé.
+// inchangé tant qu'il n'est pas un zéro signé. Seule exception : un poids NaN ou
+// infini donne 0·w = NaN là où le gather sautait la prise ; les poids du codec
+// sont finis.
 // p = [out_time, out_dim, inner, ksize, dilation, pad, x_time, has_bias, out_start,
 //      transpose, stride, taps, has_residual]
 // Conv : ligne de sortie `row`, prise k lit x[row + out_start + k·dilation - pad].
@@ -309,14 +311,19 @@ kernel void codec_tail_rows_f32(
 
 const TG_2D: (u64, u64) = (32, 8);
 const TG_1D: u64 = 256;
-/// Tuile de `codec_conv_tiled_f32` : lignes, canaux de sortie, canaux
-/// d'entrée par tranche, threads (mêmes valeurs que `CT_BM`/`CT_BN`/`CT_BK`).
+/// Tuile de `codec_conv_tiled_f32` : lignes (16·TM, TM = 4), canaux de sortie
+/// (`CT_BN`), canaux d'entrée par tranche (`CT_BK`) et threads de la
+/// disposition `tid`. Cohérence avec la source Metal vérifiée par le test
+/// `tile_constants_match_metal_source`.
 const TILE_M: u64 = 64;
 const TILE_N: usize = 32;
 const TILE_K: usize = 16;
 const TILE_THREADS: u64 = 128;
 /// Seuil de grille (threadgroups en tuiles de 64 lignes) sous lequel les tuiles
 /// de 16 lignes prennent le relais : 2 par cœur sur un M5 Max à 40 cœurs.
+///
+/// NOTE: seuil calé sur le M5 Max (40 cœurs GPU) ; une puce à moins de cœurs
+/// garde un PCM identique (même accumulation) mais peut préférer un autre seuil.
 const TILE_SMALL_BELOW: u64 = 80;
 
 /// Métadonnées + buffer GPU d'une convolution (poids réorganisé une fois).
@@ -1518,6 +1525,8 @@ fn set_params(encoder: &ComputeCommandEncoderRef, index: u64, params: &[u32]) {
 fn dispatch_2d(encoder: &ComputeCommandEncoderRef, dim_x: usize, dim_y: usize) {
     // Une seule colonne (conv finale mono) : threadgroups en colonne, sinon
     // 31 threads sur 32 sortent aussitôt. Même calcul par thread.
+    // NOTE: `SARAGOSSA_TTS_CODEC_CONV_TILED=0` ne restaure pas l'ancienne
+    // géométrie (32, 8) : elle reste en colonne pour le gather, PCM inchangé.
     let (tgx, tgy) = if dim_x == 1 { (1, 256) } else { TG_2D };
     let groups = MTLSize::new(ceil_div(dim_x as u64, tgx), ceil_div(dim_y as u64, tgy), 1);
     encoder.dispatch_thread_groups(groups, MTLSize::new(tgx, tgy, 1));
