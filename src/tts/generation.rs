@@ -257,7 +257,10 @@ impl TtsModel {
 
     /// Couches du talker en 8 dispatches (`SARAGOSSA_TTS_TALKER_FUSED_KERNELS`),
     /// identiques au bit au chemin général. `false` : chemin général.
-    fn enable_talker_fused_layers(&self, cache: &mut crate::CausalDecoderCache) -> Result<bool> {
+    pub(super) fn enable_talker_fused_layers(
+        &self,
+        cache: &mut crate::CausalDecoderCache,
+    ) -> Result<bool> {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if crate::runtime_flags::tts_talker_fused_kernels_enabled() {
             return self.talker.enable_tts_fused_layers(cache);

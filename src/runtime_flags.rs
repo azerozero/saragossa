@@ -800,6 +800,7 @@ thread_local! {
     static QKV_CONCAT_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
     static PREFILL_RESIDENT_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
     static ROPE_APPEND_KV_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    static TTS_TALKER_FUSED_KERNELS_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 /// Force la rotation de K fusionnée à l'append K/V sur ce thread le temps
@@ -3051,8 +3052,21 @@ pub(crate) fn tts_cp_fused_kernels_enabled() -> bool {
 /// Sorties identiques au bit au chemin général. Défaut ON ;
 /// `SARAGOSSA_TTS_TALKER_FUSED_KERNELS=0` rétablit les 16 dispatches par couche.
 pub(crate) fn tts_talker_fused_kernels_enabled() -> bool {
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    if let Some(forced) = TTS_TALKER_FUSED_KERNELS_TEST_OVERRIDE.with(Cell::get) {
+        return forced;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_TALKER_FUSED_KERNELS", true))
+}
+
+/// Force les couches du talker sur ce thread, puis rétablit le réglage précédent.
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) fn with_tts_talker_fused_kernels_override<R>(
+    enabled: bool,
+    run: impl FnOnce() -> R,
+) -> R {
+    with_test_override(&TTS_TALKER_FUSED_KERNELS_TEST_OVERRIDE, enabled, run)
 }
 
 /// Codec TTS streaming sur un thread dédié, en recouvrement de la génération
