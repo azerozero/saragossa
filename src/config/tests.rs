@@ -2,6 +2,33 @@ use super::*;
 use proptest::prelude::*;
 
 #[test]
+fn preserves_outer_vision_config_when_resolving_text() -> crate::Result<()> {
+    let mut value = serde_json::json!({
+        "model_type": "qwen3_5",
+        "vision_config": {"depth": 27},
+        "text_config": {
+            "hidden_size": 4, "num_hidden_layers": 1,
+            "num_attention_heads": 2, "num_key_value_heads": 2,
+            "rms_norm_eps": 0.000001, "rope_theta": 10000, "vocab_size": 3
+        }
+    });
+    let raw: RawModelConfig = serde_json::from_value(value.clone())
+        .map_err(|e| crate::InferError::Config(e.to_string()))?;
+    assert_eq!(
+        raw.resolve()?.vision_config,
+        Some(value["vision_config"].clone())
+    );
+    value
+        .as_object_mut()
+        .expect("invariant: objet JSON littéral")
+        .remove("vision_config");
+    let raw: RawModelConfig =
+        serde_json::from_value(value).map_err(|e| crate::InferError::Config(e.to_string()))?;
+    assert!(raw.resolve()?.vision_config.is_none());
+    Ok(())
+}
+
+#[test]
 fn resolves_flat_qwen_config() {
     let raw = r#"{
             "model_type":"qwen3",

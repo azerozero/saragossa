@@ -28,6 +28,23 @@ pub(crate) fn force_resident_full_linear_decode() {}
 /// Préfixe canonique des variables d'environnement du moteur.
 const ENV_PREFIX: &str = "SARAGOSSA_";
 
+/// Kill-switch vision : `VISION=0` (défaut) maintient le chargement texte.
+/// `VISION=1` demande la vision, refusée tant que le moteur ne l'implémente pas.
+///
+/// # Errors
+/// Refuse les valeurs mal formées au lieu d'activer un chemin par accident.
+pub fn vision_enabled() -> crate::Result<bool> {
+    vision_flag_value(env_var_exact("VISION").as_deref())
+}
+
+fn vision_flag_value(value: Option<&str>) -> crate::Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) => env_flag_value(value)
+            .ok_or_else(|| crate::InferError::Config("VISION : booléen invalide".into())),
+    }
+}
+
 thread_local! {
     static DECISION_NONCAUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DECISION_HEADLESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -2456,6 +2473,9 @@ const SNAPSHOT_OPERATIONAL_SERVE_FLAGS: &[&str] = &[
 ];
 
 fn snapshot_environment_name(name: &[u8]) -> bool {
+    if name == b"VISION" {
+        return true;
+    }
     let Some(suffix) = name
         .strip_prefix(ENV_PREFIX.as_bytes())
         .or_else(|| name.strip_prefix(LEGACY_ENV_PREFIX.as_bytes()))
@@ -2492,6 +2512,15 @@ fn hash_environment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vision_kill_switch_is_fail_closed_and_fingerprinted() {
+        assert_eq!(super::vision_flag_value(None).ok(), Some(false));
+        assert_eq!(super::vision_flag_value(Some("0")).ok(), Some(false));
+        assert_eq!(super::vision_flag_value(Some("1")).ok(), Some(true));
+        assert!(super::vision_flag_value(Some("invalid")).is_err());
+        assert!(super::snapshot_environment_name(b"VISION"));
+    }
+
     #[test]
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn gemma4_prefill_default_dispatch_and_kill_switch() {

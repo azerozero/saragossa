@@ -63,6 +63,10 @@ fn qwen35_offset_is_scoped_to_hf_layout_family_and_exact_norms() {
                     "layers.0.linear_attn.dt_bias".to_string(),
                     dense(&[1], &[0.25]),
                 ),
+                (
+                    "model.visual.norm.weight".to_string(),
+                    dense(&[2], &[0.5, -0.25]),
+                ),
             ]);
             for key in OFFSET_NORMS {
                 tensors.insert((*key).to_string(), dense(&[2], &[0.5, -0.25]));
@@ -90,7 +94,14 @@ fn qwen35_offset_is_scoped_to_hf_layout_family_and_exact_norms() {
 
 /// Réencode la fixture hybride en BF16 HF ou MLX. Les poids de norme HF
 /// valent zéro, ceux de MLX un : sans sanitize, les logits HF s'annulent.
-fn write_checkpoint(path: &Path, prefix: &str, head: &str, hf: bool, tied: bool) {
+fn write_checkpoint(
+    path: &Path,
+    prefix: &str,
+    head: &str,
+    hf: bool,
+    tied: bool,
+    invalid_vision: bool,
+) {
     let baseline = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
     write_hybrid_safetensors(baseline.path());
     let bytes = std::fs::read(baseline.path()).expect("invariant: fixture lisible");
@@ -123,14 +134,17 @@ fn write_checkpoint(path: &Path, prefix: &str, head: &str, hf: bool, tied: bool)
             .collect::<Vec<_>>();
         owned.push((name, shape, payload));
     }
-    // Ces sections ne doivent ni fournir les poids texte, ni déclencher
-    // l'offset dans un export MLX dont le tronc est déjà sanitizé.
+    // MTP ne doit pas fournir les poids texte ni déclencher leur offset.
+    // Les sentinelles vision invalides restent ignorées en chargement texte.
     for name in [
         "model.visual.norm.weight",
         "mtp.norm.weight",
         "mtp.layers.0.linear_attn.conv1d.weight",
         "model.visual.linear_attn.conv1d.weight",
     ] {
+        if name.starts_with("model.visual.") && !invalid_vision {
+            continue;
+        }
         let shape = if name.ends_with("conv1d.weight") {
             vec![2, 1, 2]
         } else {
@@ -173,8 +187,9 @@ fn qwen35_hf_bf16_matches_sanitized_mlx_tensors_and_cpu_logits() -> Result<()> {
             ("language_model.model.", "language_model.lm_head.", true),
         ] {
             let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
-            write_checkpoint(tmp.path(), prefix, head, hf, tied);
             let shards = [tmp.path().to_path_buf()];
+            // Une tour vision non prise en charge ne doit pas changer le texte.
+            write_checkpoint(tmp.path(), prefix, head, hf, tied, true);
             let catalog = WeightCatalog::from_shards(&shards)?;
             let tensors =
                 load_decoder_tensors(&config, &shards, &catalog, &QwenPrefixes::detect(&catalog))?;

@@ -148,6 +148,7 @@ pub mod lora;
 mod quantized;
 pub mod qwen4_exp;
 mod shape_validation;
+pub mod vision;
 
 pub use self::lora::LoraAdapter;
 #[cfg(test)]
@@ -164,6 +165,8 @@ pub type QwenDecoderContract = DecoderContract;
 /// Résumé de validation header-only d'un décodeur causal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecoderContract {
+    /// Tenseurs vision reconnus et validés, exclus du chargement texte.
+    pub vision_tensor_count: usize,
     /// Nombre de shards safetensors inspectés.
     pub shard_count: usize,
     /// Nombre de tenseurs catalogués dans les headers safetensors.
@@ -350,6 +353,11 @@ pub fn verify_decoder_contract_from_shards(
     let required_specs = specs.iter().filter(|spec| spec.required).count();
     let present_specs = metas.len();
     Ok(DecoderContract {
+        vision_tensor_count: headers
+            .iter()
+            .flat_map(|header| header.tensors.keys())
+            .filter(|name| vision::tensor_name(name).is_some())
+            .count(),
         shard_count: shards.len(),
         catalog_tensors: catalog.tensor_count(),
         required_specs,
@@ -471,6 +479,9 @@ pub fn load_qwen_causal_decoder_from_shards_with_memory_guard(
 }
 
 fn validate_supported_config(config: &ModelConfig, catalog: &WeightCatalog) -> Result<()> {
+    if crate::runtime_flags::vision_enabled()? {
+        vision::require_implementation(catalog)?;
+    }
     // Gemma 2 déclare un softcapping (tanh) des scores d'attention et des logits
     // finaux que le forward n'implémente pas : refuser net plutôt que générer du
     // charabia. Gemma 3 sérialise ces clés à `null` (qk-norm a remplacé le cap).
@@ -558,6 +569,7 @@ fn validate_no_orphan_tensors(
     specs: &[TensorSpec],
     entries: &HashMap<String, TensorEntryRef>,
 ) -> Result<()> {
+    vision::validate_headers(config, entries)?;
     if !config.is_flint() {
         return Ok(());
     }
@@ -1116,6 +1128,14 @@ pub(crate) fn read_shard_header(path: &Path) -> Result<ShardHeader> {
                 path: path.to_path_buf(),
                 message: format!("offsets invalides pour {name}: {:?}", entry.data_offsets),
             });
+        }
+        if vision::tensor_name(&name).is_some() {
+            // Les payloads vision restent non chargés, mais leur plage doit
+            // exister : un export tronqué n'est pas un encodeur valide.
+            let offset = (8 + header_len)
+                .checked_add(entry.data_offsets[0] as u64)
+                .ok_or_else(|| InferError::Shape("offset vision trop grand".into()))?;
+            crate::safetensor::check_file_range(&file, offset, entry.payload_len(&name)?, &name)?;
         }
         tensors.insert(name, entry);
     }
