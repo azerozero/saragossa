@@ -85,10 +85,12 @@ pub(crate) fn nax_source_prelude() -> &'static str {
 }
 
 /// QMV micro à quatre lignes par simdgroup (`micro_qmv4_*`), égal au bit au
-/// QMV à une ligne. Kill-switch `SARAGOSSA_RUST_MICRO_QMV_ROWS4=0`.
+/// QMV à une ligne. Opt-in `SARAGOSSA_RUST_MICRO_QMV_ROWS4=1` : la sonde M=1
+/// gagne 7 à 13 % de bande passante, mais le decode mxfp4 du 27B perd 13 %
+/// (31,2 → 27,2 tok/s, 16 nov. 2026), quatre fois moins de simdgroups en vol.
 pub(crate) fn micro_qmv_rows4_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MICRO_QMV_ROWS4", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MICRO_QMV_ROWS4", false))
 }
 
 /// Même fusion pour les poids à micro-échelles (`micro_gemm_gate_up_swiglu_*`),
