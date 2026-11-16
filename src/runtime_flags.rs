@@ -2189,6 +2189,32 @@ pub fn serve_max_connections() -> usize {
     })
 }
 
+/// Flux DFN3 simultanés (`SARAGOSSA_ENHANCE_MAX_STREAMS`, défaut 2).
+/// Une admission refusée répond 503 sans lire le corps.
+pub fn enhance_max_streams() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        env_var("SARAGOSSA_ENHANCE_MAX_STREAMS")
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(2)
+    })
+}
+
+/// Inactivité maximale par lecture ou écriture DFN3, en secondes
+/// (`SARAGOSSA_ENHANCE_IDLE_TIMEOUT_SECS`, défaut 30). Aucun plafond de durée.
+pub fn enhance_idle_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        Duration::from_secs(
+            env_var("SARAGOSSA_ENHANCE_IDLE_TIMEOUT_SECS")
+                .and_then(|v| v.trim().parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(30),
+        )
+    })
+}
+
 /// Profondeur de la file de requêtes en attente du thread moteur de
 /// `saragossa serve` (`SARAGOSSA_SERVE_QUEUE`, 32 par défaut). L'inférence
 /// reste sérielle : une file pleine répond 503 plutôt que d'accumuler des
@@ -2475,6 +2501,8 @@ pub(crate) fn environment_sha256() -> &'static str {
 /// Liste fermée (suffixes communs à SARAGOSSA_ et RETI_) ; les flags inconnus,
 /// le batching et la géométrie des blocs restent dans l'empreinte par prudence.
 const SNAPSHOT_OPERATIONAL_SERVE_FLAGS: &[&str] = &[
+    "ENHANCE_MAX_STREAMS",
+    "ENHANCE_IDLE_TIMEOUT_SECS",
     "SERVE_LOG_PROMPT_FINGERPRINT",
     "SERVE_LRU",
     "SERVE_MAX_CONNECTIONS",

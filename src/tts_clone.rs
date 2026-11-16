@@ -172,7 +172,7 @@ fn upfirdn(
     out
 }
 
-fn firwin_lowpass(numtaps: usize, cutoff: f64, beta: f64) -> Vec<f64> {
+pub(crate) fn firwin_lowpass(numtaps: usize, cutoff: f64, beta: f64) -> Vec<f64> {
     let win = kaiser_window(numtaps, beta);
     let center = (numtaps - 1) as f64 / 2.0;
     let mut h = (0..numtaps)
@@ -296,7 +296,7 @@ fn mel_to_hz(mel: f32) -> f32 {
     }
 }
 
-fn gcd(a: u32, b: u32) -> u32 {
+pub(crate) fn gcd(a: u32, b: u32) -> u32 {
     if b == 0 {
         a
     } else {
