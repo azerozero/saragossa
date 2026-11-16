@@ -3179,6 +3179,11 @@ pub(crate) fn tts_codec_decoder_only_enabled() -> bool {
     env_flag("SARAGOSSA_TTS_CODEC_DECODER_ONLY", true)
 }
 
+/// Relit les poids CPU du codec à leur premier usage après l'upload Metal.
+pub(crate) fn tts_codec_lazy_cpu_enabled() -> bool {
+    env_flag("SARAGOSSA_TTS_CODEC_LAZY_CPU", true)
+}
+
 /// Force le décodage glouton TTS historique pour les oracles.
 #[must_use]
 pub fn tts_greedy_enabled() -> bool {

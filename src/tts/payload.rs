@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SafetensorPayload {
     path: PathBuf,
     data_start: u64,
