@@ -24,3 +24,10 @@ condition = "AND"
 paths = ['''^tests/fixtures/vision/manifest\.json$''']
 regexTarget = "line"
 regexes = ['''^\s*"tokenizer_sha256": "[0-9a-f]{64}",?\s*$''']
+
+[[allowlists]]
+description = "SHA256 publics des fichiers de la calibration LLM vision"
+condition = "AND"
+paths = ['''^tests/fixtures/vision/[^/]+/llm-calibration\.json$''']
+regexTarget = "line"
+regexes = ['''^\s*"[^"]+": "[0-9a-f]{64}",?\s*$''']
