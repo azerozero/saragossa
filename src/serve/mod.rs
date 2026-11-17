@@ -29,6 +29,10 @@
 //! tout autre changement ou chemin de modèle illisible est refusé en bloc (voir
 //! `reload`).
 //!
+//! SIGUSR2 relaie sans coupure vers le binaire du même chemin (ou
+//! `--upgrade-binary PATH`) : l'enfant hérite de la socket d'écoute, puis
+//! l'ancien processus vide ses connexions et sort (voir `relay`).
+//!
 //! Hors débruitage duplex (`enhance`), le parseur accepte les corps à `Content-Length`.
 //! `Transfer-Encoding` seul répond 501 ; avec `Content-Length`, ou un
 //! `Content-Length` répété ou non numérique, le cadrage ambigu répond 400.
@@ -66,6 +70,8 @@ mod model_selection;
 pub(crate) mod mtp;
 #[cfg(feature = "serve")]
 mod protocol;
+#[cfg(all(feature = "serve", unix))]
+mod relay;
 #[cfg(feature = "serve")]
 mod reload;
 #[cfg(feature = "serve")]
@@ -123,10 +129,12 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         println!("{}", args::help_text());
         return Ok(());
     }
-    let (config_path, sets, raw_args) = take_config_args(raw_args).map_err(boxed_error)?;
+    let (config_path, sets, mut raw_args) = take_config_args(raw_args).map_err(boxed_error)?;
     let resolved = saragossa::runtime_flags::Resolved::resolve(config_path.as_deref(), &sets)?;
     resolved.install();
     let profile = resolved.profile.clone();
+    #[cfg(unix)]
+    relay::configure(&mut raw_args, profile.serve.drain_timeout_secs).map_err(boxed_error)?;
     let mut args = ServeArgs::parse_with(&profile, raw_args.clone()).map_err(boxed_error)?;
     // Sans profil, SIGHUP garde son effet par défaut (arrêt du processus).
     if config_path.is_some() {

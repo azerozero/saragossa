@@ -276,6 +276,7 @@ pub(super) fn help_text() -> String {
          [--model-27b DIR] [--model-35b DIR] \\
          {modality_options}[--backend cpu|metal] [--preload] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
          Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap and the [[models]] list (id, path) only. See `saragossa config print`.\n\
+         Upgrade (Unix): SIGUSR2 starts the same binary path (or --upgrade-binary PATH) with the same arguments on the inherited listening socket, then the old process drains for at most serve.drain_timeout_secs (30) and exits.\n\
          SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
          --prefix-cache-ssd-priority-tokens 4096 (0 disables priority).\n\
          Models: repeat --model to expose any supported checkpoint. A bare path \\
