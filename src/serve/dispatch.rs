@@ -244,7 +244,9 @@ fn run_engine<S: ServeStream>(
     max_streams: usize,
 ) {
     // Plafond `max_tokens` pour la validation d'admission, `None` sans lots.
-    let batching = (max_streams > 1).then(|| state.max_tokens_cap());
+    // NOTE: relu à chaque admission : un rechargement SIGHUP du plafond joue
+    // aussi sur l'éligibilité ; un job déjà en file est validé au plafond courant.
+    let batching = |state: &ServeState| (max_streams > 1).then(|| state.max_tokens_cap());
     // NOTE: les jobs de `pending` gardent leur place d'attente : canal et
     // file locale restent ensemble sous `SARAGOSSA_SERVE_QUEUE`.
     let pending_cap = serve_queue_depth();
@@ -254,7 +256,7 @@ fn run_engine<S: ServeStream>(
         let leader = match pending.pop_front() {
             Some(queued) => queued,
             None => match next_job(queue, state) {
-                Some(job) => Queued::new(job, batching, state),
+                Some(job) => Queued::new(job, batching(state), state),
                 None => break,
             },
         };
@@ -267,7 +269,7 @@ fn run_engine<S: ServeStream>(
             continue;
         };
         drain_queue(queue, &mut pending, pending_cap, |job| {
-            Queued::new(job, batching, state)
+            Queued::new(job, batching(state), state)
         });
         let others = take_batch(
             &mut pending,
@@ -758,6 +760,9 @@ mod tests {
 
     #[test]
     fn model_lookup_uses_registry_and_auth_without_engine() {
+        let _serial = super::super::reload::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (dispatcher, rx) = dispatcher_with(Some("test-key"), 2, usize::MAX, 1);
         for (path, authorized, status) in [
             ("/v1/models/alpha", false, 401),

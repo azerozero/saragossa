@@ -53,6 +53,10 @@ fn lock(
     slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Sérialise les tests qui lisent ou écrivent les listes globales.
+#[cfg(test)]
+pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Déclare la liste du lancement, HF résolus ; avant, SIGHUP est refusé.
 pub(super) fn set_launch_models(models: &[ServeModelConfig]) {
     *lock(&MODELS) = Some(models.to_vec());
@@ -237,6 +241,15 @@ mod tests {
     // Un seul test : les atomiques sont globales au processus.
     #[test]
     fn hot_keys_apply_and_frozen_keys_are_refused() {
+        // Les atomiques sont globales : les remettre à 0 même en cas d'échec.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                READ_TIMEOUT_SECS.store(0, Ordering::Relaxed);
+                MAX_TOKENS_CAP.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = Reset;
         let dir = std::env::temp_dir().join(format!("saragossa-reload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dossier temporaire");
         let file = dir.join("p.toml");
@@ -287,6 +300,16 @@ mod tests {
     // Un seul test touche aux listes globales MODELS et PENDING.
     #[test]
     fn model_list_is_atomic_and_applied_by_the_engine() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Listes globales : les vider même en cas d'échec.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                *lock(&MODELS) = None;
+                *lock(&PENDING) = None;
+            }
+        }
+        let _reset = Reset;
         let dir = std::env::temp_dir().join(format!("saragossa-models-{}", std::process::id()));
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::create_dir_all(&a).expect("dossier a");
