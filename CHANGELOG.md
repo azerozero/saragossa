@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8](https://github.com/azerozero/saragossa/compare/v0.3.7...v0.3.8) - 2026-11-17
+
+### Added
+
+- *(diar)* intègre main et rend la diarisation optionnelle
+- *(diarisation)* diarisation hors ligne Nemotron-3-Diarization
+
+### Fixed
+
+- *(build)* réserve l'attention à clés masquées à stt et diar
+- *(diar)* valide les dimensions et borne la lecture WAV
+
 ## [0.3.7](https://github.com/azerozero/saragossa/compare/v0.3.6...v0.3.7) - 2026-11-17
 
 ### Added
