@@ -85,6 +85,8 @@ pub struct ServeSection {
     pub read_timeout_secs: Option<u64>,
     /// Équivalent de `--max-tokens-cap`.
     pub max_tokens_cap: Option<u64>,
+    /// Délai max de vidage de l'ancien processus après un relais SIGUSR2.
+    pub drain_timeout_secs: Option<u64>,
 }
 
 /// Section `[enhance]`.
@@ -155,6 +157,7 @@ impl Profile {
             ("serve.max_inflight_bytes", self.serve.max_inflight_bytes),
             ("serve.read_timeout_secs", self.serve.read_timeout_secs),
             ("serve.max_tokens_cap", self.serve.max_tokens_cap),
+            ("serve.drain_timeout_secs", self.serve.drain_timeout_secs),
             ("enhance.max_streams", self.enhance.max_streams),
             ("enhance.idle_timeout_secs", self.enhance.idle_timeout_secs),
             ("memory.cap_bytes", self.memory.cap_bytes),
@@ -236,6 +239,12 @@ impl Profile {
                 num(s.read_timeout_secs),
             ),
             r("serve.max_tokens_cap", None, "4096", num(s.max_tokens_cap)),
+            r(
+                "serve.drain_timeout_secs",
+                None,
+                "30",
+                num(s.drain_timeout_secs),
+            ),
             r(
                 "enhance.max_streams",
                 Some("SARAGOSSA_ENHANCE_MAX_STREAMS"),
