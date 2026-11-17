@@ -6,3 +6,4 @@ src/**/*.txt text eol=lf
 # Charges utiles brutes (f32 ou utf8) vérifiées par SHA-256 : aucune conversion.
 tests/fixtures/goldens/**/*.bin -text
 tests/fixtures/vision/**/*.bin -text
+tests/fixtures/vision/preprocess/*.bin binary

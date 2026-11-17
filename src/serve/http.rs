@@ -1289,6 +1289,33 @@ mod tests {
     }
 
     #[test]
+    fn vision_media_refusal_follows_compiled_feature() {
+        for content in [
+            serde_json::json!([{"type": "image_url", "image_url": {"url": "unused"}}]),
+            serde_json::json!([{"type": "input_video"}]),
+            serde_json::json!("<|image_pad|>"),
+        ] {
+            let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "unused", "messages": [{"role": "user", "content": content}]
+            }))
+            .expect("invariant: requête synthétique valide");
+            let error = chat.validate(512).expect_err("média non pris en charge");
+            let mut response = Vec::new();
+            send_failure(&mut response, &error, false).expect("invariant: écriture dans un Vec");
+            let response = String::from_utf8_lossy(&response);
+            let status = if cfg!(feature = "vision") { 400 } else { 501 };
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{response}"
+            );
+            assert!(response.contains("messages.content"), "{response}");
+            if !cfg!(feature = "vision") {
+                assert!(response.contains("--features vision"), "{response}");
+            }
+        }
+    }
+
+    #[test]
     fn rejects_chunked_and_ambiguous_framing() {
         for (headers, status) in [
             ("Transfer-Encoding: chunked\r\n", "501"),

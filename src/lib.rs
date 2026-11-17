@@ -69,6 +69,9 @@ pub(crate) mod tts_codec_gpu;
 pub mod tts_mimi;
 #[cfg(feature = "tts")]
 pub mod tts_speaker;
+#[cfg(feature = "vision")]
+pub mod vision;
+#[cfg(not(feature = "vision"))]
 pub(crate) mod vision;
 #[cfg(feature = "stt")]
 pub mod whisper;
