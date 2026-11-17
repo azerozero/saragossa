@@ -60,27 +60,44 @@ fn reload(
     Ok((next, changed))
 }
 
-/// Installe le gestionnaire SIGHUP et son thread de rechargement.
+// Un bit par numéro de signal levé et pas encore consommé.
+#[cfg(unix)]
+static RAISED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+extern "C" fn on_signal(signal: libc::c_int) {
+    // NOTE: un RMW atomique sans verrou, seule opération du gestionnaire.
+    RAISED.fetch_or(1 << signal, Ordering::Relaxed);
+}
+
+/// Remplace l'action de `signal` par la levée d'un drapeau, lu par [`take`].
 #[cfg(unix)]
 #[allow(unsafe_code)]
-pub(super) fn watch(source: Option<String>, sets: Vec<String>, cli: Vec<String>, profile: Profile) {
-    use std::sync::atomic::AtomicBool;
-    static HUP: AtomicBool = AtomicBool::new(false);
-    extern "C" fn on_hup(_: libc::c_int) {
-        HUP.store(true, Ordering::Relaxed);
-    }
-    // SAFETY: le gestionnaire ne fait qu'un store atomique, async-signal-safe.
+pub(super) fn trap(signal: libc::c_int) {
+    // SAFETY: le gestionnaire ne fait qu'un `fetch_or` atomique, async-signal-safe.
     unsafe {
         libc::signal(
-            libc::SIGHUP,
-            on_hup as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            signal,
+            on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
         );
     }
+}
+
+/// Consomme le drapeau de `signal` : vrai s'il a été levé depuis le dernier appel.
+#[cfg(unix)]
+pub(super) fn take(signal: libc::c_int) -> bool {
+    RAISED.fetch_and(!(1 << signal), Ordering::Relaxed) & (1 << signal) != 0
+}
+
+/// Installe le gestionnaire SIGHUP et son thread de rechargement.
+#[cfg(unix)]
+pub(super) fn watch(source: Option<String>, sets: Vec<String>, cli: Vec<String>, profile: Profile) {
+    trap(libc::SIGHUP);
     std::thread::spawn(move || {
         let mut current = profile;
         loop {
             std::thread::sleep(Duration::from_millis(250));
-            if !HUP.swap(false, Ordering::Relaxed) {
+            if !take(libc::SIGHUP) {
                 continue;
             }
             match reload(source.as_deref(), &sets, &cli, &current) {
