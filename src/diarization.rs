@@ -641,6 +641,19 @@ impl DiarizationModel {
                 weight_bf16: None,
             })
         };
+        // NOTE: emplacement inerte d'un q/k/v remplacé par `qkv`.
+        static PLACEHOLDER: [f32; 1] = [0.0];
+        let separate = |linear: &Linear, fused: bool| -> Result<WhisperResidentProj> {
+            if !fused {
+                return proj(linear);
+            }
+            Ok(WhisperResidentProj {
+                weight: metal.cached_buffer_from_f32(&PLACEHOLDER, "diar_proj_unused")?,
+                bias: None,
+                weight_na: None,
+                weight_bf16: None,
+            })
+        };
         let norm = |n: &Norm| -> Result<WhisperResidentNorm> {
             Ok(WhisperResidentNorm {
                 weight: metal.cached_buffer_from_f32(n.weight.data(), "diar_ln_w")?,
@@ -653,9 +666,11 @@ impl DiarizationModel {
             .map(|l| {
                 Ok(WhisperResidentLayer {
                     self_ln: norm(&l.ln1)?,
-                    q: proj(&l.q)?,
-                    k: proj(&l.k)?,
-                    v: proj(&l.v)?,
+                    // Fusionné : q/k/v séparés ne sont jamais lus, on évite de
+                    // dupliquer ~3d² poids par couche sur le GPU.
+                    q: separate(&l.q, l.qkv.is_some())?,
+                    k: separate(&l.k, l.qkv.is_some())?,
+                    v: separate(&l.v, l.qkv.is_some())?,
                     qkv: l.qkv.as_ref().map(&proj).transpose()?,
                     o: proj(&l.o)?,
                     final_ln: norm(&l.ln2)?,

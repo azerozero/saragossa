@@ -372,8 +372,8 @@ fn metal_rope_encoder_matches_cpu_oracle() -> Result<()> {
 
 /// Résident fusionné contre résident séparé, biais q/v non nuls. La séparation
 /// est une copie ; seul l'ordre d'accumulation du GEMM `[3d, d]` peut différer
-/// (autre tuile sur N = 3d), soit quelques 1e-7 relatifs amplifiés sur 2 couches.
-/// 1e-4 reste dix fois plus serré que la tolérance CPU/Metal (1e-3).
+/// (autre tuile sur N = 3d). 1e-4 est une borne a priori, non mesurée : l'écart
+/// observé est journalisé pour la resserrer après le run de nuit.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
 #[ignore = "GPU Metal"]
@@ -401,6 +401,7 @@ fn metal_fused_qkv_matches_separate_projections() -> Result<()> {
         .zip(want.data())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f32::max);
+    eprintln!("écart max fusionné/séparé : {max:e}");
     assert!(max < 1e-4, "écart fusionné/séparé {max}");
     Ok(())
 }
