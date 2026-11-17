@@ -205,6 +205,18 @@ pub(super) fn route_front<S: Write>(
             return Some(send_error(stream, 401, "authentification bearer requise"));
         }
     }
+    #[cfg(feature = "webtransport")]
+    if request.method == "GET" && path == "/v1/audio/enhance/certificate" {
+        return Some((|| match front.enhance.certificate_info()? {
+            Some(info) => send_json(
+                stream,
+                200,
+                &info,
+                vec![("Cache-Control", "no-store".into())],
+            ),
+            None => send_error(stream, 503, "listener WebTransport non activé"),
+        })());
+    }
     if request.method == "GET" && path == "/v1/models" {
         let models = ModelsResponse::from_ids(&front.model_ids);
         return Some(send_json(stream, 200, &models, Vec::new()));

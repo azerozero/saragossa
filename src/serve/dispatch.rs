@@ -183,7 +183,7 @@ where
             read_timeout,
         }),
     };
-    #[cfg(feature = "h2")]
+    #[cfg(any(feature = "h2", feature = "webtransport"))]
     let _transports = super::enhance::async_io::start(
         Arc::clone(&dispatcher.front),
         Arc::clone(&dispatcher.connections),

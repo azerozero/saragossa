@@ -11,12 +11,16 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "h2")]
+#[cfg(any(feature = "h2", feature = "webtransport"))]
 pub(super) mod async_io;
+#[cfg(feature = "webtransport")]
+pub(super) mod certificate;
 #[cfg(feature = "h2")]
 pub(super) mod h2;
-#[cfg(any(feature = "ws", feature = "h2"))]
+#[cfg(any(feature = "ws", feature = "h2", feature = "webtransport"))]
 pub(super) mod pcm;
+#[cfg(feature = "webtransport")]
+pub(super) mod webtransport;
 #[cfg(feature = "ws")]
 pub(super) mod ws;
 
@@ -24,6 +28,8 @@ pub(super) struct EnhanceService {
     path: Option<PathBuf>,
     model: Mutex<Option<Arc<DeepFilterNet3>>>,
     active: Arc<AtomicUsize>,
+    #[cfg(feature = "webtransport")]
+    certificate: Mutex<Option<certificate::CertificateInfo>>,
 }
 
 impl EnhanceService {
@@ -32,7 +38,16 @@ impl EnhanceService {
             path,
             model: Mutex::new(None),
             active: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "webtransport")]
+            certificate: Mutex::new(None),
         }
+    }
+    #[cfg(feature = "webtransport")]
+    pub(super) fn certificate_info(&self) -> ServeResult<Option<certificate::CertificateInfo>> {
+        self.certificate
+            .lock()
+            .map(|info| info.clone())
+            .map_err(|_| ServeError::args("verrou certificat indisponible"))
     }
     fn model(&self) -> ServeResult<Arc<DeepFilterNet3>> {
         let mut loaded = self
@@ -212,7 +227,7 @@ fn write_chunk(writer: &mut impl Write, bytes: &[u8]) -> ServeResult<()> {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, any(feature = "ws", feature = "h2")))]
+#[cfg(all(test, any(feature = "ws", feature = "h2", feature = "webtransport")))]
 mod test_support;
 
 #[cfg(all(test, feature = "ws"))]

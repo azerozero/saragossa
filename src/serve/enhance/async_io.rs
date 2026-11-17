@@ -111,6 +111,23 @@ pub(in crate::serve) fn start(
                             Arc::clone(&connections),
                         ));
                     }
+                    #[cfg(feature = "webtransport")]
+                    if let Some(addr) = saragossa::runtime_flags::enhance_webtransport_addr() {
+                        if front.api_key.is_none() {
+                            return Err(error("WebTransport requiert SARAGOSSA_API_KEY"));
+                        }
+                        let endpoint =
+                            super::webtransport::bind(addr.parse().map_err(error)?, &front)?;
+                        eprintln!(
+                            "enhance WebTransport: {}",
+                            endpoint.local_addr().map_err(error)?
+                        );
+                        tokio::spawn(super::webtransport::listen(
+                            endpoint,
+                            Arc::clone(&front),
+                            Arc::clone(&connections),
+                        ));
+                    }
                     Ok(())
                 }
                 .await;

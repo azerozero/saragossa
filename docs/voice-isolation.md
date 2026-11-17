@@ -246,7 +246,7 @@ terminer HTTPS et transmettre vers ce listener.
 
 ```bash
 SARAGOSSA_ENHANCE_H2_ADDR=127.0.0.1:8082 \
-  saragossa serve --enhance-model dfn3.safetensors
+  saragossa serve --port 8080 --enhance-model dfn3.safetensors
 curl --http2-prior-knowledge --no-buffer \
   -H "Authorization: Bearer $SARAGOSSA_API_KEY" \
   --data-binary @mono.s16le \
@@ -271,6 +271,131 @@ avant END_STREAM. L'API Fetch des navigateurs exige généralement
 la fin de l'envoi : HTTP/2 ne lève pas cette restriction. Pour recevoir le son
 pendant une capture navigateur continue, utiliser WS ou WebTransport. Un
 exemple Fetch ne constitue donc pas une preuve de duplex navigateur.
+
+### WebTransport / HTTP/3
+
+La feature `webtransport` est opt-in et hors `default`. Elle utilise
+[web-transport-quinn](https://github.com/moq-dev/web-transport), une
+implémentation HTTP/3 WebTransport sur Quinn, et Rustls/ring. Le certificat
+est généré avec rcgen. Ces dépendances optionnelles récentes nécessitent
+Rust **1.88 ou supérieur** ; les features par défaut conservent leur périmètre.
+
+```bash
+SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR=127.0.0.1:4433 \
+  saragossa serve --port 8080 --enhance-model dfn3.safetensors
+```
+
+Le listener UDP accepte une session par connexion QUIC sur
+`/v1/audio/enhance/wt?rate=16000&format=s16&token=…`. La clé API est transmise
+uniquement dans la requête CONNECT chiffrée ; l'application ne journalise pas
+l'URL. Ne pas journaliser cette query dans un proxy. La même admission DFN3
+renvoie HTTP **503 avant acceptation** quand le plafond commun est atteint.
+La limite globale de connexions s'applique avant le handshake QUIC (refus
+QUIC à ce stade, puisqu'aucune requête HTTP n'existe encore).
+
+Chaque session accepte un stream bidirectionnel fiable. Chaque message
+applicatif est `u32le longueur + PCM`, limité à **16 Kio** ; aucune allocation
+proportionnelle à une longueur non validée. Un préfixe zéro suivi de FIN
+termine l'entrée. Le serveur renvoie le PCM à 48 kHz, puis un préfixe zéro et
+FIN. Les datagrammes ne sont pas utilisés. Les fenêtres QUIC sont bornées
+(16 Kio par stream, 64 Kio par connexion et en émission), et chaque réponse
+est écrite avant de lire la suivante. La contre-pression et les délais sont
+partagés avec le worker HTTP/2. Un message trop grand, une fin partielle ou
+une inactivité ferme le flux avec une erreur, sans marqueur de succès.
+
+Le certificat auto-signé **ECDSA P-256** vit 13 jours plus une marge de
+60 secondes au début (donc moins de 14 jours), reste en mémoire et est
+renouvelé tous les 12 jours. Aucun fichier de clé n'est écrit. L'endpoint
+HTTP authentifié `GET /v1/audio/enhance/certificate` expose l'URL, l'expiration
+et `serverCertificateHashes` (SHA-256 du DER, tableau de 32 octets), avec
+`Cache-Control: no-store`. Récupérer ces informations avant chaque connexion.
+
+```js
+const metadata = await fetch("/v1/audio/enhance/certificate", {
+  headers: {Authorization: `Bearer ${apiKey}`},
+}).then(r => {
+  if (!r.ok) throw new Error(`certificat: ${r.status}`);
+  return r.json();
+});
+const url = new URL(metadata.url);
+url.search = new URLSearchParams({rate: "16000", format: "s16", token: apiKey});
+const wt = new WebTransport(url, {
+  serverCertificateHashes: metadata.serverCertificateHashes.map(h => ({
+    algorithm: h.algorithm, value: Uint8Array.from(h.value),
+  })),
+});
+await wt.ready;
+const {readable, writable} = await wt.createBidirectionalStream();
+const writer = writable.getWriter();
+function packet(bytes) {
+  if (bytes.length > 16384) throw new Error("morceau PCM trop grand");
+  const out = new Uint8Array(4 + bytes.length);
+  new DataView(out.buffer).setUint32(0, bytes.length, true);
+  out.set(bytes, 4);
+  return out;
+}
+// Les lectures QUIC peuvent couper un préfixe ou regrouper plusieurs messages.
+const receiver = (async () => {
+  const reader = readable.getReader();
+  let pending = new Uint8Array();
+  let finished = false;
+  for (;;) {
+    const {value, done} = await reader.read();
+    if (done) {
+      if (!finished || pending.length) throw new Error("réponse tronquée");
+      return;
+    }
+    const joined = new Uint8Array(pending.length + value.length);
+    joined.set(pending); joined.set(value, pending.length); pending = joined;
+    while (pending.length >= 4) {
+      if (finished) throw new Error("données après fin");
+      const n = new DataView(pending.buffer, pending.byteOffset).getUint32(0, true);
+      if (n > 16384) throw new Error("trame réponse trop grande");
+      if (pending.length < 4 + n) break;
+      const pcm = pending.slice(4, 4 + n);
+      pending = pending.slice(4 + n);
+      if (n === 0) finished = true;
+      else consumePcm48k(pcm);
+    }
+  }
+})();
+const sender = (async () => {
+  for await (const pcm of pcmChunks) await writer.write(packet(pcm));
+  await writer.write(packet(new Uint8Array()));
+  await writer.close();
+})();
+try { await Promise.all([sender, receiver]); }
+finally { wt.close(); }
+```
+
+L'exemple exige un contexte navigateur sécurisé et une implémentation de
+WebTransport avec épinglage de certificat. `consumePcm48k` et `pcmChunks`
+sont les fonctions de capture/restitution de l'application. Les tests
+ordinaires utilisent de vraies connexions QUIC et vérifient le certificat,
+le duplex au bit contre le batch, le 503, les bornes et l'inactivité ; ils ne
+constituent pas un test de compatibilité de tous les navigateurs.
+
+### Reproduire les mesures de transport
+
+Les tests ignorés `ws_abba_latency`, `h2_abba_latency` et
+`webtransport_abba_latency` alternent six blocs ABBA contre le chunked sur
+loopback, après warm-up. Chaque essai contient 64 hops et vérifie `load1 < 2`
+avant et après ; sinon la mesure échoue et aucun résultat agrégé n'est publié.
+Ils distinguent la première réponse (handshake/headers), le premier PCM après
+les quatre hops d'amorçage, puis les allers-retours par hop (p50 et p99).
+Pour HTTP/2, la première réponse est mesurée à la disponibilité des headers
+par l'API ; pour WebTransport elle inclut TLS/QUIC/CONNECT. Les sorties WS/h2/WT
+sont en f32 dans ce banc, contre s16 pour l'endpoint WAV chunked existant.
+
+```bash
+CARGO_BUILD_JOBS=4 taskpolicy -b cargo test --release \
+  --no-default-features --features ws,h2,webtransport \
+  --bin saragossa abba_latency -- --ignored --nocapture --test-threads=1
+```
+
+Aucun résultat de latence sous charge n'est présenté comme une mesure valide.
+Les comparaisons de fidélité utilisent des poids récurrents synthétiques
+communs à l'oracle historique, et ne nécessitent ni téléchargement ni GPU.
 
 ### Oracle
 
