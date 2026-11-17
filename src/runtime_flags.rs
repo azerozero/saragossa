@@ -3230,16 +3230,19 @@ pub(crate) fn tts_memory_probe_enabled() -> bool {
 }
 
 /// Évite la copie CPU et l'upload de la table texte inutilisée par le talker.
+#[cfg(feature = "tts")]
 pub(crate) fn tts_compact_talker_embedding_enabled() -> bool {
     env_flag("SARAGOSSA_TTS_COMPACT_TALKER_EMBEDDING", true)
 }
 
 /// Ne charge pas les poids d'encodage audio dans le décodeur de synthèse.
+#[cfg(feature = "tts")]
 pub(crate) fn tts_codec_decoder_only_enabled() -> bool {
     env_flag("SARAGOSSA_TTS_CODEC_DECODER_ONLY", true)
 }
 
 /// Relit les poids CPU du codec à leur premier usage après l'upload Metal.
+#[cfg(feature = "tts")]
 pub(crate) fn tts_codec_lazy_cpu_enabled() -> bool {
     env_flag("SARAGOSSA_TTS_CODEC_LAZY_CPU", true)
 }

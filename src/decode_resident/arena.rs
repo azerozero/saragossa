@@ -258,6 +258,7 @@ impl Drop for ScratchLease {
 /// Un threadgroup par tête de requête (`q_heads` groupes, 256 threads chacun).
 /// Trois phases (port direct de la version CPU, correct pour tout `len`,
 impl DecodeResidentState {
+    #[cfg(feature = "tts")]
     pub(crate) fn tts_memory_stats(&self) -> Vec<(&'static str, usize)> {
         let persistent = self
             .persistent

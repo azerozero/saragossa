@@ -706,6 +706,7 @@ struct AttentionSinks {
 
 impl FullAttentionMetalState {
     /// Octets physiques des charges utiles K/V (hors échelles quantifiées).
+    #[cfg(feature = "tts")]
     pub(crate) fn payload_allocated_bytes(&self) -> usize {
         (self.keys.buffer().allocated_size() + self.values.buffer().allocated_size()) as usize
     }

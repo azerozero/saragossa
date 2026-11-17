@@ -3,6 +3,7 @@
 use super::*;
 
 impl MetalExecutor {
+    #[cfg(feature = "tts")]
     pub(crate) fn tts_memory_stats(&self) -> Vec<(&'static str, usize)> {
         let mut seen = std::collections::HashSet::new();
         let mut count = |buffer: &Buffer| {
