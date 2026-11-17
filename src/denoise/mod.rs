@@ -13,6 +13,11 @@ mod dsp;
 mod gpu_probe;
 mod layers;
 mod network;
+mod resample;
+mod stream;
+pub use resample::StreamResampler;
+pub mod wav;
+pub use stream::DenoiseStream;
 #[cfg(test)]
 mod tests;
 
@@ -21,6 +26,7 @@ use std::path::Path;
 use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
 
+pub use crate::audio_resample::resample;
 use dsp::{Analysis, FeatureState, Synthesis, FREQ_BINS, NB_DF, NB_ERB};
 pub use dsp::{FFT_SIZE, HOP_SIZE, SAMPLE_RATE};
 use network::{NetState, Network, ORDER};
@@ -32,46 +38,25 @@ const CONV_LOOKAHEAD: usize = 2;
 /// Anticipation du filtre profond (`df_lookahead`), en trames.
 const DF_LOOKAHEAD: usize = 2;
 
-/// Durée maximale d'un traitement hors ligne (cinq minutes).
-pub const MAX_DURATION_SECS: u64 = 300;
-/// Borne de la sortie mono rééchantillonnée à 48 kHz.
-pub const MAX_AUDIO_SAMPLES: usize = MAX_DURATION_SECS as usize * SAMPLE_RATE as usize;
-
-/// Vérifie la durée et la taille à 48 kHz sans allouer de tampon audio.
+/// Décode un WAV complet ; préférer [`wav::WavStream`] pour les fichiers longs.
 ///
 /// # Errors
-///
-/// Refuse les fréquences invalides, les débordements et les signaux trop longs.
-pub fn validate_input_length(samples: u64, rate: u32) -> crate::wire_audio::Result<usize> {
-    use crate::wire_audio::{validate_wav_limits, AudioParseError};
-    validate_wav_limits(rate, 1, 0)?;
-    if samples > MAX_DURATION_SECS * u64::from(rate) {
-        return Err(AudioParseError(format!(
-            "audio enhance dépasse la durée maximale de {MAX_DURATION_SECS} s (5 min)"
-        )));
-    }
-    let output = samples
-        .checked_mul(u64::from(SAMPLE_RATE))
-        .map(|n| n.div_ceil(u64::from(rate)))
-        .filter(|&n| n <= MAX_AUDIO_SAMPLES as u64)
-        .ok_or_else(|| {
-            AudioParseError(format!(
-                "audio enhance dépasse {MAX_AUDIO_SAMPLES} échantillons rééchantillonnés"
-            ))
-        })?;
-    Ok(output as usize)
-}
-
-/// Décode un WAV pour le débruitage, en bornant les tailles avant le décodage.
-///
-/// # Errors
-///
-/// Refuse les WAV invalides ou dont la durée ou la taille rééchantillonnée dépasse les limites.
+/// Refuse les en-têtes et les échantillons invalides.
 pub fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
-    crate::wire_audio::wav_to_mono_validated(bytes, |samples, rate| {
-        validate_input_length(samples, rate).map(|_| ())
-    })
-    .map_err(InferError::Audio)
+    let mut reader = wav::WavStream::new(std::io::Cursor::new(bytes)).map_err(InferError::Audio)?;
+    let rate = reader.sample_rate();
+    let mut output = Vec::new();
+    loop {
+        let chunk = reader.read_chunk().map_err(InferError::Audio)?;
+        if chunk.is_empty() {
+            break;
+        }
+        output.extend(chunk);
+    }
+    reader
+        .finish_input()
+        .map_err(|e| InferError::Audio(crate::wire_audio::AudioParseError(e.to_string())))?;
+    Ok((output, rate))
 }
 
 /// Modèle DeepFilterNet3 chargé.
@@ -122,23 +107,12 @@ impl DeepFilterNet3 {
     ///
     /// # Errors
     ///
-    /// Refuse les signaux de plus de cinq minutes avant toute allocation audio.
+    /// Propage les erreurs du traitement des trames.
     pub fn enhance(&self, audio: &[f32]) -> Result<Vec<f32>> {
-        validate_input_length(audio.len() as u64, SAMPLE_RATE).map_err(InferError::Audio)?;
-        let padded_len = (audio.len() + FFT_SIZE).div_ceil(HOP_SIZE) * HOP_SIZE;
-        let mut stream = self.stream();
-        let mut padded = audio.to_vec();
-        padded.resize(padded_len, 0.0);
-        let frames = padded.len() / HOP_SIZE;
-        let mut out = Vec::with_capacity((frames + CONV_LOOKAHEAD) * HOP_SIZE);
-        let mut hop = [0.0_f32; HOP_SIZE];
-        for chunk in padded.chunks_exact(HOP_SIZE) {
-            stream.process_hop(chunk, &mut hop)?;
-            out.extend_from_slice(&hop);
-        }
-        out.extend(stream.finish());
-        let start = DfStream::DELAY_SAMPLES;
-        Ok(out[start..start + audio.len()].to_vec())
+        let mut stream = DenoiseStream::new(self);
+        let mut out = stream.push(audio)?;
+        out.extend(stream.finish()?);
+        Ok(out)
     }
 
     /// Ouvre un flux temps réel.
@@ -200,7 +174,7 @@ impl DfStream<'_> {
             self.analysis.process(input, slot);
             self.features.process(slot, &mut erb, &mut cplx);
         }
-        self.frames += 1;
+        self.frames = (self.frames + 1).min(CONV_LOOKAHEAD + 1);
         // `pad_feat` ignore les deux premières trames de features.
         if self.frames <= CONV_LOOKAHEAD {
             output.fill(0.0);

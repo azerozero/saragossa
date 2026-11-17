@@ -1190,6 +1190,7 @@ impl CausalDecoder {
             lm_head: metal
                 .resolve_linear_weight_buffers(self.lm_head.weight(), "resident_lm_head")?,
             mtp,
+            #[cfg(feature = "tts")]
             tts_fused_qkv: None,
         });
         if let Some(t) = t_mtp_arena {

@@ -131,11 +131,7 @@ impl CausalDecoder {
     }
 
     /// Renvoie la dernière ligne du prefill AVANT la norme finale.
-    #[cfg(all(
-        target_os = "macos",
-        feature = "metal",
-        any(test, feature = "devtools")
-    ))]
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     pub(crate) fn resident_reference_start(
         &self,
         prompt: &[usize],
@@ -777,6 +773,7 @@ impl CausalDecoder {
                 let dims = self.plan.layers[index]
                     .resident
                     .resident_windowed_full_attn_layer_dims(hidden, position, eps, theta)?;
+                #[cfg(feature = "tts")]
                 let fused = match arena.tts_fused_qkv.as_ref().and_then(|qkv| qkv.get(index)) {
                     Some(qkv_proj) => self.encode_tts_cp_fused_layer(
                         metal,
@@ -792,6 +789,8 @@ impl CausalDecoder {
                     )?,
                     None => false,
                 };
+                #[cfg(not(feature = "tts"))]
+                let fused = false;
                 if !fused {
                     self.encode_resident_full_layer(
                         metal,

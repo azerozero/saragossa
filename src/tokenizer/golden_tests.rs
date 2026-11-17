@@ -211,13 +211,17 @@ fn explicit_missing_override_fails_but_automatic_absence_skips() -> TestResult {
     let temp = tempfile::tempdir()?;
     let missing = temp.path().join("missing");
     let executable = std::env::current_exe()?;
-    for (family, test) in [
+    // Only the families compiled into this test binary can be spawned.
+    let families = [
         ("QWEN3", "tokenizer::golden_tests::qwen3"),
         ("GEMMA3", "tokenizer::golden_tests::gemma3"),
         ("GEMMA4", "tokenizer::golden_tests::gemma4"),
+        #[cfg(feature = "stt")]
         ("WHISPER", "whisper::decoder::golden_tests::whisper"),
+        #[cfg(feature = "tts")]
         ("QWEN3_TTS", "tts::tokenizer::golden_tests::qwen3_tts"),
-    ] {
+    ];
+    for (family, test) in families {
         let variable = format!("SARAGOSSA_TOKENIZER_{family}");
         // Child processes isolate overrides from concurrent tests.
         let mut command = std::process::Command::new(&executable);

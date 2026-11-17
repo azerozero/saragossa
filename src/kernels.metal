@@ -9136,6 +9136,35 @@ kernel void whisper_attn_decode_vec64_f32(
     }
 }
 
+// RoPE rotate-half en place sur `[seq, heads * head_dim]`, sans normalisation
+// (encodeur de diarisation Nemotron). Un thread par paire (i, i + head_dim/2) :
+// chaque thread lit puis écrit ses deux coordonnées, d'où l'écriture en place sûre.
+kernel void rope_heads_inplace_f32(
+    device float* x [[buffer(0)]],
+    constant uint3& dims [[buffer(1)]],
+    device const float* inv_freq [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const uint seq = dims.x;
+    const uint heads = dims.y;
+    const uint head_dim = dims.z;
+    const uint half_dim = head_dim / 2u;
+    const uint pair = gid.x;
+    const uint head = gid.y;
+    const uint pos = gid.z;
+    if (pair >= half_dim || head >= heads || pos >= seq) {
+        return;
+    }
+    const uint base = pos * heads * head_dim + head * head_dim;
+    const float angle = float(pos) * inv_freq[pair];
+    const float c = precise::cos(angle);
+    const float s = precise::sin(angle);
+    const float first = x[base + pair];
+    const float second = x[base + pair + half_dim];
+    x[base + pair] = first * c - second * s;
+    x[base + pair + half_dim] = second * c + first * s;
+}
+
 kernel void rms_norm_rope_heads_f32(
     device const float* input [[buffer(0)]],
     device const float* weight [[buffer(1)]],

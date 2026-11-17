@@ -21,8 +21,15 @@ use saragossa::{
 };
 
 use super::args::{ServeArgs, ServeModelConfig};
+#[cfg(any(
+    feature = "stt",
+    feature = "tts",
+    feature = "diar",
+    feature = "denoise"
+))]
 use super::audio::AudioState;
 use super::cache::{BlockAwarePrefixCache, BlockHash};
+#[cfg(feature = "embed")]
 use super::embeddings::EmbeddingsState;
 use super::error::{ServeError, ServeResult};
 use super::mtp;
@@ -94,7 +101,14 @@ pub(super) struct ServeState {
     max_tokens_cap: usize,
     clock: u64,
     memory_guard: MemoryGuard,
+    #[cfg(any(
+        feature = "stt",
+        feature = "tts",
+        feature = "diar",
+        feature = "denoise"
+    ))]
     audio: AudioState,
+    #[cfg(feature = "embed")]
     embeddings: EmbeddingsState,
 }
 
@@ -111,7 +125,14 @@ impl ServeState {
             max_tokens_cap: args.max_tokens_cap,
             clock: 0,
             memory_guard: MemoryGuard::serve(),
+            #[cfg(any(
+                feature = "stt",
+                feature = "tts",
+                feature = "diar",
+                feature = "denoise"
+            ))]
             audio: AudioState::new(args),
+            #[cfg(feature = "embed")]
             embeddings: EmbeddingsState::new(args),
         }
     }
@@ -122,12 +143,19 @@ impl ServeState {
     }
 
     /// Renvoie l'état audio mutable pour les endpoints STT/TTS.
+    #[cfg(any(
+        feature = "stt",
+        feature = "tts",
+        feature = "diar",
+        feature = "denoise"
+    ))]
     pub(super) fn audio_mut(&mut self) -> &mut AudioState {
         self.assert_engine_thread();
         &mut self.audio
     }
 
     /// Renvoie l'état embeddings mutable pour l'endpoint `/v1/embeddings`.
+    #[cfg(feature = "embed")]
     pub(super) fn embeddings_mut(&mut self) -> &mut EmbeddingsState {
         self.assert_engine_thread();
         &mut self.embeddings

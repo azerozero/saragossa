@@ -1,3 +1,4 @@
+#![cfg(feature = "embed")]
 #[path = "support/mini_embedder.rs"]
 mod mini_embedder;
 

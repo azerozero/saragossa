@@ -12,7 +12,7 @@ fn voice_16k() -> Vec<f32> {
         .samples::<i16>()
         .map(|s| f32::from(s.expect("invariant: PCM embarqué valide")) / 32768.0)
         .collect();
-    crate::tts_clone::resample(&pcm, rate, 16_000)
+    crate::audio_resample::resample(&pcm, rate, 16_000)
         .expect("invariant: fréquence WAV embarquée valide")
 }
 

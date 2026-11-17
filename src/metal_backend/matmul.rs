@@ -112,6 +112,7 @@ fn concat_weight_key(weights: &[&LinearWeight]) -> Option<ConcatWeightKey> {
 /// par défaut si disponible. `SARAGOSSA_STT_F32=1` force l'ancien chemin f32 ;
 /// `SARAGOSSA_STT_BF16=0` garde aussi un kill-switch compatible avec les anciens benches.
 /// bf16-input / accumulation f32.
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(crate) fn whisper_bf16_gemm_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -128,6 +129,7 @@ pub(crate) fn whisper_bf16_gemm_enabled() -> bool {
 /// Projections d'attention du decode Whisper (q, k, v, o, cross q et o) sur les
 /// poids bf16 du QMV decode. Opt-in `SARAGOSSA_STT_DEC_ATTN_BF16=1` : l'arrondi
 /// bf16 des poids change les logits ; défaut OFF (f32, inchangé).
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(crate) fn whisper_decode_attn_bf16_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {

@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7](https://github.com/azerozero/saragossa/compare/v0.3.6...v0.3.7) - 2026-11-17
+
+### Added
+
+- *(denoise)* branche DFN3 sur la feature dédiée
+- *(features)* rend les modalités optionnelles à la compilation
+
+### Fixed
+
+- *(test)* ne lancer que les tokenizers des modalités compilées
+- *(features)* fusionne main et isole le débruitage en flux
+- *(serve)* refuse les modèles des modalités non compilées
+- *(features)* conserve l’ordre de lecture du flag MTP
+
+### Other
+
+- Merge pull request #245 from azerozero/feat/features-modulaires
+- fusionne main avec les features modulaires
+- *(features)* simplifie les gardes des imports et tests TTS
+- *(features)* vérifie les réponses 501 sans modalité
+- *(configuration)* décrit les features et les profils TOML
+- *(features)* vérifie les combinaisons sur macOS
+
+## [0.3.6](https://github.com/azerozero/saragossa/compare/v0.3.5...v0.3.6) - 2026-11-16
+
+### Added
+
+- *(denoise)* débruite en flux à mémoire bornée
+
+### Fixed
+
+- *(tts)* réinjecter EOS après le filtre top-k/top-p du talker
+
+### Other
+
+- Merge pull request #244 from azerozero/feat/denoise-flux
+- Merge pull request #243 from azerozero/release-plz-2026-11-16T22-06-49Z
+- Merge pull request #242 from azerozero/fix/tts-wer
+- Merge remote-tracking branch 'origin/main' into feat/denoise-flux
+- Merge remote-tracking branch 'origin/main' into fix/tts-wer
+
+## [0.3.5](https://github.com/azerozero/saragossa/compare/v0.3.4...v0.3.5) - 2026-11-16
+
+### Added
+
+- *(denoise)* débruitage DeepFilterNet3 sur CPU, saragossa enhance et /v1/audio/enhance
+
+### Fixed
+
+- *(audio)* refuse les fréquences invalides sans panique
+- *(denoise)* borne les allocations audio avant traitement
+
+### Other
+
+- Merge pull request #240 from azerozero/release-plz-2026-11-16T21-21-17Z
+- *(docs)* une seule ligne vide entre les sections de voice-isolation.md
+- Merge remote-tracking branch 'origin/main' into feat/voix-isolation
+- *(docs)* retire les lignes vides finales de voice-isolation.md
+- Merge remote-tracking branch 'origin/main' into feat/voix-isolation
+- *(voix)* corrige la fenêtre de Vorbis
+- *(audio)* couvre les limites et les hops incomplets
+- *(serve)* fusionne main en conservant le débruitage DFN3
+- *(voix)* spécifications DFN3, MossFormer2 et RE-USE, mesures et licences
+
 ## [0.3.4](https://github.com/azerozero/saragossa/compare/v0.3.3...v0.3.4) - 2026-11-16
 
 ### Added

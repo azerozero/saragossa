@@ -1160,6 +1160,7 @@ fn vision_snapshot_rejects_position_context_forged_into_text_key() -> Result<()>
 }
 
 #[test]
+#[cfg(feature = "vision")]
 fn vision_snapshot_resume_before_and_after_image_keeps_decode_logits() -> Result<()> {
     use crate::vision::prompt::SuppliedImage;
     let model = crate::decoder::vision::tests::model()?;

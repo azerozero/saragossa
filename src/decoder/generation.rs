@@ -5246,6 +5246,7 @@ impl CausalDecoder {
         };
         let hidden = self.final_norm.data().len();
         let mut states = Vec::with_capacity(suffix.len() * hidden);
+        #[allow(unused_mut)] // Muté uniquement par la capture DFlash (devtools).
         let mut captures =
             layer_ids.map(|ids| Vec::with_capacity(suffix.len() * ids.len() * hidden));
         for part in suffix.chunks(chunk) {
@@ -6287,7 +6288,7 @@ fn diff_stats_same_len(left: &[f32], right: &[f32]) -> Result<(f32, f32)> {
     Ok((max_abs, sum_abs / left.len() as f32))
 }
 
-#[cfg(feature = "devtools")]
+#[cfg(any(feature = "devtools", all(target_os = "macos", feature = "metal")))]
 fn validate_capture_layer_ids(layer_ids: &[usize], layer_count: usize) -> Result<()> {
     if layer_ids.is_empty() {
         return Err(InferError::Config(
@@ -6500,6 +6501,7 @@ fn stack_rows(top: &Tensor, bottom: &Tensor) -> Result<Tensor> {
     Tensor::from_vec(vec![rows_top + rows_bottom, cols], data)
 }
 
+#[cfg(feature = "devtools")]
 fn take_tensor_rows(tensor: &Tensor, rows: usize) -> Result<Tensor> {
     let (total_rows, cols) = tensor.as_matrix()?;
     if rows == 0 || rows > total_rows {
@@ -6563,6 +6565,6 @@ fn record_prefix_extend(suffix: usize, resident: bool) {
         }
     });
 }
-#[cfg(all(test, feature = "devtools"))]
+#[cfg(all(test, feature = "devtools", feature = "vision"))]
 #[path = "vision/ab_tests.rs"]
 mod vision_ab_tests;

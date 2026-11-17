@@ -3,56 +3,96 @@
 //! - `POST /v1/audio/transcriptions` et la session incrémentale
 //!   `/v1/audio/transcriptions/stream` : voir [`super::stt`], qui emprunte le
 //!   modèle Whisper de cet état.
+//! - `POST /v1/audio/diarization` : diarisation Nemotron-3-Diarization, même
+//!   multipart (`file` = WAV, `response_format` = `json` par défaut ou `rttm`),
+//!   réponse `{"duration", "segments": [{"speaker", "start", "end"}]}`.
 //! - `POST /v1/audio/speech` : TTS Qwen3, requête JSON `{"model", "input", "voice"?}`,
 //!   réponse WAV par défaut, ou PCM s16le mono chunked avec `stream: true`.
 //!
 //! - `POST /v1/audio/enhance` (extension saragossa) : débruitage DeepFilterNet3,
-//!   `multipart/form-data` avec `file` = WAV, réponse WAV mono 48 kHz.
+//!   WAV/multipart en duplex, réponse WAV mono 48 kHz : voir [`super::enhance`].
 //!
 //! Les modèles sont opt-in (`--stt-model`, `--tts-model`) et chargés paresseusement
 //! au premier appel : sans configuration, la route renvoie une erreur 400 claire.
 
-use std::io::{Cursor, Write};
+#[cfg(feature = "tts")]
+use std::io::Cursor;
+#[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
+use std::io::Write;
 use std::path::PathBuf;
 
-#[cfg(test)]
+#[cfg(feature = "diar")]
+use super::http::send_json;
+#[cfg(all(test, feature = "tts"))]
 use hound::WavReader;
+#[cfg(feature = "tts")]
 use hound::{SampleFormat, WavSpec, WavWriter};
+#[cfg(feature = "diar")]
+use saragossa::wire_audio::extract_boundary;
+#[cfg(feature = "tts")]
 use serde::Deserialize;
-#[cfg(test)]
+#[cfg(any(feature = "diar", all(test, feature = "tts")))]
 use serde_json::json;
 
+#[cfg(feature = "tts")]
 use saragossa::tts::TTS_GENERATION_HARD_CAP;
-use saragossa::wire_audio::extract_boundary;
+#[cfg(any(feature = "stt", feature = "diar"))]
+use saragossa::ForwardRuntime;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(any(feature = "stt", feature = "diar"))]
 use saragossa::MetalExecutor;
-use saragossa::{ForwardRuntime, TtsModel, TtsSynthesisOutput, WhisperModel};
+#[cfg(feature = "stt")]
+use saragossa::WhisperModel;
+#[cfg(feature = "tts")]
+use saragossa::{TtsModel, TtsSynthesisOutput};
 
 use super::args::ServeArgs;
+#[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
 use super::error::{ServeError, ServeResult};
+#[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
 use super::http::write_headers;
+#[cfg(any(feature = "stt", feature = "diar"))]
 use crate::RuntimeKind;
 
 /// Budget minimal conservé pour les clauses courtes.
+#[cfg(feature = "tts")]
 const MIN_TTS_MAX_FRAMES: usize = 160;
 /// Surcharge du cap de frames TTS pour les entrées longues.
+#[cfg(feature = "tts")]
 const TTS_MAX_FRAMES_ENV: &str = "SARAGOSSA_TTS_MAX_FRAMES";
+#[cfg(feature = "stt")]
 const STT_NOT_CONFIGURED: &str =
     "endpoint STT non configuré: relancez saragossa serve avec --stt-model <dir>";
+#[cfg(feature = "tts")]
 const TTS_NOT_CONFIGURED: &str =
     "endpoint TTS non configuré: relancez saragossa serve avec --tts-model <dir>";
 
 /// Etat audio du serveur : slots STT/TTS chargés à la demande.
 pub(super) struct AudioState {
+    #[cfg(any(feature = "stt", feature = "diar"))]
     backend: RuntimeKind,
+    #[cfg(feature = "stt")]
     stt: SttSlot,
+    #[cfg(feature = "diar")]
+    diar: DiarSlot,
+    #[cfg(feature = "tts")]
     tts: TtsSlot,
+    #[cfg(feature = "denoise")]
     enhance_path: Option<PathBuf>,
-    enhancer: Option<saragossa::denoise::DeepFilterNet3>,
     /// Sessions STT à entrée incrémentale, indépendantes du modèle chargé.
+    #[cfg(feature = "stt")]
     pub(super) stt_sessions: super::stt::SttSessions,
 }
 
+#[cfg(feature = "diar")]
+struct DiarSlot {
+    path: Option<PathBuf>,
+    model: Option<saragossa::diarization::DiarizationModel>,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    metal: Option<MetalExecutor>,
+}
+
+#[cfg(feature = "stt")]
 struct SttSlot {
     path: Option<PathBuf>,
     model: Option<WhisperModel>,
@@ -60,6 +100,7 @@ struct SttSlot {
     metal: Option<MetalExecutor>,
 }
 
+#[cfg(feature = "tts")]
 struct TtsSlot {
     path: Option<PathBuf>,
     model: Option<TtsModel>,
@@ -67,6 +108,7 @@ struct TtsSlot {
 
 // Seule la synthèse est substituable : les tests conservent le choix WAV/PCM
 // du gestionnaire de production, sans charger de poids ni initialiser Metal.
+#[cfg(feature = "tts")]
 pub(super) trait SpeechSynthesis {
     fn configure_voice(
         &mut self,
@@ -90,46 +132,37 @@ impl AudioState {
     /// Construit l'état audio depuis les chemins CLI, sans charger les poids.
     pub(super) fn new(args: &ServeArgs) -> Self {
         Self {
+            #[cfg(any(feature = "stt", feature = "diar"))]
             backend: args.backend,
+            #[cfg(feature = "stt")]
             stt: SttSlot {
                 path: args.stt_model.clone(),
                 model: None,
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 metal: None,
             },
+            #[cfg(feature = "diar")]
+            diar: DiarSlot {
+                path: args.diar_model.clone(),
+                model: None,
+                #[cfg(all(target_os = "macos", feature = "metal"))]
+                metal: None,
+            },
+            #[cfg(feature = "tts")]
             tts: TtsSlot {
                 path: args.tts_model.clone(),
                 model: None,
             },
+            #[cfg(feature = "denoise")]
             enhance_path: args.enhance_model.clone(),
-            enhancer: None,
+            #[cfg(feature = "stt")]
             stt_sessions: super::stt::SttSessions::default(),
         }
     }
 
-    /// Débruite un signal mono 48 kHz avec DeepFilterNet3 (CPU), chargé au premier appel.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si `--enhance-model` est absent ou si les poids sont invalides.
-    pub(super) fn enhance(&mut self, samples: &[f32]) -> ServeResult<Vec<f32>> {
-        if self.enhancer.is_none() {
-            let path = self.enhance_path.clone().ok_or_else(|| {
-                ServeError::args(
-                    "endpoint enhance non configuré: relancez saragossa serve avec --enhance-model <dfn3.safetensors>",
-                )
-            })?;
-            eprintln!(
-                "saragossa serve loading enhance model path={}",
-                path.display()
-            );
-            self.enhancer = Some(saragossa::denoise::DeepFilterNet3::load(&path)?);
-        }
-        let model = self
-            .enhancer
-            .as_ref()
-            .ok_or_else(|| ServeError::args("modèle enhance absent après chargement"))?;
-        Ok(model.enhance(samples)?)
+    #[cfg(feature = "denoise")]
+    pub(super) fn enhance_path(&self) -> Option<PathBuf> {
+        self.enhance_path.clone()
     }
 
     /// Transcrit des échantillons mono 16 kHz avec le backend Whisper.
@@ -137,6 +170,7 @@ impl AudioState {
     /// # Errors
     ///
     /// Renvoie une erreur si le modèle STT n'est pas configuré ou si l'inférence échoue.
+    #[cfg(feature = "stt")]
     pub(super) fn transcribe(&mut self, samples: &[f32], lang: &str) -> ServeResult<String> {
         self.with_stt(|model, runtime| Ok(model.transcribe(samples, lang, runtime)?.0))
     }
@@ -146,6 +180,7 @@ impl AudioState {
     /// # Errors
     ///
     /// Renvoie une erreur si le modèle STT n'est pas configuré, ou celle de `use_model`.
+    #[cfg(feature = "stt")]
     pub(super) fn with_stt_sessions<T>(
         &mut self,
         use_model: impl FnOnce(
@@ -169,6 +204,7 @@ impl AudioState {
     /// # Errors
     ///
     /// Renvoie une erreur si le modèle STT n'est pas configuré, ou celle de `use_model`.
+    #[cfg(feature = "stt")]
     pub(super) fn with_stt<T>(
         &mut self,
         use_model: impl FnOnce(&WhisperModel, ForwardRuntime<'_>) -> ServeResult<T>,
@@ -183,6 +219,7 @@ impl AudioState {
         use_model(model, runtime)
     }
 
+    #[cfg(feature = "stt")]
     fn ensure_stt_loaded(&mut self) -> ServeResult<()> {
         if self.stt.model.is_some() {
             return Ok(());
@@ -216,6 +253,56 @@ impl AudioState {
         Ok(())
     }
 
+    /// Diarise des échantillons mono 16 kHz avec son exécuteur Metal.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le modèle n'est pas configuré ou si l'inférence échoue.
+    #[cfg(feature = "diar")]
+    pub(super) fn diarize(
+        &mut self,
+        samples: &[f32],
+    ) -> ServeResult<Vec<saragossa::diarization::SpeakerSegment>> {
+        if self.diar.model.is_none() {
+            let path = self.diar.path.clone().ok_or_else(|| {
+                ServeError::args(
+                    "endpoint diarisation non configuré: relancez saragossa serve avec --diar-model <dir>",
+                )
+            })?;
+            eprintln!(
+                "saragossa serve loading diarization model path={}",
+                path.display()
+            );
+            let model = saragossa::diarization::DiarizationModel::from_model_dir(&path)?;
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            if self.backend == RuntimeKind::Metal && self.diar.metal.is_none() {
+                self.diar.metal = Some(MetalExecutor::new()?);
+            }
+            self.diar.model = Some(model);
+        }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let runtime = self
+            .diar
+            .metal
+            .as_ref()
+            .map_or_else(ForwardRuntime::cpu, ForwardRuntime::metal);
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let runtime = if self.backend == RuntimeKind::Metal {
+            return Err(ServeError::args(
+                "backend metal diarisation indisponible — recompiler avec --features metal",
+            ));
+        } else {
+            ForwardRuntime::cpu()
+        };
+        let model = self
+            .diar
+            .model
+            .as_ref()
+            .ok_or_else(|| ServeError::args("modèle de diarisation absent après chargement"))?;
+        Ok(model.diarize(samples, runtime)?.segments)
+    }
+
+    #[cfg(feature = "tts")]
     fn ensure_tts_loaded(&mut self) -> ServeResult<()> {
         if self.tts.model.is_some() {
             return Ok(());
@@ -238,6 +325,7 @@ impl AudioState {
     }
 }
 
+#[cfg(feature = "tts")]
 impl SpeechSynthesis for AudioState {
     fn configure_voice(
         &mut self,
@@ -301,6 +389,7 @@ impl SpeechSynthesis for AudioState {
     }
 }
 
+#[cfg(feature = "stt")]
 impl SttSlot {
     fn forward_runtime(&self, backend: RuntimeKind) -> ForwardRuntime<'_> {
         match backend {
@@ -318,6 +407,7 @@ impl SttSlot {
     }
 }
 
+#[cfg(feature = "tts")]
 fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
     override_value
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -331,8 +421,9 @@ fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
         .min(TTS_GENERATION_HARD_CAP)
 }
 
-/// Sert `POST /v1/audio/enhance` : WAV quelconque en entrée, WAV mono 48 kHz débruité en sortie.
-pub(super) fn handle_enhance<S: Write>(
+/// Sert `POST /v1/audio/diarization`.
+#[cfg(feature = "diar")]
+pub(super) fn handle_diarization<S: Write>(
     stream: &mut S,
     audio: &mut AudioState,
     content_type: Option<&str>,
@@ -348,22 +439,23 @@ pub(super) fn handle_enhance<S: Write>(
         .iter()
         .find(|field| field.name == "file")
         .ok_or_else(|| ServeError::Http("champ multipart 'file' requis".to_string()))?;
-    let (mono, rate) =
-        saragossa::denoise::decode_wav(&file.data).map_err(|e| ServeError::Http(e.to_string()))?;
-    let rate48 = saragossa::denoise::SAMPLE_RATE;
-    let samples = saragossa::tts_clone::resample(&mono, rate, rate48)
-        .map_err(|e| ServeError::Http(e.to_string()))?;
-    let wav = mono_f32_to_wav(&audio.enhance(&samples)?, rate48)?;
-    write_headers(stream, 200, "OK", "audio/wav", Some(wav.len()), Vec::new())?;
-    stream
-        .write_all(&wav)
-        .map_err(|e| ServeError::io("écriture réponse WAV", e))?;
-    stream
-        .flush()
-        .map_err(|e| ServeError::io("flush réponse WAV", e))
+    let response_format = text_field(&fields, "response_format").unwrap_or_default();
+    let samples = wav_to_mono_16k(&file.data)?;
+    let segments = audio.diarize(&samples)?;
+    if response_format.eq_ignore_ascii_case("rttm") {
+        return send_text(stream, &saragossa::diarization::to_rttm(&segments, "audio"));
+    }
+    let duration = samples.len() as f64 / 16_000.0;
+    send_json(
+        stream,
+        200,
+        &json!({ "duration": duration, "segments": saragossa::diarization::to_json(&segments) }),
+        Vec::new(),
+    )
 }
 
 /// Sert `POST /v1/audio/speech`.
+#[cfg(feature = "tts")]
 pub(super) fn handle_speech<S: Write>(
     stream: &mut S,
     audio: &mut impl SpeechSynthesis,
@@ -394,6 +486,7 @@ pub(super) fn handle_speech<S: Write>(
 
 // L'injection permet de vérifier les arguments transmis par la route sans
 // charger de poids ni initialiser Metal.
+#[cfg(feature = "tts")]
 fn handle_speech_with<S: Write>(
     stream: &mut S,
     body: &[u8],
@@ -420,6 +513,7 @@ fn handle_speech_with<S: Write>(
 
 // Valeur fournie par le client : échapper les contrôles et l'UTF-8 pour ne
 // jamais injecter une ligne HTTP. Les noms usuels (alloy, nova…) restent tels quels.
+#[cfg(feature = "tts")]
 fn voice_fallback_header(voice: Option<&str>) -> Option<(&'static str, String)> {
     voice.map(|voice| {
         let value = voice
@@ -436,6 +530,7 @@ fn voice_fallback_header(voice: Option<&str>) -> Option<(&'static str, String)> 
     })
 }
 
+#[cfg(feature = "tts")]
 fn send_speech<S: Write>(
     stream: &mut S,
     output: &TtsSynthesisOutput,
@@ -464,6 +559,7 @@ fn send_speech<S: Write>(
 
 // L'écriture reste synchrone sur le thread moteur : pas de producteur détaché
 // ni de file audio non bornée. Les sockets ont déjà un timeout d'écriture.
+#[cfg(feature = "tts")]
 fn send_speech_stream<S: Write>(
     stream: &mut S,
     sample_rate: u32,
@@ -517,6 +613,7 @@ fn send_speech_stream<S: Write>(
     Ok(())
 }
 
+#[cfg(feature = "tts")]
 fn write_pcm_chunk<S: Write>(stream: &mut S, samples: &[f32]) -> std::io::Result<()> {
     if samples.is_empty() {
         return Ok(());
@@ -531,12 +628,14 @@ fn write_pcm_chunk<S: Write>(stream: &mut S, samples: &[f32]) -> std::io::Result
     stream.flush()
 }
 
-fn pcm_i16(sample: f32) -> i16 {
+#[cfg(any(feature = "tts", feature = "denoise"))]
+pub(super) fn pcm_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
 }
 
 /// Requête `/v1/audio/speech` : `voice` sélectionne un locuteur CustomVoice.
 #[derive(Debug, Deserialize)]
+#[cfg(feature = "tts")]
 struct SpeechRequest {
     /// Texte à synthétiser.
     input: String,
@@ -549,6 +648,7 @@ struct SpeechRequest {
     stream: bool,
 }
 
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(super) fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
     let body = text.as_bytes();
     write_headers(
@@ -568,27 +668,31 @@ pub(super) fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()>
 }
 
 // Les cibles fuzz et le serveur exécutent le même décodeur, sans copie.
-#[cfg(test)]
+#[cfg(any(feature = "diar", all(test, feature = "stt", feature = "tts")))]
 use saragossa::wire_audio::text_field;
+#[cfg(any(feature = "stt", feature = "diar"))]
 use saragossa::wire_audio::MultipartField;
-#[cfg(test)]
+#[cfg(all(test, feature = "stt", feature = "tts"))]
 use saragossa::wire_audio::MAX_WAV_SAMPLES;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "stt", feature = "tts"))]
 fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult<Vec<f32>> {
     saragossa::wire_audio::downsample(samples, input_rate, target_rate)
         .map_err(|e| ServeError::Http(e.0))
 }
 
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(super) fn parse_multipart(body: &[u8], boundary: &str) -> ServeResult<Vec<MultipartField>> {
     saragossa::wire_audio::parse_multipart(body, boundary).map_err(|e| ServeError::Http(e.0))
 }
 
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(super) fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
     saragossa::wire_audio::wav_to_mono_16k(bytes).map_err(|e| ServeError::Http(e.0))
 }
 
 /// Encode des échantillons mono f32 en WAV PCM i16 en mémoire.
+#[cfg(feature = "tts")]
 fn mono_f32_to_wav(samples: &[f32], sample_rate: u32) -> ServeResult<Vec<u8>> {
     let spec = WavSpec {
         channels: 1,
@@ -613,7 +717,7 @@ fn mono_f32_to_wav(samples: &[f32], sample_rate: u32) -> ServeResult<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -623,7 +727,7 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "stt", feature = "tts"))]
 mod tests {
     use std::io::Cursor;
 
@@ -1017,66 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn enhance_without_model_returns_clear_error() {
-        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
-        let mut audio = AudioState::new(&args);
-        let mut stream = Cursor::new(Vec::new());
-        let wav = mono_f32_to_wav(&[0.1_f32; 1600], 16_000).expect("invariant: WAV");
-        let body = multipart_body("BND", &wav, None);
-
-        let error = handle_enhance(
-            &mut stream,
-            &mut audio,
-            Some("multipart/form-data; boundary=BND"),
-            &body,
-        )
-        .expect_err("invariant: enhance non configuré refusé");
-
-        assert!(error.to_string().contains("enhance non configuré"));
-        assert!(stream.get_ref().is_empty());
-    }
-
-    #[test]
-    fn enhance_rejects_invalid_audio_with_http_400_before_model_loading() {
-        for (rate, channels, samples, expected) in [
-            (0, 1, 8, "taux WAV"),
-            (8_000, 1, 8_000 * 300 + 1, "300 s"),
-            (8_000, 2, 2 * (8_000 * 300 + 1), "300 s"),
-        ] {
-            let wav = pcm_wav(rate, channels, 16, samples);
-            let body = multipart_body("BND", &wav, None);
-            let mut raw = format!(
-                "POST /v1/audio/enhance HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=BND\r\nContent-Length: {}\r\n\r\n", body.len()
-            ).into_bytes();
-            raw.extend_from_slice(&body);
-            let request = super::super::http::read_request(
-                &mut Cursor::new(raw),
-                std::time::Instant::now() + std::time::Duration::from_secs(30),
-            )
-            .unwrap()
-            .unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let args = ServeArgs::parse([
-                "--enhance-model".to_string(),
-                dir.path()
-                    .join("absent.safetensors")
-                    .to_string_lossy()
-                    .into_owned(),
-            ])
-            .unwrap();
-            let mut state = super::super::state::ServeState::new(&args);
-            let mut response = Vec::new();
-            let error =
-                super::super::http::handle_job(&mut response, &mut state, &request).unwrap_err();
-            assert!(matches!(error, ServeError::Http(_)), "{error}");
-            assert!(error.to_string().contains(expected), "{error}");
-            assert!(response.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
-            assert!(String::from_utf8_lossy(&response).contains(expected));
-            assert!(state.audio_mut().enhancer.is_none());
-        }
-    }
-
-    #[test]
+    #[cfg(feature = "denoise")]
     fn enhance_model_flag_is_parsed() {
         let args = ServeArgs::parse([
             "--enhance-model".to_string(),
@@ -1114,8 +1159,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 mod stream_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 mod mutation_tests;

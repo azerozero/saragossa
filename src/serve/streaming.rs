@@ -1,10 +1,14 @@
 //! Deltas texte sûrs pour les réponses SSE.
 
+// Ces types sont aussi utilisés par le REPL sans transport HTTP.
+#![cfg_attr(not(feature = "serve"), allow(dead_code))]
+
 use std::time::Duration;
 
 use saragossa::ModelAssets;
 
 use super::error::{ServeError, ServeResult};
+#[cfg(feature = "serve")]
 use super::state::ServedCompletion;
 
 #[cfg(test)]
@@ -74,6 +78,7 @@ impl<'a> StreamTerminalError<'a> {
 /// Réponse streamée d'un client : reçoit les événements d'une complétion,
 /// puis son issue. Le chemin solo et le lot partagent ainsi le même format
 /// SSE par dialecte (OpenAI, Anthropic).
+#[cfg(feature = "serve")]
 pub(super) trait CompletionSink {
     /// Ecrit un événement ; une erreur arrête la génération de ce client.
     fn event(&mut self, event: CompletionStreamEvent<'_>) -> ServeResult<()>;

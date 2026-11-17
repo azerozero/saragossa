@@ -29,6 +29,8 @@ pub(super) struct ServeArgs {
     pub(super) models: Vec<ServeModelConfig>,
     /// Répertoire du modèle STT Whisper exposé sur `/v1/audio/transcriptions`.
     pub(super) stt_model: Option<PathBuf>,
+    /// Répertoire du modèle de diarisation exposé sur `/v1/audio/diarization`.
+    pub(super) diar_model: Option<PathBuf>,
     /// Répertoire du modèle TTS Qwen3 exposé sur `/v1/audio/speech`.
     pub(super) tts_model: Option<PathBuf>,
     /// Répertoire du modèle d'embeddings e5-small exposé sur `/v1/embeddings`.
@@ -68,6 +70,7 @@ impl ServeArgs {
         let mut models = Vec::new();
         let mut stt_model = None;
         let mut tts_model = None;
+        let mut diar_model = None;
         let mut embed_model = None;
         let mut enhance_model = None;
         let mut backend = RuntimeKind::default_backend();
@@ -116,15 +119,23 @@ impl ServeArgs {
                     )?;
                 }
                 "--stt-model" => {
+                    require_feature("--stt-model", "stt", cfg!(feature = "stt"))?;
                     stt_model = Some(next_value(&mut iter, "--stt-model")?.into());
                 }
+                "--diar-model" => {
+                    require_feature("--diar-model", "diar", cfg!(feature = "diar"))?;
+                    diar_model = Some(next_value(&mut iter, "--diar-model")?.into());
+                }
                 "--tts-model" => {
+                    require_feature("--tts-model", "tts", cfg!(feature = "tts"))?;
                     tts_model = Some(next_value(&mut iter, "--tts-model")?.into());
                 }
                 "--embed-model" => {
+                    require_feature("--embed-model", "embed", cfg!(feature = "embed"))?;
                     embed_model = Some(next_value(&mut iter, "--embed-model")?.into());
                 }
                 "--enhance-model" => {
+                    require_feature("--enhance-model", "denoise", cfg!(feature = "denoise"))?;
                     enhance_model = Some(next_value(&mut iter, "--enhance-model")?.into());
                 }
                 "--backend" | "--runtime" => {
@@ -165,6 +176,7 @@ impl ServeArgs {
             api_key,
             models,
             stt_model,
+            diar_model,
             tts_model,
             embed_model,
             enhance_model,
@@ -189,12 +201,52 @@ impl ServeArgs {
 
 /// Renvoie l'aide concise de `serve`.
 pub(super) fn help_text() -> String {
+    let mut modality_options = String::new();
+    let mut modality_help = String::new();
+    for (enabled, flag, description) in [
+        (
+            cfg!(feature = "diar"),
+            "--diar-model",
+            "Nemotron-3-Diarization on /v1/audio/diarization",
+        ),
+        (
+            cfg!(feature = "stt"),
+            "--stt-model",
+            "Whisper STT on /v1/audio/transcriptions",
+        ),
+        (
+            cfg!(feature = "tts"),
+            "--tts-model",
+            "Qwen3 TTS on /v1/audio/speech",
+        ),
+        (
+            cfg!(feature = "embed"),
+            "--embed-model",
+            "e5-small on /v1/embeddings",
+        ),
+        (
+            cfg!(feature = "denoise"),
+            "--enhance-model",
+            "DeepFilterNet3 denoising on /v1/audio/enhance",
+        ),
+    ] {
+        if enabled {
+            let value = if flag == "--enhance-model" {
+                "FILE"
+            } else {
+                "DIR"
+            };
+            modality_options.push_str(&format!("[{flag} {value}] "));
+            modality_help.push_str(&format!(
+                "{flag} enables {description} (opt-in, lazy-loaded).\n"
+            ));
+        }
+    }
     format!(
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
          [--api-key TOKEN] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
-         [--stt-model DIR] [--tts-model DIR] [--embed-model DIR] [--enhance-model FILE] \\
-         [--backend cpu|metal] [--preload]\n\
+         {modality_options}[--backend cpu|metal] [--preload]\n\
          SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
          --prefix-cache-ssd-priority-tokens 4096 (0 disables priority).\n\
          Models: repeat --model to expose any supported checkpoint. A bare path \\
@@ -203,19 +255,24 @@ pub(super) fn help_text() -> String {
          opens a local-model picker. \\
          Backward-compatible aliases: --model-27b registers reti-27b, \\
          --model-35b registers reti-35b.\n\
-         Audio/embeddings (opt-in, lazy-loaded): --stt-model enables Whisper STT \\
-         on /v1/audio/transcriptions, --tts-model enables Qwen3 TTS on \\
-         /v1/audio/speech, --embed-model enables e5-small on /v1/embeddings, \\
-         --enhance-model enables DeepFilterNet3 denoising on /v1/audio/enhance.\n\
-         Safety defaults: --read-timeout-secs {DEFAULT_READ_TIMEOUT_SECS}, \\
+         {modality_help}Safety defaults: --read-timeout-secs {DEFAULT_READ_TIMEOUT_SECS}, \\
          --max-tokens-cap {DEFAULT_MAX_TOKENS_CAP}.\n\
          Default transport: Unix socket {DEFAULT_SOCKET} (0600). \\
          --port enables TCP on 127.0.0.1 for grob and requires --api-key \\
          or {API_KEY_ENV}.\n\
          Endpoints: GET /v1/models, POST /v1/chat/completions, \\
          POST /v1/audio/transcriptions, POST /v1/audio/transcriptions/stream, \
-         POST /v1/audio/speech, POST /v1/audio/enhance, POST /v1/embeddings"
+         POST /v1/audio/diarization, POST /v1/audio/speech, POST /v1/audio/enhance, POST /v1/embeddings"
     )
+}
+
+fn require_feature(flag: &str, feature: &str, enabled: bool) -> ServeResult<()> {
+    if !enabled {
+        return Err(ServeError::args(format!(
+            "{flag} indisponible: compilé sans la feature {feature}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_tcp_args(host: &str, port: Option<u16>, api_key: Option<&str>) -> ServeResult<()> {
@@ -322,6 +379,45 @@ fn parse_positive_usize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modality_options_follow_compiled_features() {
+        let help = help_text();
+        for (enabled, flag, feature) in [
+            (cfg!(feature = "diar"), "--diar-model", "diar"),
+            (cfg!(feature = "stt"), "--stt-model", "stt"),
+            (cfg!(feature = "tts"), "--tts-model", "tts"),
+            (cfg!(feature = "embed"), "--embed-model", "embed"),
+            (cfg!(feature = "denoise"), "--enhance-model", "denoise"),
+        ] {
+            assert_eq!(help.contains(flag), enabled, "{flag}");
+            let parsed = ServeArgs::parse([flag.to_string(), "/m/modality".to_string()]);
+            if enabled {
+                let args = parsed.expect("invariant: modalité compilée acceptée");
+                let path = match feature {
+                    "diar" => args.diar_model,
+                    "stt" => args.stt_model,
+                    "tts" => args.tts_model,
+                    "denoise" => args.enhance_model,
+                    _ => args.embed_model,
+                };
+                assert_eq!(path, Some(PathBuf::from("/m/modality")));
+            } else {
+                let expected = format!("compilé sans la feature {feature}");
+                let error = parsed.expect_err("invariant: modalité absente refusée");
+                assert!(error.to_string().contains(&expected));
+                for values in [
+                    vec![flag],
+                    vec!["--model", "llm=/m/llm", flag, "/m/modality"],
+                    vec![flag, "/m/modality", "--model", "llm=/m/llm"],
+                ] {
+                    let error = ServeArgs::parse(values.into_iter().map(str::to_string))
+                        .expect_err("invariant: option absente refusée avant la sélection LLM");
+                    assert!(error.to_string().contains(&expected));
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_defaults_to_unix_socket_without_implicit_models() {

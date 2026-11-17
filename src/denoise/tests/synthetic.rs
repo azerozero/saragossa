@@ -3,11 +3,29 @@ use super::*;
 use std::collections::HashMap;
 
 pub(super) fn model() -> DeepFilterNet3 {
+    build(false)
+}
+
+pub(super) fn recurrent_model() -> DeepFilterNet3 {
+    build(true)
+}
+
+fn build(recurrent: bool) -> DeepFilterNet3 {
     let mut weights = HashMap::new();
     let mut add = |name: String, shape: &[usize], value: f32| {
+        let size = shape.iter().product();
+        let values = if recurrent && shape.len() >= 2 {
+            (0..size)
+                .map(|i| ((i * 17 % 31) as f32 - 15.0) * 0.001)
+                .collect()
+        } else if recurrent && name.contains(".gru.bias_") {
+            (0..size).map(|i| (i % 13) as f32 * 0.003).collect()
+        } else {
+            vec![value; size]
+        };
         weights.insert(
             name,
-            crate::Tensor::from_vec(shape.to_vec(), vec![value; shape.iter().product()]).unwrap(),
+            crate::Tensor::from_vec(shape.to_vec(), values).unwrap(),
         );
     };
     // Préfixe, canaux entrée/sortie, groupes, noyau temps/fréquence, séparable.
