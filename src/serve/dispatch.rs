@@ -115,7 +115,8 @@ impl<S: ServeStream> Dispatcher<S> {
 
     /// Ne bloque jamais l'accept : au-delà du plafond, 503 immédiat.
     fn dispatch(&self, mut stream: S) {
-        if let Err(error) = stream.configure(self.limits.read_timeout) {
+        if let Err(error) = stream.configure(super::reload::read_timeout(self.limits.read_timeout))
+        {
             eprintln!("saragossa serve request error: {error}");
             return;
         }
@@ -374,7 +375,7 @@ impl<S: ServeStream> Connection<S> {
     /// Lit les headers, sert les routes statiques et le refus bearer avant de
     /// lire le corps, puis met en file sans bloquer.
     fn handle(&self, mut stream: S) -> ServeResult<()> {
-        let deadline = Instant::now() + self.limits.read_timeout;
+        let deadline = Instant::now() + super::reload::read_timeout(self.limits.read_timeout);
         let Some((mut request, content_length)) =
             read_or_reject(&mut stream, |s| read_head(s, deadline))?
         else {

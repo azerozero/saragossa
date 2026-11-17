@@ -139,7 +139,7 @@ impl ServeState {
 
     /// Renvoie le plafond serveur du budget de génération.
     pub(super) fn max_tokens_cap(&self) -> usize {
-        self.max_tokens_cap
+        super::reload::max_tokens_cap(self.max_tokens_cap)
     }
 
     /// Renvoie l'état audio mutable pour les endpoints STT/TTS.
@@ -222,7 +222,7 @@ impl ServeState {
         request: ChatCompletionRequest,
         session_key: Option<&str>,
     ) -> ServeResult<ServedCompletion> {
-        let max_tokens_cap = self.max_tokens_cap;
+        let max_tokens_cap = self.max_tokens_cap();
         let max_tokens = request.validate(max_tokens_cap)?;
         let index = self
             .models
@@ -250,7 +250,7 @@ impl ServeState {
         session_key: Option<&str>,
         mut on_event: impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<ServedCompletion> {
-        let max_tokens_cap = self.max_tokens_cap;
+        let max_tokens_cap = self.max_tokens_cap();
         let max_tokens = request.validate(max_tokens_cap)?;
         let index = self
             .models
@@ -309,7 +309,7 @@ impl ServeState {
         let Some(model) = requests.first().map(|request| request.model.clone()) else {
             return (Vec::new(), 0);
         };
-        let max_tokens_cap = self.max_tokens_cap;
+        let max_tokens_cap = self.max_tokens_cap();
         let loaded = self
             .models
             .iter()
