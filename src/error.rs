@@ -28,6 +28,11 @@ pub enum InferError {
     #[error("dimension incompatible: {0}")]
     Dimension(String),
 
+    /// Refuse un tampon vision avant allocation lorsque le profil est dépassé.
+    #[cfg(feature = "vision")]
+    #[error("budget vision dépassé: {pixels} pixels, maximum {max_pixels}")]
+    VisionPixelBudget { pixels: u64, max_pixels: u64 },
+
     /// Signale un poids absent du modèle.
     #[error("poids manquant: {0}")]
     MissingWeight(String),

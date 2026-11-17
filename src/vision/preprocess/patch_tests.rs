@@ -11,7 +11,9 @@ fn vision_patch_rows_follow_spatial_groups_then_channels_and_time() -> Result<()
         }
     }
     let image = RgbImage::from_rgb8(64, 96, pixels)?;
-    let patches = image.normalize_and_repeat()?.into_patches()?;
+    let patches = image
+        .normalize_and_repeat(ImageProfile::Qwen38)?
+        .into_patches(ImageProfile::Qwen38)?;
     assert_eq!(patches.grid_thw, [1, 4, 6]);
     assert_eq!(patches.pixel_values.len(), 24 * 1536);
     let origins = [
@@ -63,7 +65,10 @@ fn vision_patch_rows_follow_spatial_groups_then_channels_and_time() -> Result<()
 fn vision_patch_order_rejects_unaligned_images() -> Result<()> {
     for (h, w) in [(31, 32), (32, 31), (16, 16), (33, 64)] {
         let image = RgbImage::from_rgb8(h, w, vec![0; (h * w * 3) as usize])?;
-        assert!(image.normalize_and_repeat()?.into_patches().is_err());
+        assert!(image
+            .normalize_and_repeat(ImageProfile::Qwen38)?
+            .into_patches(ImageProfile::Qwen38)
+            .is_err());
     }
     Ok(())
 }

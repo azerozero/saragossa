@@ -1,6 +1,6 @@
 //! Normalisation f32 fusionnée du processeur Qwen, puis duplication temporelle.
 
-use super::{allocate, invalid, Result, RgbImage};
+use super::{allocate, temporal_len, ImageProfile, Result, RgbImage};
 
 /// Deux frames identiques normalisées, contiguës dans l'ordre [T,C,H,W].
 #[derive(Debug)]
@@ -22,11 +22,12 @@ impl TemporalImage {
     }
 }
 
-pub(super) fn normalize_and_repeat(image: &RgbImage) -> Result<TemporalImage> {
+pub(super) fn normalize_and_repeat(
+    image: &RgbImage,
+    profile: ImageProfile,
+) -> Result<TemporalImage> {
+    let len = temporal_len(image.height, image.width, profile)?;
     let frame_len = image.pixels.len();
-    let len = frame_len
-        .checked_mul(2)
-        .ok_or_else(|| invalid("taille temporelle non représentable"))?;
     let mut pixels = allocate::<f32>(len)?;
     let plane_len = frame_len / 3;
     let (first, second) = pixels.split_at_mut(frame_len);

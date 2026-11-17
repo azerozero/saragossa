@@ -1,6 +1,6 @@
 //! Permutation des patchs Qwen : groupes spatiaux 2 × 2, puis C,T,H,W.
 
-use super::{allocate, invalid, ImageProfile, Result, RgbImage, TemporalImage};
+use super::{allocate, invalid, temporal_len, ImageProfile, Result, RgbImage, TemporalImage};
 
 /// Entrée du ViT : une ligne de 1 536 valeurs par patch 16 × 16 × 2.
 #[derive(Debug)]
@@ -14,7 +14,10 @@ pub struct PreprocessedImage {
 impl TemporalImage {
     /// Regroupe les lignes par [bloc_h,bloc_w,intra_h,intra_w].
     /// Chaque ligne conserve [C,T,patch_h,patch_w], et non le layout MLX.
-    pub fn into_patches(self) -> Result<PreprocessedImage> {
+    /// Vérifie le plafond du profil avant allocation ; les deux tampons f32
+    /// coexistants occupent au plus 48 octets par pixel autorisé.
+    pub fn into_patches(self, profile: ImageProfile) -> Result<PreprocessedImage> {
+        let len = temporal_len(self.height, self.width, profile)?;
         let height = self.height as usize;
         let width = self.width as usize;
         if height % 32 != 0 || width % 32 != 0 {
@@ -22,7 +25,7 @@ impl TemporalImage {
         }
         let plane = height * width;
         let frame = plane * 3;
-        let mut pixel_values = allocate::<f32>(self.pixels.len())?;
+        let mut pixel_values = allocate::<f32>(len)?;
         let mut destination = 0;
         for block_h in 0..height / 32 {
             for block_w in 0..width / 32 {
@@ -56,6 +59,6 @@ impl TemporalImage {
 pub fn preprocess(image: &RgbImage, profile: ImageProfile) -> Result<PreprocessedImage> {
     image
         .resized(profile)?
-        .normalize_and_repeat()?
-        .into_patches()
+        .normalize_and_repeat(profile)?
+        .into_patches(profile)
 }

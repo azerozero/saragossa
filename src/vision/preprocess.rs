@@ -52,9 +52,29 @@ impl RgbImage {
     }
 
     /// Normalise les canaux RGB en f32 puis répète l'image sur T=2.
-    pub fn normalize_and_repeat(&self) -> Result<TemporalImage> {
-        normalize::normalize_and_repeat(self)
+    /// Le plafond du profil est vérifié avant allocation (24 octets par pixel).
+    pub fn normalize_and_repeat(&self, profile: ImageProfile) -> Result<TemporalImage> {
+        normalize::normalize_and_repeat(self, profile)
     }
+}
+
+/// Valide le plafond partagé avec smart_resize avant de calculer une allocation.
+/// Le minimum du resize n'est pas imposé aux étapes intermédiaires.
+fn temporal_len(height: u32, width: u32, profile: ImageProfile) -> Result<usize> {
+    let pixels = u64::from(height) * u64::from(width);
+    let max_pixels = u64::from(profile.pixel_bounds().1);
+    if pixels > max_pixels {
+        return Err(InferError::VisionPixelBudget { pixels, max_pixels });
+    }
+    let len = rgb_len(height, width)?
+        .checked_mul(2)
+        .ok_or_else(|| invalid("taille temporelle non représentable"))?;
+    // Deux tampons f32 coexistent pendant into_patches : au plus 48 octets
+    // par pixel, soit 768 Mio pour Qwen et 75 Mio pour THX/d3.
+    len.checked_mul(2 * size_of::<f32>())
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| invalid("taille des tampons f32 non représentable"))?;
+    Ok(len)
 }
 
 fn rgb_len(height: u32, width: u32) -> Result<usize> {
@@ -143,6 +163,9 @@ mod fixtures;
 
 #[cfg(test)]
 mod patch_tests;
+
+#[cfg(test)]
+mod budget_tests;
 
 #[cfg(test)]
 mod tests {
