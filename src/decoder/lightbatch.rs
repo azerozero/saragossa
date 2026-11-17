@@ -299,6 +299,7 @@ impl CausalDecoder {
     /// # Errors
     ///
     /// Mêmes erreurs que [`Self::generate_greedy_lightbatch_streaming_with_options`].
+    #[cfg(any(feature = "devtools", test))]
     pub(crate) fn generate_greedy_lightbatch_profiled(
         &self,
         prompts: &[Vec<usize>],

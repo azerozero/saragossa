@@ -6,47 +6,74 @@
 //! - `POST /v1/audio/speech` : TTS Qwen3, requête JSON `{"model", "input", "voice"?}`,
 //!   réponse WAV par défaut, ou PCM s16le mono chunked avec `stream: true`.
 //!
+//! - `POST /v1/audio/enhance` (extension saragossa) : débruitage DeepFilterNet3,
+//!   WAV/multipart en duplex, réponse WAV mono 48 kHz : voir [`super::enhance`].
+//!
 //! Les modèles sont opt-in (`--stt-model`, `--tts-model`) et chargés paresseusement
 //! au premier appel : sans configuration, la route renvoie une erreur 400 claire.
 
-use std::io::{Cursor, Write};
+#[cfg(feature = "tts")]
+use std::io::Cursor;
+#[cfg(any(feature = "stt", feature = "tts"))]
+use std::io::Write;
 use std::path::PathBuf;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 use hound::WavReader;
+#[cfg(feature = "tts")]
 use hound::{SampleFormat, WavSpec, WavWriter};
+#[cfg(feature = "tts")]
 use serde::Deserialize;
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 use serde_json::json;
 
+#[cfg(feature = "tts")]
 use saragossa::tts::TTS_GENERATION_HARD_CAP;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(feature = "stt")]
 use saragossa::MetalExecutor;
-use saragossa::{ForwardRuntime, TtsModel, TtsSynthesisOutput, WhisperModel};
+#[cfg(feature = "stt")]
+use saragossa::{ForwardRuntime, WhisperModel};
+#[cfg(feature = "tts")]
+use saragossa::{TtsModel, TtsSynthesisOutput};
 
 use super::args::ServeArgs;
+#[cfg(any(feature = "stt", feature = "tts"))]
 use super::error::{ServeError, ServeResult};
+#[cfg(any(feature = "stt", feature = "tts"))]
 use super::http::write_headers;
+#[cfg(feature = "stt")]
 use crate::RuntimeKind;
 
 /// Budget minimal conservé pour les clauses courtes.
+#[cfg(feature = "tts")]
 const MIN_TTS_MAX_FRAMES: usize = 160;
 /// Surcharge du cap de frames TTS pour les entrées longues.
+#[cfg(feature = "tts")]
 const TTS_MAX_FRAMES_ENV: &str = "SARAGOSSA_TTS_MAX_FRAMES";
+#[cfg(feature = "stt")]
 const STT_NOT_CONFIGURED: &str =
     "endpoint STT non configuré: relancez saragossa serve avec --stt-model <dir>";
+#[cfg(feature = "tts")]
 const TTS_NOT_CONFIGURED: &str =
     "endpoint TTS non configuré: relancez saragossa serve avec --tts-model <dir>";
 
 /// Etat audio du serveur : slots STT/TTS chargés à la demande.
 pub(super) struct AudioState {
+    #[cfg(feature = "stt")]
     backend: RuntimeKind,
+    #[cfg(feature = "stt")]
     stt: SttSlot,
+    #[cfg(feature = "tts")]
     tts: TtsSlot,
+    #[cfg(feature = "denoise")]
+    enhance_path: Option<PathBuf>,
     /// Sessions STT à entrée incrémentale, indépendantes du modèle chargé.
+    #[cfg(feature = "stt")]
     pub(super) stt_sessions: super::stt::SttSessions,
 }
 
+#[cfg(feature = "stt")]
 struct SttSlot {
     path: Option<PathBuf>,
     model: Option<WhisperModel>,
@@ -54,6 +81,7 @@ struct SttSlot {
     metal: Option<MetalExecutor>,
 }
 
+#[cfg(feature = "tts")]
 struct TtsSlot {
     path: Option<PathBuf>,
     model: Option<TtsModel>,
@@ -61,6 +89,7 @@ struct TtsSlot {
 
 // Seule la synthèse est substituable : les tests conservent le choix WAV/PCM
 // du gestionnaire de production, sans charger de poids ni initialiser Metal.
+#[cfg(feature = "tts")]
 pub(super) trait SpeechSynthesis {
     fn configure_voice(
         &mut self,
@@ -84,19 +113,30 @@ impl AudioState {
     /// Construit l'état audio depuis les chemins CLI, sans charger les poids.
     pub(super) fn new(args: &ServeArgs) -> Self {
         Self {
+            #[cfg(feature = "stt")]
             backend: args.backend,
+            #[cfg(feature = "stt")]
             stt: SttSlot {
                 path: args.stt_model.clone(),
                 model: None,
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 metal: None,
             },
+            #[cfg(feature = "tts")]
             tts: TtsSlot {
                 path: args.tts_model.clone(),
                 model: None,
             },
+            #[cfg(feature = "denoise")]
+            enhance_path: args.enhance_model.clone(),
+            #[cfg(feature = "stt")]
             stt_sessions: super::stt::SttSessions::default(),
         }
+    }
+
+    #[cfg(feature = "denoise")]
+    pub(super) fn enhance_path(&self) -> Option<PathBuf> {
+        self.enhance_path.clone()
     }
 
     /// Transcrit des échantillons mono 16 kHz avec le backend Whisper.
@@ -104,6 +144,7 @@ impl AudioState {
     /// # Errors
     ///
     /// Renvoie une erreur si le modèle STT n'est pas configuré ou si l'inférence échoue.
+    #[cfg(feature = "stt")]
     pub(super) fn transcribe(&mut self, samples: &[f32], lang: &str) -> ServeResult<String> {
         self.with_stt(|model, runtime| Ok(model.transcribe(samples, lang, runtime)?.0))
     }
@@ -113,6 +154,7 @@ impl AudioState {
     /// # Errors
     ///
     /// Renvoie une erreur si le modèle STT n'est pas configuré, ou celle de `use_model`.
+    #[cfg(feature = "stt")]
     pub(super) fn with_stt_sessions<T>(
         &mut self,
         use_model: impl FnOnce(
@@ -136,6 +178,7 @@ impl AudioState {
     /// # Errors
     ///
     /// Renvoie une erreur si le modèle STT n'est pas configuré, ou celle de `use_model`.
+    #[cfg(feature = "stt")]
     pub(super) fn with_stt<T>(
         &mut self,
         use_model: impl FnOnce(&WhisperModel, ForwardRuntime<'_>) -> ServeResult<T>,
@@ -150,6 +193,7 @@ impl AudioState {
         use_model(model, runtime)
     }
 
+    #[cfg(feature = "stt")]
     fn ensure_stt_loaded(&mut self) -> ServeResult<()> {
         if self.stt.model.is_some() {
             return Ok(());
@@ -183,6 +227,7 @@ impl AudioState {
         Ok(())
     }
 
+    #[cfg(feature = "tts")]
     fn ensure_tts_loaded(&mut self) -> ServeResult<()> {
         if self.tts.model.is_some() {
             return Ok(());
@@ -205,6 +250,7 @@ impl AudioState {
     }
 }
 
+#[cfg(feature = "tts")]
 impl SpeechSynthesis for AudioState {
     fn configure_voice(
         &mut self,
@@ -268,6 +314,7 @@ impl SpeechSynthesis for AudioState {
     }
 }
 
+#[cfg(feature = "stt")]
 impl SttSlot {
     fn forward_runtime(&self, backend: RuntimeKind) -> ForwardRuntime<'_> {
         match backend {
@@ -285,6 +332,7 @@ impl SttSlot {
     }
 }
 
+#[cfg(feature = "tts")]
 fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
     override_value
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -299,6 +347,7 @@ fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
 }
 
 /// Sert `POST /v1/audio/speech`.
+#[cfg(feature = "tts")]
 pub(super) fn handle_speech<S: Write>(
     stream: &mut S,
     audio: &mut impl SpeechSynthesis,
@@ -329,6 +378,7 @@ pub(super) fn handle_speech<S: Write>(
 
 // L'injection permet de vérifier les arguments transmis par la route sans
 // charger de poids ni initialiser Metal.
+#[cfg(feature = "tts")]
 fn handle_speech_with<S: Write>(
     stream: &mut S,
     body: &[u8],
@@ -355,6 +405,7 @@ fn handle_speech_with<S: Write>(
 
 // Valeur fournie par le client : échapper les contrôles et l'UTF-8 pour ne
 // jamais injecter une ligne HTTP. Les noms usuels (alloy, nova…) restent tels quels.
+#[cfg(feature = "tts")]
 fn voice_fallback_header(voice: Option<&str>) -> Option<(&'static str, String)> {
     voice.map(|voice| {
         let value = voice
@@ -371,6 +422,7 @@ fn voice_fallback_header(voice: Option<&str>) -> Option<(&'static str, String)> 
     })
 }
 
+#[cfg(feature = "tts")]
 fn send_speech<S: Write>(
     stream: &mut S,
     output: &TtsSynthesisOutput,
@@ -399,6 +451,7 @@ fn send_speech<S: Write>(
 
 // L'écriture reste synchrone sur le thread moteur : pas de producteur détaché
 // ni de file audio non bornée. Les sockets ont déjà un timeout d'écriture.
+#[cfg(feature = "tts")]
 fn send_speech_stream<S: Write>(
     stream: &mut S,
     sample_rate: u32,
@@ -452,6 +505,7 @@ fn send_speech_stream<S: Write>(
     Ok(())
 }
 
+#[cfg(feature = "tts")]
 fn write_pcm_chunk<S: Write>(stream: &mut S, samples: &[f32]) -> std::io::Result<()> {
     if samples.is_empty() {
         return Ok(());
@@ -466,12 +520,14 @@ fn write_pcm_chunk<S: Write>(stream: &mut S, samples: &[f32]) -> std::io::Result
     stream.flush()
 }
 
-fn pcm_i16(sample: f32) -> i16 {
+#[cfg(any(feature = "tts", feature = "denoise"))]
+pub(super) fn pcm_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
 }
 
 /// Requête `/v1/audio/speech` : `voice` sélectionne un locuteur CustomVoice.
 #[derive(Debug, Deserialize)]
+#[cfg(feature = "tts")]
 struct SpeechRequest {
     /// Texte à synthétiser.
     input: String,
@@ -484,6 +540,7 @@ struct SpeechRequest {
     stream: bool,
 }
 
+#[cfg(feature = "stt")]
 pub(super) fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
     let body = text.as_bytes();
     write_headers(
@@ -503,27 +560,31 @@ pub(super) fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()>
 }
 
 // Les cibles fuzz et le serveur exécutent le même décodeur, sans copie.
-#[cfg(test)]
+#[cfg(all(test, feature = "stt", feature = "tts"))]
 use saragossa::wire_audio::text_field;
+#[cfg(feature = "stt")]
 use saragossa::wire_audio::MultipartField;
-#[cfg(test)]
+#[cfg(all(test, feature = "stt", feature = "tts"))]
 use saragossa::wire_audio::MAX_WAV_SAMPLES;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "stt", feature = "tts"))]
 fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult<Vec<f32>> {
     saragossa::wire_audio::downsample(samples, input_rate, target_rate)
         .map_err(|e| ServeError::Http(e.0))
 }
 
+#[cfg(feature = "stt")]
 pub(super) fn parse_multipart(body: &[u8], boundary: &str) -> ServeResult<Vec<MultipartField>> {
     saragossa::wire_audio::parse_multipart(body, boundary).map_err(|e| ServeError::Http(e.0))
 }
 
+#[cfg(feature = "stt")]
 pub(super) fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
     saragossa::wire_audio::wav_to_mono_16k(bytes).map_err(|e| ServeError::Http(e.0))
 }
 
 /// Encode des échantillons mono f32 en WAV PCM i16 en mémoire.
+#[cfg(feature = "tts")]
 fn mono_f32_to_wav(samples: &[f32], sample_rate: u32) -> ServeResult<Vec<u8>> {
     let spec = WavSpec {
         channels: 1,
@@ -548,7 +609,7 @@ fn mono_f32_to_wav(samples: &[f32], sample_rate: u32) -> ServeResult<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -558,7 +619,7 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "stt", feature = "tts"))]
 mod tests {
     use std::io::Cursor;
 
@@ -952,6 +1013,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "denoise")]
+    fn enhance_model_flag_is_parsed() {
+        let args = ServeArgs::parse([
+            "--enhance-model".to_string(),
+            "dfn3.safetensors".to_string(),
+        ])
+        .expect("invariant: args valides");
+        assert_eq!(args.enhance_model, Some(PathBuf::from("dfn3.safetensors")));
+    }
+
+    #[test]
     fn speech_without_model_returns_clear_error() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut audio = AudioState::new(&args);
@@ -979,8 +1051,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 mod stream_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 mod mutation_tests;

@@ -22,7 +22,7 @@ const TOKENIZER_CONTRACT_SHA256: &str =
 const LABEL_ROWS_FORMAT: &str = "lightning-label-rows-1";
 /// Regex de `Qwen2Tokenizer`, avec laquelle H2O et d3 ont été entraînés ;
 /// elle diverge de [`QWEN35_REGEX`] sur les marques combinantes.
-pub(crate) const QWEN2_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+use crate::tokenizer::QWEN2_REGEX;
 /// Le chemin de décision non causal est validé jusqu'à 2048 tokens.
 const MAX_BIDIRECTIONAL_TOKENS: usize = 2048;
 /// `MAX_LEN` du `serve.sh` H2O (état de 32 000 tokens plus la question).

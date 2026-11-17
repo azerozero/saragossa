@@ -323,6 +323,7 @@ pub(crate) fn limited_threadgroup_pipeline(device: &metal::Device) -> Result<Com
 }
 
 #[test]
+#[cfg(feature = "stt")]
 fn whisper_rejects_insufficient_threadgroup_limit() -> Result<()> {
     let Some(mut executor) = test_executor()? else { return Ok(()); };
     executor.whisper_attn_decode_vec64_f32 = limited_threadgroup_pipeline(&executor.device)?;
@@ -336,6 +337,7 @@ fn whisper_rejects_insufficient_threadgroup_limit() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "stt")]
 fn whisper_vec64_supported_threadgroup_matches_exact_oracle() -> Result<()> {
     let Some(executor) = test_executor()? else { return Ok(()); };
     if executor.whisper_attn_decode_vec64_f32.max_total_threads_per_threadgroup() < 1024 { return Ok(()); }

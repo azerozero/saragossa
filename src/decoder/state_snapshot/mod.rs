@@ -211,6 +211,13 @@ pub(super) struct State {
     pub(super) cache: CausalDecoderCache,
     pub(super) final_state: Tensor,
     pub(super) history: Option<LayerKvCache>,
+    #[cfg_attr(
+        not(feature = "devtools"),
+        allow(
+            dead_code,
+            reason = "Format commun des snapshots avec ou sans capture DFlash"
+        )
+    )]
     pub(super) captures: Option<PrefixCaptures>,
 }
 

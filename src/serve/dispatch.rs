@@ -37,11 +37,18 @@ use super::state::ServeState;
 pub(super) struct Front {
     pub(super) api_key: Option<String>,
     pub(super) model_ids: Vec<String>,
+    #[cfg(feature = "denoise")]
+    pub(super) enhance: super::enhance::EnhanceService,
 }
 
 impl Front {
     pub(super) fn new(api_key: Option<String>, model_ids: Vec<String>) -> Self {
-        Self { api_key, model_ids }
+        Self {
+            api_key,
+            model_ids,
+            #[cfg(feature = "denoise")]
+            enhance: super::enhance::EnhanceService::new(None),
+        }
     }
 }
 
@@ -156,6 +163,11 @@ where
     S: ServeStream,
     A: FnOnce(Dispatcher<S>) -> ServeResult<()> + Send + 'static,
 {
+    #[cfg(feature = "denoise")]
+    let front = Front {
+        enhance: super::enhance::EnhanceService::new(state.audio_mut().enhance_path()),
+        ..front
+    };
     let queue_depth = serve_queue_depth();
     let (jobs, queue) = sync_channel(queue_depth);
     let dispatcher = Dispatcher {
@@ -366,6 +378,19 @@ impl<S: ServeStream> Connection<S> {
         if let Some(result) = route_front(&mut stream, &self.front, &request) {
             return reply_on_error(&mut stream, result);
         }
+        if request.is_enhance() {
+            #[cfg(not(feature = "denoise"))]
+            return send_error(
+                &mut stream,
+                501,
+                "modalité débruitage absente : recompiler avec --features denoise",
+            );
+            #[cfg(feature = "denoise")]
+            return self
+                .front
+                .enhance
+                .handle(&mut stream, &mut request, content_length);
+        }
         let Some(bytes) = Reservation::acquire(
             &self.inflight_bytes,
             content_length,
@@ -414,13 +439,13 @@ impl<S: ServeStream> Connection<S> {
 }
 
 /// Part réservée d'un compteur plafonné (connexions, octets), rendue au drop.
-struct Reservation {
+pub(super) struct Reservation {
     counter: Arc<AtomicUsize>,
     amount: usize,
 }
 
 impl Reservation {
-    fn acquire(counter: &Arc<AtomicUsize>, amount: usize, max: usize) -> Option<Self> {
+    pub(super) fn acquire(counter: &Arc<AtomicUsize>, amount: usize, max: usize) -> Option<Self> {
         // NOTE: boucle compare-exchange plutôt que `fetch_update`, déprécié au
         // profit de `try_update` absent de la MSRV 1.85.
         let mut count = counter.load(Ordering::Acquire);
@@ -541,6 +566,27 @@ mod tests {
             .read_to_string(&mut response)
             .expect("invariant: réponse lisible avant le timeout");
         response
+    }
+
+    #[test]
+    #[cfg(not(feature = "denoise"))]
+    fn enhance_without_feature_rejects_before_upload_or_queueing() {
+        let (dispatcher, queue) = dispatcher_with(Some("secret"), 2, 0, 0);
+        for framing in ["Content-Length: 99999999999", "Transfer-Encoding: chunked"] {
+            for (authorization, status) in [("", 401), ("Authorization: Bearer secret\r\n", 501)] {
+                let raw = format!(
+                    "POST /v1/audio/enhance?stream=true HTTP/1.1\r\n{authorization}{framing}\r\n\r\n"
+                );
+                let reply = response(connect(&dispatcher, raw.as_bytes()));
+                assert!(reply.starts_with(&format!("HTTP/1.1 {status}")), "{reply}");
+                if status == 501 {
+                    assert!(reply.contains("--features denoise"), "{reply}");
+                }
+                settle(&dispatcher);
+                assert!(queue.try_recv().is_err());
+                assert_eq!(dispatcher.inflight_bytes.load(Ordering::Acquire), 0);
+            }
+        }
     }
 
     /// Le lot prend les éléments du même modèle dans l'ordre, sous le

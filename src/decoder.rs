@@ -43,6 +43,7 @@ pub use state_snapshot::persistent::{
     configure_prefix_disk_cache, flush_prefix_disk_cache, PrefixDiskSession,
 };
 pub(crate) use state_snapshot::{ReadSource, SnapshotSources};
+#[cfg(feature = "tts")]
 mod tts_prefill;
 mod vision;
 #[cfg(test)]
@@ -61,6 +62,7 @@ mod mtp_history;
 mod multi;
 mod resident;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(feature = "tts")]
 pub(crate) use resident::tts_codebooks::TtsCodebookWeights;
 
 use self::flags::*;
@@ -649,6 +651,13 @@ struct ResidentVerifyCaptures;
 /// Tête appliquée aux états finaux du verify résident.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(
+    not(feature = "devtools"),
+    allow(
+        dead_code,
+        reason = "La variante échantillonnée est utilisée par DFlash"
+    )
+)]
 enum ResidentVerifyHead {
     Skip,
     Argmax,
@@ -2054,6 +2063,7 @@ impl CausalDecoder {
     ///
     /// # Errors
     /// Refuse les séquences hors contrat et les architectures non Qwen3.5.
+    #[cfg(feature = "decision")]
     pub fn decision_hidden(&self, token_ids: &[usize], rows: &[usize]) -> Result<Tensor> {
         self.decision_hidden_packed(&[(token_ids, rows)])?
             .pop()
@@ -2068,6 +2078,7 @@ impl CausalDecoder {
     ///
     /// # Errors
     /// Comme [`Self::decision_hidden`], pour chaque séquence.
+    #[cfg(feature = "decision")]
     pub fn decision_hidden_packed(
         &self,
         sequences: &[(&[usize], &[usize])],

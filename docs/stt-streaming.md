@@ -9,9 +9,9 @@ Requête `multipart/form-data` compatible OpenAI : `file` (WAV), `language`
 
 | `response_format` | Décodage | Réponse |
 |---|---|---|
-| `json` (défaut) | `<|notimestamps|>` | `{"text": …}` |
-| `text` | `<|notimestamps|>` | texte brut |
-| `verbose_json` | tokens `<|t.tt|>` | `text`, `language`, `duration`, `segments[]` |
+| `json` (défaut) | `<\|notimestamps\|>` | `{"text": …}` |
+| `text` | `<\|notimestamps\|>` | texte brut |
+| `verbose_json` | tokens `<\|t.tt\|>` | `text`, `language`, `duration`, `segments[]` |
 
 Chaque segment porte `id`, `seek`, `start`, `end`, `text`, `tokens`,
 `temperature` (toujours 0), `avg_logprob`, `compression_ratio` et
@@ -51,9 +51,9 @@ pas `stream`. Une erreur après les en-têtes produit un événement
 
 ## Entrée en flux : `POST /v1/audio/transcriptions/stream`
 
-Le serveur HTTP lit des corps à `Content-Length` sur un thread moteur
-séquentiel : il ne lit pas de requête chunked et ne peut pas répondre pendant
-la réception. L'entrée en flux passe donc par une session : une requête par
+La route STT lit des corps à `Content-Length` avant le passage au thread moteur
+séquentiel : elle ne lit pas de requête chunked et ne répond pas pendant
+la réception (le débruitage DFN3 dispose de son propre transport duplex). L'entrée en flux passe donc par une session : une requête par
 morceau audio, une réponse JSON par requête. Le client reste bloquant et
 simple, comme le client HTTP de reti.
 

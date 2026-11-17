@@ -120,17 +120,12 @@ Les commits filtrés peuvent néanmoins apparaître dans le changelog.
 Voir la [configuration de release-plz](https://release-plz.dev/docs/config#the-release_commits-field)
 et le [fonctionnement des PR de release](https://release-plz.dev/docs/usage/release-pr).
 
-**Le label `release` seul n'active pas l'auto-merge.** Le mainteneur ajoute
-`release-ready` lorsque le lot est prêt. Le workflow active alors l'auto-merge
-avec un commit de merge, après les checks requis. Retirer `release-ready` ou
-`release` désactive l'auto-merge tant que la PR n'est pas fusionnée. Ne pas
-attribuer le label générique `automerge` aux PR de release.
-
-Sans cette décision, la PR reste ouverte pour regrouper les contributions.
-Un auto-merge systématique dès l'ajout de `release` pourrait au contraire
-produire une release par merge éligible de `main` : release-plz n'impose ni
-délai ni nombre minimal de commits. `release_always = false` réserve la
-publication à une PR de release fusionnée ; ce réglage ne crée pas de délai.
+**Publication continue.** Dès que release-plz ouvre ou met à jour sa PR avec
+le label `release`, le workflow active l'auto-merge avec un commit de merge,
+après les checks requis : chaque merge éligible de `main` produit une release.
+Retirer `release` désactive l'auto-merge tant que la PR n'est pas fusionnée.
+Ne pas attribuer le label générique `automerge` aux PR de release.
+`release_always = false` réserve la publication à une PR de release fusionnée.
 
 La PR de release conserve la CI ordinaire et compile en plus le binaire avec
 `--locked --release --target aarch64-apple-darwin --bin saragossa --features metal,devtools`,
@@ -186,10 +181,7 @@ commandes ci-dessus ne font pas partie de la préparation d'une contribution.
   **`Release build (Apple Silicon)`** comme check requis séparé ; retirer
   cette exigence si elle avait déjà été configurée. Conserver les autres
   protections et contrôles concernés (GPU, CodeQL et documentation).
-- Créer les labels `release` et `release-ready`. Seul `release` figure dans
-  `pr_labels` ; `release-ready` reste une décision du mainteneur. Désactiver
-  l'auto-merge des éventuelles PR de release déjà ouvertes avant ce changement
-  si leur lot n'est pas prêt.
+- Créer le label `release`, seul label de `pr_labels`.
 - Configurer `RELEASE_PLZ_TOKEN` avec les droits de création/mise à jour des
   PR, de fusion et d'écriture des tags dans ce dépôt, ainsi que d'écriture
   dans `azerozero/homebrew-tap`. Utiliser un PAT ou un jeton d'application

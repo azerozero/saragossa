@@ -1,5 +1,7 @@
 //! Prétraitement clone Base/ICL pour Qwen3-TTS.
 
+pub use crate::audio_resample::resample;
+
 use crate::{InferError, Result, Tensor};
 use rustfft::{num_complex::Complex, FftPlanner};
 
@@ -19,27 +21,7 @@ const N_FREQS: usize = N_FFT / 2 + 1;
 /// Renvoie une erreur si le WAV est invalide ou si le format est unsupported.
 pub fn load_wav_24k(bytes: &[u8]) -> Result<Vec<f32>> {
     let (mono, sample_rate) = decode_wav_mono(bytes)?;
-    Ok(resample(&mono, sample_rate, 24_000))
-}
-
-/// Rééchantillonne un signal mono par polyphase rationnel.
-#[must_use]
-pub fn resample(samples: &[f32], from_hz: u32, to_hz: u32) -> Vec<f32> {
-    if from_hz == to_hz || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let g = gcd(from_hz, to_hz);
-    let up = (to_hz / g) as usize;
-    let down = (from_hz / g) as usize;
-    let max_rate = up.max(down);
-    let half_len = 10 * max_rate;
-    let numtaps = 2 * half_len + 1;
-    let cutoff = 1.0 / max_rate as f64;
-    let mut h = firwin_lowpass(numtaps, cutoff, 5.0);
-    for value in &mut h {
-        *value *= up as f64;
-    }
-    upfirdn(samples, &h, up, down, numtaps)
+    resample(&mono, sample_rate, 24_000)
 }
 
 /// Calcule le log-mel speaker `[1, frames, 128]`.
@@ -85,11 +67,22 @@ pub fn log_mel_24k(samples: &[f32]) -> Result<Tensor> {
     Tensor::from_vec(vec![1, n_frames, N_MELS], mel_out)
 }
 
-fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+/// Décode un WAV PCM entier ou flottant en mono f32 (moyenne des canaux) et renvoie sa fréquence.
+///
+/// # Errors
+///
+/// Renvoie une erreur si le WAV est invalide ou si son format n'est pas supporté.
+pub fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
     let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))
         .map_err(|err| InferError::Config(format!("parse WAV clone: {err}")))?;
     let spec = reader.spec();
-    let channels = spec.channels.max(1) as usize;
+    crate::wire_audio::validate_wav_limits(
+        spec.sample_rate,
+        spec.channels,
+        u64::from(reader.len()),
+    )
+    .map_err(InferError::Audio)?;
+    let channels = usize::from(spec.channels);
     let interleaved = match spec.sample_format {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
@@ -119,81 +112,6 @@ fn decode_wav_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
             .collect()
     };
     Ok((mono, spec.sample_rate))
-}
-
-fn upfirdn(samples: &[f32], h: &[f64], up: usize, down: usize, numtaps: usize) -> Vec<f32> {
-    let n_in = samples.len();
-    let n_out = n_in.checked_mul(up).map(|v| v.div_ceil(down)).unwrap_or(0);
-    let pad = (numtaps - 1) / 2;
-    let mut out = Vec::with_capacity(n_out);
-    for i in 0..n_out {
-        let center = i * down + pad;
-        let kstart = center % up;
-        let mut k = kstart;
-        let mut acc = 0.0_f64;
-        while k < numtaps && k <= center {
-            let j = center - k;
-            let sample_idx = j / up;
-            if sample_idx < n_in {
-                acc += h[k] * samples[sample_idx] as f64;
-            }
-            k += up;
-        }
-        out.push(acc as f32);
-    }
-    out
-}
-
-fn firwin_lowpass(numtaps: usize, cutoff: f64, beta: f64) -> Vec<f64> {
-    let win = kaiser_window(numtaps, beta);
-    let center = (numtaps - 1) as f64 / 2.0;
-    let mut h = (0..numtaps)
-        .map(|i| {
-            let m = i as f64 - center;
-            let arg = cutoff * m;
-            let sinc = if arg == 0.0 {
-                1.0
-            } else {
-                (std::f64::consts::PI * arg).sin() / (std::f64::consts::PI * arg)
-            };
-            cutoff * sinc * win[i]
-        })
-        .collect::<Vec<_>>();
-    let sum = h.iter().sum::<f64>();
-    if sum.abs() > 1.0e-12 {
-        for value in &mut h {
-            *value /= sum;
-        }
-    }
-    h
-}
-
-fn kaiser_window(n: usize, beta: f64) -> Vec<f64> {
-    if n == 1 {
-        return vec![1.0];
-    }
-    let denom = bessel_i0(beta);
-    let nm1 = (n - 1) as f64;
-    (0..n)
-        .map(|i| {
-            let r = 2.0 * i as f64 / nm1 - 1.0;
-            bessel_i0(beta * (1.0 - r * r).max(0.0).sqrt()) / denom
-        })
-        .collect()
-}
-
-fn bessel_i0(x: f64) -> f64 {
-    let mut sum = 1.0_f64;
-    let mut term = 1.0_f64;
-    let half_x = x / 2.0;
-    for k in 1..50 {
-        term *= (half_x / k as f64) * (half_x / k as f64);
-        sum += term;
-        if term < 1.0e-12 * sum {
-            break;
-        }
-    }
-    sum
 }
 
 fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
@@ -268,28 +186,51 @@ fn mel_to_hz(mel: f32) -> f32 {
     }
 }
 
-fn gcd(a: u32, b: u32) -> u32 {
-    if b == 0 {
-        a
-    } else {
-        gcd(b, a % b)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn zero_rates_return_typed_errors_even_for_empty_audio() {
+        for samples in [&[][..], &[0.25][..]] {
+            for (from, to) in [(0, 24_000), (24_000, 0), (0, 0)] {
+                assert!(matches!(
+                    resample(samples, from, to),
+                    Err(InferError::Audio(_))
+                ));
+            }
+        }
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(
+                &mut cursor,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 24_000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            writer.write_sample(1_i16).unwrap();
+            writer.finalize().unwrap();
+        }
+        let mut wav = cursor.into_inner();
+        wav[24..32].fill(0);
+        assert!(matches!(decode_wav_mono(&wav), Err(InferError::Audio(_))));
+        assert!(matches!(load_wav_24k(&wav), Err(InferError::Audio(_))));
+    }
+
+    #[test]
     fn resample_preserves_same_rate() {
         let samples = vec![0.1, -0.2, 0.3, 0.4];
-        assert_eq!(resample(&samples, 24_000, 24_000), samples);
+        assert_eq!(resample(&samples, 24_000, 24_000).unwrap(), samples);
     }
 
     #[test]
     fn resample_32k_to_24k_has_expected_length() {
         let samples = vec![0.0_f32; 32_000];
-        let out = resample(&samples, 32_000, 24_000);
+        let out = resample(&samples, 32_000, 24_000).unwrap();
         assert_eq!(out.len(), (samples.len() * 3).div_ceil(4));
     }
 
