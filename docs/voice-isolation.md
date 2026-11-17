@@ -184,6 +184,56 @@ sans prétendre mesurer une heure d'inférence DFN3. Les tests TCP vérifient
 l'émission avant la fin de l'envoi, les deux cadrages HTTP, multipart, le 400,
 le 503, la contre-pression et l'inactivité en lecture/écriture.
 
+### WebSocket
+
+La feature `ws` (activée par défaut, impliquant `serve` et `denoise`) expose
+`GET /v1/audio/enhance/ws?rate=16000&format=s16` sur le même listener.
+Le handshake RFC 6455 exige HTTP/1.1, version 13 et une clé de 16 octets.
+Les messages binaires portent du PCM mono little-endian, `s16` ou `f32` ; la
+réponse utilise le même format à **48 kHz**. `rate` est obligatoire (8–192 kHz).
+Les échantillons peuvent traverser les limites de messages. Les NaN, infinis
+et échantillons tronqués sont refusés. Les trames **et messages reconstitués**
+sont limités à 16 Kio ; le dépassement ferme avec 1009. Les erreurs de cadrage
+ferment avec 1002. Les masques client, continuations, ping/pong et close sont
+contrôlés ; aucune extension de compression n'est négociée.
+
+Un **message binaire vide** termine l'entrée : le serveur vide FIR et DFN3,
+renvoie la fin audio, un message binaire vide puis close 1000. Un close client
+abandonne le traitement et reçoit son écho ; il ne remplace pas la fin d'entrée.
+Lire pendant l'envoi est indispensable : le serveur écrit avant de relire,
+sans file audio. Les limites de flux (503 avant upgrade), délais d'inactivité
+et réservations sont partagés avec le chunked.
+
+Le navigateur ne permet pas d'ajouter `Authorization` au handshake WebSocket.
+Le serveur accepte donc aussi `bearer.<clé>` dans les sous-protocoles, sans
+renvoyer cette valeur ; seul `saragossa` est négocié. La clé doit être un token
+HTTP valide (par exemple une chaîne hexadécimale). Hors boucle locale, placer
+le listener derrière un proxy TLS (`wss://`) qui conserve l'upgrade.
+
+```js
+// pcmChunks produit des Uint8Array de PCM s16le mono, <= 16 Kio.
+const ws = new WebSocket(
+  "ws://localhost:8080/v1/audio/enhance/ws?rate=16000&format=s16",
+  ["saragossa", `bearer.${apiKey}`],
+);
+ws.binaryType = "arraybuffer";
+ws.onmessage = ({data}) => {
+  if (data.byteLength) consumePcm48k(new Uint8Array(data));
+};
+await new Promise((resolve, reject) => {
+  ws.onopen = resolve;
+  ws.onerror = reject;
+});
+for await (const chunk of pcmChunks) {
+  while (ws.bufferedAmount > 16384) {
+    if (ws.readyState !== WebSocket.OPEN) throw new Error("flux fermé");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  ws.send(chunk);
+}
+ws.send(new Uint8Array()); // vider le retard avant close
+```
+
 ### Oracle
 
 `tools/voice/dfn3_ref.py` construit la référence : les classes PyTorch

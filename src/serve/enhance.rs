@@ -11,6 +11,11 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "ws")]
+pub(super) mod pcm;
+#[cfg(feature = "ws")]
+pub(super) mod ws;
+
 pub(super) struct EnhanceService {
     path: Option<PathBuf>,
     model: Mutex<Option<Arc<DeepFilterNet3>>>,
@@ -202,3 +207,9 @@ fn write_chunk(writer: &mut impl Write, bytes: &[u8]) -> ServeResult<()> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "ws"))]
+mod test_support;
+
+#[cfg(all(test, feature = "ws"))]
+mod latency;

@@ -378,6 +378,10 @@ impl<S: ServeStream> Connection<S> {
         if let Some(result) = route_front(&mut stream, &self.front, &request) {
             return reply_on_error(&mut stream, result);
         }
+        #[cfg(feature = "ws")]
+        if request.route() == "/v1/audio/enhance/ws" {
+            return self.front.enhance.handle_ws(&mut stream, &mut request);
+        }
         if request.is_enhance() {
             #[cfg(not(feature = "denoise"))]
             return send_error(

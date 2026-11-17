@@ -1787,6 +1787,7 @@ dependencies = [
 name = "saragossa"
 version = "0.3.7"
 dependencies = [
+ "base64 0.22.1",
  "bytemuck",
  "flate2",
  "fs2",
@@ -1802,6 +1803,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha1_smol",
  "sha2",
  "tempfile",
  "thiserror",
@@ -1865,6 +1867,12 @@ dependencies = [
  "ryu",
  "serde",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
