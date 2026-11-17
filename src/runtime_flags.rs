@@ -1492,7 +1492,7 @@ pub(crate) fn prefix_extend_resident_min_tokens() -> usize {
 /// sur stderr et garde le choix automatique.
 fn prefix_align_setting() -> Option<Option<usize>> {
     #[cfg(test)]
-    if let Some(align) = PREFIX_ALIGN_TEST_OVERRIDE.with(Cell::get) {
+    if let Some(align) = PREFIX_ALIGN_TEST_OVERRIDE.with(std::cell::Cell::get) {
         return Some(align);
     }
     static SETTING: OnceLock<Option<Option<usize>>> = OnceLock::new();
@@ -1555,7 +1555,8 @@ pub fn prefix_align_for_model(dense_bf16_gemm: bool) -> Option<(usize, usize)> {
 
 #[cfg(test)]
 thread_local! {
-    static PREFIX_ALIGN_TEST_OVERRIDE: Cell<Option<Option<usize>>> = const { Cell::new(None) };
+    static PREFIX_ALIGN_TEST_OVERRIDE: std::cell::Cell<Option<Option<usize>>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Exécute `run` avec l'alignement `align` (`None` : reprises à la longueur

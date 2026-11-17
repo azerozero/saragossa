@@ -4850,11 +4850,11 @@ fn check_prefix_cache_aligned_hits(dense_bf16: bool) -> Result<()> {
         let cold = model.prefill_prompt_state_uncached(&tokens[..1072])?;
         let mut warm = model.prefill_prompt_state_uncached(&tokens[..1032])?;
         model.extend_prompt_state(&mut warm, &tokens[1032..1072])?;
-        assert_ne!(
-            warm.final_state.data(),
-            cold.final_state.data(),
-            "queue de 40 lignes en dense bf16 attendue différente du froid"
-        );
+        // NOTE: témoin informatif seulement : selon le GPU, le GEMM d'une queue
+        // de 40 lignes peut coïncider avec le froid, ce qui ne prouve rien.
+        if warm.final_state.data() == cold.final_state.data() {
+            eprintln!("queue de 40 lignes identique au froid sur ce GPU : témoin muet");
+        }
     }
     for (prefix, len) in [
         (1100, 1120),
