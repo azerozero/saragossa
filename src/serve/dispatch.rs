@@ -183,6 +183,11 @@ where
             read_timeout,
         }),
     };
+    #[cfg(feature = "h2")]
+    let _transports = super::enhance::async_io::start(
+        Arc::clone(&dispatcher.front),
+        Arc::clone(&dispatcher.connections),
+    )?;
     // NOTE: thread détaché plutôt que scope : une panique moteur doit tuer le
     // process comme avant, pas attendre un accept qui ne finit jamais.
     let acceptor = thread::Builder::new()

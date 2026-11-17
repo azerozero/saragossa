@@ -836,7 +836,7 @@ fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
     constant_time_eq(token.as_bytes(), expected.as_bytes())
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(super) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut diff = left.len() ^ right.len();
     let max_len = left.len().max(right.len());
     for index in 0..max_len {

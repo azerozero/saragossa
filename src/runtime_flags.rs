@@ -2202,6 +2202,13 @@ pub fn serve_max_connections() -> usize {
     })
 }
 
+/// Listener h2c DFN3 opt-in (`SARAGOSSA_ENHANCE_H2_ADDR`, par exemple
+/// `127.0.0.1:8082`). Aucune écoute supplémentaire sans cette variable.
+#[must_use]
+pub fn enhance_h2_addr() -> Option<String> {
+    env_var("SARAGOSSA_ENHANCE_H2_ADDR").filter(|s| !s.is_empty())
+}
+
 /// Flux DFN3 simultanés (`SARAGOSSA_ENHANCE_MAX_STREAMS`, défaut 2).
 /// Une admission refusée répond 503 sans lire le corps.
 pub fn enhance_max_streams() -> usize {
@@ -2514,6 +2521,7 @@ pub(crate) fn environment_sha256() -> &'static str {
 /// Liste fermée (suffixes communs à SARAGOSSA_ et RETI_) ; les flags inconnus,
 /// le batching et la géométrie des blocs restent dans l'empreinte par prudence.
 const SNAPSHOT_OPERATIONAL_SERVE_FLAGS: &[&str] = &[
+    "ENHANCE_H2_ADDR",
     "ENHANCE_MAX_STREAMS",
     "ENHANCE_IDLE_TIMEOUT_SECS",
     "SERVE_LOG_PROMPT_FINGERPRINT",

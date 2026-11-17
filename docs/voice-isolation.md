@@ -234,6 +234,44 @@ for await (const chunk of pcmChunks) {
 ws.send(new Uint8Array()); // vider le retard avant close
 ```
 
+### HTTP/2 h2c
+
+`--features h2` active les dépendances async optionnelles (hors `default`).
+Le listener dédié est explicitement activé par
+`SARAGOSSA_ENHANCE_H2_ADDR=127.0.0.1:8082` ; le listener HTTP/1 reste disponible.
+Le démarrage échoue si l'adresse ne peut pas être liée ou si aucune clé API
+n'est configurée. Le listener accepte le **prior knowledge h2c**, sans upgrade
+HTTP/1 ni TLS intégré. Pour un navigateur, un proxy TLS avec ALPN `h2` doit
+terminer HTTPS et transmettre vers ce listener.
+
+```bash
+SARAGOSSA_ENHANCE_H2_ADDR=127.0.0.1:8082 \
+  saragossa serve --enhance-model dfn3.safetensors
+curl --http2-prior-knowledge --no-buffer \
+  -H "Authorization: Bearer $SARAGOSSA_API_KEY" \
+  --data-binary @mono.s16le \
+  'http://localhost:8082/v1/audio/enhance/h2?rate=16000&format=s16' > propre.s16le
+```
+
+La requête est `POST`, le corps et la réponse sont du PCM brut comme en WS,
+sans préfixe WAV ; la sortie est à 48 kHz. END_STREAM termine l'entrée et vide
+le retard. L'admission partage `SARAGOSSA_ENHANCE_MAX_STREAMS` avec les autres
+transports et répond 503 avant de consommer le corps. La taille de DATA et la
+fenêtre par flux sont de 16 Kio, la fenêtre de connexion de 32 Kio ; une trame
+supérieure au maximum négocié produit FRAME_SIZE_ERROR. La capacité reçue
+n'est rendue qu'après l'émission de la sortie, et l'envoi attend WINDOW_UPDATE.
+Un worker CPU par flux admis communique par deux canaux de capacité un : les
+E/S des autres flux continuent pendant le calcul DFN3. Lectures, écritures,
+handshake et attente de capacité sont bornés par le délai enhance ; une erreur
+après les headers réinitialise le flux, sans toucher aux autres requêtes.
+
+**Limite de [Fetch](https://fetch.spec.whatwg.org/#dom-request-duplex).** Le duplex HTTP/2 est testé avec un client natif qui reçoit
+avant END_STREAM. L'API Fetch des navigateurs exige généralement
+`duplex: "half"` pour un corps ReadableStream et n'expose la réponse qu'après
+la fin de l'envoi : HTTP/2 ne lève pas cette restriction. Pour recevoir le son
+pendant une capture navigateur continue, utiliser WS ou WebTransport. Un
+exemple Fetch ne constitue donc pas une preuve de duplex navigateur.
+
 ### Oracle
 
 `tools/voice/dfn3_ref.py` construit la référence : les classes PyTorch

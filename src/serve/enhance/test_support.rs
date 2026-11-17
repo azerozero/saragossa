@@ -2,8 +2,11 @@
 use super::*;
 #[path = "../../../tests/support/dfn3_weights.rs"]
 mod fixture;
+#[cfg(feature = "ws")]
 use std::io::BufRead;
+#[cfg(feature = "ws")]
 use std::net::{TcpListener, TcpStream};
+#[cfg(feature = "ws")]
 use std::time::Duration;
 
 pub fn model() -> Arc<DeepFilterNet3> {
@@ -40,11 +43,13 @@ pub fn model() -> Arc<DeepFilterNet3> {
         Arc::new(DeepFilterNet3::load(file.path()).unwrap())
     }))
 }
+#[cfg(feature = "ws")]
 pub fn service() -> EnhanceService {
     let service = EnhanceService::new(None);
     *service.model.lock().unwrap() = Some(model());
     service
 }
+#[cfg(feature = "ws")]
 pub fn pair() -> (TcpStream, TcpStream) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -53,6 +58,7 @@ pub fn pair() -> (TcpStream, TcpStream) {
     server.configure(Duration::from_secs(15)).unwrap();
     (client, server)
 }
+#[cfg(feature = "ws")]
 pub fn headers(reader: &mut impl BufRead) -> String {
     let mut result = String::new();
     loop {

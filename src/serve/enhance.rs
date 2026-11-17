@@ -11,7 +11,11 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "ws")]
+#[cfg(feature = "h2")]
+pub(super) mod async_io;
+#[cfg(feature = "h2")]
+pub(super) mod h2;
+#[cfg(any(feature = "ws", feature = "h2"))]
 pub(super) mod pcm;
 #[cfg(feature = "ws")]
 pub(super) mod ws;
@@ -208,7 +212,7 @@ fn write_chunk(writer: &mut impl Write, bytes: &[u8]) -> ServeResult<()> {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "ws"))]
+#[cfg(all(test, any(feature = "ws", feature = "h2")))]
 mod test_support;
 
 #[cfg(all(test, feature = "ws"))]
