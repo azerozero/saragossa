@@ -389,8 +389,8 @@ impl DiarizationModel {
 
     /// Regroupe (ou dégroupe) les projections q, k, v de chaque couche en un
     /// seul matmul `[3d, d]`. Opt-in : `SARAGOSSA_DIAR_FUSED_QKV=1` à la
-    /// construction. Chemin CPU/per-op uniquement ; l'encodeur Metal résident
-    /// garde ses projections séparées.
+    /// construction. Vaut aussi pour l'encodeur Metal résident, construit après
+    /// l'appel (un GEMM `[3d, d]` puis une séparation exacte).
     ///
     /// # Errors
     ///
@@ -656,6 +656,7 @@ impl DiarizationModel {
                     q: proj(&l.q)?,
                     k: proj(&l.k)?,
                     v: proj(&l.v)?,
+                    qkv: l.qkv.as_ref().map(&proj).transpose()?,
                     o: proj(&l.o)?,
                     final_ln: norm(&l.ln2)?,
                     fc1: proj(&l.fc1)?,

@@ -12154,3 +12154,25 @@ QMVT_ALL(3) QMVT_ALL(4) QMVT_ALL(5) QMVT_ALL(6) QMVT_ALL(7) QMVT_ALL(8) QMVT_ALL
 QMVT_ALL(10) QMVT_ALL(11) QMVT_ALL(12) QMVT_ALL(13) QMVT_ALL(14) QMVT_ALL(15)
 // R = 16 : variante device seule ; `txt` threadgroup (R × 2176 octets) dépasserait 32 Ko.
 QMVT_DEV(16)
+
+// Sépare `[seq, 3 * d]` (q, k, v côte à côte par ligne, sortie du GEMM `[3d, d]`
+// fusionné) en trois buffers `[seq, d]`. Un thread par élément de sortie : copie
+// exacte, donc aucun écart numérique par rapport aux projections séparées.
+kernel void split_qkv_rows_f32(
+    device const float* qkv [[buffer(0)]],
+    device float* q [[buffer(1)]],
+    device float* k [[buffer(2)]],
+    device float* v [[buffer(3)]],
+    constant uint2& dims [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint d = dims.y;
+    if (gid.x >= d || gid.y >= dims.x) {
+        return;
+    }
+    const uint src = gid.y * 3u * d + gid.x;
+    const uint dst = gid.y * d + gid.x;
+    q[dst] = qkv[src];
+    k[dst] = qkv[src + d];
+    v[dst] = qkv[src + 2u * d];
+}

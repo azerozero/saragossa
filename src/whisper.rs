@@ -418,6 +418,7 @@ impl WhisperEncoder {
                 q: proj(&layer.self_attn.q_proj)?,
                 k: proj(&layer.self_attn.k_proj)?,
                 v: proj(&layer.self_attn.v_proj)?,
+                qkv: None,
                 o: proj(&layer.self_attn.out_proj)?,
                 final_ln: norm(&layer.final_layer_norm)?,
                 fc1: proj(&layer.fc1)?,

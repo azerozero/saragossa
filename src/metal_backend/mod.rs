@@ -380,6 +380,8 @@ pub struct MetalExecutor {
     rms_norm_rope_heads_f32: ComputePipelineState,
     #[cfg(feature = "diar")]
     rope_heads_inplace_f32: ComputePipelineState,
+    #[cfg(feature = "diar")]
+    split_qkv_rows_f32: ComputePipelineState,
     rms_norm_mrope_heads_f32: ComputePipelineState,
     rms_norm_heads_no_scale_f32: ComputePipelineState,
     causal_attention_prefill_f32: ComputePipelineState,
