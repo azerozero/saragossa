@@ -611,3 +611,24 @@ Pas de référence exécutée : le code dépend de `mamba_ssm` (noyaux CUDA), ab
 sur macOS. Un oracle demanderait d'abord un scan Mamba de référence en PyTorch
 pur. Estimation du port : 6 à 10 jours (scan bidirectionnel GPU, convs 2D
 denses, InstanceNorm, sous-pixel, iSTFT).
+
+## Débruitage multi-cœur (opt-in)
+
+`SARAGOSSA_DENOISE_THREADS=N` (défaut 1 : chemin historique, bit-identique)
+découpe le signal en N segments, chacun chauffé sur 1 s de contexte, traités en
+parallèle puis recollés par un fondu linéaire de 0,5 s centré sur chaque
+frontière. Le fichier entier est gardé en mémoire (pas de flux borné) : environ
+0,7 Go par heure en entrée et autant en sortie (f32, 48 kHz), plus les copies par
+segment. Seuil de proximité au mono-cœur fixé avant mesure : SNR ≥ 30 dB,
+validé seulement sur le modèle synthétique, pas encore mesuré sur le vrai DFN3.
+Risque connu : quand le début d'un segment n'est pas multiple de 480, sa grille
+STFT est décalée par rapport au mono-cœur (écart borné par le fondu, non mesuré).
+
+Bench de nuit, RTF 1 contre N threads sur le même clip long :
+
+```bash
+for n in 1 2 4 8; do SARAGOSSA_DENOISE_THREADS=$n cargo run --release -- enhance \
+  --model $SARAGOSSA_DFN3_DIR/dfn3.safetensors --input long.wav --output out_$n.wav; done
+```
+
+Chaque run affiche `RTF` ; comparer `out_N.wav` à `out_1.wav` (SNR ≥ 30 dB).
