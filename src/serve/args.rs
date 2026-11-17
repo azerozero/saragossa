@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::error::{ServeError, ServeResult};
 use crate::{hf_resolve, RuntimeKind};
-use saragossa::runtime_flags::Profile;
+use saragossa::runtime_flags::{ModelEntry, Profile};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8081;
@@ -189,6 +189,12 @@ impl ServeArgs {
                 other => return Err(ServeError::args(format!("argument serve inconnu: {other}"))),
             }
         }
+        // La CLI gagne : une entrée TOML de même id est ignorée.
+        for entry in &profile.models {
+            if !models.iter().any(|model| model.id == entry.id) {
+                models.push(config_from_entry(entry)?);
+            }
+        }
         prefix_ssd.bytes()?;
         validate_tcp_args(&host, port, api_key.as_deref())?;
         Ok(Self {
@@ -269,7 +275,7 @@ pub(super) fn help_text() -> String {
          [--api-key TOKEN] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
          {modality_options}[--backend cpu|metal] [--preload] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
-         Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs and serve.max_tokens_cap only. See `saragossa config print`.\n\
+         Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap and the [[models]] list (id, path) only. See `saragossa config print`.\n\
          SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
          --prefix-cache-ssd-priority-tokens 4096 (0 disables priority).\n\
          Models: repeat --model to expose any supported checkpoint. A bare path \\
@@ -341,6 +347,20 @@ pub(super) fn parse_model_registration(value: &str) -> ServeResult<ServeModelCon
     Ok(ServeModelConfig {
         id,
         path: PathBuf::from(value),
+        hf_repo,
+    })
+}
+
+/// Convertit une entrée `[[models]]` ; une référence HF nue est résolue au lancement.
+fn config_from_entry(entry: &ModelEntry) -> ServeResult<ServeModelConfig> {
+    if entry.id.trim().is_empty() || entry.path.trim().is_empty() {
+        return Err(ServeError::args("[[models]]: id et path requis"));
+    }
+    let hf_repo = (!Path::new(&entry.path).exists() && hf_resolve::is_hf_model_id(&entry.path))
+        .then(|| entry.path.clone());
+    Ok(ServeModelConfig {
+        id: entry.id.trim().to_string(),
+        path: PathBuf::from(entry.path.trim()),
         hf_repo,
     })
 }
