@@ -617,8 +617,12 @@ denses, InstanceNorm, sous-pixel, iSTFT).
 `SARAGOSSA_DENOISE_THREADS=N` (défaut 1 : chemin historique, bit-identique)
 découpe le signal en N segments, chacun chauffé sur 1 s de contexte, traités en
 parallèle puis recollés par un fondu linéaire de 0,5 s centré sur chaque
-frontière. Le fichier entier est gardé en mémoire (pas de flux borné). Seuil
-de proximité au mono-cœur fixé avant mesure : SNR ≥ 30 dB.
+frontière. Le fichier entier est gardé en mémoire (pas de flux borné) : environ
+0,7 Go par heure en entrée et autant en sortie (f32, 48 kHz), plus les copies par
+segment. Seuil de proximité au mono-cœur fixé avant mesure : SNR ≥ 30 dB,
+validé seulement sur le modèle synthétique, pas encore mesuré sur le vrai DFN3.
+Risque connu : quand le début d'un segment n'est pas multiple de 480, sa grille
+STFT est décalée par rapport au mono-cœur (écart borné par le fondu, non mesuré).
 
 Bench de nuit, RTF 1 contre N threads sur le même clip long :
 

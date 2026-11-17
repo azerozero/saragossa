@@ -132,7 +132,7 @@ fn enhance_to_writer<R: Read>(
     writer.write_all(&output_header(None)?)?;
     let mut resampler = StreamResampler::new(reader.sample_rate(), SAMPLE_RATE)?;
     let threads = saragossa::runtime_flags::denoise_threads();
-    let mut stream = DenoiseStream::new(model);
+    let mut stream = (threads <= 1).then(|| DenoiseStream::new(model));
     let mut whole = Vec::new();
     let mut count = 0_u64;
     let mut emit = |samples: &[f32]| -> CliResult<()> {
@@ -152,7 +152,7 @@ fn enhance_to_writer<R: Read>(
         let samples = resampler.push(&chunk)?;
         if threads > 1 {
             whole.extend(samples);
-        } else {
+        } else if let Some(stream) = stream.as_mut() {
             emit(&stream.push(&samples)?)?;
         }
     }
@@ -162,7 +162,7 @@ fn enhance_to_writer<R: Read>(
         // NOTE: le découpage en segments exige le signal entier en mémoire (opt-in).
         whole.extend(tail);
         emit(&model.enhance_parallel(&whole, threads)?)?;
-    } else {
+    } else if let Some(stream) = stream.as_mut() {
         emit(&stream.push(&tail)?)?;
         emit(&stream.finish()?)?;
     }
