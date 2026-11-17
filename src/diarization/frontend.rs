@@ -27,20 +27,56 @@ pub(super) struct MelFeatures {
     pub frames_valid: usize,
 }
 
+/// Banc mel avec les bornes des bandes non nulles de chaque filtre.
+pub(super) struct MelBank {
+    filters: Vec<f32>,
+    spans: Vec<(usize, usize)>,
+}
+
+impl MelBank {
+    pub(super) fn new(n_mels: usize) -> Self {
+        let filters = build_mel_filters(n_mels);
+        // Bandes creuses : chaque fréquence touche au plus deux filtres triangulaires.
+        let spans = filters
+            .chunks_exact(N_FREQS)
+            .map(|row| {
+                let first = row.iter().position(|w| *w != 0.0).unwrap_or(0);
+                let last = row.iter().rposition(|w| *w != 0.0).map_or(first, |i| i + 1);
+                (first, last)
+            })
+            .collect();
+        Self { filters, spans }
+    }
+
+    /// Une trame : `buf` contient déjà le signal fenêtré, `out` reçoit les `n_mels` log-mel.
+    fn row(&self, buf: &mut [Complex<f32>], out: &mut [f32]) {
+        fft_512().process(buf);
+        let mut power = [0.0_f32; N_FREQS];
+        for (p, value) in power.iter_mut().zip(buf.iter()) {
+            // La référence prend le module puis le remet au carré.
+            let magnitude = (value.re * value.re + value.im * value.im).sqrt();
+            *p = magnitude * magnitude;
+        }
+        for ((o, &(first, last)), filter) in out
+            .iter_mut()
+            .zip(&self.spans)
+            .zip(self.filters.chunks_exact(N_FREQS))
+        {
+            let acc: f32 = filter[first..last]
+                .iter()
+                .zip(&power[first..])
+                .map(|(w, p)| w * p)
+                .sum();
+            *o = (acc + LOG_GUARD).ln();
+        }
+    }
+}
+
 pub(super) fn log_mel(samples: &[f32], n_mels: usize) -> Result<MelFeatures> {
     if samples.is_empty() {
         return Err(InferError::Dimension("diarisation: audio vide".into()));
     }
-    let filters = build_mel_filters(n_mels);
-    // Bandes creuses : chaque fréquence touche au plus deux filtres triangulaires.
-    let rows: Vec<(usize, &[f32])> = filters
-        .chunks_exact(N_FREQS)
-        .map(|row| {
-            let first = row.iter().position(|w| *w != 0.0).unwrap_or(0);
-            let last = row.iter().rposition(|w| *w != 0.0).map_or(first, |i| i + 1);
-            (first, &row[first..last])
-        })
-        .collect();
+    let bank = MelBank::new(n_mels);
     let window = window();
     let pad = N_FFT / 2;
     let mut padded = vec![0.0_f32; samples.len() + 2 * pad];
@@ -50,7 +86,6 @@ pub(super) fn log_mel(samples: &[f32], n_mels: usize) -> Result<MelFeatures> {
     }
     let frames_total = 1 + samples.len() / HOP;
     let frames_valid = samples.len() / HOP;
-    let fft = fft_512();
     let mut data = vec![0.0_f32; frames_total * n_mels];
     data.par_chunks_mut(n_mels)
         .take(frames_valid)
@@ -62,21 +97,7 @@ pub(super) fn log_mel(samples: &[f32], n_mels: usize) -> Result<MelFeatures> {
                 for (i, slot) in buf.iter_mut().enumerate() {
                     *slot = Complex::new(padded[start + i] * window[i], 0.0);
                 }
-                fft.process(buf);
-                let mut power = [0.0_f32; N_FREQS];
-                for (p, value) in power.iter_mut().zip(buf.iter()) {
-                    // La référence prend le module puis le remet au carré.
-                    let magnitude = (value.re * value.re + value.im * value.im).sqrt();
-                    *p = magnitude * magnitude;
-                }
-                for (out, (first, weights)) in row.iter_mut().zip(&rows) {
-                    let acc: f32 = weights
-                        .iter()
-                        .zip(&power[*first..])
-                        .map(|(w, p)| w * p)
-                        .sum();
-                    *out = (acc + LOG_GUARD).ln();
-                }
+                bank.row(buf, row);
             },
         );
     Ok(MelFeatures {
@@ -84,6 +105,86 @@ pub(super) fn log_mel(samples: &[f32], n_mels: usize) -> Result<MelFeatures> {
         frames_total,
         frames_valid,
     })
+}
+
+/// Log-mel incrémental : mêmes opérations que `log_mel`, état borné à une
+/// fenêtre de 512 échantillons préaccentués.
+pub(super) struct MelStream {
+    bank: MelBank,
+    n_mels: usize,
+    /// Échantillons préaccentués à partir de l'indice absolu `base`.
+    pre: Vec<f32>,
+    base: usize,
+    total: usize,
+    last_raw: f32,
+    next_frame: usize,
+}
+
+impl MelStream {
+    pub(super) fn new(n_mels: usize) -> Self {
+        Self {
+            bank: MelBank::new(n_mels),
+            n_mels,
+            pre: Vec::new(),
+            base: 0,
+            total: 0,
+            last_raw: 0.0,
+            next_frame: 0,
+        }
+    }
+
+    pub(super) fn push(&mut self, samples: &[f32]) {
+        for &s in samples {
+            self.pre.push(if self.total == 0 {
+                s
+            } else {
+                s - PREEMPHASIS * self.last_raw
+            });
+            self.last_raw = s;
+            self.total += 1;
+        }
+    }
+
+    /// Trames valides : `floor(total / HOP)` une fois le signal fini.
+    pub(super) fn frames_valid(&self) -> usize {
+        self.total / HOP
+    }
+
+    /// Calcule les trames dont la fenêtre est entièrement connue (ou toutes les
+    /// trames valides si `finished`, le reste du signal valant zéro).
+    pub(super) fn ready(&mut self, finished: bool) -> Vec<f32> {
+        let window = window();
+        let half = N_FFT / 2;
+        let mut out = Vec::new();
+        let mut buf = vec![Complex::new(0.0_f32, 0.0); N_FFT];
+        loop {
+            let f = self.next_frame;
+            let known = if finished {
+                f < self.frames_valid()
+            } else {
+                f * HOP + half <= self.total
+            };
+            if !known {
+                break;
+            }
+            for (i, slot) in buf.iter_mut().enumerate() {
+                let v = (f * HOP + i)
+                    .checked_sub(half)
+                    .filter(|&idx| idx < self.total)
+                    .map_or(0.0, |idx| self.pre[idx - self.base]);
+                *slot = Complex::new(v * window[i], 0.0);
+            }
+            let at = out.len();
+            out.resize(at + self.n_mels, 0.0);
+            self.bank.row(&mut buf, &mut out[at..]);
+            self.next_frame += 1;
+        }
+        // La trame suivante lit à partir de `next_frame * HOP - half`.
+        let keep_from = (self.next_frame * HOP).saturating_sub(half).min(self.total);
+        self.pre.drain(..keep_from - self.base);
+        self.base = keep_from;
+        out
+    }
 }
 
 /// Empile `factor` trames consécutives (zéros pour le groupe incomplet final) :
