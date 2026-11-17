@@ -13,6 +13,7 @@ mod dsp;
 mod gpu_probe;
 mod layers;
 mod network;
+mod parallel;
 mod resample;
 mod stream;
 pub use resample::StreamResampler;

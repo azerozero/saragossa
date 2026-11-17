@@ -257,3 +257,38 @@ fn enhance_resampling_preserves_validation_without_tts() {
     assert_eq!(converted.len(), 480);
     assert!(converted.iter().all(|value| value.is_finite()));
 }
+
+/// Seuil annoncé avant toute mesure : SNR ≥ 30 dB contre le mono-cœur (énergie
+/// d'écart ≤ 0,1 % du signal). Le GRU de DFN3 oublie son état en bien moins que
+/// la chauffe de 1 s ; 30 dB laisse la place au seul bruit de fondu, et reste
+/// 10 dB au-dessus d'un échec franc (un segment mal chauffé donne ~20 dB).
+const PARALLEL_MIN_SNR_DB: f64 = 30.0;
+
+#[test]
+fn parallel_enhance_is_bit_exact_at_one_thread_and_close_beyond() {
+    let model = synthetic::recurrent_model();
+    // 9 s : deux segments de 4 s au moins (le débug est lent, 3 segments mesurés : 52,8 dB).
+    let input: Vec<f32> = (0..9_u64 * 48_000)
+        .map(|i| ((i * 7919 % 997) as f32 - 498.0) / 997.0 * 0.5)
+        .collect();
+    let mono = model.enhance(&input).unwrap();
+    let one = model.enhance_parallel(&input, 1).unwrap();
+    assert_eq!(
+        one.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+        mono.iter().map(|s| s.to_bits()).collect::<Vec<_>>()
+    );
+    let threads = 2;
+    {
+        let par = model.enhance_parallel(&input, threads).unwrap();
+        assert_eq!(par.len(), mono.len());
+        let signal: f64 = mono.iter().map(|&s| f64::from(s).powi(2)).sum();
+        let error: f64 = mono
+            .iter()
+            .zip(&par)
+            .map(|(&a, &b)| f64::from(a - b).powi(2))
+            .sum();
+        let snr = 10.0 * (signal / error.max(1e-30)).log10();
+        eprintln!("threads={threads} SNR contre mono {snr:.1} dB");
+        assert!(snr >= PARALLEL_MIN_SNR_DB, "threads={threads}: {snr:.1} dB");
+    }
+}
