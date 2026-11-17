@@ -399,6 +399,11 @@ CARGO_BUILD_JOBS=4 taskpolicy -b cargo test --release \
   --bin saragossa abba_latency -- --ignored --nocapture --test-threads=1
 ```
 
+`SARAGOSSA_ABBA_BLOCKS=<n>` change le nombre de blocs (6 par défaut) et la sortie
+donne p50, p95 et p99. Pour comparer HTTP/1 SSE et WebSocket contre un serveur
+déjà lancé, `python3 -I tools/bench_transports.py {sse,ws} -n 30` mesure le
+premier octet, le premier événement ou PCM et la latence par trame (p50, p95).
+
 Aucun résultat de latence sous charge n'est présenté comme une mesure valide.
 Les comparaisons de fidélité utilisent des poids récurrents synthétiques
 communs à l'oracle historique, et ne nécessitent ni téléchargement ni GPU.

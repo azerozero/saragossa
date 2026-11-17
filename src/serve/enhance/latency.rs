@@ -116,7 +116,11 @@ pub(super) fn abba(name: &str, mut candidate: impl FnMut() -> Timing) {
     candidate();
     let mut base = Vec::new();
     let mut other = Vec::new();
-    for _ in 0..6 {
+    let blocks = std::env::var("SARAGOSSA_ABBA_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
+    for _ in 0..blocks {
         for is_candidate in [false, true, true, false] {
             low_load();
             let result = if is_candidate {
@@ -141,10 +145,11 @@ pub(super) fn abba(name: &str, mut candidate: impl FnMut() -> Timing) {
         let pcm = trials.iter().map(|t| t.first_pcm).collect();
         let hops: Vec<_> = trials.into_iter().flat_map(|t| t.hops).collect();
         eprintln!(
-            "{label}: first_response_p50={}us first_pcm_p50={}us hop_p50={}us hop_p99={}us",
+            "{label}: first_response_p50={}us first_pcm_p50={}us hop_p50={}us hop_p95={}us hop_p99={}us",
             percentile(first, 50),
             percentile(pcm, 50),
             percentile(hops.clone(), 50),
+            percentile(hops.clone(), 95),
             percentile(hops, 99)
         );
     }
