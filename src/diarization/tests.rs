@@ -130,6 +130,101 @@ fn policy() -> CachePolicy {
     }
 }
 
+fn small_model_fixture() -> Result<(DiarizationConfig, HashMap<String, Tensor>)> {
+    let config = DiarizationConfig {
+        hidden_size: 8,
+        heads: 2,
+        layers: 0,
+        num_mel_bins: 2,
+        subsampling: 2,
+        rope_theta: 10_000.0,
+        head_hidden: 4,
+        num_speakers: 2,
+        chunk_length: 4,
+        chunk_right_context: 1,
+        chunk_left_context: 0,
+        cache: policy(),
+    };
+    let mut tensors = HashMap::new();
+    for (name, shape) in [
+        ("model.audio_tower.embedder.projection.weight", vec![8, 4]),
+        ("model.audio_tower.input_layer_norm.weight", vec![8]),
+        ("model.audio_tower.input_layer_norm.bias", vec![8]),
+        ("model.audio_tower.layer_norm.weight", vec![8]),
+        ("model.audio_tower.layer_norm.bias", vec![8]),
+        ("model.proj.weight", vec![4, 8]),
+        ("model.upsampler.conv.weight", vec![8, 4, 3]),
+        ("model.upsampler.conv.bias", vec![8]),
+        ("classifier.dense.weight", vec![4, 4]),
+        ("classifier.out_proj.weight", vec![2, 4]),
+        ("silence_embeds", vec![8]),
+    ] {
+        let values = vec![0.0; shape.iter().product()];
+        tensors.insert(name.into(), Tensor::from_vec(shape, values)?);
+    }
+    Ok((config, tensors))
+}
+
+#[test]
+fn from_tensors_rejects_incompatible_head_projection() -> Result<()> {
+    let (config, tensors) = small_model_fixture()?;
+    let model = DiarizationModel::from_tensors(config.clone(), tensors.clone())?;
+    let hidden = Tensor::from_vec(vec![3, 8], vec![0.0; 24])?;
+    assert_eq!(model.head(&hidden, ForwardRuntime::cpu())?.len(), 12);
+    for shape in [vec![3, 8], vec![5, 8], vec![4, 7], vec![4, 9]] {
+        let mut invalid = tensors.clone();
+        let values = vec![0.0; shape.iter().product()];
+        invalid.insert("model.proj.weight".into(), Tensor::from_vec(shape, values)?);
+        assert!(matches!(
+            DiarizationModel::from_tensors(config.clone(), invalid),
+            Err(InferError::Shape(message)) if message.contains("model.proj.weight")
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn from_tensors_revalidates_mutated_config() -> Result<()> {
+    let (config, tensors) = small_model_fixture()?;
+    DiarizationModel::from_tensors(config.clone(), tensors.clone())?;
+    for (field, value) in [
+        ("heads", 0),
+        ("heads", 3), // hidden_size non divisible par heads.
+        ("heads", 8), // Dimension par tête impaire, incompatible avec RoPE.
+        ("chunk_length", 0),
+        ("subsampling", 0),
+        ("hidden_size", 0),
+        ("num_mel_bins", 0),
+        ("head_hidden", 0),
+        ("num_speakers", 0),
+        ("num_speakers", 3), // Le cache doit rester cohérent avec la tête.
+    ] {
+        let mut invalid = config.clone();
+        match field {
+            "heads" => invalid.heads = value,
+            "chunk_length" => invalid.chunk_length = value,
+            "subsampling" => invalid.subsampling = value,
+            "hidden_size" => invalid.hidden_size = value,
+            "num_mel_bins" => invalid.num_mel_bins = value,
+            "head_hidden" => invalid.head_hidden = value,
+            "num_speakers" => invalid.num_speakers = value,
+            _ => {
+                return Err(InferError::Config(format!(
+                    "champ de test inconnu: {field}"
+                )))
+            }
+        }
+        assert!(
+            matches!(
+                DiarizationModel::from_tensors(invalid, tensors.clone()),
+                Err(InferError::Config(_))
+            ),
+            "{field}={value}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn cache_compression_keeps_length_and_speaker_order() {
     // 12 trames de dimension 1 (valeur = indice) ; locuteur 0 sur 0..6, 1 sur 6..12.

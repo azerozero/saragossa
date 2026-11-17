@@ -133,14 +133,7 @@ impl DiarizationConfig {
         if a.rope_parameters.partial_rotary_factor != 1.0 {
             return unsupported("RoPE partielle non prise en charge".into());
         }
-        if a.num_attention_heads == 0
-            || a.hidden_size % a.num_attention_heads != 0
-            || (a.hidden_size / a.num_attention_heads) % 2 != 0
-            || a.intermediate_size == 0
-            || a.subsampling_factor == 0
-            || raw.chunk_length == 0
-            || raw.head_config.num_speakers == 0
-        {
+        if a.intermediate_size == 0 || raw.head_config.num_speakers == 0 {
             return unsupported("dimensions incohérentes".into());
         }
         let s = &raw.streaming_config;
@@ -150,7 +143,7 @@ impl DiarizationConfig {
             .ok_or_else(|| {
                 InferError::Config("diarisation: cache des locuteurs trop court".into())
             })? as f32;
-        Ok(Self {
+        let config = Self {
             hidden_size: a.hidden_size,
             heads: a.num_attention_heads,
             layers: a.num_hidden_layers,
@@ -174,7 +167,35 @@ impl DiarizationConfig {
                 weak_boosted: (budget * s.weak_boost_rate).floor() as usize,
                 num_speakers: speakers,
             },
-        })
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    // Les champs publics peuvent être modifiés après la lecture du fichier.
+    fn validate(&self) -> Result<()> {
+        if self.hidden_size == 0
+            || self.heads == 0
+            || self.hidden_size % self.heads != 0
+            || (self.hidden_size / self.heads) % 2 != 0
+            || self.subsampling == 0
+            || self.num_mel_bins == 0
+            || self.head_hidden == 0
+            || self.chunk_length == 0
+            || self.num_speakers == 0
+        {
+            return Err(InferError::Config(
+                "diarisation: dimensions incohérentes".into(),
+            ));
+        }
+        if self.cache.num_speakers != self.num_speakers
+            || self.cache.cache_length / self.num_speakers < self.cache.silence_frames
+        {
+            return Err(InferError::Config(
+                "diarisation: cache des locuteurs incohérent".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -300,8 +321,10 @@ impl DiarizationModel {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si un poids manque ou n'a pas la forme attendue.
+    /// Renvoie une erreur si la configuration est invalide, si un poids manque
+    /// ou n'a pas la forme attendue.
     pub fn from_tensors(config: DiarizationConfig, mut t: HashMap<String, Tensor>) -> Result<Self> {
+        config.validate()?;
         let (d, sub, mels) = (config.hidden_size, config.subsampling, config.num_mel_bins);
         let p = "model.audio_tower";
         let embed_w = take(&mut t, &format!("{p}.embedder.projection.weight"))?;
@@ -321,6 +344,9 @@ impl DiarizationModel {
             });
         }
         let hh = config.head_hidden;
+        let proj_w = take(&mut t, "model.proj.weight")?;
+        expect_shape(&proj_w, &[hh, d], "model.proj.weight")?;
+        let proj = Linear::new(proj_w, t.remove("model.proj.bias"))?;
         let up_w = take(&mut t, "model.upsampler.conv.weight")?;
         expect_shape(&up_w, &[hh * sub, hh, 3], "upsampler.conv")?;
         let up_w = Tensor::from_vec(vec![hh * sub, hh * 3], up_w.data().to_vec())?;
@@ -336,7 +362,7 @@ impl DiarizationModel {
             input_ln: take_norm(&mut t, &format!("{p}.input_layer_norm"))?,
             layers,
             final_ln: take_norm(&mut t, &format!("{p}.layer_norm"))?,
-            proj: take_linear(&mut t, "model.proj")?,
+            proj,
             upsampler: Linear::new(up_w, Some(up_b))?,
             dense: take_linear(&mut t, "classifier.dense")?,
             out_proj,
