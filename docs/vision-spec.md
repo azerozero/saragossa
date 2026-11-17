@@ -183,13 +183,15 @@ agrégée sont versionnés ; le wheel ne fournit pas de SHA Git, signalé par
 `transformers_git_sha: null`. Ne pas présenter le SHA256 de contenu comme un
 identifiant de commit amont. Le script de capture est lui-même empreinté.
 
-L'environnement ne contient pas torchvision. Les trois images déterministes
-256×256, 224×320 et 320×224 ne nécessitent aucun resize. La normalisation
+L'environnement de la capture initiale ne contenait pas torchvision. Les trois
+images déterministes 256×256, 224×320 et 320×224 ne nécessitent aucun resize. La normalisation
 fusionnée et la permutation du processeur sont reproduites explicitement ;
 les tests contrôlent les pixels, la duplication temporelle et l'ordre des
 patchs indépendamment. Cette capture initiale n'exécute aucune porte de resize.
 Les fixtures du [prétraitement CPU](vision-preprocess.md) ajoutent séparément
-la référence PIL et les portes de resize de l'étape 1.
+les références PIL et torchvision et les portes de resize de l'étape 1.
+La mesure torchvision atteint 2 niveaux uint8 sur deux captures : la porte
+fixée à un niveau échoue et reste inchangée (voir le rapport de prétraitement).
 
 Les 12 embeddings sont calculés par le modèle vision installé, avec les vrais
 poids BF16 promus f32 et chargés un par un ; aucun LLM complet, aucun code

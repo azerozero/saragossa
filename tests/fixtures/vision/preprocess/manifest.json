@@ -978,5 +978,187 @@
       "file": "probe-5-rgb.bin",
       "sha256": "a9f4772bf36a960332cb65a0e60db140b5cc6c213ed7a8a44f867ab2a9c7a999"
     }
-  ]
+  ],
+  "torchvision_reference": {
+    "backend": "torchvision",
+    "torch": "2.12.0",
+    "torchvision": "0.27.0",
+    "pillow": "12.2.0",
+    "numpy": "2.5.5",
+    "hf_pipeline": "https://github.com/huggingface/transformers/blob/v5.8.1/src/transformers/image_processing_backends.py",
+    "hf_processor": "https://github.com/huggingface/transformers/blob/v5.8.1/src/transformers/models/qwen2_vl/image_processing_qwen2_vl.py",
+    "input": "CPU uint8 contiguous NCHW, batch=1",
+    "interpolation": "BICUBIC",
+    "antialias": true,
+    "generator_sha256": "4341f7151e6454056e91322eda3f4dfbfa1a674f7a3dafde6bb90a85112db623",
+    "resize_source_sha256": "339a06bee7c69cf2df352feda02ea76832fb4c31cd19e8d4c477e147036ca1b8",
+    "fixtures": [
+      {
+        "name": "square",
+        "height": 256,
+        "width": 256,
+        "pattern": "ramp",
+        "profile": "Qwen38",
+        "resized": [
+          256,
+          256
+        ],
+        "file": "square-torchvision-rgb.bin",
+        "sha256": "210a51407298656709c88c7cd5dc63a914aa90d16a9f291973009681a2dd9694",
+        "grid_thw": [
+          1,
+          16,
+          16
+        ],
+        "patches_sha256": "65c9c6cd09eb6bce2e4f42aed27e4a65f132ab531ea22805afa012eef3947829",
+        "pil_max_abs_uint8": 0
+      },
+      {
+        "name": "ties",
+        "height": 272,
+        "width": 304,
+        "pattern": "ramp",
+        "profile": "Qwen38",
+        "resized": [
+          256,
+          320
+        ],
+        "file": "ties-torchvision-rgb.bin",
+        "sha256": "62905c905ce347ac9241b4ca754de22157b1c0afa3277e3b5487ca9c9d3e3527",
+        "grid_thw": [
+          1,
+          16,
+          20
+        ],
+        "patches_sha256": "be279eb593635abbaf544c0318a9964af1298de79f51af184f4dae9b5ca39498",
+        "pil_max_abs_uint8": 2
+      },
+      {
+        "name": "tiny",
+        "height": 17,
+        "width": 31,
+        "pattern": "ramp",
+        "profile": "Qwen36",
+        "resized": [
+          192,
+          352
+        ],
+        "file": "tiny-torchvision-rgb.bin",
+        "sha256": "8be147824c1a1848f638c057f125f5d1e7da5663f137b668b557681d6b780e9f",
+        "grid_thw": [
+          1,
+          12,
+          22
+        ],
+        "patches_sha256": "bc6ff70e070b573995ec9053801f9bee4088b88d1203ccbf03ce097ca618ab03",
+        "pil_max_abs_uint8": 2
+      },
+      {
+        "name": "up-portrait",
+        "height": 129,
+        "width": 63,
+        "pattern": "checker",
+        "profile": "Thx02",
+        "resized": [
+          384,
+          192
+        ],
+        "file": "up-portrait-torchvision-rgb.bin",
+        "sha256": "1437fe32d4d296a18c2dd28e848f0b3d902ba6431b4848472c209e2977ea9103",
+        "grid_thw": [
+          1,
+          24,
+          12
+        ],
+        "patches_sha256": "88352b7b41e89be836c90c85cf6a46966e540af11faedd0df9a523498e559243",
+        "pil_max_abs_uint8": 1
+      }
+    ],
+    "filter_probes": [
+      {
+        "name": "probe-0",
+        "height": 257,
+        "width": 259,
+        "pattern": "checker",
+        "profile": "Qwen38",
+        "resized": [
+          32,
+          32
+        ],
+        "file": "probe-0-torchvision-rgb.bin",
+        "sha256": "62dffd0eea70e09bb71bb11954eb1c2169749a61543d7939c6ba2ceed232953c",
+        "pil_max_abs_uint8": 1
+      },
+      {
+        "name": "probe-1",
+        "height": 33,
+        "width": 49,
+        "pattern": "ramp",
+        "profile": "Qwen38",
+        "resized": [
+          7,
+          11
+        ],
+        "file": "probe-1-torchvision-rgb.bin",
+        "sha256": "a0504daf9419d0425ce2204cccee163499821693125f9efb1030ae79f73a0b44",
+        "pil_max_abs_uint8": 0
+      },
+      {
+        "name": "probe-2",
+        "height": 1,
+        "width": 73,
+        "pattern": "ramp",
+        "profile": "Qwen38",
+        "resized": [
+          32,
+          32
+        ],
+        "file": "probe-2-torchvision-rgb.bin",
+        "sha256": "58c8532ffaa0609748f0b97ae542d7dffcbea5e91eeddd0786b46b0029bd1a9a",
+        "pil_max_abs_uint8": 0
+      },
+      {
+        "name": "probe-3",
+        "height": 73,
+        "width": 1,
+        "pattern": "ramp",
+        "profile": "Qwen38",
+        "resized": [
+          32,
+          32
+        ],
+        "file": "probe-3-torchvision-rgb.bin",
+        "sha256": "8339d51e82b83d0dd8aeeff048d1e3b4fe394ce166e8097e68fe54c8f02123be",
+        "pil_max_abs_uint8": 0
+      },
+      {
+        "name": "probe-4",
+        "height": 64,
+        "width": 64,
+        "pattern": "impulse",
+        "profile": "Qwen38",
+        "resized": [
+          17,
+          64
+        ],
+        "file": "probe-4-torchvision-rgb.bin",
+        "sha256": "82959e92b161674adfeac36a4281c9d6bf6f3cec1287963f4e6846f876aa9a96",
+        "pil_max_abs_uint8": 0
+      },
+      {
+        "name": "probe-5",
+        "height": 64,
+        "width": 64,
+        "pattern": "colors",
+        "profile": "Qwen38",
+        "resized": [
+          64,
+          17
+        ],
+        "file": "probe-5-torchvision-rgb.bin",
+        "sha256": "3bbe69ab7e029a8c256be750f860d922f578aa8ed9fca468540d623398764500",
+        "pil_max_abs_uint8": 1
+      }
+    ]
+  }
 }

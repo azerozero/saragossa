@@ -13,12 +13,19 @@ Le décodage reste à intégrer lorsque des crates adaptées seront autorisées.
 
 ## Référence du redimensionnement
 
-Torchvision n'est pas installé dans l'environnement de référence local.
-La référence de repli est Pillow, `Image.Resampling.BICUBIC` sur une image RGB
-uint8, avec l'antialias inhérent au rééchantillonnage PIL. La porte reste
-un écart absolu maximal d'un niveau uint8 (1/255 dans [0,1]). La parité avec
-torchvision n'est pas mesurée ; les arrondis et la saturation intermédiaire
-de PIL peuvent différer de ceux du backend tenseur de torchvision.
+Les captures Pillow, `Image.Resampling.BICUBIC` sur RGB uint8, sont conservées.
+Une seconde référence utilise torchvision 0.27.0 avec PyTorch 2.12.0 sur CPU :
+tenseur uint8 NCHW contigu, batch de taille 1, `transforms.v2.functional.resize`,
+`BICUBIC`, `antialias=True`, avant conversion f32 et normalisation fusionnée.
+C'est le pipeline du [backend HF 5.8.1](https://github.com/huggingface/transformers/blob/v5.8.1/src/transformers/image_processing_backends.py)
+appelé par le [processeur Qwen2VL](https://github.com/huggingface/transformers/blob/v5.8.1/src/transformers/models/qwen2_vl/image_processing_qwen2_vl.py).
+Les tailles proviennent du `smart_resize` déjà capturé ; aucun processeur ni
+poids téléchargé depuis un checkpoint n'est exécuté.
+
+La porte reste un écart maximal d'un niveau uint8 (1/255 dans [0,1]).
+**Elle échoue actuellement contre torchvision : 2 niveaux sur `ties` et
+`tiny`**, soit 2/255 dans [0,1]. Le seuil n'est pas élargi et les tests ne
+sont pas ignorés. La parité PIL ne suffit donc pas à valider le resize HF.
 
 ## Interface et reproduction
 
@@ -29,22 +36,34 @@ pixels)` et `preprocess(&image, ImageProfile)`. Les profils `Qwen38`, `Qwen36`,
 `grid_thw = [1,H/16,W/16]` et `pixel_values`, matrice aplatie
 `[H/16 × W/16,1536]` : lignes `[bloc_h,bloc_w,intra_h,intra_w]`, colonnes
 `[C,T,patch_h,patch_w]`. La normalisation précède la répétition temporelle ×2.
-Les étapes intermédiaires `resized`, `normalize_and_repeat` et `into_patches`
-permettent de comparer les captures. Les dimensions nulles, les tampons RGB
-mal dimensionnés et les patchs non alignés sont refusés.
+Les étapes intermédiaires `resized(profile)`, `normalize_and_repeat(profile)`
+et `into_patches(profile)` permettent de comparer les captures. Les deux
+dernières exigent explicitement un profil et vérifient son plafond de pixels
+avant toute allocation de sortie. Un dépassement renvoie
+`InferError::VisionPixelBudget { pixels, max_pixels }`, sans allouer de message.
+La normalisation alloue 24 octets par pixel ; la permutation fait coexister
+deux tampons f32, soit au plus 48 octets par pixel (768 Mio pour Qwen,
+75 Mio pour THX/d3), hors entrée RGB déjà fournie par l'appelant.
+Le minimum de `smart_resize` ne s'applique pas aux étapes intermédiaires.
+Les dimensions nulles, les tampons RGB mal dimensionnés et les patchs non
+alignés sont refusés. Une image 8192×8192 est refusée avant allocation f32.
 
 Les [fixtures](../tests/fixtures/vision/preprocess/manifest.json) contiennent
 12 images synthétiques, 6 sondes de filtre (forte réduction, axe d'un pixel,
 redimensionnement d'un seul axe), 60 dimensions calculées par la fonction
 `smart_resize` installée et les 256 niveaux de normalisation f32. Le manifeste
 conserve versions et empreintes SHA256 du générateur, de la source Python,
-des pixels et des patchs. Aucun poids ni appareil GPU n'est nécessaire.
+des pixels et des patchs. La section `torchvision_reference` ajoute quatre
+images (dont une sans resize) et les six sondes, moins de 1 Mio de RGB au total,
+avec versions, paramètres, empreintes et écart PIL/torchvision par capture.
+Aucun poids ni appareil GPU n'est nécessaire.
 
-Définir `REF_PYTHON` vers l'interpréteur existant, sans installer de paquet :
+Définir `REF_PYTHON` vers un environnement contenant torch 2.12.0,
+torchvision 0.27.0, Pillow 12.2.0 et NumPy (version enregistrée au manifeste).
+Le générateur additionnel vérifie les captures PIL existantes sans les modifier :
 
 ```sh
-"$REF_PYTHON" -I -B tools/goldens/vision_preprocess.py \
-  --output tests/fixtures/vision/preprocess
+taskpolicy -b "$REF_PYTHON" -I -B tests/fixtures/vision/preprocess/generate_torchvision.py
 CARGO_BUILD_JOBS=4 taskpolicy -b cargo fmt --all -- --check
 CARGO_BUILD_JOBS=4 taskpolicy -b cargo clippy --all-targets --all-features -- -D warnings
 CARGO_BUILD_JOBS=4 taskpolicy -b cargo test --release --no-default-features --features vision --lib vision::preprocess
@@ -58,5 +77,6 @@ Mesure locale avec Pillow 12.2.0, PyTorch 2.12.0 et Transformers 5.8.1 :
 écart maximal **0 niveau uint8** sur les 12 fixtures et les 6 sondes ;
 écart maximal **0 en f32** sur les 256 niveaux et sur les pixels/patchs des
 5 fixtures sans resize. Les 60 dimensions et les grilles/ordres des 12 images
-correspondent exactement à la référence Python. Ces mesures ne prétendent
-pas quantifier l'écart avec torchvision, absent de cet environnement.
+correspondent exactement à la référence Python. Contre torchvision 0.27.0,
+le maximum est **2 niveaux uint8** ; les portes de resize et de patchs
+redimensionnés échouent. Les captures sans resize gardent la porte f32 à 1e-6.

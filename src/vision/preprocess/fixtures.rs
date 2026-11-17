@@ -34,6 +34,13 @@ struct Manifest {
     filter_probes: Vec<Fixture>,
     smart_resize: Vec<ResizeCase>,
     normalized_sha256: String,
+    torchvision_reference: TorchvisionReference,
+}
+
+#[derive(Deserialize)]
+struct TorchvisionReference {
+    fixtures: Vec<Fixture>,
+    filter_probes: Vec<Fixture>,
 }
 
 fn profile(name: &str) -> ImageProfile {
@@ -103,7 +110,7 @@ fn vision_normalization_matches_all_python_levels_and_repeats_afterward() -> Res
         .flat_map(|value| [value, 255 - value, 127])
         .collect();
     let image = RgbImage::from_rgb8(16, 16, pixels)?;
-    let actual = image.normalize_and_repeat()?;
+    let actual = image.normalize_and_repeat(ImageProfile::Qwen38)?;
     assert_eq!(actual.shape(), [2, 3, 16, 16]);
     let frame_len = 3 * 16 * 16;
     assert_eq!(&actual.pixels()[..frame_len], &actual.pixels()[frame_len..]);
@@ -133,7 +140,7 @@ fn vision_normalized_no_resize_fixtures_pass_f32_gate() -> Result<()> {
         count += 1;
         let source = synthetic(&fixture);
         let image = source.resized(profile(&fixture.profile))?;
-        let actual = image.normalize_and_repeat()?;
+        let actual = image.normalize_and_repeat(ImageProfile::Qwen38)?;
         let rgb = golden(&fixture);
         let plane = (fixture.height * fixture.width) as usize;
         let mut max_error = 0_f32;
@@ -214,6 +221,46 @@ fn vision_bicubic_antialiases_strong_reduction_and_handles_single_pixel_axes() -
 }
 
 #[test]
+fn vision_bicubic_matches_torchvision_with_documented_uint8_tolerance() -> Result<()> {
+    let reference = manifest().torchvision_reference;
+    assert_eq!(reference.fixtures.len(), 4);
+    assert_eq!(reference.filter_probes.len(), 6);
+    let mut maximum = 0;
+    for fixture in reference
+        .fixtures
+        .into_iter()
+        .chain(reference.filter_probes)
+    {
+        let actual = resize::bicubic(&synthetic(&fixture), fixture.resized[0], fixture.resized[1])?;
+        let expected = golden(&fixture);
+        assert_eq!(actual.pixels().len(), expected.len());
+        let error = actual
+            .pixels()
+            .iter()
+            .zip(&expected)
+            .map(|(&a, &b)| a.abs_diff(b))
+            .max()
+            .unwrap();
+        eprintln!("{} torchvision: max_abs_uint8={error}", fixture.name);
+        maximum = maximum.max(error);
+        if fixture.resized == [fixture.height, fixture.width] {
+            assert_eq!(error, 0, "{} sans resize", fixture.name);
+        }
+    }
+    eprintln!(
+        "torchvision global: max_abs_uint8={maximum}, max_abs_01={}",
+        f64::from(maximum) / 255.0
+    );
+    // Porte inchangée de vision-spec.md : un niveau uint8, et non un
+    // pourcentage ni une tolérance recalibrée sur les écarts observés.
+    assert!(
+        maximum <= 1,
+        "écart torchvision: {maximum} niveaux uint8, maximum autorisé: 1"
+    );
+    Ok(())
+}
+
+#[test]
 fn vision_rgb_rejects_malformed_buffers() {
     for (h, w, bytes) in [(0, 0, 0), (1, 1, 2), (1, 1, 4), (u32::MAX, u32::MAX, 0)] {
         assert!(RgbImage::from_rgb8(h, w, vec![0; bytes]).is_err());
@@ -224,7 +271,12 @@ fn vision_rgb_rejects_malformed_buffers() {
 #[test]
 fn vision_preprocess_matches_python_patch_order_and_numeric_gates() -> Result<()> {
     let levels = normalized_levels();
-    for fixture in manifest().fixtures {
+    let reference = manifest();
+    for fixture in reference
+        .fixtures
+        .into_iter()
+        .chain(reference.torchvision_reference.fixtures)
+    {
         let actual = preprocess(&synthetic(&fixture), profile(&fixture.profile))?;
         assert_eq!(actual.grid_thw, fixture.grid_thw, "{}", fixture.name);
         let rgb = golden(&fixture);
