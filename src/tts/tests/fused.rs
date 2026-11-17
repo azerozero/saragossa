@@ -14,7 +14,9 @@
 
 use super::*;
 use crate::decode_resident::TtsCodebookSample;
+use crate::runtime_flags::TTS_FUSED_LAYER_ENCODES;
 use crate::sampling::token_distribution_top_k_top_p;
+use std::cell::Cell;
 
 const LOGITS_MAX_ABS: f32 = 1e-3;
 const PROBS_MAX_ABS: f32 = 1e-6;
@@ -106,6 +108,7 @@ fn tts_talker_fused_kernels_match_general_layers() -> Result<()> {
                 frame_codes.extend(codes.iter().map(|&code| code as i32));
                 // Les mêmes codes alimentent les deux historiques KV sur toute la séquence.
                 let next = model.next_talker_input(&prepared, &mut trailing, &frame_codes)?;
+                let encoded_before = TTS_FUSED_LAYER_ENCODES.with(Cell::get);
                 let (fused_state, fused_logits) =
                     with_tts_talker_fused_kernels_override(true, || {
                         model
@@ -113,6 +116,12 @@ fn tts_talker_fused_kernels_match_general_layers() -> Result<()> {
                             .decode_state_logits_resident_from_embedding(&mut fused_cache, &next)
                     })?
                     .expect("invariant: talker fusionné résident");
+                let encoded_fused = TTS_FUSED_LAYER_ENCODES.with(Cell::get) - encoded_before;
+                assert_eq!(
+                    encoded_fused,
+                    model.assets.model_config.talker_config.num_hidden_layers as usize,
+                    "toutes les couches du talker doivent passer par la voie fusionnée ({repo})"
+                );
                 let (general_state, general_logits) =
                     with_tts_talker_fused_kernels_override(false, || {
                         model
@@ -120,6 +129,11 @@ fn tts_talker_fused_kernels_match_general_layers() -> Result<()> {
                             .decode_state_logits_resident_from_embedding(&mut general_cache, &next)
                     })?
                     .expect("invariant: talker général résident");
+                assert_eq!(
+                    TTS_FUSED_LAYER_ENCODES.with(Cell::get) - encoded_before,
+                    encoded_fused,
+                    "le chemin général ne doit encoder aucune couche fusionnée ({repo})"
+                );
                 for (name, fused, general) in [
                     ("état", &fused_state, &general_state),
                     ("logits", &fused_logits, &general_logits),

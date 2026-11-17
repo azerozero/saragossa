@@ -791,6 +791,11 @@ impl CausalDecoder {
                 };
                 #[cfg(not(feature = "tts"))]
                 let fused = false;
+                #[cfg(all(test, feature = "tts"))]
+                if fused {
+                    crate::runtime_flags::TTS_FUSED_LAYER_ENCODES
+                        .with(|count| count.set(count.get() + 1));
+                }
                 if !fused {
                     self.encode_resident_full_layer(
                         metal,
