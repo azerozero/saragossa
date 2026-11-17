@@ -65,6 +65,16 @@ pub struct EngineSection {
     pub preload: Option<bool>,
 }
 
+/// Entrée `[[models]]` : équivalent de `--model ID=CHEMIN`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEntry {
+    /// Identifiant exposé sur `/v1/models`.
+    pub id: String,
+    /// Répertoire local du modèle (ou référence HF au lancement seulement).
+    pub path: String,
+}
+
 /// Section `[serve]`.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -127,6 +137,9 @@ pub struct Profile {
     /// Garde mémoire globale.
     #[serde(default)]
     pub memory: MemorySection,
+    /// Modèles servis, rechargeables à chaud par SIGHUP.
+    #[serde(default)]
+    pub models: Vec<ModelEntry>,
 }
 
 /// Une clé de profil avec son origine d'environnement et son défaut lecteur.
@@ -164,6 +177,14 @@ impl Profile {
         ];
         if let Some((key, _)) = positive.iter().find(|(_, v)| *v == Some(0)) {
             return Err(err(key, "doit être strictement positif"));
+        }
+        for (i, model) in self.models.iter().enumerate() {
+            if model.id.trim().is_empty() || model.path.trim().is_empty() {
+                return Err(err("models", "id et path requis"));
+            }
+            if self.models[..i].iter().any(|m| m.id == model.id) {
+                return Err(err("models", format!("id en double: {}", model.id)));
+            }
         }
         if let Some(backend) = &self.engine.backend {
             if !matches!(backend.as_str(), "cpu" | "metal") {

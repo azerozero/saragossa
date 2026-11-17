@@ -25,8 +25,9 @@
 //!   en file.
 //!
 //! SIGHUP relit le profil (`--profile`/`--config`, `--set` compris) et n'applique
-//! que `serve.read_timeout_secs` et `serve.max_tokens_cap` ; tout autre
-//! changement est refusé en bloc (voir `reload`).
+//! que `serve.read_timeout_secs`, `serve.max_tokens_cap` et la liste `[[models]]` ;
+//! tout autre changement ou chemin de modèle illisible est refusé en bloc (voir
+//! `reload`).
 //!
 //! SIGUSR2 relaie sans coupure vers le binaire du même chemin (ou
 //! `--upgrade-binary PATH`) : l'enfant hérite de la socket d'écoute, puis
@@ -148,6 +149,7 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     }
     model_selection::select_if_missing(&mut args).map_err(boxed_error)?;
     model_selection::resolve_models(&mut args).map_err(boxed_error)?;
+    reload::set_launch_models(&args.models);
     saragossa::force_resident_full_linear_decode();
     let mut state = state::ServeState::new(&args);
     if args.preload {
