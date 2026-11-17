@@ -129,7 +129,8 @@ async fn idle_stream_is_reset_and_slot_released() {
         .unwrap();
     let mut recv = response.await.unwrap().into_body();
     let result = tokio::time::timeout(
-        enhance_idle_timeout() + std::time::Duration::from_secs(5),
+        // Marge proportionnelle : indépendante de la charge de la machine.
+        enhance_idle_timeout() * 4,
         recv.data(),
     )
     .await
@@ -269,7 +270,8 @@ async fn backpressure_waits_for_window_and_times_out() {
         panic!("le serveur a consommé une entrée non bornée sans lecteur");
     });
     let result = tokio::time::timeout(
-        enhance_idle_timeout() + std::time::Duration::from_secs(5),
+        // Marge proportionnelle : indépendante de la charge de la machine.
+        enhance_idle_timeout() * 4,
         async {
             let mut total = 0;
             while let Some(frame) = recv.data().await {

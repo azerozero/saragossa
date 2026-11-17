@@ -6,7 +6,18 @@ use super::*;
 use std::net::SocketAddr;
 use web_transport_quinn::{RecvStream, SendStream};
 
+/// Le certificat est auto-signé et l'API locale : seul le loopback est admis.
+pub(super) fn require_loopback(addr: SocketAddr) -> ServeResult<()> {
+    if addr.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(error(format!(
+            "SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR={addr} refusée : WebTransport n'écoute que sur le loopback (127.0.0.0/8 ou [::1])"
+        )))
+    }
+}
 pub(super) fn bind(addr: SocketAddr, front: &Front) -> ServeResult<quinn::Endpoint> {
+    require_loopback(addr)?;
     let identity = super::certificate::identity(addr)?;
     let endpoint = quinn::Endpoint::server(identity.config, addr).map_err(error)?;
     let mut info = identity.info;

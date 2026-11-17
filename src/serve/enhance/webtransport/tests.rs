@@ -185,7 +185,8 @@ async fn idle_client_releases_slot() {
     // Rend le stream visible côté serveur, puis abandonne le corps annoncé.
     send.write_all(&4_u32.to_le_bytes()).await.unwrap();
     let result = tokio::time::timeout(
-        enhance_idle_timeout() + std::time::Duration::from_secs(5),
+        // Marge proportionnelle : indépendante de la charge de la machine.
+        enhance_idle_timeout() * 4,
         recv.read(&mut [0; 4]),
     )
     .await
@@ -299,7 +300,8 @@ async fn unread_output_applies_backpressure_and_releases_slot() {
         panic!("le flux a consommé plus que les fenêtres sans lecteur");
     });
     tokio::time::timeout(
-        enhance_idle_timeout() + std::time::Duration::from_secs(5),
+        // Marge proportionnelle : indépendante de la charge de la machine.
+        enhance_idle_timeout() * 4,
         session.closed(),
     )
     .await
@@ -318,4 +320,17 @@ async fn unread_output_applies_backpressure_and_releases_slot() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("réservation retenue après contre-pression");
+}
+
+#[test]
+fn only_loopback_addresses_are_accepted() {
+    for ok in ["127.0.0.1:4433", "127.0.0.2:0", "[::1]:4433"] {
+        assert!(require_loopback(ok.parse().unwrap()).is_ok(), "{ok}");
+    }
+    for refused in ["0.0.0.0:4433", "192.168.1.10:4433", "[::]:4433"] {
+        assert!(
+            require_loopback(refused.parse().unwrap()).is_err(),
+            "{refused}"
+        );
+    }
 }
