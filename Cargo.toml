@@ -98,6 +98,10 @@ name = "bench_stt"
 required-features = ["stt"]
 
 [[example]]
+name = "tts_pcm_digest"
+required-features = ["tts"]
+
+[[example]]
 name = "decision_bench"
 required-features = ["decision"]
 
