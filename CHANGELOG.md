@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.9](https://github.com/azerozero/saragossa/compare/v0.3.8...v0.3.9) - 2026-11-17
+
+### Added
+
+- *(webtransport)* ajoute le débruitage duplex sur HTTP/3 WebTransport
+- *(h2)* ajoute le débruitage duplex sur h2c
+- *(ws)* expose le débruitage PCM en duplex
+
+### Fixed
+
+- *(prefill)* plafond flint vérifié avant l'ancre alignée et le prolongement
+- *(build)* réserve les sondes mémoire TTS à la feature tts
+- *(enhance)* durcit WS (échéance par trame, origine, pings), h2c loopback et statuts de chargement
+- *(enhance)* refuse WebTransport hors loopback et stabilise le test de contre-pression h2
+- *(test)* import Cell hors Metal et témoin dense bf16 informatif
+- *(build)* réserve l'exemple tts_pcm_digest à la feature tts
+- *(tts)* stabilise la relecture des poids et centralise les flags
+- *(mtp)* prefill résident MTP sans couche de capture accepté
+- *(prefill)* reprises du cache de préfixe identiques au bit au prefill à froid
+
+### Other
+
+- Merge pull request #241 from azerozero/fix/prefix-cache-alignement-propre
+- Merge pull request #249 from azerozero/perf/tts-memoire
+- Merge pull request #253 from azerozero/feat/transports-flux
+- intègre main dans la réduction mémoire TTS
+- *(tts)* consigne les mesures mémoire et les écarts de latence
+- fusionne origin/main après les mesures TTS
+- *(prefill)* hit exact sans queue et écart mesuré sans alignement
+- Merge remote-tracking branch 'origin/main' into fix/prefix-cache-alignement-propre
+- *(prefill)* marge du froid au token divergent dans l'oracle de préfixe
+- *(prefill)* garder l'entrée du prompt complet pour les hits exacts
+- *(tts)* ajoute les sondes mémoire et les empreintes PCM
+- *(tts)* recharge les poids CPU du codec à la demande
+- *(tts)* écarte les poids de l'encodeur du codec
+- *(tts)* retire la table texte inutilisée du talker
+
 ## [0.3.8](https://github.com/azerozero/saragossa/compare/v0.3.7...v0.3.8) - 2026-11-17
 
 ### Added
