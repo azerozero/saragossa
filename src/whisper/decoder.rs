@@ -733,7 +733,7 @@ impl WhisperModel {
         // rétablit le readback ; les replis per-op le rétablissent aussi.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if let Some(metal) = runtime.metal_executor() {
-            if crate::runtime_flags::env_var_os("SARAGOSSA_STT_FEATURES_HOST").is_none()
+            if !crate::runtime_flags::stt_features_host()
                 && crate::runtime_flags::env_var_os("SARAGOSSA_STT_DECODER_PEROP").is_none()
             {
                 if let Some(features) = self.encoder.encode_samples_resident(samples, metal)? {

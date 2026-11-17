@@ -142,6 +142,41 @@ fn golden_encoder_matches_fixture() -> Result<()> {
     Ok(())
 }
 
+/// Features résidentes (sans readback intermédiaire) contre le chemin hôte
+/// `SARAGOSSA_STT_FEATURES_HOST=1` : identiques au bit sur whisper-tiny.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "inférence: whisper-tiny local et verrou GPU requis"]
+fn resident_features_match_host_path_bitwise() -> Result<()> {
+    let Some(model_dir) = local_whisper_tiny_dir() else {
+        return Err(crate::InferError::Config(
+            "snapshot whisper-tiny requis".into(),
+        ));
+    };
+    let encoder = WhisperEncoder::from_model_dir(model_dir)?;
+    let metal = crate::MetalExecutor::new()?;
+    // Signal déterministe de 5 s à 16 kHz : somme de deux sinus.
+    let samples: Vec<f32> = (0..80_000)
+        .map(|i| {
+            let t = i as f32 / 16_000.0;
+            0.3 * (440.0 * std::f32::consts::TAU * t).sin()
+                + 0.1 * (1_234.0 * std::f32::consts::TAU * t).sin()
+        })
+        .collect();
+    let host = encoder.encode_samples(&samples, ForwardRuntime::metal(&metal))?;
+    let resident = encoder
+        .encode_samples_resident(&samples, &metal)?
+        .ok_or_else(|| crate::InferError::Config("chemin résident indisponible".into()))?;
+    let (rows, cols) = host.as_matrix()?;
+    assert_eq!((resident.rows, resident.cols), (rows, cols));
+    let got = crate::metal_backend::read_f32_buffer(&resident.buffer, rows * cols)?;
+    assert!(!got.is_empty() && got.iter().all(|v| v.is_finite()));
+    for (index, (a, b)) in got.iter().zip(host.data()).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "feature {index}");
+    }
+    Ok(())
+}
+
 fn local_whisper_tiny_dir() -> Option<PathBuf> {
     if let Some(path) = crate::runtime_flags::env_var("SARAGOSSA_WHISPER_TINY_DIR") {
         let path = PathBuf::from(path);

@@ -636,7 +636,7 @@ impl WhisperEncoder {
 ///
 /// Renvoie une erreur si `num_mel_bins` n'est pas supporté.
 pub fn log_mel_spectrogram(samples: &[f32], num_mel_bins: usize) -> Result<Tensor> {
-    let serial = crate::runtime_flags::env_var_os("SARAGOSSA_STT_MEL_SERIAL").is_some();
+    let serial = crate::runtime_flags::stt_mel_serial();
     log_mel_impl(samples, num_mel_bins, !serial)
 }
 

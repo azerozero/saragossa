@@ -224,6 +224,26 @@ pub fn env_flag(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Features STT relues par l'hôte au lieu de rester sur le GPU. Défaut OFF ;
+/// `SARAGOSSA_STT_FEATURES_HOST=1` rétablit le readback.
+#[cfg(all(feature = "stt", target_os = "macos", feature = "metal"))]
+pub(crate) fn stt_features_host() -> bool {
+    env_flag("SARAGOSSA_STT_FEATURES_HOST", false)
+}
+
+/// Log-mel séquentiel. Défaut OFF ; `SARAGOSSA_STT_MEL_SERIAL=1` désactive rayon.
+#[cfg(feature = "stt")]
+pub(crate) fn stt_mel_serial() -> bool {
+    env_flag("SARAGOSSA_STT_MEL_SERIAL", false)
+}
+
+/// Poids bf16 pour l'attention du decode Whisper. Défaut OFF ;
+/// `SARAGOSSA_STT_DEC_ATTN_BF16=1` l'active.
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(crate) fn stt_dec_attn_bf16() -> bool {
+    env_flag("SARAGOSSA_STT_DEC_ATTN_BF16", false)
+}
+
 pub(crate) fn env_flag_value(value: &str) -> Option<bool> {
     let value = value.trim();
     if value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on") {
@@ -2925,6 +2945,27 @@ mod tests {
         std::env::remove_var("RETI_TEST_PRIORITE");
     }
 
+    #[cfg(feature = "stt")]
+    #[test]
+    fn stt_kill_switches_honour_zero_and_one() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        for (name, read) in [
+            ("SARAGOSSA_STT_MEL_SERIAL", stt_mel_serial as fn() -> bool),
+            (
+                "SARAGOSSA_STT_DEC_ATTN_BF16",
+                stt_dec_attn_bf16 as fn() -> bool,
+            ),
+        ] {
+            std::env::remove_var(name);
+            assert!(!read(), "{name} absent");
+            std::env::set_var(name, "0");
+            assert!(!read(), "{name}=0");
+            std::env::set_var(name, "1");
+            assert!(read(), "{name}=1");
+            std::env::remove_var(name);
+        }
+    }
+
     #[test]
     fn env_var_falls_back_to_legacy_prefix() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -3102,6 +3143,13 @@ pub(crate) fn tts_talker_fused_kernels_enabled() -> bool {
     }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_TALKER_FUSED_KERNELS", true))
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "tts"))]
+thread_local! {
+    /// Couches encodées par la voie TTS fusionnée sur ce thread, pour prouver
+    /// qu'un test compare bien deux chemins distincts.
+    pub(crate) static TTS_FUSED_LAYER_ENCODES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Force les couches du talker sur ce thread, puis rétablit le réglage précédent.

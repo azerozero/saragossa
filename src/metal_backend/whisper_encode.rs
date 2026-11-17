@@ -457,7 +457,12 @@ impl MetalExecutor {
     /// [`Self::encode_whisper_encoder`].
     ///
     /// NOTE: le buffer rendu est mémoïsé par label (`we_normed`) ; il doit être
-    /// consommé avant le prochain encodage Whisper sur cet exécuteur.
+    /// consommé avant le prochain encodage Whisper sur cet exécuteur. Invariant
+    /// tenu par serve : `AudioState::with_stt` prend `&mut self` (src/serve/audio.rs:208)
+    /// depuis `ServeState::audio_mut(&mut self)` (src/serve/state.rs:152), tous deux
+    /// sur l'unique thread moteur (`assert_engine_thread`, src/serve/state.rs:211),
+    /// et l'exécuteur STT (src/serve/audio.rs:244) n'est partagé avec aucun autre
+    /// modèle (la diarisation a le sien, audio.rs:260) : deux STT ne se chevauchent pas.
     ///
     /// # Errors
     ///

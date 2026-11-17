@@ -133,11 +133,7 @@ pub(crate) fn whisper_bf16_gemm_enabled() -> bool {
 pub(crate) fn whisper_decode_attn_bf16_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        whisper_decode_bf16_qmv_enabled()
-            && matches!(
-                crate::runtime_flags::env_var("SARAGOSSA_STT_DEC_ATTN_BF16").as_deref(),
-                Some("1" | "true" | "on" | "yes")
-            )
+        whisper_decode_bf16_qmv_enabled() && crate::runtime_flags::stt_dec_attn_bf16()
     })
 }
 
