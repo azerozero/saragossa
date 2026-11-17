@@ -350,6 +350,30 @@ avec l'alignement 64), plus une passe de prefill pour l'ancre. Les textes de la
 conversation sont identiques au prefill à froid dans toutes les variantes ; sans
 alignement, c'est le cas ici seulement faute de near-tie.
 
+Depuis le 17 nov., l'entrée du prompt complet reste au cache à côté de son
+ancre, et un hit exact la reprend sans recalculer la queue. Mesures sous charge
+vérifiée (< 2 au départ de chaque run, revérifiée après la prise du verrou),
+alignement automatique (16) contre `=0`, ABBA :
+
+| chemin | tours 3 à 5 avant | après | hit exact avant | après |
+|---|---|---|---|---|
+| MTP | 294-322 ms | 386-426 ms | 28-29 ms | 30-31 ms |
+| DFlash | 326-347 ms | 414-443 ms | 55-62 ms | 55-56 ms |
+
+Écart réel sans alignement (`=0`), 27B u4ls, 64 tokens greedy, 51 paires
+(code4k-1 à 3, concaténations jusqu'à 7023 tokens). Aucune paire n'est
+identique au bit :
+
+| | médiane | max |
+|---|---|---|
+| état final | 0,058 à 0,075 | 1,06 |
+| logits | 0,064 à 0,079 | 1,87 |
+
+4 paires sur 51 divergent en greedy dans les 64 tokens, dont une dès le premier
+token. La divergence est la même en AR, MTP et DFlash. Toutes tombent sur des
+quasi-égalités du froid : marges top-1/top-2 de 0,012, 0,021, 0,022 et 0,027
+logit.
+
 Oracles :
 
 - synthétiques, sans poids : `prefill_resident_aligned_prefix_matches_cold_nax_linear`
