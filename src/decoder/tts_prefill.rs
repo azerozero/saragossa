@@ -4,6 +4,29 @@ use super::attention_ops::{causal_attention_suffix, full_attention_prepare_rows,
 use super::*;
 
 impl CausalDecoderCache {
+    pub(crate) fn trace_tts_memory(&self, phase: &'static str) {
+        if !crate::tts::memory::enabled() {
+            return;
+        }
+        let fields = vec![("kv_cpu", self.estimated_cpu_bytes())];
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let fields = {
+            let mut fields = fields;
+            fields.push((
+                "kv_gpu_payload",
+                self.layers
+                    .iter()
+                    .filter_map(|layer| layer.full.as_ref())
+                    .map(FullAttentionMetalState::payload_allocated_bytes)
+                    .sum(),
+            ));
+            if let Some(arena) = self.resident.as_ref() {
+                fields.extend(arena.state.tts_memory_stats());
+            }
+            fields
+        };
+        crate::tts::memory::checkpoint(phase, &fields);
+    }
     /// Un préfixe mémorisé ne grandit plus : sa copie ne doit pas immobiliser
     /// la réserve d'ajout de chaque couche. Clone écarte les états résidents.
     pub(crate) fn compact_tts_snapshot(&self) -> Self {
@@ -17,6 +40,17 @@ impl CausalDecoderCache {
 }
 
 impl CausalDecoder {
+    pub(crate) fn trace_tts_memory(&self, phase: &'static str) {
+        if !crate::tts::memory::enabled() {
+            return;
+        }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(metal) = self.runtime.metal.as_ref() {
+            crate::tts::memory::checkpoint(phase, &metal.tts_memory_stats());
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        crate::tts::memory::checkpoint(phase, &[]);
+    }
     pub(crate) fn extend_tts_prefill(
         &self,
         cache: &mut CausalDecoderCache,

@@ -12,6 +12,7 @@ mod generation;
 mod helpers;
 mod inputs;
 mod load;
+pub(crate) mod memory;
 mod model;
 mod payload;
 mod prefill;

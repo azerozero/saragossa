@@ -363,6 +363,10 @@ where
         let codec_started = Instant::now();
         let pcm = decode(generated)?;
         let codec_elapsed = codec_started.elapsed();
+        super::memory::checkpoint(
+            "first_pcm",
+            &[("pcm_chunk", pcm.capacity() * size_of::<f32>())],
+        );
         if profile {
             codec_calls += 1;
             codec_total += codec_elapsed;
@@ -559,6 +563,12 @@ where
         let started = Instant::now();
         let pcm = decode(&prefix);
         let elapsed = started.elapsed();
+        if let Ok(pcm) = &pcm {
+            super::memory::checkpoint(
+                "first_pcm",
+                &[("pcm_chunk", pcm.capacity() * size_of::<f32>())],
+            );
+        }
         stats.calls += 1;
         stats.total += elapsed;
         stats.first.get_or_insert(elapsed);
