@@ -45,6 +45,12 @@ pub(super) fn fnv1a64_update(hash: u64, byte: u8) -> u64 {
 
 impl SafetensorPayload {
     pub(crate) fn open(path: &Path) -> Result<Self> {
+        // Les relectures paresseuses doivent survivre à un changement de cwd.
+        let path = path.canonicalize().map_err(|source| InferError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let path = path.as_path();
         let mut file = std::fs::File::open(path).map_err(|source| InferError::Io {
             path: path.to_path_buf(),
             source,

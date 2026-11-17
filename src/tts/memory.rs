@@ -3,10 +3,7 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-pub(crate) fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_TTS_MEMORY_PROFILE", false))
-}
+pub(crate) use crate::runtime_flags::tts_memory_profile_enabled as enabled;
 
 /// Une capture par phase et par processus : `footprint` perturbe les timings.
 /// Les champs sont des octets retenus, sauf mention explicite dans leur nom.
@@ -34,7 +31,7 @@ pub(crate) fn checkpoint(phase: &'static str, fields: &[(&str, usize)]) {
         line.push_str(&format!(" {name}={bytes}"));
     }
     eprintln!("{line}");
-    if crate::runtime_flags::env_flag("SARAGOSSA_TTS_MEMORY_PROBE", false) {
+    if crate::runtime_flags::tts_memory_probe_enabled() {
         match std::process::Command::new("/usr/bin/footprint")
             .args(["-p", &std::process::id().to_string(), "-f", "bytes"])
             .output()

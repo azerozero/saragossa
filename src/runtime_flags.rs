@@ -3216,6 +3216,19 @@ pub(crate) fn with_sampling_topk_scan<T>(enabled: bool, work: impl FnOnce() -> T
     out
 }
 
+/// Active les mesures mémoire TTS, séparées des mesures de latence.
+#[cfg(feature = "tts")]
+pub(crate) fn tts_memory_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_MEMORY_PROFILE", false))
+}
+
+/// Lance la sonde externe `footprint` à chaque nouvelle phase du profil mémoire.
+#[cfg(feature = "tts")]
+pub(crate) fn tts_memory_probe_enabled() -> bool {
+    env_flag("SARAGOSSA_TTS_MEMORY_PROBE", false)
+}
+
 /// Évite la copie CPU et l'upload de la table texte inutilisée par le talker.
 pub(crate) fn tts_compact_talker_embedding_enabled() -> bool {
     env_flag("SARAGOSSA_TTS_COMPACT_TALKER_EMBEDDING", true)

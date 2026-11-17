@@ -105,6 +105,84 @@ mod tests {
     }
 
     #[test]
+    fn lazy_weights_survive_current_directory_change(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        const CHILD: &str = "SARAGOSSA_TEST_TTS_CWD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Un seul test dans un processus isolé : aucun autre lecteur de
+            // chemin relatif ne peut subir notre changement de cwd global.
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "tts_codec::weights::tests::lazy_weights_survive_current_directory_change",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+
+        struct RestoreCwd(std::path::PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0)
+                    .expect("invariant: le répertoire initial existe encore");
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let other = tempfile::tempdir()?;
+        // Déclarée après les répertoires temporaires, la garde restaure le cwd
+        // avant leur suppression, y compris en cas d'erreur ou de panique.
+        let restore = RestoreCwd(std::env::current_dir()?);
+        let values = [0.0_f32, -0.0, 1.25, f32::from_bits(0x7fc00001)];
+        write(&dir.path().join("codec.safetensors"), &values)?;
+        std::env::set_current_dir(dir.path())?;
+        let payload = SafetensorPayload::open(std::path::Path::new("codec.safetensors"))?;
+        let lazy = CodecWeights::new(
+            HashMap::from([("weight".into(), payload.read_dense_tensor("weight")?)]),
+            &payload,
+            |_| true,
+        );
+        assert_eq!(lazy.retained_bytes(), 0);
+        std::env::set_current_dir(other.path())?;
+        let loaded = lazy.get("weight")?.expect("invariant: poids présent");
+        assert_eq!(
+            loaded
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        let original = restore.0.clone();
+        drop(restore);
+        assert_eq!(std::env::current_dir()?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_payload_returns_typed_io_error(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("missing.safetensors");
+        let error = SafetensorPayload::open(&path).expect_err("invariant: fichier absent");
+        assert!(matches!(
+            error,
+            InferError::Io { path: failed, source }
+                if failed == path && source.kind() == std::io::ErrorKind::NotFound
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn lazy_weights_preserve_bits_and_reject_replaced_payloads() -> Result<()> {
         let dir = tempfile::tempdir().map_err(|source| InferError::Io {
             path: "tempdir".into(),
