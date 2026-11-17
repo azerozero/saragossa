@@ -129,3 +129,11 @@ absentes. Comparer sans profil les mêmes sorties et tests qu'aujourd'hui.
 Tester un rechargement valide, invalide et concurrent, un changement figé
 refusé et une baisse de budget avec des requêtes actives. Aucune de ces
 fonctionnalités de configuration n'est livrée par l'étape 1.
+
+## Implémenté : `config`, `--set`, presets, SIGHUP
+
+- `saragossa config check FILE|PRESET [--set k=v]...` : valide ; erreur de syntaxe ou de schéma avec ligne et colonne, code de sortie 2.
+- `saragossa config print [FILE|PRESET] [--set k=v]...` : une ligne `cle = valeur  # origine` par clé (`--set`, `env NOM`, `profil FICHIER`, `preset NOM`, `défaut`). Les options dédiées de `serve` (`--max-tokens-cap`...) et les secrets ne sont pas concernés.
+- `serve --set section.cle=valeur` (répétable) : priorité de la CLI, donc au-dessus de l'environnement. Valeur TOML, ou texte brut. Une option dédiée explicite (`--read-timeout-secs`) l'emporte sur `--set` pour la même clé.
+- Presets : `--profile low-mem|throughput` ou `extends = "low-mem"` (un seul niveau). Ordre : `--set` > env > fichier > preset > défaut. `low-mem` : 16 connexions, file 8, 2 flux, pool 1, 64 Mio en vol, cache de préfixe 2 Gio, 1 flux enhance, marge mémoire 4 Gio. `throughput` : 128 connexions, file 64, pool 4, 1 Gio en vol, cache de préfixe 32 Gio, 4 flux enhance. Valeurs non mesurées. Un fichier local nommé comme un preset doit être passé avec un chemin (`./low-mem`).
+- SIGHUP (Unix) : relit le profil et n'applique que `serve.read_timeout_secs` (nouvelles connexions) et `serve.max_tokens_cap` (requêtes suivantes). Si une autre clé change, tout est refusé avec la liste (« redémarrage requis »), rien n'est appliqué ; une erreur de lecture garde l'ancien état. Sans profil, ou avec un preset seul, rien à recharger. Le plafond de tokens utilisé pour l'éligibilité aux lots reste celui du lancement.

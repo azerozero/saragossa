@@ -2175,6 +2175,7 @@ dependencies = [
  "hf-hub",
  "hound",
  "http",
+ "libc",
  "llguidance",
  "mach-sys",
  "md5",

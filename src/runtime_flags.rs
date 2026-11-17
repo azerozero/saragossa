@@ -4,7 +4,7 @@
 pub(crate) mod pairwise;
 
 mod profile;
-pub use profile::{Profile, ProfileError};
+pub use profile::{Profile, ProfileError, Resolved, HOT_KEYS, PRESETS};
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::cell::Cell;
@@ -174,6 +174,9 @@ fn claim_legacy_warning(legacy: &str) -> bool {
 /// dépendre du nom de son consommateur (cf. ADR 0011, dette « namespace »).
 pub fn env_var(name: &str) -> Option<String> {
     environment_sha256();
+    if let Some(value) = profile::forced(name) {
+        return Some(value);
+    }
     if let Ok(value) = std::env::var(name) {
         record_snapshot_ablation(name, &value);
         return Some(value);

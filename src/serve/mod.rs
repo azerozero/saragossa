@@ -24,6 +24,10 @@
 //! - `SARAGOSSA_SERVE_MAX_INFLIGHT_BYTES` (256 Mio) : octets de corps lus ou
 //!   en file.
 //!
+//! SIGHUP relit le profil (`--profile`/`--config`, `--set` compris) et n'applique
+//! que `serve.read_timeout_secs` et `serve.max_tokens_cap` ; tout autre
+//! changement est refusé en bloc (voir `reload`).
+//!
 //! Hors débruitage duplex (`enhance`), le parseur accepte les corps à `Content-Length`.
 //! `Transfer-Encoding` seul répond 501 ; avec `Content-Length`, ou un
 //! `Content-Length` répété ou non numérique, le cadrage ambigu répond 400.
@@ -62,6 +66,8 @@ pub(crate) mod mtp;
 #[cfg(feature = "serve")]
 mod protocol;
 #[cfg(feature = "serve")]
+mod reload;
+#[cfg(feature = "serve")]
 mod responses;
 #[cfg(feature = "serve")]
 mod state;
@@ -84,24 +90,25 @@ use args::ServeArgs;
 use super::CliResult;
 
 #[cfg(feature = "serve")]
-/// Extrait `--config CHEMIN` (sinon `SARAGOSSA_CONFIG`) des arguments de serve.
-fn take_config_arg(args: Vec<String>) -> error::ServeResult<(Option<String>, Vec<String>)> {
+/// Extrait `--profile`/`--config` (sinon `SARAGOSSA_CONFIG`) et les `--set` répétables.
+fn take_config_args(
+    args: Vec<String>,
+) -> error::ServeResult<(Option<String>, Vec<String>, Vec<String>)> {
     let mut path = std::env::var("SARAGOSSA_CONFIG")
         .ok()
         .filter(|value| !value.is_empty());
+    let mut sets = Vec::new();
     let mut rest = Vec::with_capacity(args.len());
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
-        if arg == "--config" {
-            path = Some(
-                iter.next()
-                    .ok_or_else(|| error::ServeError::args("--config attend un chemin"))?,
-            );
-        } else {
-            rest.push(arg);
+        let missing = || error::ServeError::args(format!("{arg} attend une valeur"));
+        match arg.as_str() {
+            "--config" | "--profile" => path = Some(iter.next().ok_or_else(missing)?),
+            "--set" => sets.push(iter.next().ok_or_else(missing)?),
+            _ => rest.push(arg),
         }
     }
-    Ok((path, rest))
+    Ok((path, sets, rest))
 }
 
 /// Lance le serveur OpenAI-compatible local.
@@ -115,13 +122,15 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         println!("{}", args::help_text());
         return Ok(());
     }
-    let (config_path, raw_args) = take_config_arg(raw_args).map_err(boxed_error)?;
-    let profile = match config_path {
-        Some(path) => saragossa::runtime_flags::Profile::load(std::path::Path::new(&path))?,
-        None => saragossa::runtime_flags::Profile::default(),
-    };
-    profile.install();
-    let mut args = ServeArgs::parse_with(&profile, raw_args).map_err(boxed_error)?;
+    let (config_path, sets, raw_args) = take_config_args(raw_args).map_err(boxed_error)?;
+    let resolved = saragossa::runtime_flags::Resolved::resolve(config_path.as_deref(), &sets)?;
+    resolved.install();
+    let profile = resolved.profile.clone();
+    let mut args = ServeArgs::parse_with(&profile, raw_args.clone()).map_err(boxed_error)?;
+    // Sans profil, SIGHUP garde son effet par défaut (arrêt du processus).
+    if config_path.is_some() {
+        reload::watch(config_path, sets, raw_args, profile);
+    }
     if let Some(root) = &args.prefix_ssd.directory {
         saragossa::decoder::configure_prefix_disk_cache(
             root,

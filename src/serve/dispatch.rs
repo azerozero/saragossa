@@ -115,7 +115,8 @@ impl<S: ServeStream> Dispatcher<S> {
 
     /// Ne bloque jamais l'accept : au-delà du plafond, 503 immédiat.
     fn dispatch(&self, mut stream: S) {
-        if let Err(error) = stream.configure(self.limits.read_timeout) {
+        if let Err(error) = stream.configure(super::reload::read_timeout(self.limits.read_timeout))
+        {
             eprintln!("saragossa serve request error: {error}");
             return;
         }
@@ -243,7 +244,9 @@ fn run_engine<S: ServeStream>(
     max_streams: usize,
 ) {
     // Plafond `max_tokens` pour la validation d'admission, `None` sans lots.
-    let batching = (max_streams > 1).then(|| state.max_tokens_cap());
+    // NOTE: relu à chaque admission : un rechargement SIGHUP du plafond joue
+    // aussi sur l'éligibilité ; un job déjà en file est validé au plafond courant.
+    let batching = |state: &ServeState| (max_streams > 1).then(|| state.max_tokens_cap());
     // NOTE: les jobs de `pending` gardent leur place d'attente : canal et
     // file locale restent ensemble sous `SARAGOSSA_SERVE_QUEUE`.
     let pending_cap = serve_queue_depth();
@@ -252,7 +255,7 @@ fn run_engine<S: ServeStream>(
         let leader = match pending.pop_front() {
             Some(queued) => queued,
             None => match queue.recv() {
-                Ok(job) => Queued::new(job, batching, state),
+                Ok(job) => Queued::new(job, batching(state), state),
                 Err(_) => break,
             },
         };
@@ -265,7 +268,7 @@ fn run_engine<S: ServeStream>(
             continue;
         };
         drain_queue(queue, &mut pending, pending_cap, |job| {
-            Queued::new(job, batching, state)
+            Queued::new(job, batching(state), state)
         });
         let others = take_batch(
             &mut pending,
@@ -374,7 +377,7 @@ impl<S: ServeStream> Connection<S> {
     /// Lit les headers, sert les routes statiques et le refus bearer avant de
     /// lire le corps, puis met en file sans bloquer.
     fn handle(&self, mut stream: S) -> ServeResult<()> {
-        let deadline = Instant::now() + self.limits.read_timeout;
+        let deadline = Instant::now() + super::reload::read_timeout(self.limits.read_timeout);
         let Some((mut request, content_length)) =
             read_or_reject(&mut stream, |s| read_head(s, deadline))?
         else {

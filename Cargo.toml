@@ -103,6 +103,10 @@ default-features = false
 [dependencies.toktrie]
 version = "=1.2.0"
 
+[target.'cfg(unix)'.dependencies]
+# SIGHUP de `serve` (rechargement du profil).
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.33", optional = true }
 mach-sys = "0.5"
