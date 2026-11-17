@@ -4669,7 +4669,10 @@ impl CausalDecoder {
         {
             return Ok(None);
         }
-        validate_capture_layer_ids(layer_ids, self.layers.len())?;
+        // Sans couche cible (MTP seul), aucune capture n'est demandée.
+        if !layer_ids.is_empty() {
+            validate_capture_layer_ids(layer_ids, self.layers.len())?;
+        }
         let (Some(head), Some(metal)) =
             (self.mtp.as_ref(), self.forward_runtime().metal_executor())
         else {
