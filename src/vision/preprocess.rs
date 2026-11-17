@@ -9,7 +9,7 @@ mod resize;
 pub use normalize::TemporalImage;
 pub use patches::{preprocess, PreprocessedImage};
 
-/// Image RGB uint8 contiguë, dans l'ordre [H,W,C], sans padding.
+/// Image RGB uint8 contiguë, dans l'ordre `[H, W, C]`, sans padding.
 #[derive(Debug)]
 pub struct RgbImage {
     height: u32,

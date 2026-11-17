@@ -2,7 +2,7 @@
 
 use super::{allocate, temporal_len, ImageProfile, Result, RgbImage};
 
-/// Deux frames identiques normalisées, contiguës dans l'ordre [T,C,H,W].
+/// Deux frames identiques normalisées, contiguës dans l'ordre `[T, C, H, W]`.
 #[derive(Debug)]
 pub struct TemporalImage {
     pub(super) height: u32,
@@ -11,7 +11,7 @@ pub struct TemporalImage {
 }
 
 impl TemporalImage {
-    /// Dimensions [2,3,H,W] ; les frames sont répétées après normalisation.
+    /// Dimensions `[2, 3, H, W]` ; les frames sont répétées après normalisation.
     pub fn shape(&self) -> [usize; 4] {
         [2, 3, self.height as usize, self.width as usize]
     }

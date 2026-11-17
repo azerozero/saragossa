@@ -12,8 +12,8 @@ pub struct PreprocessedImage {
 }
 
 impl TemporalImage {
-    /// Regroupe les lignes par [bloc_h,bloc_w,intra_h,intra_w].
-    /// Chaque ligne conserve [C,T,patch_h,patch_w], et non le layout MLX.
+    /// Regroupe les lignes par `[bloc_h, bloc_w, intra_h, intra_w]`.
+    /// Chaque ligne conserve `[C, T, patch_h, patch_w]`, et non le layout MLX.
     /// Vérifie le plafond du profil avant allocation ; les deux tampons f32
     /// coexistants occupent au plus 48 octets par pixel autorisé.
     pub fn into_patches(self, profile: ImageProfile) -> Result<PreprocessedImage> {
