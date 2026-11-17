@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.11](https://github.com/azerozero/saragossa/compare/v0.3.10...v0.3.11) - 2026-11-17
+
+### Added
+
+- *(denoise)* débruitage multi-cœur opt-in par segments avec fondu
+
+### Other
+
+- Merge pull request #262 from azerozero/release-plz-2026-11-17T20-34-59Z
+- Merge pull request #260 from azerozero/feat/denoise-multicoeur
+- *(denoise)* seuil limité au modèle synthétique, mémoire du mode N>1, flux inutile évité
+
 ## [0.3.10](https://github.com/azerozero/saragossa/compare/v0.3.9...v0.3.10) - 2026-11-17
 
 ### Added
