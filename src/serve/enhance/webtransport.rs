@@ -1,34 +1,77 @@
 //! Une session HTTP/3 WebTransport par flux DFN3, un stream bidirectionnel fiable.
 use super::super::dispatch::Front;
-use super::async_io::{deadline, error, Worker};
+use super::async_io::{deadline, drained, draining, error, Drain, Worker};
 use super::pcm::{Config, MAX_FRAME};
 use super::*;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use web_transport_quinn::{RecvStream, SendStream};
 
-pub(super) fn bind(addr: SocketAddr, front: &Front) -> ServeResult<quinn::Endpoint> {
+/// Endpoint sur `socket` déjà liée (ou héritée d'un relais) au loopback.
+pub(super) fn bind(socket: std::net::UdpSocket, front: &Front) -> ServeResult<quinn::Endpoint> {
+    let addr = socket.local_addr().map_err(error)?;
     super::async_io::require_loopback(addr, "SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR")?;
     let identity = super::certificate::identity(addr)?;
-    let endpoint = quinn::Endpoint::server(identity.config, addr).map_err(error)?;
-    let mut info = identity.info;
-    // Le port 0 est utile aux tests et aux démarrages avec allocation automatique.
-    if addr.port() == 0 {
-        info.url = info.url.replace(
-            ":0/",
-            &format!(":{}/", endpoint.local_addr().map_err(error)?.port()),
-        );
-    }
+    let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+    let socket = Arc::new(Relayed(runtime.wrap_udp_socket(socket).map_err(error)?));
+    let endpoint = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(identity.config),
+        socket,
+        runtime,
+    )
+    .map_err(error)?;
     *front
         .enhance
         .certificate
         .lock()
-        .map_err(|_| error("verrou certificat"))? = Some(info);
+        .map_err(|_| error("verrou certificat"))? = Some(identity.info);
     Ok(endpoint)
 }
+/// Socket UDP partagée avec un successeur de relais : une fois celui-ci prêt,
+/// ce processus ne la lit plus (les datagrammes lui reviennent) mais émet
+/// encore ses CONNECTION_CLOSE.
+#[derive(Debug)]
+struct Relayed(Arc<dyn quinn::AsyncUdpSocket>);
+impl quinn::AsyncUdpSocket for Relayed {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        Arc::clone(&self.0).create_io_poller()
+    }
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
+        self.0.try_send(transmit)
+    }
+    fn poll_recv(
+        &self,
+        cx: &mut Context,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<std::io::Result<usize>> {
+        if draining() {
+            return Poll::Pending;
+        }
+        self.0.poll_recv(cx, bufs, meta)
+    }
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.0.local_addr()
+    }
+    fn max_transmit_segments(&self) -> usize {
+        self.0.max_transmit_segments()
+    }
+    fn max_receive_segments(&self) -> usize {
+        self.0.max_receive_segments()
+    }
+    fn may_fragment(&self) -> bool {
+        self.0.may_fragment()
+    }
+}
+/// Accepte jusqu'au relais ; ferme alors toutes les sessions (H3_NO_ERROR),
+/// qui ne migrent pas : les clients se reconnectent chez le successeur.
 pub(super) async fn listen(
     endpoint: quinn::Endpoint,
     front: Arc<Front>,
     connections: Arc<AtomicUsize>,
+    mut drain: Drain,
 ) {
     let mut tasks = tokio::task::JoinSet::new();
     let rotation = tokio::time::sleep(std::time::Duration::from_secs(12 * 86400));
@@ -51,6 +94,10 @@ pub(super) async fn listen(
                 });
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {},
+            _ = drained(&mut drain) => {
+                endpoint.close(quinn::VarInt::from_u32(0x100), b"relais");
+                break;
+            }
             _ = &mut rotation => {
                 let renewed = endpoint.local_addr().map_err(error).and_then(super::certificate::identity);
                 match renewed {
@@ -65,6 +112,10 @@ pub(super) async fn listen(
                 rotation.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(12 * 86400));
             }
         }
+    }
+    if draining() {
+        // Laisse partir les CONNECTION_CLOSE avant l'arrêt du runtime.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
     }
 }
 pub(super) async fn session(conn: quinn::Connection, front: Arc<Front>) -> ServeResult<()> {

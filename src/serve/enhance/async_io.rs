@@ -7,6 +7,35 @@ use tokio::sync::mpsc;
 pub(super) fn error(error: impl std::fmt::Display) -> ServeError {
     ServeError::args(format!("transport enhance: {error}"))
 }
+/// Passe à `true` quand un relais SIGUSR2 a un successeur prêt.
+pub(super) type Drain = tokio::sync::watch::Receiver<bool>;
+/// Se résout à la demande de vidage ; jamais si l'émetteur a disparu.
+pub(super) async fn drained(drain: &mut Drain) {
+    if drain.wait_for(|d| *d).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+/// Vrai une fois le successeur prêt : ce processus vide ses transports.
+pub(super) fn draining() -> bool {
+    #[cfg(unix)]
+    return super::super::relay::draining();
+    #[cfg(not(unix))]
+    false
+}
+/// Refuse une socket héritée qui n'écoute pas sur l'adresse configurée.
+pub(super) fn same_addr(
+    local: std::io::Result<std::net::SocketAddr>,
+    addr: std::net::SocketAddr,
+) -> ServeResult<()> {
+    let local = local.map_err(error)?;
+    if local == addr {
+        Ok(())
+    } else {
+        Err(error(format!(
+            "socket héritée sur {local}, attendue sur {addr}"
+        )))
+    }
+}
 /// Certificat auto-signé et API locale : seuls les listeners loopback sont admis.
 pub(super) fn require_loopback(addr: std::net::SocketAddr, name: &str) -> ServeResult<()> {
     if addr.ip().is_loopback() {
@@ -107,7 +136,15 @@ pub(in crate::serve) fn start(
                 }
             };
             runtime.block_on(async move {
-                let result: ServeResult<()> = async {
+                let (drain_sender, drain) = tokio::sync::watch::channel(false);
+                tokio::spawn(async move {
+                    while !draining() {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    let _ = drain_sender.send(true);
+                });
+                let result: ServeResult<Vec<tokio::task::JoinHandle<()>>> = async {
+                    let mut listeners = Vec::new();
                     #[cfg(feature = "h2")]
                     if let Some(addr) = saragossa::runtime_flags::enhance_h2_addr() {
                         if front.api_key.is_none() {
@@ -115,39 +152,87 @@ pub(in crate::serve) fn start(
                         }
                         let parsed: std::net::SocketAddr = addr.parse().map_err(error)?;
                         super::async_io::require_loopback(parsed, "SARAGOSSA_ENHANCE_H2_ADDR")?;
-                        let listener =
-                            tokio::net::TcpListener::bind(parsed).await.map_err(error)?;
+                        #[cfg(unix)]
+                        let inherited =
+                            super::super::relay::inherited_named("h2", libc::SOCK_STREAM)?
+                                .map(std::net::TcpListener::from);
+                        #[cfg(not(unix))]
+                        let inherited: Option<std::net::TcpListener> = None;
+                        let listener = match inherited {
+                            Some(listener) => {
+                                same_addr(listener.local_addr(), parsed)?;
+                                listener.set_nonblocking(true).map_err(error)?;
+                                tokio::net::TcpListener::from_std(listener).map_err(error)?
+                            }
+                            None => tokio::net::TcpListener::bind(parsed).await.map_err(error)?,
+                        };
+                        #[cfg(unix)]
+                        super::super::relay::share(
+                            "h2",
+                            std::os::fd::AsRawFd::as_raw_fd(&listener),
+                        );
                         eprintln!("enhance h2c: {}", listener.local_addr().map_err(error)?);
-                        tokio::spawn(super::h2::listen(
+                        listeners.push(tokio::spawn(super::h2::listen(
                             listener,
                             Arc::clone(&front),
                             Arc::clone(&connections),
-                        ));
+                            drain.clone(),
+                        )));
                     }
                     #[cfg(feature = "webtransport")]
                     if let Some(addr) = saragossa::runtime_flags::enhance_webtransport_addr() {
                         if front.api_key.is_none() {
                             return Err(error("WebTransport requiert SARAGOSSA_API_KEY"));
                         }
-                        let endpoint =
-                            super::webtransport::bind(addr.parse().map_err(error)?, &front)?;
+                        let parsed: std::net::SocketAddr = addr.parse().map_err(error)?;
+                        require_loopback(parsed, "SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR")?;
+                        #[cfg(unix)]
+                        let inherited =
+                            super::super::relay::inherited_named("wt", libc::SOCK_DGRAM)?
+                                .map(std::net::UdpSocket::from);
+                        #[cfg(not(unix))]
+                        let inherited: Option<std::net::UdpSocket> = None;
+                        let socket = match inherited {
+                            Some(socket) => {
+                                same_addr(socket.local_addr(), parsed)?;
+                                socket
+                            }
+                            None => std::net::UdpSocket::bind(parsed).map_err(error)?,
+                        };
+                        #[cfg(unix)]
+                        super::super::relay::share("wt", std::os::fd::AsRawFd::as_raw_fd(&socket));
+                        let endpoint = super::webtransport::bind(socket, &front)?;
                         eprintln!(
                             "enhance WebTransport: {}",
                             endpoint.local_addr().map_err(error)?
                         );
-                        tokio::spawn(super::webtransport::listen(
+                        listeners.push(tokio::spawn(super::webtransport::listen(
                             endpoint,
                             Arc::clone(&front),
                             Arc::clone(&connections),
-                        ));
+                            drain.clone(),
+                        )));
                     }
-                    Ok(())
+                    Ok(listeners)
                 }
                 .await;
-                let failed = result.is_err();
-                let _ = ready.send(result);
-                if !failed {
-                    let _ = stopped.await;
+                let listeners = match result {
+                    Ok(listeners) => {
+                        let _ = ready.send(Ok(()));
+                        listeners
+                    }
+                    Err(e) => {
+                        let _ = ready.send(Err(e));
+                        return;
+                    }
+                };
+                let _ = stopped.await;
+                // NOTE: en relais, connexions h2 et fermetures QUIC finissent
+                // avant l'arrêt ; le délai de vidage du parent borne l'attente.
+                if draining() {
+                    for listener in listeners {
+                        let _ = listener.await;
+                    }
                 }
             });
             // Les canaux des sessions sont lâchés lors de l'annulation des tâches.

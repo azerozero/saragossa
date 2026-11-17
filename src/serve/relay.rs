@@ -2,8 +2,8 @@
 //!
 //! Sur SIGUSR2, le processus relance le binaire du même chemin (ou
 //! `--upgrade-binary PATH`) avec les mêmes arguments. L'enfant hérite de la
-//! socket d'écoute (`SARAGOSSA_LISTEN_FDS`, seul fd dont FD_CLOEXEC est retiré,
-//! avec l'extrémité d'une paire de sockets `SARAGOSSA_RELAY_READY_FD`), vérifie
+//! socket d'écoute (`SARAGOSSA_LISTEN_FDS` ; seuls les fd transmis perdent
+//! FD_CLOEXEC, avec l'extrémité d'une paire de sockets `SARAGOSSA_RELAY_READY_FD`), vérifie
 //! que c'est bien une socket en écoute à la même adresse, l'adopte au lieu de
 //! la lier, puis écrit un octet sur la paire juste avant d'accepter. Le parent
 //! cesse alors d'accepter, laisse finir ses connexions en cours (une requête
@@ -12,9 +12,19 @@
 //! qui ne se dit pas prêt en 10 min est arrêté.
 //! Si l'enfant sort avant d'être prêt, le parent continue et journalise.
 //!
-//! Limites : les listeners enhance h2/WebTransport ne sont pas transmis ;
-//! l'enfant échoue à les lier, et le parent reste donc en place. Les modèles
-//! préchargés le sont deux fois pendant le relais.
+//! Les listeners enhance suivent dans la même variable (`7,h2=9,wt=10`).
+//! HTTP/2 : le parent cesse d'accepter, envoie GOAWAY à ses connexions et
+//! attend qu'elles finissent. QUIC : parent et enfant partagent la socket UDP ;
+//! dès l'enfant prêt, le parent ne la lit plus et ferme ses sessions
+//! (CONNECTION_CLOSE, H3_NO_ERROR) pour que les clients se reconnectent chez
+//! l'enfant. Une session QUIC ouverte ne migre pas, et l'enfant présente un
+//! nouveau certificat auto-signé (empreinte à relire).
+//!
+//! `serve.relay_mode` : `parallel` garde les deux processus résidents pendant
+//! le vidage ; `sequential` lance l'enfant sans précharger, son moteur attend
+//! la sortie du parent (requêtes en file, plafonnée par `serve.queue`) puis
+//! précharge ; `auto` (défaut) choisit `sequential` seulement si la garde
+//! mémoire de `serve` refuse deux fois l'empreinte courante.
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -22,24 +32,47 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
+
+use saragossa::memory_guard::{process_footprint_bytes, MemoryGuard};
+use saragossa::runtime_flags::ServeSection;
 
 use super::error::{ServeError, ServeResult};
 
 const LISTEN_FDS_ENV: &str = "SARAGOSSA_LISTEN_FDS";
 const READY_FD_ENV: &str = "SARAGOSSA_RELAY_READY_FD";
+/// Pid du parent dont l'enfant séquentiel attend la sortie.
+const SEQUENTIAL_ENV: &str = "SARAGOSSA_RELAY_SEQUENTIAL";
 const DEFAULT_DRAIN_SECS: u64 = 30;
 /// Attente max du signal « prêt » ; couvre un `--preload` de gros modèles.
 const READY_TIMEOUT: Duration = Duration::from_secs(600);
 
 static DRAINING: AtomicBool = AtomicBool::new(false);
-static CONFIG: OnceLock<(PathBuf, Duration)> = OnceLock::new();
+static CONFIG: OnceLock<Config> = OnceLock::new();
+/// Listeners enhance à transmettre en plus de l'écoute principale.
+static SHARED: Mutex<Vec<(&'static str, RawFd)>> = Mutex::new(Vec::new());
+/// Listeners enhance hérités, pas encore adoptés.
+static INHERITED: Mutex<Vec<(String, RawFd)>> = Mutex::new(Vec::new());
+/// Parent à attendre en relais séquentiel, 0 sinon.
+static PREDECESSOR: AtomicU32 = AtomicU32::new(0);
+static DEFERRED_PRELOAD: AtomicBool = AtomicBool::new(false);
 
-/// Retire `--upgrade-binary PATH` de `args` et fige le binaire du relais et
-/// le délai de vidage ; à appeler au démarrage, avant tout remplacement.
-pub(super) fn configure(args: &mut Vec<String>, drain_secs: Option<u64>) -> ServeResult<()> {
+struct Config {
+    binary: PathBuf,
+    drain: Duration,
+    /// `None` : auto.
+    sequential: Option<bool>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Retire `--upgrade-binary PATH` de `args` et fige le binaire du relais, le
+/// délai de vidage et le mode ; à appeler au démarrage, avant tout remplacement.
+pub(super) fn configure(args: &mut Vec<String>, serve: &ServeSection) -> ServeResult<()> {
     let mut binary = None;
     if let Some(at) = args.iter().position(|arg| arg == "--upgrade-binary") {
         if at + 1 >= args.len() {
@@ -54,32 +87,120 @@ pub(super) fn configure(args: &mut Vec<String>, drain_secs: Option<u64>) -> Serv
         Some(path) => path,
         None => std::env::current_exe().map_err(|e| ServeError::io("binaire courant", e))?,
     };
-    let drain = Duration::from_secs(drain_secs.unwrap_or(DEFAULT_DRAIN_SECS));
-    let _ = CONFIG.set((binary, drain));
+    let drain = Duration::from_secs(serve.drain_timeout_secs.unwrap_or(DEFAULT_DRAIN_SECS));
+    let sequential = match serve.relay_mode.as_deref() {
+        None | Some("auto") => None,
+        Some("parallel") => Some(false),
+        Some("sequential") => Some(true),
+        Some(other) => {
+            return Err(ServeError::args(format!(
+                "serve.relay_mode={other} invalide (auto, parallel, sequential)"
+            )))
+        }
+    };
+    if let Ok(pid) = std::env::var(SEQUENTIAL_ENV) {
+        std::env::remove_var(SEQUENTIAL_ENV);
+        let pid = pid
+            .parse()
+            .map_err(|_| ServeError::args(format!("{SEQUENTIAL_ENV}={pid} invalide")))?;
+        PREDECESSOR.store(pid, Ordering::Relaxed);
+    }
+    let _ = CONFIG.set(Config {
+        binary,
+        drain,
+        sequential,
+    });
     Ok(())
 }
 
+/// Vrai si le préchargement attend la sortie du parent (relais séquentiel).
+pub(super) fn defer_preload(preload: bool) -> bool {
+    let deferred = preload && PREDECESSOR.load(Ordering::Relaxed) != 0;
+    DEFERRED_PRELOAD.store(deferred, Ordering::Relaxed);
+    deferred
+}
+
+/// Sur le thread moteur, avant la première requête : en relais séquentiel,
+/// attend la sortie du parent (les requêtes restent en file) ; vrai si le
+/// préchargement différé est à faire maintenant.
+pub(super) fn await_predecessor() -> bool {
+    let parent = PREDECESSOR.swap(0, Ordering::Relaxed);
+    if parent == 0 {
+        return false;
+    }
+    eprintln!(
+        "saragossa serve relais séquentiel: moteur en attente de la sortie du parent {parent}"
+    );
+    // NOTE: le parent sort au plus tard après son délai de vidage ; l'enfant
+    // est alors rattaché à un autre parent.
+    while std::os::unix::process::parent_id() == parent {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!("saragossa serve relais séquentiel: parent {parent} sorti, moteur actif");
+    DEFERRED_PRELOAD.load(Ordering::Relaxed)
+}
+
+/// Vrai une fois l'enfant prêt : ce processus ne doit plus rien accepter.
+pub(super) fn draining() -> bool {
+    DRAINING.load(Ordering::Relaxed)
+}
+
+/// Inscrit un listener enhance à transmettre au prochain relais.
+pub(super) fn share(name: &'static str, fd: RawFd) {
+    lock(&SHARED).push((name, fd));
+}
+
 /// Socket d'écoute héritée d'un parent en relais ; `None` hors relais.
-/// L'appelant vérifie qu'elle écoute sur l'adresse attendue.
-#[allow(unsafe_code)]
+/// L'appelant vérifie qu'elle écoute sur l'adresse attendue. Les listeners
+/// enhance nommés sont mis de côté pour [`inherited_named`].
 pub(super) fn inherited() -> ServeResult<Option<OwnedFd>> {
-    let Some(fd) = env_fd(LISTEN_FDS_ENV)? else {
+    let Ok(value) = std::env::var(LISTEN_FDS_ENV) else {
         return Ok(None);
     };
+    // NOTE: les sous-processus ne doivent pas croire hériter de ces fd ; std
+    // sérialise ses propres accès à l'environnement.
+    std::env::remove_var(LISTEN_FDS_ENV);
+    let invalid = || ServeError::args(format!("{LISTEN_FDS_ENV}={value} invalide"));
+    let mut parts = value.split(',');
+    let main = parse_fd(parts.next().unwrap_or("")).ok_or_else(invalid)?;
+    let mut named = Vec::new();
+    for part in parts {
+        let (name, fd) = part.split_once('=').ok_or_else(invalid)?;
+        named.push((name.to_string(), parse_fd(fd).ok_or_else(invalid)?));
+    }
+    *lock(&INHERITED) = named;
+    adopt(main, libc::SOCK_STREAM, "d'écoute").map(Some)
+}
+
+/// Listener enhance `name` hérité, de type `kind` (`SOCK_STREAM` ou
+/// `SOCK_DGRAM`) ; `None` s'il n'a pas été transmis.
+pub(super) fn inherited_named(name: &str, kind: libc::c_int) -> ServeResult<Option<OwnedFd>> {
+    let mut named = lock(&INHERITED);
+    let Some(at) = named.iter().position(|(n, _)| n == name) else {
+        return Ok(None);
+    };
+    let (_, fd) = named.remove(at);
+    drop(named);
+    adopt(fd, kind, name).map(Some)
+}
+
+/// Vérifie le type de socket `fd` héritée, la possède et rétablit FD_CLOEXEC.
+#[allow(unsafe_code)]
+fn adopt(fd: RawFd, kind: libc::c_int, label: &str) -> ServeResult<OwnedFd> {
     // NOTE: l'appelant vérifie l'adresse locale ; SO_ACCEPTCONN est contrôlé
     // là où le système l'expose (pas macOS, qui répond ENOPROTOOPT).
-    if option(fd, libc::SO_TYPE) != Some(libc::SOCK_STREAM) {
+    if option(fd, libc::SO_TYPE) != Some(kind) {
         return Err(ServeError::args(format!(
-            "{LISTEN_FDS_ENV}={fd} n'est pas une socket flux"
+            "socket {label} héritée (fd {fd}) de type inattendu"
         )));
     }
-    if option(fd, libc::SO_ACCEPTCONN) == Some(0) {
+    if kind == libc::SOCK_STREAM && option(fd, libc::SO_ACCEPTCONN) == Some(0) {
         return Err(ServeError::args(format!(
-            "{LISTEN_FDS_ENV}={fd} n'est pas en écoute"
+            "socket {label} héritée (fd {fd}) pas en écoute"
         )));
     }
-    // SAFETY: socket flux vérifiée ci-dessus, transmise à ce seul
-    // processus par le parent ; personne d'autre ici ne la ferme.
+    // SAFETY: socket vérifiée ci-dessus, transmise à ce seul processus par le
+    // parent et retirée des listes d'héritage ; personne d'autre ne la ferme.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     // SAFETY: fd possédé et valide ; rétablit FD_CLOEXEC pour les sous-processus.
     if unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
@@ -88,16 +209,22 @@ pub(super) fn inherited() -> ServeResult<Option<OwnedFd>> {
             io::Error::last_os_error(),
         ));
     }
-    // NOTE: les sous-processus ne doivent pas croire hériter de ce fd ; std
-    // sérialise ses propres accès à l'environnement.
-    std::env::remove_var(LISTEN_FDS_ENV);
-    eprintln!("saragossa serve relais: socket d'écoute héritée (fd {fd})");
-    Ok(Some(owned))
+    eprintln!("saragossa serve relais: socket {label} héritée (fd {fd})");
+    Ok(owned)
 }
 
 /// Prévient le parent que l'enfant accepte ; sans effet hors relais.
+/// Ferme d'abord les listeners hérités que ce binaire n'a pas adoptés : une
+/// écoute orpheline accepterait des connexions jamais servies.
 #[allow(unsafe_code)]
 pub(super) fn ready() -> ServeResult<()> {
+    for (name, fd) in lock(&INHERITED).drain(..) {
+        if option(fd, libc::SO_TYPE).is_some() {
+            eprintln!("saragossa serve relais: socket {name} héritée inutilisée, fermée");
+            // SAFETY: socket transmise par le parent et jamais adoptée ici.
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+    }
     let Some(fd) = env_fd(READY_FD_ENV)? else {
         return Ok(());
     };
@@ -129,12 +256,13 @@ fn option(fd: RawFd, name: libc::c_int) -> Option<libc::c_int> {
     (rc == 0).then_some(value)
 }
 
+fn parse_fd(value: &str) -> Option<RawFd> {
+    value.parse::<RawFd>().ok().filter(|fd| *fd > 2)
+}
+
 fn env_fd(name: &str) -> ServeResult<Option<RawFd>> {
     match std::env::var(name) {
-        Ok(value) => value
-            .parse::<RawFd>()
-            .ok()
-            .filter(|fd| *fd > 2)
+        Ok(value) => parse_fd(&value)
             .map(Some)
             .ok_or_else(|| ServeError::args(format!("{name}={value} invalide"))),
         Err(_) => Ok(None),
@@ -187,18 +315,24 @@ pub(super) fn watch(listener: RawFd) {
         if !super::reload::take(libc::SIGUSR2) {
             continue;
         }
-        let Some((binary, drain)) = CONFIG.get() else {
+        let Some(config) = CONFIG.get() else {
             eprintln!("saragossa serve relais refusé: non configuré");
             continue;
         };
-        match hand_over(binary, listener) {
+        let sequential = config.sequential.unwrap_or_else(over_budget);
+        if sequential {
+            eprintln!(
+                "saragossa serve relais séquentiel: l'enfant attendra la sortie de ce processus"
+            );
+        }
+        match hand_over(&config.binary, listener, sequential) {
             Ok(pid) => {
                 eprintln!(
                     "saragossa serve relais: enfant pid {pid} prêt, vidage (max {}s)",
-                    drain.as_secs()
+                    config.drain.as_secs()
                 );
                 DRAINING.store(true, Ordering::Relaxed);
-                std::thread::sleep(*drain);
+                std::thread::sleep(config.drain);
                 eprintln!("saragossa serve relais: délai de vidage atteint, sortie");
                 std::process::exit(0);
             }
@@ -207,22 +341,39 @@ pub(super) fn watch(listener: RawFd) {
     });
 }
 
+/// Vrai si la garde mémoire de `serve` refuse un second processus de même
+/// empreinte ; faux si elle est désactivée ou la mesure indisponible.
+fn over_budget() -> bool {
+    process_footprint_bytes()
+        .and_then(|footprint| MemoryGuard::serve().projection_over_limit(footprint))
+        .is_some()
+}
+
 /// Lance l'enfant et attend son octet « prêt » ; renvoie son pid.
 #[allow(unsafe_code)]
-fn hand_over(binary: &PathBuf, listener: RawFd) -> ServeResult<u32> {
+fn hand_over(binary: &PathBuf, listener: RawFd, sequential: bool) -> ServeResult<u32> {
     let io_error = |context: &'static str| move |e| ServeError::io(context, e);
     let (mut parent_end, child_end) = UnixStream::pair().map_err(io_error("paire de relais"))?;
     let ready = child_end.as_raw_fd();
+    let mut fds = vec![listener, ready];
+    let mut listen = listener.to_string();
+    for (name, fd) in lock(&SHARED).iter() {
+        listen.push_str(&format!(",{name}={fd}"));
+        fds.push(*fd);
+    }
     let mut command = Command::new(binary);
     command
         .args(std::env::args_os().skip(1))
-        .env(LISTEN_FDS_ENV, listener.to_string())
+        .env(LISTEN_FDS_ENV, listen)
         .env(READY_FD_ENV, ready.to_string());
-    // SAFETY: entre fork et exec, seul `fcntl` est appelé, async-signal-safe ;
-    // il ne retire FD_CLOEXEC qu'aux deux fd transmis.
+    if sequential {
+        command.env(SEQUENTIAL_ENV, std::process::id().to_string());
+    }
+    // SAFETY: entre fork et exec, seul `fcntl` est appelé, async-signal-safe,
+    // sur un vecteur déjà alloué ; il ne retire FD_CLOEXEC qu'aux fd transmis.
     unsafe {
         command.pre_exec(move || {
-            for fd in [listener, ready] {
+            for &fd in &fds {
                 if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
                     return Err(io::Error::last_os_error());
                 }
