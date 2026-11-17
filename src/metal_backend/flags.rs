@@ -67,6 +67,63 @@ pub(crate) fn prefill_fused_mlp_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_FUSED_MLP", true))
 }
 
+/// Déroulement complet des pas K des GEMM tuilés NAX (`NAX_KK_UNROLL` de
+/// `na_gemm.metal`), égal au bit. Kill-switch `SARAGOSSA_RUST_NAX_KK_UNROLL=0`.
+pub(crate) fn nax_kk_unroll_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_NAX_KK_UNROLL", true))
+}
+
+/// Préambule des sources NAX : vide par défaut, macro de déroulement vide
+/// sous le kill-switch.
+pub(crate) fn nax_source_prelude() -> &'static str {
+    if nax_kk_unroll_enabled() {
+        ""
+    } else {
+        "#define NAX_KK_UNROLL\n"
+    }
+}
+
+/// QMV micro à quatre lignes par simdgroup (`micro_qmv4_*`), égal au bit au
+/// QMV à une ligne. Opt-in `SARAGOSSA_RUST_MICRO_QMV_ROWS4=1` : la sonde M=1
+/// gagne 7 à 13 % de bande passante, mais le decode mxfp4 du 27B perd 13 %
+/// (31,2 → 27,2 tok/s, 16 nov. 2026), quatre fois moins de simdgroups en vol.
+pub(crate) fn micro_qmv_rows4_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = MICRO_QMV_ROWS4_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MICRO_QMV_ROWS4", false))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MICRO_QMV_ROWS4_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force le QMV micro à quatre lignes sur ce thread le temps de `run`.
+#[cfg(test)]
+pub(crate) fn with_micro_qmv_rows4_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MICRO_QMV_ROWS4_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(MICRO_QMV_ROWS4_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
+    run()
+}
+
+/// Même fusion pour les poids à micro-échelles (`micro_gemm_gate_up_swiglu_*`),
+/// égale au bit aux passes séparées. Kill-switch
+/// `SARAGOSSA_RUST_PREFILL_FUSED_MLP_MICRO=0`.
+pub(crate) fn prefill_fused_mlp_micro_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_FUSED_MLP_MICRO", true))
+}
+
 /// Flag historique retiré. Une demande `SARAGOSSA_RUST_LINEAR_CHUNKED=1`
 /// est refusée dès la construction du backend : garder le NAX ou le scan par défaut.
 pub(crate) fn linear_chunked_enabled() -> bool {

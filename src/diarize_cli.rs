@@ -42,14 +42,22 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> CliResult<()> {
         std::fs::read(&audio).map_err(|e| cli_error(format!("{}: {e}", audio.display())))?;
     let samples = saragossa::wire_audio::wav_to_mono_16k(&bytes)?;
     let model = DiarizationModel::from_model_dir(&model_dir)?;
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let executor = if metal {
         Some(saragossa::MetalExecutor::new()?)
     } else {
         None
     };
+    #[cfg(all(target_os = "macos", feature = "metal"))]
     let runtime = executor
         .as_ref()
         .map_or_else(ForwardRuntime::cpu, ForwardRuntime::metal);
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let runtime = if metal {
+        return Err(cli_error("backend metal diarisation indisponible : utilisez --cpu ou recompilez avec --features metal"));
+    } else {
+        ForwardRuntime::cpu()
+    };
     let out = model.diarize(&samples, runtime)?;
     let uri = audio
         .file_stem()

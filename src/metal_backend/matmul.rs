@@ -112,6 +112,7 @@ fn concat_weight_key(weights: &[&LinearWeight]) -> Option<ConcatWeightKey> {
 /// par défaut si disponible. `SARAGOSSA_STT_F32=1` force l'ancien chemin f32 ;
 /// `SARAGOSSA_STT_BF16=0` garde aussi un kill-switch compatible avec les anciens benches.
 /// bf16-input / accumulation f32.
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(crate) fn whisper_bf16_gemm_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -1499,7 +1500,7 @@ impl MetalExecutor {
 /// spéculative), le qmv garde son résultat par ligne indépendant du batch, ce
 /// qui préserve l'identité vérification/AR ; au-dessus (prefill), relire le
 /// poids par ligne bornait le débit à ~20 tok/s sur un 27B BF16.
-const DENSE_BF16_GEMM_MIN_BATCH: usize = 64;
+pub(crate) const DENSE_BF16_GEMM_MIN_BATCH: usize = 64;
 
 fn can_use_dense_bf16_gemm(batch: usize, in_dim: usize, out_dim: usize) -> bool {
     batch >= DENSE_BF16_GEMM_MIN_BATCH

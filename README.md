@@ -78,7 +78,8 @@ the **single-user latency × Apple Silicon** quadrant:
 | `POST /v1/chat/completions` | OpenAI-compatible chat (SSE or not), `response_format`: `json_object`, `json_schema` |
 | `POST /v1/responses` | Stateless text and function calls (JSON or SSE) |
 | `POST /v1/messages` | Anthropic Messages shim + `tool_use` (drivable by Claude Code) |
-| `POST /v1/audio/transcriptions` | Whisper STT (multipart WAV, opt-in `--stt-model`) |
+| `POST /v1/audio/transcriptions` | Whisper STT (multipart WAV, `json`/`text`/`verbose_json`, SSE `stream=true`, opt-in `--stt-model`) |
+| `POST /v1/audio/transcriptions/stream` | Whisper STT à entrée incrémentale (PCM par morceaux, voir [docs/stt-streaming.md](docs/stt-streaming.md)) |
 | `POST /v1/audio/speech` | Qwen3 TTS (JSON → WAV ou PCM chunked avec `stream: true`, opt-in `--tts-model`) |
 | `POST /v1/embeddings` | e5-small embeddings (opt-in `--embed-model`) |
 
@@ -426,3 +427,10 @@ Prerequisite: the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain
 ## License
 
 [Apache-2.0](https://spdx.org/licenses/Apache-2.0.html) (SPDX `Apache-2.0`).
+
+## Compilation modulaire
+
+Toutes les modalités sont actives par défaut. Le [tableau des features](docs/features.md)
+détaille les binaires LLM et STT minimaux, les réponses 501 du serveur et les
+vérifications de compilation. Les [profils TOML](docs/design/configuration.md)
+sont une proposition de conception, sans implémentation à ce stade.

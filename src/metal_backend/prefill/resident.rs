@@ -430,7 +430,9 @@ impl MetalExecutor {
         }
         let start = prefix.map_or(0, |prefix| prefix.rows);
         let (rows, hidden_dim) = match input {
-            PrefillInput::Hidden(hidden) => hidden.as_matrix()?,
+            PrefillInput::Hidden(hidden) | PrefillInput::PositionedHidden(hidden, _) => {
+                hidden.as_matrix()?
+            }
             PrefillInput::Tokens { ids, embedding, .. } => {
                 (ids.len(), embedding.shape().get(1).copied().unwrap_or(0))
             }
@@ -500,10 +502,32 @@ impl MetalExecutor {
         let hidden_len = checked_len(rows, hidden_dim, "prefill résident hidden")?;
         let chunk_hidden_capacity =
             checked_len(chunk_rows, hidden_dim, "prefill résident hidden morceau")?;
+        let rope_positions = match input {
+            PrefillInput::PositionedHidden(_, positions) => {
+                if positions.len() != spec.seq
+                    || start != 0
+                    || mtp_seed.is_some()
+                    || crate::runtime_flags::decision_noncausal()
+                {
+                    return Err(InferError::Config(
+                        "positions M-RoPE incompatibles avec ce prefill".into(),
+                    ));
+                }
+                let ids = positions
+                    .iter()
+                    .flatten()
+                    .map(|&p| checked_u32(p, "M-RoPE position"))
+                    .collect::<Result<Vec<_>>>()?;
+                Some(self.upload_u32_buffer(&ids, "mrope_positions")?)
+            }
+            _ => None,
+        };
         let source = match input {
-            PrefillInput::Hidden(hidden) => ResidentPrefillSource::Hidden(
-                self.upload_f32_buffer(hidden.data(), "resident_input")?,
-            ),
+            PrefillInput::Hidden(hidden) | PrefillInput::PositionedHidden(hidden, _) => {
+                ResidentPrefillSource::Hidden(
+                    self.upload_f32_buffer(hidden.data(), "resident_input")?,
+                )
+            }
             PrefillInput::Tokens {
                 ids,
                 embedding,
@@ -578,6 +602,7 @@ impl MetalExecutor {
         // (flint) lisent leur K/V dans son format de stockage, le NAX d128
         // avec sinks seulement sur un stockage bf16.
         let bf16_mirror = self.prefill_kv_bf16_mirror
+            && rope_positions.is_none()
             && chunked
             && !has_sinks
             && layers.iter().all(|layer| match layer.attention {
@@ -612,6 +637,7 @@ impl MetalExecutor {
         #[cfg(test)]
         let bf16_min_rows = layout_override.map_or(bf16_min_rows, |(_, min_rows)| Some(min_rows));
         let bf16_store = chunked
+            && rope_positions.is_none()
             && kv_bf16_readable
             && bf16_min_rows.is_some_and(|min_rows| spec.seq >= min_rows);
         if trace_prefill_enabled() {
@@ -1096,6 +1122,7 @@ impl MetalExecutor {
                             q_dim,
                             layer_index,
                             kv_only,
+                            rope_positions.as_deref(),
                         )?
                     } else {
                         let caches: Vec<_> = std::iter::once(&layer_cache_buffers[layer_index])

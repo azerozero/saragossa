@@ -28,6 +28,23 @@ pub(crate) fn force_resident_full_linear_decode() {}
 /// Préfixe canonique des variables d'environnement du moteur.
 const ENV_PREFIX: &str = "SARAGOSSA_";
 
+/// Kill-switch vision : `VISION=0` (défaut) maintient le chargement texte.
+/// `VISION=1` demande la vision, refusée tant que le moteur ne l'implémente pas.
+///
+/// # Errors
+/// Refuse les valeurs mal formées au lieu d'activer un chemin par accident.
+pub fn vision_enabled() -> crate::Result<bool> {
+    vision_flag_value(env_var_exact("VISION").as_deref())
+}
+
+fn vision_flag_value(value: Option<&str>) -> crate::Result<bool> {
+    match value {
+        None => Ok(false),
+        Some(value) => env_flag_value(value)
+            .ok_or_else(|| crate::InferError::Config("VISION : booléen invalide".into())),
+    }
+}
+
 thread_local! {
     static DECISION_NONCAUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DECISION_HEADLESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -39,6 +56,7 @@ pub(crate) fn decision_headless() -> bool {
     DECISION_HEADLESS.with(std::cell::Cell::get)
 }
 
+#[cfg(any(feature = "decision", test))]
 pub(crate) fn with_decision_headless<T>(run: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {
@@ -71,6 +89,7 @@ pub(crate) fn decision_gemm_bf16_enabled() -> bool {
 /// Tokens au plus par prefill empaqueté des lectures TTA d'une décision
 /// (`SARAGOSSA_DECISION_PACK_TOKENS`, 0 : un prefill par lecture). Au-delà,
 /// le GEMM est déjà saturé et l'empaquetage ne gagne plus rien (mesuré).
+#[cfg(feature = "decision")]
 pub(crate) fn decision_pack_tokens() -> usize {
     static TOKENS: OnceLock<usize> = OnceLock::new();
     *TOKENS.get_or_init(|| {
@@ -80,6 +99,7 @@ pub(crate) fn decision_pack_tokens() -> usize {
     })
 }
 
+#[cfg(any(feature = "decision", test))]
 pub(crate) fn with_decision_noncausal<T>(run: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {
@@ -590,7 +610,7 @@ thread_local! {
 /// Force l'argmax GPU et les drafts lookup du MTP sur ce thread le temps de
 /// `run` (oracle O2 du repli `Skip` : vérification sans argmax GPU d'une
 /// proposition lookup multiligne).
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 pub(crate) fn with_mtp_skip_override<R>(lookup_drafts: usize, run: impl FnOnce() -> R) -> R {
     /// Rétablit les réglages précédents, panique comprise.
     struct Restore(Option<bool>, Option<usize>);
@@ -1091,7 +1111,7 @@ thread_local! {
 
 /// Exécute `run` avec `n` drafts de lookup greedy sur ce thread (bench A/B dans
 /// un même processus), puis rétablit la valeur précédente.
-#[cfg(test)]
+#[cfg(all(test, feature = "devtools"))]
 pub(crate) fn with_lookup_greedy_override<R>(drafts: usize, run: impl FnOnce() -> R) -> R {
     let previous = LOOKUP_GREEDY_OVERRIDE.with(|cell| cell.replace(Some(drafts)));
     let result = run();
@@ -1892,6 +1912,7 @@ pub(crate) fn qmm_na_dequant_allowed() -> bool {
 
 /// Mémoïsation du préfixe VoiceDesign. Opt-in jusqu'à validation de l'oracle
 /// Metal ; `SARAGOSSA_TTS_PREFILL_CACHE=0` conserve le prefill complet.
+#[cfg(feature = "tts")]
 pub(crate) fn tts_prefill_cache_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = TTS_PREFILL_CACHE_OVERRIDE.with(std::cell::Cell::get) {
@@ -1908,7 +1929,7 @@ thread_local! {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 pub(crate) fn with_tts_prefill_cache_for_test<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
     struct Reset(Option<bool>);
     impl Drop for Reset {
@@ -1943,6 +1964,7 @@ pub(super) fn prefix_extend_rows() -> usize {
 /// Seuil de bascule DFlash → MTP (`SARAGOSSA_RUST_DFLASH_SWITCH_MIN`, tokens
 /// acceptés par tour en moyenne) ; 0 = pas de bascule. Lu à chaque appel : le
 /// harnais d'acceptance le fait varier entre deux runs d'un même processus.
+#[cfg(feature = "devtools")]
 pub(super) fn dflash_switch_min() -> f64 {
     crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_SWITCH_MIN")
         .and_then(|value| value.trim().parse::<f64>().ok())
@@ -1952,6 +1974,7 @@ pub(super) fn dflash_switch_min() -> f64 {
 /// Attention fenêtrée du drafter DFlash en lignes (défaut) ;
 /// `SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS=0` rétablit la boucle naïve ligne par
 /// ligne, référence de dérive et de débit.
+#[cfg(feature = "devtools")]
 pub(crate) fn dflash_windowed_rows() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DFLASH_WINDOWED_ROWS", true))
@@ -1961,6 +1984,7 @@ pub(crate) fn dflash_windowed_rows() -> bool {
 /// sont fenêtrées et leurs types complets. `SARAGOSSA_RUST_DFLASH_DRAFTER_BASE=0`
 /// conserve la capacité pleine et `skip_context`. Lu à chaque génération pour
 /// les comparaisons plein/base fixe dans les harnais d'identité.
+#[cfg(feature = "devtools")]
 pub(crate) fn dflash_drafter_base() -> bool {
     env_flag("SARAGOSSA_RUST_DFLASH_DRAFTER_BASE", true)
 }
@@ -1971,6 +1995,7 @@ pub(crate) fn dflash_drafter_base() -> bool {
 /// absente) : défaut `DFLASH_TREE_DEFAULT_BUDGET` quand le modèle le supporte,
 /// chaîne sinon. Lu à chaque génération ; une valeur explicite invalide ou hors
 /// périmètre est refusée avant la boucle.
+#[cfg(feature = "devtools")]
 pub(crate) fn dflash_tree_budget() -> Option<Result<usize, String>> {
     let value = crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_TREE")?;
     // Une coquille ne doit pas faire mesurer la chaîne en croyant mesurer
@@ -1981,6 +2006,7 @@ pub(crate) fn dflash_tree_budget() -> Option<Result<usize, String>> {
 /// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE` : B = 8 garde les
 /// 9 lignes de la chaîne (même coût de vérification) et gagne +12 à +35 % de
 /// decode en pairwise (`docs/perf/mtp-pairwise.md`).
+#[cfg(feature = "devtools")]
 pub(crate) const DFLASH_TREE_DEFAULT_BUDGET: usize = 8;
 
 /// Budget de l'arbre DFlash 2 par défaut en vérification stricte
@@ -1988,11 +2014,13 @@ pub(crate) const DFLASH_TREE_DEFAULT_BUDGET: usize = 8;
 /// exacts. Mesuré le 5 nov. 2026 (27B, ABBA, M5 Max, tok/s) : B = 3 strict
 /// 52,4-53,8 à 4k et 44,9-45,1 à 32k, contre 39,1-39,5 et 29,6-30,1 pour
 /// B = 8 strict en qmv-T, et 55,1-56,5 et 50,3-51,3 pour le défaut rapide.
+#[cfg(feature = "devtools")]
 pub(crate) const DFLASH_TREE_STRICT_DEFAULT_BUDGET: usize = 3;
 
 /// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE` : B = 3 pour une
 /// requête greedy (`greedy`, température nulle) en mode strict, B = 8 sinon
 /// (échantillonné compris, que le mode strict ne touche pas).
+#[cfg(feature = "devtools")]
 pub(crate) fn dflash_tree_default_budget(greedy: bool) -> usize {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     if greedy && verify_strict_enabled() {
@@ -2005,6 +2033,7 @@ pub(crate) fn dflash_tree_default_budget(greedy: bool) -> usize {
 
 /// Parse `SARAGOSSA_RUST_DFLASH_TREE` (entier, espaces ignorés) ; `None` si
 /// invalide.
+#[cfg(feature = "devtools")]
 pub(crate) fn parse_dflash_tree_budget(value: &str) -> Option<usize> {
     value.trim().parse::<usize>().ok()
 }
@@ -2014,6 +2043,7 @@ pub(crate) fn parse_dflash_tree_budget(value: &str) -> Option<usize> {
 /// sélecteur, puis la séquence générée ; sert à estimer hors ligne une vérification
 /// en arbre. Chaque génération recrée le fichier (sous `serve`, la dernière requête
 /// gagne). Absent (défaut) : aucune trace, aucun calcul supplémentaire.
+#[cfg(feature = "devtools")]
 pub(crate) fn dflash_tree_trace_path() -> Option<std::path::PathBuf> {
     crate::runtime_flags::env_var("SARAGOSSA_RUST_DFLASH_TREE_TRACE")
         .filter(|value| !value.trim().is_empty())
@@ -2109,6 +2139,23 @@ pub fn mtp_sampled_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_SAMPLED", true))
 }
 
+/// Routage spéculatif par classe de prompt, actif par défaut : avec un drafter
+/// DFlash chargé, le greedy dont la conversation ne montre aucun indice de code
+/// passe par la tête MTP, le reste garde DFlash (`crate::spec_route`).
+/// Campagne du 16 novembre : prose +5 à +29 % sur DFlash seul, code inchangé à
+/// ±1 % (docs/perf/spec-route.md). Kill-switch `SARAGOSSA_RUST_SPEC_ROUTE=0`.
+pub fn spec_route_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_SPEC_ROUTE", true))
+}
+
+/// Dossier local de `multilingual-e5-small` pour le routage par embeddings
+/// (`SARAGOSSA_RUST_SPEC_ROUTE_EMBED_DIR`, opt-in, jamais téléchargé) : le
+/// classifieur code/prose remplace la règle « écriture latine ».
+pub fn spec_route_embed_dir() -> Option<std::path::PathBuf> {
+    env_var_os("SARAGOSSA_RUST_SPEC_ROUTE_EMBED_DIR").map(std::path::PathBuf::from)
+}
+
 /// Route les requêtes échantillonnées (température > 0) vers le drafter DFlash
 /// quand il est configuré (`SARAGOSSA_RUST_DFLASH_DRAFT_DIR`), au lieu de la tête
 /// MTP : chaque ligne de vérification (chaîne ou arbre) est tirée sur le GPU par
@@ -2152,6 +2199,32 @@ pub fn serve_max_connections() -> usize {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|max| *max > 0)
             .unwrap_or(64)
+    })
+}
+
+/// Flux DFN3 simultanés (`SARAGOSSA_ENHANCE_MAX_STREAMS`, défaut 2).
+/// Une admission refusée répond 503 sans lire le corps.
+pub fn enhance_max_streams() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        env_var("SARAGOSSA_ENHANCE_MAX_STREAMS")
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(2)
+    })
+}
+
+/// Inactivité maximale par lecture ou écriture DFN3, en secondes
+/// (`SARAGOSSA_ENHANCE_IDLE_TIMEOUT_SECS`, défaut 30). Aucun plafond de durée.
+pub fn enhance_idle_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        Duration::from_secs(
+            env_var("SARAGOSSA_ENHANCE_IDLE_TIMEOUT_SECS")
+                .and_then(|v| v.trim().parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(30),
+        )
     })
 }
 
@@ -2441,6 +2514,8 @@ pub(crate) fn environment_sha256() -> &'static str {
 /// Liste fermée (suffixes communs à SARAGOSSA_ et RETI_) ; les flags inconnus,
 /// le batching et la géométrie des blocs restent dans l'empreinte par prudence.
 const SNAPSHOT_OPERATIONAL_SERVE_FLAGS: &[&str] = &[
+    "ENHANCE_MAX_STREAMS",
+    "ENHANCE_IDLE_TIMEOUT_SECS",
     "SERVE_LOG_PROMPT_FINGERPRINT",
     "SERVE_LRU",
     "SERVE_MAX_CONNECTIONS",
@@ -2456,6 +2531,9 @@ const SNAPSHOT_OPERATIONAL_SERVE_FLAGS: &[&str] = &[
 ];
 
 fn snapshot_environment_name(name: &[u8]) -> bool {
+    if name == b"VISION" {
+        return true;
+    }
     let Some(suffix) = name
         .strip_prefix(ENV_PREFIX.as_bytes())
         .or_else(|| name.strip_prefix(LEGACY_ENV_PREFIX.as_bytes()))
@@ -2492,6 +2570,15 @@ fn hash_environment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vision_kill_switch_is_fail_closed_and_fingerprinted() {
+        assert_eq!(super::vision_flag_value(None).ok(), Some(false));
+        assert_eq!(super::vision_flag_value(Some("0")).ok(), Some(false));
+        assert_eq!(super::vision_flag_value(Some("1")).ok(), Some(true));
+        assert!(super::vision_flag_value(Some("invalid")).is_err());
+        assert!(super::snapshot_environment_name(b"VISION"));
+    }
+
     #[test]
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn gemma4_prefill_default_dispatch_and_kill_switch() {
@@ -2986,6 +3073,7 @@ pub(crate) fn prefix_ssd_staging_bytes(
 /// 15 têtes, tirage top-k/top-p et gather d'embedding sur GPU, un seul
 /// readback par trame. Défaut ON ; `SARAGOSSA_TTS_CP_FUSED=0` rétablit le
 /// chemin pas à pas (projection et tirage CPU). Sans effet sur le glouton.
+#[cfg(feature = "tts")]
 pub(crate) fn tts_cp_fused_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CP_FUSED", true))
@@ -2995,6 +3083,7 @@ pub(crate) fn tts_cp_fused_enabled() -> bool {
 /// concaténé, norm+RoPE de Q et K avec append K/V, gate+up+SwiGLU et
 /// down+résiduel u6). Sorties identiques au bit au chemin général. Défaut ON ;
 /// `SARAGOSSA_TTS_CP_FUSED_KERNELS=0` rétablit les 16 dispatches par couche.
+#[cfg(feature = "tts")]
 pub(crate) fn tts_cp_fused_kernels_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CP_FUSED_KERNELS", true))
@@ -3004,6 +3093,7 @@ pub(crate) fn tts_cp_fused_kernels_enabled() -> bool {
 /// des trames suivantes ; les lots en attente sont fusionnés quand le codec
 /// prend du retard. Défaut ON ; `SARAGOSSA_TTS_CODEC_OVERLAP=0` rétablit le
 /// décodage synchrone dans le callback de trame. PCM identique par causalité.
+#[cfg(feature = "tts")]
 pub(crate) fn tts_codec_overlap_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CODEC_OVERLAP", true))
@@ -3014,15 +3104,28 @@ pub(crate) fn tts_codec_overlap_enabled() -> bool {
 /// Le CPU ne garde que la somme des embeddings RVQ. Écart au préfixe CPU mesuré
 /// par `codec_gpu_prefix_matches_cpu_prefix`. Défaut ON ;
 /// `SARAGOSSA_TTS_CODEC_GPU_PREFIX=0` rétablit le préfixe CPU (oracle).
+#[cfg(feature = "tts")]
 pub(crate) fn tts_codec_gpu_prefix_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CODEC_GPU_PREFIX", true))
+}
+
+/// Convolutions du codec TTS GPU en tuiles (im2col implicite en mémoire
+/// threadgroup, conv2 + raccord résiduel fusionnés) au lieu du kernel gather
+/// un thread par sortie. Même ordre d'accumulation par sortie : PCM identique
+/// au bit (`codec_gpu_tiled_conv_matches_gather`). Défaut ON ;
+/// `SARAGOSSA_TTS_CODEC_CONV_TILED=0` rétablit le kernel gather.
+#[cfg(feature = "tts")]
+pub(crate) fn tts_codec_conv_tiled_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CODEC_CONV_TILED", true))
 }
 
 /// Tirage TTS GPU : sélection partielle exacte des 64 premiers rangs (tri
 /// par blocs de 64 puis fusions) au lieu du tri bitonique complet, quand
 /// `top_k <= 64`. Mêmes rangs au bit près. Défaut ON ;
 /// `SARAGOSSA_TTS_SAMPLER_TOPK=0` rétablit le tri complet.
+#[cfg(feature = "tts")]
 pub(crate) fn tts_sampler_partial_topk_enabled() -> bool {
     if let Some(enabled) = TTS_SAMPLER_TOPK_OVERRIDE.with(std::cell::Cell::get) {
         return enabled;
@@ -3038,11 +3141,78 @@ thread_local! {
 }
 
 /// Force la sélection partielle du tirage TTS pendant `work` (oracles).
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 pub(crate) fn with_tts_sampler_partial_topk<T>(enabled: bool, work: impl FnOnce() -> T) -> T {
     let previous = TTS_SAMPLER_TOPK_OVERRIDE.with(|flag| flag.replace(Some(enabled)));
     let out = work();
     TTS_SAMPLER_TOPK_OVERRIDE.with(|flag| flag.set(previous));
+    out
+}
+
+/// Sampler GPU top-k/top-p : balayage simdgroup (`sample_topk_scan_*`, 8192
+/// logits par threadgroup, fusion en une simdgroup) au lieu des 20 réductions
+/// par bloc de 256 et de la fusion sérielle. Même top-k trié, donc même
+/// token ; un logit NaN, infini ou égal à -FLT_MAX rend la main aux kernels
+/// historiques sur le GPU. Défaut ON ; `SARAGOSSA_SAMPLER_TOPK_SCAN=0`
+/// rétablit le chemin historique.
+///
+/// Contrat : la régularité est jugée sur la valeur classée, donc APRÈS le
+/// softcap (`cap * tanh(x / cap)`), comme le chemin historique qui classe
+/// les logits plafonnés. Un ±inf brut devient ±cap, fini, et reste sur le
+/// balayage ; un NaN reste NaN et part en repli. Sans softcap, la valeur
+/// classée est le logit brut.
+pub(crate) fn sampler_topk_scan_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = SAMPLER_TOPK_SCAN_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_SAMPLER_TOPK_SCAN", true))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAMPLER_TOPK_SCAN_OVERRIDE: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Force le balayage du sampler GPU top-k pendant `work` (oracles).
+#[cfg(test)]
+pub(crate) fn with_sampler_topk_scan<T>(enabled: bool, work: impl FnOnce() -> T) -> T {
+    let previous = SAMPLER_TOPK_SCAN_OVERRIDE.with(|flag| flag.replace(Some(enabled)));
+    let out = work();
+    SAMPLER_TOPK_SCAN_OVERRIDE.with(|flag| flag.set(previous));
+    out
+}
+
+/// Tirage CPU top-k : sélection des `k` premiers rangs en un balayage des
+/// probabilités (seuil sur la clé `total_cmp` du k-ième) au lieu de
+/// `select_nth_unstable` sur 248k couples. `by_rank` est un ordre total strict :
+/// mêmes rangs, même ordre, au bit près. Défaut ON ;
+/// `SARAGOSSA_SAMPLING_TOPK_SCAN=0` rétablit la sélection historique.
+pub(crate) fn sampling_topk_scan_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = SAMPLING_TOPK_SCAN_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_SAMPLING_TOPK_SCAN", true))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SAMPLING_TOPK_SCAN_OVERRIDE: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Force la sélection top-k par balayage pendant `work` (oracles).
+#[cfg(test)]
+pub(crate) fn with_sampling_topk_scan<T>(enabled: bool, work: impl FnOnce() -> T) -> T {
+    let previous = SAMPLING_TOPK_SCAN_OVERRIDE.with(|flag| flag.replace(Some(enabled)));
+    let out = work();
+    SAMPLING_TOPK_SCAN_OVERRIDE.with(|flag| flag.set(previous));
     out
 }
 
@@ -3063,7 +3233,7 @@ thread_local! {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 pub(crate) fn with_tts_greedy_for_test<T>(enabled: bool, run: impl FnOnce() -> T) -> T {
     struct Reset(Option<bool>);
     impl Drop for Reset {

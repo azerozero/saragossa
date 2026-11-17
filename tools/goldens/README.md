@@ -1,5 +1,11 @@
 # Références externes
 
+La référence vision Qwen de l'étape 0 a son propre environnement figé et son
+inventaire exhaustif : voir [le contrat vision](../../docs/vision-spec.md),
+`vision.py` et `test_vision.py`. Elle fonctionne hors ligne en CPU, uniquement
+avec des checkpoints locaux en lecture seule et un interpréteur existant en
+`-I -B` ; elle ne reprend pas les versions plus récentes de `common.py`.
+
 Les scripts de capture de références n'utilisent que des modèles locaux, en lecture seule. Ils forcent
 le mode hors ligne et exigent `SARAGOSSA_GOLDEN_CAPTURE=1`. Installer les versions
 épinglées dans `common.py` dans un environnement **hors dépôt**, puis définir

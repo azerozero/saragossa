@@ -1303,6 +1303,7 @@ fn should_parallelize_quant_matmul(outputs: usize, inner: usize) -> bool {
         && inner >= PARALLEL_QUANT_MATMUL_INNER_THRESHOLD
 }
 
+#[cfg(any(feature = "tts", test))]
 pub(crate) fn bytes_to_u32(bytes: &[u8], name: &str) -> Result<Vec<u32>> {
     let chunks = bytes.chunks_exact(4);
     if !chunks.remainder().is_empty() {

@@ -57,7 +57,9 @@ mod layers;
 mod moe_tail;
 mod multi;
 mod rows;
+#[cfg(feature = "tts")]
 mod tts_layer;
+#[cfg(feature = "tts")]
 mod tts_sampler;
 mod types;
 mod utils;
@@ -84,14 +86,16 @@ pub(crate) use self::kv_quant::KvFormat;
 #[cfg(test)]
 pub(crate) use self::layers::QKV_CONCAT_NO_GATE_HITS;
 pub(crate) use self::multi::MultiFullAttnStream;
+#[cfg(feature = "tts")]
 pub(crate) use self::tts_layer::TtsCpLayerWeights;
+#[cfg(feature = "tts")]
 pub(crate) use self::tts_sampler::{TtsCodebookSample, TTS_SAMPLER_MAX_VOCAB, TTS_SAMPLER_TRACE_K};
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
     GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,
     LinearAttnDenseLayerWeights, LinearAttnLayerWeights, MtpD2Segments,
 };
-#[cfg(all(test, feature = "devtools"))]
+#[cfg(test)]
 pub(crate) use self::utils::with_kv_format_override;
 pub(crate) use self::utils::{kv_bf16_dense, kv_bf16_dense_by_default, kv_element_bytes};
 
@@ -139,6 +143,7 @@ pub(crate) struct DecodeResidentState {
     /// Kernels d'attention avec sinks appris (flint), compilés au premier usage.
     sink_kernels: OnceLock<attention::SinkKernels>,
     /// Tirage des codebooks TTS sur GPU, compilé au premier usage.
+    #[cfg(feature = "tts")]
     tts_sampler_kernel: OnceLock<tts_sampler::TtsSamplerKernel>,
     /// Instrumentation per-section (tranche 3), active si `SARAGOSSA_RUST_GPU_COUNTERS`.
     timer: Option<GpuSectionTimer>,

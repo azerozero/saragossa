@@ -1287,6 +1287,9 @@ impl CausalDecoder {
         retain_hidden: bool,
         after_submit: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<Option<ResidentMtpSpecOneOutput>> {
+        if cache.vision_positions.is_some() {
+            return Ok(None);
+        }
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
         };
@@ -1340,6 +1343,7 @@ impl CausalDecoder {
             layers,
             position: cache_position,
             resident,
+            ..
         } = cache;
         let Some(arena) = resident.as_mut() else {
             return Ok(None);
@@ -1887,7 +1891,7 @@ impl CausalDecoder {
             .next()
             .ok_or_else(|| InferError::Metal("MTP fused sans bonus".to_string()))?;
         // Oracle O2 : lignes du cycle fusionné D1 (`verify_final`, dernier bail).
-        #[cfg(test)]
+        #[cfg(all(test, feature = "devtools"))]
         if super::verify::verify_recorder_active() {
             if let Some(verify_final) = scratch.last() {
                 let states = crate::metal_backend::read_f32_buffer(
@@ -1968,6 +1972,9 @@ impl CausalDecoder {
         retain_hidden: bool,
         after_submit: Option<&mut dyn FnMut() -> bool>,
     ) -> Result<Option<ResidentMtpSpecTwoOutput>> {
+        if cache.vision_positions.is_some() {
+            return Ok(None);
+        }
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
         };
@@ -2016,6 +2023,7 @@ impl CausalDecoder {
             layers,
             position: cache_position,
             resident,
+            ..
         } = cache;
         let Some(arena) = resident.as_mut() else {
             return Ok(None);
@@ -2528,7 +2536,7 @@ impl CausalDecoder {
             )?)
         };
         // Oracle O2 : lignes du cycle fusionné (entrée puis deux drafts).
-        #[cfg(test)]
+        #[cfg(all(test, feature = "devtools"))]
         if super::verify::verify_recorder_active() {
             let states = crate::metal_backend::read_f32_buffer(
                 verify_final.tensor().buffer(),

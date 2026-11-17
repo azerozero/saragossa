@@ -475,7 +475,8 @@ impl DiarizationModel {
             } else {
                 (k, v)
             };
-            let ctx = crate::whisper::multi_head_attention(&q, &k, &v, heads, false, runtime)?;
+            let ctx =
+                crate::audio_attention::multi_head_attention(&q, &k, &v, heads, false, runtime)?;
             h = h.add(&layer.o.forward_batched(&ctx, runtime)?)?;
             let x = layer.ln2.forward(&h)?;
             let ff = layer

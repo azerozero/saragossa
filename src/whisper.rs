@@ -13,11 +13,23 @@
 //! sans EOT, toute la transcription échoue explicitement : sans timestamps,
 //! une reprise sur le texte partiel ne permettrait pas de garantir l'absence
 //! de mots perdus. Le frontend log-mel seul conserve sa fenêtre fixe de 30 s.
+//!
+//! [`WhisperModel::transcribe_verbose`] décode les mêmes fenêtres avec les
+//! tokens `<|t.tt|>` ; [`WhisperModel::transcribe_with_deltas`] émet le texte
+//! token par token ; [`WhisperStream`] accepte le PCM par morceaux.
 
 mod decoder;
 mod segments;
+mod streaming;
+mod timestamps;
 
+use crate::audio_attention::multi_head_attention;
 pub use decoder::{WhisperDecoder, WhisperModel};
+pub use streaming::{
+    StreamLimit, WhisperStream, WhisperStreamUpdate, MAX_CHUNK_SAMPLES, MAX_SESSION_CHUNKS,
+    MAX_SESSION_INFERENCES, MAX_SESSION_SAMPLES, MIN_PARTIAL_SAMPLES,
+};
+pub use timestamps::{WhisperSegment, WhisperTranscript};
 
 use crate::{
     gelu, layer_norm, load_float_tensors, ForwardRuntime, InferError, Linear, Result, Tensor,
@@ -424,6 +436,7 @@ impl WhisperEncoder {
             heads: self.config.encoder_attention_heads,
             ffn_dim,
             eps: LAYER_NORM_EPS,
+            #[cfg(feature = "diar")]
             rope_theta: None,
         })
     }
@@ -998,82 +1011,6 @@ pub(super) fn attention_forward(
     let v = attn.v_proj.forward_batched(key_value, runtime)?;
     let context = multi_head_attention(&q, &k, &v, heads, causal, runtime)?;
     attn.out_proj.forward_batched(&context, runtime)
-}
-
-pub(super) fn multi_head_attention(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    heads: usize,
-    causal: bool,
-    runtime: ForwardRuntime<'_>,
-) -> Result<Tensor> {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    if let Some(metal) = runtime.metal_executor() {
-        if !causal && q.shape() == k.shape() && k.shape() == v.shape() {
-            return metal.noncausal_attention_prefill(q, k, v, heads, heads);
-        }
-    }
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
-    let _ = runtime;
-    let (q_seq, dim) = q.as_matrix()?;
-    let (kv_seq, k_dim) = k.as_matrix()?;
-    if v.shape() != k.shape() || k_dim != dim {
-        return Err(InferError::Dimension(format!(
-            "attention q={:?}, k={:?}, v={:?}",
-            q.shape(),
-            k.shape(),
-            v.shape()
-        )));
-    }
-    if heads == 0 || dim % heads != 0 {
-        return Err(InferError::Dimension(format!(
-            "attention dim={dim} heads={heads}"
-        )));
-    }
-    let head_dim = dim / heads;
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0.0_f32; q_seq * dim];
-    let mut scores = vec![0.0_f32; kv_seq];
-    for head in 0..heads {
-        let head_base = head * head_dim;
-        for row_q in 0..q_seq {
-            let mut max_score = f32::NEG_INFINITY;
-            for (row_k, score_value) in scores.iter_mut().enumerate().take(kv_seq) {
-                if causal && row_k > row_q {
-                    *score_value = f32::NEG_INFINITY;
-                    continue;
-                }
-                let mut dot = 0.0_f32;
-                for col in 0..head_dim {
-                    dot += q.data()[row_q * dim + head_base + col]
-                        * k.data()[row_k * dim + head_base + col];
-                }
-                let score = dot * scale;
-                *score_value = score;
-                max_score = max_score.max(score);
-            }
-            let mut denom = 0.0_f32;
-            for score in scores.iter_mut().take(kv_seq) {
-                if *score == f32::NEG_INFINITY {
-                    continue;
-                }
-                *score = (*score - max_score).exp();
-                denom += *score;
-            }
-            for col in 0..head_dim {
-                let mut acc = 0.0_f32;
-                for (row_v, prob) in scores.iter().take(kv_seq).enumerate() {
-                    if *prob == f32::NEG_INFINITY {
-                        continue;
-                    }
-                    acc += (*prob / denom) * v.data()[row_v * dim + head_base + col];
-                }
-                out[row_q * dim + head_base + col] = acc;
-            }
-        }
-    }
-    Tensor::from_vec(vec![q_seq, dim], out)
 }
 
 fn feed_forward(

@@ -131,11 +131,7 @@ impl CausalDecoder {
     }
 
     /// Renvoie la dernière ligne du prefill AVANT la norme finale.
-    #[cfg(all(
-        target_os = "macos",
-        feature = "metal",
-        any(test, feature = "devtools")
-    ))]
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     pub(crate) fn resident_reference_start(
         &self,
         prompt: &[usize],
@@ -417,7 +413,7 @@ impl CausalDecoder {
         let eps = self.config.rms_eps;
 
         let hidden = self.final_norm.data().len();
-        let position = cache.position;
+        let position = cache.current_pos()?;
         let linear_dims = if self.has_resident_linear_attention_layer() {
             let la_config = self.config.linear_attention_config()?;
             let la_spec = LinearAttentionStepSpec {
@@ -447,6 +443,7 @@ impl CausalDecoder {
             layers,
             position: cache_position,
             resident,
+            ..
         } = cache;
         let arena = resident.as_mut().ok_or_else(|| {
             InferError::Metal("arène résidente absente (decode résident)".to_string())
@@ -722,7 +719,7 @@ impl CausalDecoder {
             InferError::Config("rope_theta manquant (decode résident embedding)".to_string())
         })?;
         let eps = self.config.rms_eps;
-        let position = cache.position;
+        let position = cache.current_pos()?;
         let linear_dims = if self.has_resident_linear_attention_layer() {
             let la_config = self.config.linear_attention_config()?;
             let la_spec = LinearAttentionStepSpec {
@@ -751,6 +748,7 @@ impl CausalDecoder {
             layers,
             position: cache_position,
             resident,
+            ..
         } = cache;
         let Some(arena) = resident.as_mut() else {
             return Ok(None);

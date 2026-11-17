@@ -1428,6 +1428,7 @@ fn nax_chunk_attention(
         kv_rows,
         kv_rows,
         None,
+        true,
     );
     encoder.end_encoding();
     encoded?;
@@ -1855,7 +1856,7 @@ fn nax_d256_chunk_microbench() -> Result<()> {
                 let cb = executor.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 executor.encode_causal_attention_prefill_chunk(
-                    enc, &q_buf, &k_buf, &v_buf, &out, spec, kv_rows, kv_rows, bf16_kv,
+                    enc, &q_buf, &k_buf, &v_buf, &out, spec, kv_rows, kv_rows, bf16_kv, true,
                 )?;
                 enc.end_encoding();
                 let t = std::time::Instant::now();

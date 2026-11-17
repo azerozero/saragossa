@@ -1,5 +1,8 @@
 //! Erreurs typées du serveur OpenAI local.
 
+// Ces types sont aussi utilisés par le REPL sans transport HTTP.
+#![cfg_attr(not(feature = "serve"), allow(dead_code))]
+
 use std::io;
 use thiserror::Error;
 

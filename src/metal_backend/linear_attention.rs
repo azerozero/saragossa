@@ -1047,6 +1047,7 @@ impl MetalExecutor {
         state: &LinearAttentionMetalState,
         spec: LinearAttentionStepSpec,
         dims: LinearAttnResidentDims,
+        allow_nax: bool,
     ) -> Result<()> {
         ensure_biasless(weights.in_proj_qkv, "linear_attn.in_proj_qkv")?;
         ensure_biasless(weights.in_proj_z, "linear_attn.in_proj_z")?;
@@ -1365,7 +1366,8 @@ impl MetalExecutor {
                     rows,
                     spec,
                 )?;
-            } else if !state.ssm_bf16
+            } else if allow_nax
+                && !state.ssm_bf16
                 && self.encode_gated_delta_nax(
                     encoder,
                     &conv_out_buffer,
@@ -3635,12 +3637,12 @@ impl MetalExecutor {
         Ok(snapshots)
     }
 
-    #[cfg(any(test, feature = "devtools"))]
     /// Compare deux états linear-attn déjà synchronisés côté GPU.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si les formes divergent ou si un readback échoue.
+    #[cfg(feature = "devtools")]
     pub(crate) fn diff_linear_attn_states(
         &self,
         left: &LinearAttentionMetalState,
@@ -3824,6 +3826,7 @@ impl MetalExecutor {
     ///
     /// Renvoie une erreur si une série n'est pas une série arbre complète, si le
     /// chemin est vide ou sort des captures, ou si l'encodage échoue.
+    #[cfg(feature = "devtools")]
     pub(crate) fn restore_linear_attn_tree(
         &self,
         layers: &[(&LinearAttentionMetalState, &[LinearAttentionMetalState])],
@@ -3919,7 +3922,7 @@ impl MetalExecutor {
     }
 }
 
-#[cfg(any(test, feature = "devtools"))]
+#[cfg(feature = "devtools")]
 fn diff_f32_slices(left: &[f32], right: &[f32]) -> Result<(f32, f32)> {
     if left.len() != right.len() {
         return Err(InferError::Dimension(format!(

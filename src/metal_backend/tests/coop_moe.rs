@@ -2,6 +2,7 @@
 
 impl MetalExecutor {
     /// Exécute le coop routé avec des poids et activations de modèle réels.
+    #[cfg(feature = "devtools")]
     pub(crate) fn moe_routed_rows_coop_real_for_test(
         &self,
         input: &Tensor,

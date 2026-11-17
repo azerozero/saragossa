@@ -8,7 +8,7 @@ use crate::decoder::ResidentVerifyHead;
 /// première ligne, tokens d'entrée, parents de l'arbre éventuel, états finaux
 /// normés `[lignes, hidden]` et chemin réellement exécuté (`batched` : kernels
 /// en lignes ; faux pour le repli séquentiel, un pas mono par token).
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 #[derive(Clone, Debug)]
 pub(in crate::decoder) struct VerifyRecord {
     pub(in crate::decoder) base_position: usize,
@@ -20,19 +20,19 @@ pub(in crate::decoder) struct VerifyRecord {
     pub(in crate::decoder) skip_head: bool,
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 thread_local! {
     /// Enregistreur des vérifications résidentes : `Some` pendant un oracle O2.
     pub(in crate::decoder) static VERIFY_RECORDER: std::cell::RefCell<Option<Vec<VerifyRecord>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 pub(super) fn verify_recorder_active() -> bool {
     VERIFY_RECORDER.with(|slot| slot.borrow().is_some())
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 pub(super) fn record_verify(
     base_position: usize,
     tokens: &[usize],
@@ -164,10 +164,12 @@ impl CausalDecoder {
             None
         };
 
+        let rope_position = cache.current_pos()?;
         let CausalDecoderCache {
             layers,
             position: cache_position,
             resident,
+            ..
         } = cache;
         let Some(arena) = resident.as_mut() else {
             return Ok(None);
@@ -284,7 +286,7 @@ impl CausalDecoder {
                         .resident
                         .resident_windowed_full_attn_layer_dims(
                             hidden,
-                            *cache_position,
+                            rope_position,
                             eps,
                             theta,
                         )?;
@@ -539,7 +541,7 @@ impl CausalDecoder {
                     Tensor::from_vec(vec![batch, target_capture_cols], values)
                 })
                 .transpose()?;
-            #[cfg(test)]
+            #[cfg(all(test, feature = "devtools"))]
             record_verify(
                 base_position,
                 token_ids,
@@ -610,7 +612,7 @@ impl CausalDecoder {
         for (token_pos, input) in token_inputs.iter().enumerate() {
             let mut current = input.buffer();
             let mut other = arena.hidden_b.buffer();
-            let position = *cache_position + token_pos;
+            let position = rope_position + token_pos;
             for (index, layer) in self.layers.iter().enumerate() {
                 let layer_cache = &mut layers[index];
                 if self.plan.layers[index].resident_full {
@@ -749,14 +751,14 @@ impl CausalDecoder {
         };
         encoder.end_encoding();
         crate::metal_backend::commit_and_wait(command_buffer)?;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "devtools"))]
         let base_position = *cache_position;
         *cache_position += token_ids.len();
         let output = crate::metal_backend::read_f32_buffer(
             final_states.tensor().buffer(),
             token_ids.len() * hidden,
         )?;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "devtools"))]
         record_verify(
             base_position,
             token_ids,

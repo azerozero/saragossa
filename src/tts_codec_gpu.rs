@@ -31,6 +31,12 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 mod prefix;
+#[cfg(test)]
+mod profile;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+pub(crate) use profile::KernelTime;
 
 const CODEC_KERNELS: &str = r#"
 #include <metal_stdlib>
@@ -112,6 +118,128 @@ kernel void codec_transpose1d_f32(
     out[out_row * out_dim + oc] = acc;
 }
 
+// conv1d et conv transposée en tuiles (im2col implicite) : threadgroup de 128
+// threads, tuile (16·TM) lignes × 32 canaux de sortie, TM×4 sorties par thread,
+// entrées et poids par tranches de 16 canaux d'entrée en mémoire threadgroup.
+// TM = 4 (64 lignes) par défaut, TM = 1 (16 lignes) quand la grille serait trop
+// petite pour occuper le GPU.
+// Chaque sortie garde l'accumulation du kernel gather (biais d'abord pour la conv,
+// à la fin pour la transposée ; prises puis canaux dans l'ordre croissant) : une
+// ligne hors bornes charge 0 au lieu d'être sautée, ce qui laisse l'accumulateur
+// inchangé tant qu'il n'est pas un zéro signé. Seule exception : un poids NaN ou
+// infini donne 0·w = NaN là où le gather sautait la prise ; les poids du codec
+// sont finis.
+// p = [out_time, out_dim, inner, ksize, dilation, pad, x_time, has_bias, out_start,
+//      transpose, stride, taps, has_residual]
+// Conv : ligne de sortie `row`, prise k lit x[row + out_start + k·dilation - pad].
+// Transposée (phase r = grille z) : ligne q = out_start/stride + i, prise j lit
+// x[q - (taps-1) + j] avec le poids k = r + (taps-1-j)·stride, sortie i·stride + r.
+#define CT_BN 32u
+#define CT_BK 16u
+template <uint TM>
+inline void codec_conv_tiled(
+    device const float* x,
+    device const float* w,
+    device const float* bias,
+    device float* out,
+    constant uint* p,
+    device const float* residual,
+    uint3 tg,
+    uint tid,
+    threadgroup float* xs,
+    threadgroup float* ws
+) {
+    constexpr uint BM = 16u * TM;
+    constexpr uint XS = BM + 1u;
+    constexpr uint WS = CT_BN + 1u;
+    const uint out_time = p[0];
+    const uint out_dim = p[1];
+    const uint inner = p[2];
+    const uint ksize = p[3];
+    const uint dilation = p[4];
+    const uint pad = p[5];
+    const int x_time = int(p[6]);
+    const bool has_bias = p[7] != 0u;
+    const uint out_start = p[8];
+    const bool transpose = p[9] != 0u;
+    const uint stride = p[10];
+    const uint taps = p[11];
+    const bool has_residual = p[12] != 0u;
+    const uint phase = tg.z;
+    const uint oc0 = tg.x * CT_BN;
+    const uint i0 = tg.y * BM;
+    const uint tx = tid & 7u;
+    const uint ty = tid >> 3u;
+    float acc[TM][4];
+    for (uint j = 0u; j < 4u; ++j) {
+        const float b0 = (!transpose && has_bias) ? bias[oc0 + tx + 8u * j] : 0.0f;
+        for (uint i = 0u; i < TM; ++i) { acc[i][j] = b0; }
+    }
+    const uint q0 = transpose ? out_start / stride : 0u;
+    for (uint tap = 0u; tap < taps; ++tap) {
+        const uint k = transpose ? phase + (taps - 1u - tap) * stride : tap;
+        for (uint ic0 = 0u; ic0 < inner; ic0 += CT_BK) {
+            for (uint e = 0u; e < 2u * TM; ++e) {
+                const uint lin = tid + 128u * e;
+                const uint r = lin / CT_BK;
+                const uint c = lin % CT_BK;
+                const int src = transpose
+                    ? int(q0 + i0 + r) - int(taps - 1u) + int(tap)
+                    : int(i0 + r + out_start + k * dilation) - int(pad);
+                const bool ok = src >= 0 && src < x_time;
+                xs[c * XS + r] = ok ? x[uint(src) * inner + ic0 + c] : 0.0f;
+            }
+            for (uint e = 0u; e < 4u; ++e) {
+                const uint lin = tid + 128u * e;
+                const uint n = lin / CT_BK;
+                const uint c = lin % CT_BK;
+                ws[c * WS + n] = w[((oc0 + n) * ksize + k) * inner + ic0 + c];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint kk = 0u; kk < CT_BK; ++kk) {
+                float xv[TM];
+                float wv[4];
+                for (uint i = 0u; i < TM; ++i) { xv[i] = xs[kk * XS + ty + 16u * i]; }
+                for (uint j = 0u; j < 4u; ++j) { wv[j] = ws[kk * WS + tx + 8u * j]; }
+                for (uint i = 0u; i < TM; ++i) {
+                    for (uint j = 0u; j < 4u; ++j) { acc[i][j] += xv[i] * wv[j]; }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    for (uint i = 0u; i < TM; ++i) {
+        const uint li = i0 + ty + 16u * i;
+        const uint row = transpose ? li * stride + phase : li;
+        if (row >= out_time) { continue; }
+        for (uint j = 0u; j < 4u; ++j) {
+            const uint oc = oc0 + tx + 8u * j;
+            float v = acc[i][j];
+            if (transpose && has_bias) { v += bias[oc]; }
+            if (has_residual) { v = residual[row * out_dim + oc] + v; }
+            out[row * out_dim + oc] = v;
+        }
+    }
+}
+
+#define CODEC_CONV_TILED_KERNEL(NAME, TM)                                         \
+kernel void NAME(                                                                 \
+    device const float* x        [[buffer(0)]],                                   \
+    device const float* w        [[buffer(1)]],                                   \
+    device const float* bias     [[buffer(2)]],                                   \
+    device float* out            [[buffer(3)]],                                   \
+    constant uint* p             [[buffer(4)]],                                   \
+    device const float* residual [[buffer(5)]],                                   \
+    uint3 tg [[threadgroup_position_in_grid]],                                    \
+    uint tid [[thread_index_in_threadgroup]]                                      \
+) {                                                                               \
+    threadgroup float xs[CT_BK * (16u * TM + 1u)];                                \
+    threadgroup float ws[CT_BK * (CT_BN + 1u)];                                   \
+    codec_conv_tiled<TM>(x, w, bias, out, p, residual, tg, tid, xs, ws);          \
+}
+CODEC_CONV_TILED_KERNEL(codec_conv_tiled_f32, 4u)
+CODEC_CONV_TILED_KERNEL(codec_conv_tiled_small_f32, 1u)
+
 // Snake-β : un thread par élément. a_exp/b_exp = exp(alpha)/exp(beta) par canal,
 // précalculés sur CPU (identiques à la version CPU). p = [total, channels]
 kernel void codec_snake_beta_f32(
@@ -183,6 +311,20 @@ kernel void codec_tail_rows_f32(
 
 const TG_2D: (u64, u64) = (32, 8);
 const TG_1D: u64 = 256;
+/// Tuile de `codec_conv_tiled_f32` : lignes (16·TM, TM = 4), canaux de sortie
+/// (`CT_BN`), canaux d'entrée par tranche (`CT_BK`) et threads de la
+/// disposition `tid`. Cohérence avec la source Metal vérifiée par le test
+/// `tile_constants_match_metal_source`.
+const TILE_M: u64 = 64;
+const TILE_N: usize = 32;
+const TILE_K: usize = 16;
+const TILE_THREADS: u64 = 128;
+/// Seuil de grille (threadgroups en tuiles de 64 lignes) sous lequel les tuiles
+/// de 16 lignes prennent le relais : 2 par cœur sur un M5 Max à 40 cœurs.
+///
+/// NOTE: seuil calé sur le M5 Max (40 cœurs GPU) ; une puce à moins de cœurs
+/// garde un PCM identique (même accumulation) mais peut préférer un autre seuil.
+const TILE_SMALL_BELOW: u64 = 80;
 
 /// Métadonnées + buffer GPU d'une convolution (poids réorganisé une fois).
 #[derive(Debug)]
@@ -221,6 +363,10 @@ pub(crate) struct CodecGpu {
     add_pipeline: ComputePipelineState,
     concat_pipeline: ComputePipelineState,
     tail_pipeline: ComputePipelineState,
+    tiled_pipeline: ComputePipelineState,
+    tiled_small_pipeline: ComputePipelineState,
+    /// Convolutions en tuiles (`SARAGOSSA_TTS_CODEC_CONV_TILED`).
+    conv_tiled: bool,
     convs: HashMap<String, GpuConv>,
     transposes: HashMap<String, GpuConv>,
     snakes: HashMap<String, GpuSnake>,
@@ -322,6 +468,12 @@ impl BufPool {
 }
 
 impl CodecGpu {
+    /// Bascule les convolutions en tuiles (oracles gather contre tuiles).
+    #[cfg(test)]
+    pub(crate) fn set_conv_tiled(&mut self, enabled: bool) {
+        self.conv_tiled = enabled;
+    }
+
     /// Crée un état vide pour décoder un flux codec par suffixes.
     pub(crate) fn new_stream(&self) -> CodecGpuStream {
         CodecGpuStream::default()
@@ -335,6 +487,22 @@ impl CodecGpu {
     /// Renvoie une erreur si Metal est indisponible, si la compilation échoue ou
     /// si un poids attendu est absent / mal formé.
     pub(crate) fn new(weights: &HashMap<String, Tensor>, cfg: &TtsDecoderConfig) -> Result<Self> {
+        let upsample_rates = cfg
+            .upsample_rates
+            .iter()
+            .map(|rate| usize::try_from(*rate))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| InferError::Config("upsample_rate codec négatif".to_string()))?;
+        let mut gpu = Self::without_weights(upsample_rates)?;
+        gpu.register_weights(weights)?;
+        if crate::runtime_flags::tts_codec_gpu_prefix_enabled() {
+            gpu.register_prefix(weights, cfg)?;
+        }
+        Ok(gpu)
+    }
+
+    /// Device, file et pipelines compilés, sans aucun poids enregistré.
+    fn without_weights(upsample_rates: Vec<usize>) -> Result<Self> {
         let device = Device::system_default()
             .ok_or_else(|| InferError::Metal("aucun device Metal pour le codec".to_string()))?;
         let queue = device.new_command_queue();
@@ -344,15 +512,9 @@ impl CodecGpu {
         let add_pipeline = compile(&device, "codec_add_f32")?;
         let concat_pipeline = compile(&device, "codec_concat_rows_f32")?;
         let tail_pipeline = compile(&device, "codec_tail_rows_f32")?;
-
-        let upsample_rates = cfg
-            .upsample_rates
-            .iter()
-            .map(|rate| usize::try_from(*rate))
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|_| InferError::Config("upsample_rate codec négatif".to_string()))?;
-
-        let mut gpu = Self {
+        let tiled_pipeline = compile(&device, "codec_conv_tiled_f32")?;
+        let tiled_small_pipeline = compile(&device, "codec_conv_tiled_small_f32")?;
+        Ok(Self {
             device,
             queue,
             conv_pipeline,
@@ -361,17 +523,15 @@ impl CodecGpu {
             add_pipeline,
             concat_pipeline,
             tail_pipeline,
+            tiled_pipeline,
+            tiled_small_pipeline,
+            conv_tiled: crate::runtime_flags::tts_codec_conv_tiled_enabled(),
             convs: HashMap::new(),
             transposes: HashMap::new(),
             snakes: HashMap::new(),
             upsample_rates,
             prefix: None,
-        };
-        gpu.register_weights(weights)?;
-        if crate::runtime_flags::tts_codec_gpu_prefix_enabled() {
-            gpu.register_prefix(weights, cfg)?;
-        }
-        Ok(gpu)
+        })
     }
 
     /// Enregistre (réorganise + téléverse) les poids de toute la section résidente.
@@ -546,6 +706,7 @@ impl CodecGpu {
             "decoder.decoder.0.conv",
             1,
             false,
+            None,
         )?;
         pool.release(input);
 
@@ -589,6 +750,7 @@ impl CodecGpu {
             &format!("decoder.decoder.{tail_conv}.conv"),
             1,
             false,
+            None,
         )?;
         pool.release(snaked);
 
@@ -620,20 +782,32 @@ impl CodecGpu {
             &format!("{prefix}.conv1.conv"),
             dilation,
             false,
+            None,
         )?;
         pool.release(h);
         let h3 = self.snake(encoder, pool, &h2, &format!("{prefix}.act2"))?;
         pool.release(h2);
-        let h4 = self.conv(encoder, pool, &h3, &format!("{prefix}.conv2.conv"), 1, true)?;
+        // conv2 + raccord résiduel en un dispatch (`x + conv2(...)`).
+        let out = self.conv(
+            encoder,
+            pool,
+            &h3,
+            &format!("{prefix}.conv2.conv"),
+            1,
+            true,
+            Some(&x),
+        )?;
         pool.release(h3);
-        let out = self.add(encoder, pool, &x, &h4)?;
-        pool.release(h4);
         pool.release(x);
         Ok(out)
     }
 
     /// conv1d causale (`nopad=false`, `pad=(k-1)·dilation`, `out_time=x_time`) ou
     /// valide (`nopad=true`, `pad=0`, `out_time=x_time-k+1`). groupes = 1.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "primitive codec GPU chaude: forme et résiduel suivent le dispatch Metal"
+    )]
     fn conv(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -642,51 +816,9 @@ impl CodecGpu {
         prefix: &str,
         dilation: usize,
         nopad: bool,
+        residual: Option<&GpuNlc>,
     ) -> Result<GpuNlc> {
-        let conv = self
-            .convs
-            .get(prefix)
-            .ok_or_else(|| InferError::MissingWeight(format!("conv GPU {prefix}")))?;
-        if x.channels != conv.inner {
-            return Err(InferError::Dimension(format!(
-                "conv GPU {prefix} attendu in={}, reçu {}",
-                conv.inner, x.channels
-            )));
-        }
-        let (pad, out_time) = if nopad {
-            if conv.kernel > x.time {
-                return Err(InferError::Dimension(format!(
-                    "conv valid GPU {prefix} kernel={} > time={}",
-                    conv.kernel, x.time
-                )));
-            }
-            (0_usize, x.time - conv.kernel + 1)
-        } else {
-            ((conv.kernel - 1) * dilation, x.time)
-        };
-        let out = pool.acquire(out_time, conv.out_dim)?;
-        let params = [
-            u32_of(out_time)?,
-            u32_of(conv.out_dim)?,
-            u32_of(conv.inner)?,
-            u32_of(conv.kernel)?,
-            u32_of(dilation)?,
-            u32_of(pad)?,
-            u32_of(conv.out_dim)?, // out_per_group (groupes = 1)
-            u32_of(x.channels)?,
-            u32_of(x.time)?,
-            u32::from(conv.bias.is_some()),
-            0,
-        ];
-        encoder.set_compute_pipeline_state(&self.conv_pipeline);
-        encoder.set_buffer(0, Some(&x.buffer), 0);
-        encoder.set_buffer(1, Some(&conv.wkc), 0);
-        encoder.set_buffer(2, conv.bias.as_deref(), 0);
-        encoder.set_buffer(3, Some(&out.buffer), 0);
-        set_params(encoder, 4, &params);
-        dispatch_2d(encoder, conv.out_dim, out_time);
-        post_dispatch_barrier(encoder);
-        Ok(out)
+        self.conv_with_start(encoder, pool, x, prefix, dilation, nopad, 0, residual)
     }
 
     /// conv transposée 1d causale (groupes = 1), `out_time = x_time·stride`.
@@ -698,46 +830,12 @@ impl CodecGpu {
         prefix: &str,
         stride: usize,
     ) -> Result<GpuNlc> {
-        let conv = self
-            .transposes
-            .get(prefix)
-            .ok_or_else(|| InferError::MissingWeight(format!("transpose GPU {prefix}")))?;
-        if x.channels != conv.inner {
-            return Err(InferError::Dimension(format!(
-                "transpose GPU {prefix} attendu in={}, reçu {}",
-                conv.inner, x.channels
-            )));
-        }
-        if stride == 0 || conv.kernel < stride {
-            return Err(InferError::Dimension(format!(
-                "transpose GPU {prefix} stride={stride} kernel={}",
-                conv.kernel
-            )));
-        }
         // out_time = (x_time-1)·stride + kernel - (kernel - stride) = x_time·stride
         // (identique au trim causal de `causal_transpose1d`).
-        let raw_time = (x.time - 1) * stride + conv.kernel;
-        let out_time = raw_time - (conv.kernel - stride);
-        let out = pool.acquire(out_time, conv.out_dim)?;
-        let params = [
-            u32_of(out_time)?,
-            u32_of(conv.out_dim)?,
-            u32_of(conv.inner)?,
-            u32_of(conv.kernel)?,
-            u32_of(stride)?,
-            u32_of(x.time)?,
-            u32::from(conv.bias.is_some()),
-            0,
-        ];
-        encoder.set_compute_pipeline_state(&self.transpose_pipeline);
-        encoder.set_buffer(0, Some(&x.buffer), 0);
-        encoder.set_buffer(1, Some(&conv.wkc), 0);
-        encoder.set_buffer(2, conv.bias.as_deref(), 0);
-        encoder.set_buffer(3, Some(&out.buffer), 0);
-        set_params(encoder, 4, &params);
-        dispatch_2d(encoder, conv.out_dim, out_time);
-        post_dispatch_barrier(encoder);
-        Ok(out)
+        let out_time = x.time.checked_mul(stride).ok_or_else(|| {
+            InferError::Dimension(format!("transpose GPU {prefix} temps déborde"))
+        })?;
+        self.transpose_with_start(encoder, pool, x, prefix, stride, 0, out_time)
     }
 
     fn snake(
@@ -887,6 +985,7 @@ impl CodecGpu {
             "decoder.decoder.0.conv",
             1,
             false,
+            None,
         )?;
         pool.release(input);
 
@@ -932,6 +1031,7 @@ impl CodecGpu {
             &format!("decoder.decoder.{tail_conv}.conv"),
             1,
             false,
+            None,
         )?;
         pool.release(snaked);
 
@@ -962,11 +1062,12 @@ impl CodecGpu {
             &format!("{prefix}.conv1.conv"),
             dilation,
             false,
+            None,
         )?;
         pool.release(h);
         let h3 = self.snake(encoder, pool, &h2, &format!("{prefix}.act2"))?;
         pool.release(h2);
-        let h4 = self.conv_stream(
+        let out = self.conv_stream(
             state,
             encoder,
             pool,
@@ -974,10 +1075,9 @@ impl CodecGpu {
             &format!("{prefix}.conv2.conv"),
             1,
             true,
+            Some(&x),
         )?;
         pool.release(h3);
-        let out = self.add(encoder, pool, &x, &h4)?;
-        pool.release(h4);
         pool.release(x);
         Ok(out)
     }
@@ -995,6 +1095,7 @@ impl CodecGpu {
         prefix: &str,
         dilation: usize,
         nopad: bool,
+        residual: Option<&GpuNlc>,
     ) -> Result<GpuNlc> {
         let conv = self
             .convs
@@ -1014,7 +1115,7 @@ impl CodecGpu {
                     conv.kernel
                 )));
             }
-            return self.conv_with_start(encoder, pool, x, prefix, dilation, true, 0);
+            return self.conv_with_start(encoder, pool, x, prefix, dilation, true, 0, residual);
         }
 
         let keep_rows = (conv.kernel - 1).checked_mul(dilation).ok_or_else(|| {
@@ -1024,8 +1125,16 @@ impl CodecGpu {
         let (local, context_rows, release_local) =
             self.context_input(encoder, pool, state, &key, x, keep_rows)?;
         self.copy_tail_context(encoder, state, &key, &local, keep_rows)?;
-        let out =
-            self.conv_with_start(encoder, pool, &local, prefix, dilation, false, context_rows)?;
+        let out = self.conv_with_start(
+            encoder,
+            pool,
+            &local,
+            prefix,
+            dilation,
+            false,
+            context_rows,
+            residual,
+        )?;
         if release_local {
             pool.release(local);
         }
@@ -1045,6 +1154,7 @@ impl CodecGpu {
         dilation: usize,
         nopad: bool,
         out_start: usize,
+        residual: Option<&GpuNlc>,
     ) -> Result<GpuNlc> {
         let conv = self
             .convs
@@ -1068,7 +1178,34 @@ impl CodecGpu {
         } else {
             ((conv.kernel - 1) * dilation, x.time - out_start)
         };
+        if let Some(res) = residual {
+            if res.time != out_time || res.channels != conv.out_dim {
+                return Err(InferError::Dimension(format!(
+                    "conv GPU {prefix} résiduel [{},{}] != [{out_time},{}]",
+                    res.time, res.channels, conv.out_dim
+                )));
+            }
+        }
         let out = pool.acquire(out_time, conv.out_dim)?;
+        if self.tiled_eligible(conv) {
+            let params = [
+                u32_of(out_time)?,
+                u32_of(conv.out_dim)?,
+                u32_of(conv.inner)?,
+                u32_of(conv.kernel)?,
+                u32_of(dilation)?,
+                u32_of(pad)?,
+                u32_of(x.time)?,
+                u32::from(conv.bias.is_some()),
+                u32_of(out_start)?,
+                0,
+                1,
+                u32_of(conv.kernel)?,
+                u32::from(residual.is_some()),
+            ];
+            self.dispatch_tiled(encoder, x, conv, &out, residual, &params, out_time, 1);
+            return Ok(out);
+        }
         let params = [
             u32_of(out_time)?,
             u32_of(conv.out_dim)?,
@@ -1090,7 +1227,66 @@ impl CodecGpu {
         set_params(encoder, 4, &params);
         dispatch_2d(encoder, conv.out_dim, out_time);
         post_dispatch_barrier(encoder);
-        Ok(out)
+        match residual {
+            Some(res) => {
+                let sum = self.add(encoder, pool, res, &out)?;
+                pool.release(out);
+                Ok(sum)
+            }
+            None => Ok(out),
+        }
+    }
+
+    /// Le kernel en tuiles couvre la conv : groupes = 1, canaux de sortie
+    /// multiples de 32 et d'entrée multiples de 16.
+    fn tiled_eligible(&self, conv: &GpuConv) -> bool {
+        self.conv_tiled
+            && conv.groups == 1
+            && conv.out_dim % TILE_N == 0
+            && conv.inner % TILE_K == 0
+    }
+
+    /// Moins de 2 threadgroups par cœur en tuiles de 64 lignes : tuiles de 16
+    /// lignes, quatre fois plus nombreuses (même accumulation par sortie).
+    fn tiled_small(&self, conv: &GpuConv, rows: usize, phases: usize) -> bool {
+        let col_tiles = (conv.out_dim / TILE_N) as u64 * phases as u64;
+        col_tiles * ceil_div(rows as u64, TILE_M) < TILE_SMALL_BELOW
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "dispatch Metal: buffers liés et grille de la tuile"
+    )]
+    fn dispatch_tiled(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        x: &GpuNlc,
+        conv: &GpuConv,
+        out: &GpuNlc,
+        residual: Option<&GpuNlc>,
+        params: &[u32; 13],
+        rows: usize,
+        phases: usize,
+    ) {
+        let (pipeline, tile_m) = if self.tiled_small(conv, rows, phases) {
+            (&self.tiled_small_pipeline, TILE_M / 4)
+        } else {
+            (&self.tiled_pipeline, TILE_M)
+        };
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(&x.buffer), 0);
+        encoder.set_buffer(1, Some(&conv.wkc), 0);
+        encoder.set_buffer(2, conv.bias.as_deref(), 0);
+        encoder.set_buffer(3, Some(&out.buffer), 0);
+        set_params(encoder, 4, params);
+        encoder.set_buffer(5, residual.map(|res| &*res.buffer), 0);
+        let groups = MTLSize::new(
+            (conv.out_dim / TILE_N) as u64,
+            ceil_div(rows as u64, tile_m),
+            phases as u64,
+        );
+        encoder.dispatch_thread_groups(groups, MTLSize::new(TILE_THREADS, 1, 1));
+        post_dispatch_barrier(encoder);
     }
 
     fn transpose_stream(
@@ -1167,6 +1363,38 @@ impl CodecGpu {
             )));
         }
         let out = pool.acquire(out_time, conv.out_dim)?;
+        if self.tiled_eligible(conv)
+            && conv.kernel % stride == 0
+            && out_start % stride == 0
+            && out_time % stride == 0
+        {
+            let params = [
+                u32_of(out_time)?,
+                u32_of(conv.out_dim)?,
+                u32_of(conv.inner)?,
+                u32_of(conv.kernel)?,
+                1,
+                0,
+                u32_of(x.time)?,
+                u32::from(conv.bias.is_some()),
+                u32_of(out_start)?,
+                1,
+                u32_of(stride)?,
+                u32_of(conv.kernel / stride)?,
+                0,
+            ];
+            self.dispatch_tiled(
+                encoder,
+                x,
+                conv,
+                &out,
+                None,
+                &params,
+                out_time / stride,
+                stride,
+            );
+            return Ok(out);
+        }
         let params = [
             u32_of(out_time)?,
             u32_of(conv.out_dim)?,
@@ -1295,7 +1523,11 @@ fn set_params(encoder: &ComputeCommandEncoderRef, index: u64, params: &[u32]) {
 }
 
 fn dispatch_2d(encoder: &ComputeCommandEncoderRef, dim_x: usize, dim_y: usize) {
-    let (tgx, tgy) = TG_2D;
+    // Une seule colonne (conv finale mono) : threadgroups en colonne, sinon
+    // 31 threads sur 32 sortent aussitôt. Même calcul par thread.
+    // NOTE: `SARAGOSSA_TTS_CODEC_CONV_TILED=0` ne restaure pas l'ancienne
+    // géométrie (32, 8) : elle reste en colonne pour le gather, PCM inchangé.
+    let (tgx, tgy) = if dim_x == 1 { (1, 256) } else { TG_2D };
     let groups = MTLSize::new(ceil_div(dim_x as u64, tgx), ceil_div(dim_y as u64, tgy), 1);
     encoder.dispatch_thread_groups(groups, MTLSize::new(tgx, tgy, 1));
 }

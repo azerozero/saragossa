@@ -21,8 +21,15 @@ use saragossa::{
 };
 
 use super::args::{ServeArgs, ServeModelConfig};
+#[cfg(any(
+    feature = "stt",
+    feature = "tts",
+    feature = "diar",
+    feature = "denoise"
+))]
 use super::audio::AudioState;
 use super::cache::{BlockAwarePrefixCache, BlockHash};
+#[cfg(feature = "embed")]
 use super::embeddings::EmbeddingsState;
 use super::error::{ServeError, ServeResult};
 use super::mtp;
@@ -94,7 +101,14 @@ pub(super) struct ServeState {
     max_tokens_cap: usize,
     clock: u64,
     memory_guard: MemoryGuard,
+    #[cfg(any(
+        feature = "stt",
+        feature = "tts",
+        feature = "diar",
+        feature = "denoise"
+    ))]
     audio: AudioState,
+    #[cfg(feature = "embed")]
     embeddings: EmbeddingsState,
 }
 
@@ -111,7 +125,14 @@ impl ServeState {
             max_tokens_cap: args.max_tokens_cap,
             clock: 0,
             memory_guard: MemoryGuard::serve(),
+            #[cfg(any(
+                feature = "stt",
+                feature = "tts",
+                feature = "diar",
+                feature = "denoise"
+            ))]
             audio: AudioState::new(args),
+            #[cfg(feature = "embed")]
             embeddings: EmbeddingsState::new(args),
         }
     }
@@ -122,12 +143,19 @@ impl ServeState {
     }
 
     /// Renvoie l'état audio mutable pour les endpoints STT/TTS.
+    #[cfg(any(
+        feature = "stt",
+        feature = "tts",
+        feature = "diar",
+        feature = "denoise"
+    ))]
     pub(super) fn audio_mut(&mut self) -> &mut AudioState {
         self.assert_engine_thread();
         &mut self.audio
     }
 
     /// Renvoie l'état embeddings mutable pour l'endpoint `/v1/embeddings`.
+    #[cfg(feature = "embed")]
     pub(super) fn embeddings_mut(&mut self) -> &mut EmbeddingsState {
         self.assert_engine_thread();
         &mut self.embeddings
@@ -709,11 +737,12 @@ impl LoadedModel {
             // snapshots par blocs de serve pour ces seules requêtes greedy
             // non guidées ; le chemin AR reste strictement inchangé.
             let mut text_stop = TextStop::new(&self.assets, stop_texts, max_tokens);
-            let output = self.decoder.generate_greedy_mtp_streaming_with_options(
+            let output = self.decoder.generate_greedy_mtp_routed(
                 prompt_tokens_ids,
                 max_tokens,
                 options,
                 mtp::max_draft_tokens(),
+                request.allows_dflash(),
                 |token| text_stop.push(token),
             )?;
             text_stop.finish()?;
@@ -820,11 +849,12 @@ impl LoadedModel {
             // du décodeur et by-passe les snapshots serve v1. Le callback observe
             // uniquement les tokens committés, puis le detokenizer existant garde
             // l'exacte même politique de stops et de texte visible.
-            let output = self.decoder.generate_greedy_mtp_streaming_with_options(
+            let output = self.decoder.generate_greedy_mtp_routed(
                 prompt_tokens_ids,
                 max_tokens,
                 options,
                 mtp::max_draft_tokens(),
+                request.allows_dflash(),
                 |token| {
                     if stream_error.is_some() {
                         return false;
@@ -1348,7 +1378,7 @@ impl LoadedModel {
         if reused_prefix_tokens < full_block_tokens {
             let hash = tokens[..full_block_tokens]
                 .chunks_exact(block_tokens)
-                .fold(root, BlockHash::chain);
+                .fold(root, |hash, block| hash.chain(block, &[]));
             self.decoder
                 .persist_prompt(&tokens[..full_block_tokens], &state)?;
             self.remember_prefix_block(root, hash, full_block_tokens, &state, memory_guard)?;
@@ -1372,7 +1402,7 @@ impl LoadedModel {
         if boundary == tokens.len() {
             let hash = tokens
                 .chunks_exact(self.prefix_cache.block_tokens())
-                .fold(root, BlockHash::chain);
+                .fold(root, |hash, block| hash.chain(block, &[]));
             self.remember_prefix_block(root, hash, boundary, &state, memory_guard)?;
         }
         // Une frontière prolongée sera mémorisée une seule fois par l'appelant.

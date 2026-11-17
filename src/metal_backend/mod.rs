@@ -68,6 +68,8 @@ mod linear_attention_encode;
 pub(super) use linear_attention_encode::LinearAttnBatchLayout;
 mod lm_head;
 mod matmul;
+#[cfg(feature = "decision")]
+pub(crate) use matmul::DENSE_BF16_GEMM_MIN_BATCH;
 mod matmul_align64;
 mod matmul_encode;
 mod matmul_resident;
@@ -110,6 +112,7 @@ pub(crate) use self::matmul::with_concat_vram_fraction_override;
 pub(crate) use self::moe_na::moe_coop_tiled_trace_for_test;
 #[cfg(test)]
 pub(crate) use self::prefill::routed_coop_trace_for_test;
+#[cfg(feature = "decision")]
 pub(crate) use self::prefill::with_decision_segments;
 #[cfg(test)]
 pub(crate) use self::prefill::with_prefill_kv_layout_override;
@@ -120,6 +123,7 @@ mod profiling;
 pub(crate) mod rope;
 mod scratch;
 // Fondation du K/V sparse : seuls ses tests l'utilisent avant A2.
+mod bf16_encode;
 #[cfg_attr(not(test), expect(dead_code, reason = "branché en A2"))]
 mod sparse;
 #[cfg(test)]
@@ -128,12 +132,16 @@ pub(crate) mod tests;
 mod transfer;
 // Arbre de vérification DFlash : construit par la boucle DFlash (devtools).
 #[cfg_attr(
-    not(feature = "devtools"),
+    not(any(feature = "devtools", test)),
     expect(dead_code, reason = "arbre construit par la boucle DFlash (devtools)")
 )]
 mod verify_tree;
+#[cfg(any(feature = "stt", feature = "diar"))]
+#[cfg_attr(not(feature = "stt"), allow(dead_code))]
 mod whisper_encode;
 
+#[cfg(all(test, any(feature = "tts", feature = "denoise")))]
+pub(crate) use self::barriers::command_buffer_gpu_ns;
 #[doc(hidden)]
 pub use self::barriers::dump_commit_components;
 pub(crate) use self::barriers::{
@@ -144,6 +152,7 @@ pub(crate) use self::byte_helpers::read_u16_buffer;
 pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
 pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at, write_u8_buffer};
 use self::core::*;
+#[cfg(any(feature = "devtools", test))]
 pub(crate) use self::eligibility::install_qmm_skinny_bf16_scope;
 pub(crate) use self::flags::resident_concurrent_enabled;
 pub(crate) use self::lightbatch_duo::{
@@ -151,11 +160,13 @@ pub(crate) use self::lightbatch_duo::{
 };
 #[cfg(feature = "devtools")]
 pub(crate) use self::linear_attention::linear_tree_journal_refusal;
-#[cfg(test)]
+#[cfg(all(test, feature = "devtools"))]
 pub(crate) use self::linear_attention::{linear_tree_refusal, LinearTreeShape};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) use self::matmul::take_concat_profile;
-pub(crate) use self::matmul::{whisper_bf16_gemm_enabled, whisper_decode_bf16_qmv_enabled};
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(crate) use self::matmul::whisper_bf16_gemm_enabled;
+pub(crate) use self::matmul::whisper_decode_bf16_qmv_enabled;
 use self::na_gemm::NA_GEMM_SRC;
 #[cfg(test)]
 use self::pipelines::KernelSources;
@@ -178,8 +189,13 @@ pub(crate) use self::verify_tree::{
 pub(crate) fn qmvt_dispatches_for_test() -> usize {
     matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get)
 }
+#[cfg(feature = "stt")]
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
+    WhisperStepEmit, WhisperStepOutput,
+};
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(crate) use self::whisper_encode::{
     WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
 };
 
@@ -215,6 +231,13 @@ fn affine_biases_offset(weight: &AffineQuantizedTensor) -> Result<NSUInteger> {
 
 /// Exécute les premiers kernels Metal du backend Rust expérimental.
 #[derive(Debug)]
+#[cfg_attr(
+    not(all(feature = "stt", feature = "tts")),
+    allow(
+        dead_code,
+        reason = "Les pipelines partagés gardent une initialisation uniforme entre builds"
+    )
+)]
 pub struct MetalExecutor {
     kernel_profile: crate::KernelProfile,
     rope_frequencies: rope::RopeFrequencyCache,
@@ -354,7 +377,9 @@ pub struct MetalExecutor {
     whisper_attn_decode_vec64_f32: ComputePipelineState,
     im2col_f32: ComputePipelineState,
     rms_norm_rope_heads_f32: ComputePipelineState,
+    #[cfg(feature = "diar")]
     rope_heads_inplace_f32: ComputePipelineState,
+    rms_norm_mrope_heads_f32: ComputePipelineState,
     rms_norm_heads_no_scale_f32: ComputePipelineState,
     causal_attention_prefill_f32: ComputePipelineState,
     causal_attention_prefill_mid_f32: ComputePipelineState,
@@ -425,6 +450,8 @@ pub struct MetalExecutor {
     sample_gumbel_blocks_f32: ComputePipelineState,
     sample_topk_blocks_f32: ComputePipelineState,
     sample_topk_finalize_f32: ComputePipelineState,
+    sample_topk_scan_blocks_f32: ComputePipelineState,
+    sample_topk_scan_finalize_f32: ComputePipelineState,
     argmax_blocks_f32: ComputePipelineState,
     argmax_finalize_f32: ComputePipelineState,
     talker_greedy_argmax_f32: ComputePipelineState,
@@ -485,6 +512,8 @@ pub struct MetalExecutor {
     /// demande (qmv-T du mode strict, une instance par largeur de lot).
     library: metal::Library,
     micro_library: Mutex<Option<metal::Library>>,
+    /// Bibliothèque micro compilée en fast-math, réservée au MLP fusionné.
+    micro_fast_library: Mutex<Option<metal::Library>>,
     /// Pipelines qmv-T déjà créés, par nom de kernel.
     qmvt_pipelines: Mutex<HashMap<String, ComputePipelineState>>,
     /// Force la rétention des dérivés de poids avant de libérer leurs payloads CPU.
@@ -641,7 +670,7 @@ pub(crate) struct MetalLinearAttnResidentDenseWeights {
     pub norm_weight: Buffer,
 }
 
-#[cfg(any(test, feature = "devtools"))]
+#[cfg(feature = "devtools")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LinearAttentionStateDiff {
     pub conv_max_abs: f32,
@@ -936,6 +965,8 @@ pub(crate) struct PrefillCaptures {
 pub(crate) enum PrefillInput<'a> {
     /// Flux résiduel déjà plongé `[rows, hidden]`.
     Hidden(&'a Tensor),
+    /// Embeddings fournis et positions par ligne, sans encodeur vision.
+    PositionedHidden(&'a Tensor, &'a [[usize; 3]]),
     /// Jetons plongés sur le GPU morceau par morceau : ni `[rows, hidden]` CPU
     /// ni sa copie GPU (2 × 5,4 Go à 256k sur le 27B). Réservé à un embedding
     /// dont le gather Metal est l'octet près celui du CPU.

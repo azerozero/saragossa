@@ -1225,6 +1225,75 @@ impl MetalExecutor {
         Ok(())
     }
 
+    pub(crate) fn encode_rms_norm_mrope_heads(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        weight_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        spec: PrefillAttentionSpec,
+        heads: usize,
+        position_offset: usize,
+        positions: Option<&BufferRef>,
+    ) -> Result<()> {
+        let Some(positions) = positions else {
+            return self.encode_rms_norm_rope_heads(
+                encoder,
+                input_buffer,
+                weight_buffer,
+                output_buffer,
+                spec,
+                heads,
+                position_offset,
+            );
+        };
+        if spec.head_dim != 256
+            || spec.rope_dims != 64
+            || spec.rope_frequency_dim != 64
+            || spec.rope_theta != 10_000_000.0
+        {
+            return Err(InferError::Config(
+                "prefill M-RoPE hors contrat Qwen".into(),
+            ));
+        }
+        encoder.set_buffer(6, Some(positions), (position_offset * 3 * 4) as u64);
+        let dims = [
+            checked_u32(spec.seq, "rope seq")?,
+            checked_u32(heads, "rope heads")?,
+            checked_u32(spec.head_dim, "rope head_dim")?,
+            checked_u32(spec.rope_dims, "rope dims")?,
+        ];
+        let frequencies = self.rope_frequencies(spec.rope_theta, spec.rope_frequency_dim)?;
+        encoder.set_compute_pipeline_state(&self.rms_norm_mrope_heads_f32);
+        encoder.set_buffer(5, Some(&frequencies), 0);
+        encoder.set_buffer(0, Some(input_buffer), 0);
+        encoder.set_buffer(1, Some(weight_buffer), 0);
+        encoder.set_buffer(2, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 3, &dims, "rms_rope_dims")?;
+        set_f32_bytes(
+            encoder,
+            4,
+            &[
+                spec.eps,
+                spec.rope_theta,
+                spec.rope_frequency_dim as f32,
+                position_offset as f32,
+            ],
+            "rms_rope_params",
+        )?;
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(heads, "rope heads")?,
+                checked_nsuint(spec.seq, "rope seq")?,
+                1,
+            ),
+            MTLSize::new(FULL_ATTN_PREFILL_TG_WIDTH, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
     pub(super) fn encode_causal_attention_prefill(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1271,6 +1340,7 @@ impl MetalExecutor {
             spec.seq,
             spec.seq,
             None,
+            true,
         )? {
             return Ok(());
         }
@@ -1684,6 +1754,7 @@ impl MetalExecutor {
         kv_rows: usize,
         kv_capacity: usize,
         bf16_kv: Option<[&BufferRef; 2]>,
+        allow_nax: bool,
     ) -> Result<()> {
         let spec = spec.with_effective_window(kv_rows);
         if kv_rows > kv_capacity
@@ -1697,6 +1768,7 @@ impl MetalExecutor {
                 kv_rows,
                 kv_capacity,
                 bf16_kv,
+                allow_nax,
             )?
         {
             return Err(InferError::Config(format!(
@@ -1753,10 +1825,12 @@ impl MetalExecutor {
         kv_rows: usize,
         kv_capacity: usize,
         bf16_kv: Option<[&BufferRef; 2]>,
+        allow_nax: bool,
     ) -> Result<bool> {
         // NOTE: le seuil seq > 256 est un choix de perf du prefill en un bloc ;
-        // un morceau (kv_rows > seq) passe toujours par le Steel/NAX.
-        let in_scope = if kv_rows > spec.seq {
+        // Un morceau passe toujours par le Steel/NAX, y compris le premier
+        // (kv_rows == seq) : sa capacité couvre aussi les morceaux suivants.
+        let in_scope = if kv_rows > spec.seq || kv_capacity > spec.seq {
             prefill_attn_steel_shape_supported(spec)
         } else {
             prefill_attn_steel_supported(spec)
@@ -1770,6 +1844,7 @@ impl MetalExecutor {
         let nax_kv;
         let (pipeline, block_q, block_k, threads_y, q_in, k_in, v_in, head_major) = match self
             .causal_attention_prefill_nax(spec)
+            .filter(|_| allow_nax)
         {
             Some(nax) => {
                 let q_len = checked_len(spec.seq, spec.q_heads * spec.head_dim, "nax q")?;
@@ -1870,6 +1945,7 @@ impl MetalExecutor {
                 spec.seq,
                 spec.seq,
                 None,
+                true,
             )?
         {
             return Ok(());

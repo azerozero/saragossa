@@ -451,6 +451,14 @@ impl MetalExecutor {
         down: &MetalLinearWeightBuffers,
         inter_dim: usize,
     ) -> bool {
+        if let (
+            MetalLinearWeightBuffers::MicroScaled(g),
+            MetalLinearWeightBuffers::MicroScaled(u),
+            MetalLinearWeightBuffers::MicroScaled(d),
+        ) = (gate, up, down)
+        {
+            return Self::fused_micro_mlp_supported(batch, in_dim, inter_dim, [g, u, d]);
+        }
         // Ce chemin MLP ne sert pas les projections GDN ; le dispatch down
         // ci-dessous reste lié à zéro, donc les vues décalées en sont exclues.
         let u4_gs64 = |weight: &MetalLinearWeightBuffers, expect_in: usize, expect_out: usize| {
@@ -537,6 +545,38 @@ impl MetalExecutor {
                     "MLP fusionné : {name} n'est pas quantifié"
                 ))),
             }
+        }
+        if let (
+            MetalLinearWeightBuffers::MicroScaled(g),
+            MetalLinearWeightBuffers::MicroScaled(u),
+            MetalLinearWeightBuffers::MicroScaled(d),
+        ) = (gate, up, down)
+        {
+            if !Self::fused_micro_mlp_supported(batch, in_dim, inter_dim, [g, u, d]) {
+                return Err(InferError::Config(
+                    "MLP micro fusionné : poids ou dimensions hors prédicat".into(),
+                ));
+            }
+            let lhs_bf16 = self.private_bf16_buffer(
+                checked_len(batch, in_dim, "MLP micro lhs")?,
+                "fused_mlp_lhs_bf16",
+            )?;
+            let hidden_bf16 = self.private_bf16_buffer(
+                checked_len(batch, inter_dim, "MLP micro hidden")?,
+                "fused_mlp_hidden_bf16",
+            )?;
+            self.encode_f32_to_bf16(encoder, lhs_buffer, &lhs_bf16, batch * in_dim)?;
+            self.encode_micro_gate_up_swiglu(
+                encoder,
+                &lhs_bf16,
+                g,
+                u,
+                &hidden_bf16,
+                batch,
+                in_dim,
+            )?;
+            self.encode_micro_gemm_bf16(encoder, &hidden_bf16, output_buffer, batch, inter_dim, d)?;
+            return Ok(());
         }
         let (gp, gpo, gs, gso, gb, gbo) = quant(gate, "gate_proj")?;
         let (up_p, upo, us, uso, ub, ubo) = quant(up, "up_proj")?;
