@@ -1996,6 +1996,7 @@ impl MetalExecutor {
     /// Attention non causale où seules les `key_rows` premières clés comptent :
     /// les clés de queue sont masquées, toutes les requêtes restent calculées
     /// (trame de remplissage finale de la diarisation). Exige le Steel d64.
+    #[cfg(any(feature = "stt", feature = "diar"))]
     #[expect(clippy::too_many_arguments, reason = "buffers d'attention + spec")]
     pub(super) fn encode_noncausal_attention_prefill_keys(
         &self,
