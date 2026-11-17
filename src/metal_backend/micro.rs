@@ -22,18 +22,32 @@ impl MetalExecutor {
         if let Some(pipeline) = cache.get(name) {
             return Ok(pipeline.clone());
         }
-        let mut library = self
-            .micro_library
+        // Le MLP fusionné calcule SwiGLU comme `swiglu_f32` : même texte, même
+        // mode fast-math que la bibliothèque principale. Le reste garde le mode
+        // précis exigé par les échelles extrêmes.
+        let fast = name.starts_with("micro_gemm_gate_up_swiglu_");
+        let slot = if fast {
+            &self.micro_fast_library
+        } else {
+            &self.micro_library
+        };
+        let mut library = slot
             .lock()
             .map_err(|_| InferError::Metal("bibliothèque micro empoisonnée".into()))?;
         if library.is_none() {
             let source = format!(
-                "{}\n{}",
+                "{}{}\n{}",
+                super::flags::nax_source_prelude(),
                 include_str!("na_gemm.metal"),
                 include_str!("micro.metal")
             );
-            let options = CompileOptions::new();
-            options.set_fast_math_enabled(false);
+            let options = if fast {
+                super::pipelines::compile_options(true)
+            } else {
+                let options = CompileOptions::new();
+                options.set_fast_math_enabled(false);
+                options
+            };
             *library = Some(
                 self.device
                     .new_library_with_source(&source, &options)
@@ -129,21 +143,55 @@ impl MetalExecutor {
             return Err(InferError::Dimension("matmul micro incompatible".into()));
         }
         let use_gemm = batch >= 16 && in_dim % 64 == 0;
-        let name = format!(
-            "micro_{}_{}",
-            if use_gemm { "gemm" } else { "qmv" },
-            weight.mode.name()
-        );
-        let pipeline = self.micro_pipeline(&name)?;
-        let bf16;
-        let input = if use_gemm {
-            bf16 =
+        if use_gemm {
+            let bf16 =
                 self.new_bf16_buffer(checked_len(batch, in_dim, "micro lhs")?, "micro_lhs_bf16")?;
             self.encode_f32_to_bf16(encoder, lhs, &bf16, batch * in_dim)?;
-            &bf16
-        } else {
-            lhs
+            return self.encode_micro_gemm_bf16(encoder, &bf16, output, batch, in_dim, weight);
+        }
+        self.encode_micro_dispatch(encoder, lhs, output, batch, in_dim, weight, false)
+    }
+
+    /// GEMM micro sur un lhs déjà en bf16 (`batch >= 16`, `in_dim % 64 == 0`).
+    pub(super) fn encode_micro_gemm_bf16(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_bf16: &BufferRef,
+        output: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        weight: &MicroWeightBuffers,
+    ) -> Result<usize> {
+        if in_dim != weight.in_dim || batch < 16 || in_dim % 64 != 0 {
+            return Err(InferError::Dimension("GEMM micro bf16 incompatible".into()));
+        }
+        self.encode_micro_dispatch(encoder, lhs_bf16, output, batch, in_dim, weight, true)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "dispatch micro: buffers, formes et choix GEMM explicites"
+    )]
+    fn encode_micro_dispatch(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input: &BufferRef,
+        output: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        weight: &MicroWeightBuffers,
+        use_gemm: bool,
+    ) -> Result<usize> {
+        // QMV à quatre lignes par simdgroup : x lu une fois pour quatre lignes,
+        // sommes de chaque ligne inchangées (égal au bit).
+        let rows4 = !use_gemm && super::flags::micro_qmv_rows4_enabled();
+        let kind = match (use_gemm, rows4) {
+            (true, _) => "gemm",
+            (false, true) => "qmv4",
+            (false, false) => "qmv",
         };
+        let name = format!("micro_{kind}_{}", weight.mode.name());
+        let pipeline = self.micro_pipeline(&name)?;
         encoder.set_compute_pipeline_state(&pipeline);
         encoder.set_buffer(0, Some(input), 0);
         encoder.set_buffer(1, Some(&weight.packed), 0);
@@ -171,12 +219,87 @@ impl MetalExecutor {
             );
         } else {
             encoder.dispatch_thread_groups(
-                MTLSize::new(weight.out_dim.div_ceil(4) as u64, batch as u64, 1),
+                MTLSize::new(
+                    weight.out_dim.div_ceil(if rows4 { 16 } else { 4 }) as u64,
+                    batch as u64,
+                    1,
+                ),
                 MTLSize::new(128, 1, 1),
             );
         }
         post_dispatch_barrier(encoder);
         Ok(weight.out_dim)
+    }
+
+    /// Vrai si gate, up et down sont des poids micro du même mode éligibles au
+    /// MLP fusionné. `fast::exp` du kernel ne reproduit `swiglu_f32` que si
+    /// la bibliothèque principale est compilée en fast-math.
+    pub(super) fn fused_micro_mlp_supported(
+        batch: usize,
+        in_dim: usize,
+        inter_dim: usize,
+        [gate, up, down]: [&MicroWeightBuffers; 3],
+    ) -> bool {
+        super::flags::prefill_fused_mlp_enabled()
+            && super::flags::prefill_fused_mlp_micro_enabled()
+            && super::flags::metal_fast_math_enabled()
+            && batch >= 16
+            && in_dim % 64 == 0
+            && inter_dim % 64 == 0
+            && gate.mode == up.mode
+            && gate.mode == down.mode
+            && [gate, up]
+                .iter()
+                .all(|w| w.out_dim == inter_dim && w.in_dim == in_dim)
+            && down.out_dim == in_dim
+            && down.in_dim == inter_dim
+    }
+
+    /// `hidden = bf16(silu(lhs·gateᵀ) ⊙ lhs·upᵀ)`, lhs bf16 `[batch, in_dim]`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "MLP micro fusionné: buffers et formes explicites"
+    )]
+    pub(super) fn encode_micro_gate_up_swiglu(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_bf16: &BufferRef,
+        gate: &MicroWeightBuffers,
+        up: &MicroWeightBuffers,
+        hidden_bf16: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+    ) -> Result<()> {
+        let pipeline =
+            self.micro_pipeline(&format!("micro_gemm_gate_up_swiglu_{}", gate.mode.name()))?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(lhs_bf16), 0);
+        encoder.set_buffer(1, Some(&gate.packed), 0);
+        encoder.set_buffer(2, Some(&gate.scales), 0);
+        encoder.set_buffer(3, Some(&up.packed), 0);
+        encoder.set_buffer(4, Some(&up.scales), 0);
+        encoder.set_buffer(5, Some(hidden_bf16), 0);
+        set_u32_bytes(
+            encoder,
+            6,
+            &[
+                checked_u32(batch, "micro MLP M")?,
+                checked_u32(gate.out_dim, "micro MLP N")?,
+                checked_u32(in_dim, "micro MLP K")?,
+            ],
+            "micro_mlp_dims",
+        )?;
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                batch.div_ceil(64) as u64,
+                gate.out_dim.div_ceil(64) as u64,
+                1,
+            ),
+            MTLSize::new(128, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, hidden_bf16);
+        Ok(())
     }
 
     #[expect(

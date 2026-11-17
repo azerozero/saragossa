@@ -20,6 +20,7 @@ mod scratch;
 mod segments;
 #[cfg(test)]
 mod segments_tests;
+#[cfg(any(feature = "decision", test))]
 pub(crate) use self::segments::with_decision_segments;
 mod scratch_phases;
 #[cfg(test)]

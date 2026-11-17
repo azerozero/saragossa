@@ -115,6 +115,18 @@ const MAX_STOP_SEQUENCES: usize = 16;
 const MAX_STOP_BYTES: usize = 1024;
 
 impl ChatCompletionRequest {
+    /// Le routage spéculatif laisse-t-il DFlash servir la requête ? Lit toute
+    /// la conversation et les outils (`saragossa::spec_route::allows_dflash`),
+    /// rien quand le routage est coupé.
+    pub(super) fn allows_dflash(&self) -> bool {
+        saragossa::spec_route::allows_dflash(
+            self.messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.content_text())),
+            self.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+        )
+    }
+
     /// Désérialise sans exposer le diagnostic serde, qui peut citer une valeur.
     /// Le JSON brut reste utilisé sur le chemin valide (ordre des outils).
     pub(super) fn parse(body: &[u8]) -> ServeResult<Self> {
@@ -171,6 +183,12 @@ impl ChatCompletionRequest {
     pub(super) fn validate(&self, max_tokens_cap: usize) -> ServeResult<usize> {
         for message in &self.messages {
             if message.content.as_ref().is_some_and(contains_vision_media) {
+                #[cfg(not(feature = "vision"))]
+                return Err(ServeError::NotImplementedParameter {
+                    param: "messages.content".to_string(),
+                    message: "modalité vision absente : recompiler avec --features vision",
+                });
+                #[cfg(feature = "vision")]
                 return Err(ServeError::InvalidParameter {
                     param: "messages.content",
                     message: "vision non implémentée : les images et vidéos sont refusées",
@@ -1004,7 +1022,11 @@ mod tests {
             });
             let request: ChatCompletionRequest =
                 serde_json::from_value(value).expect("invariant: requête synthétique valide");
-            assert!(request.validate(512).is_err());
+            let error = request.validate(512).expect_err("média non pris en charge");
+            #[cfg(feature = "vision")]
+            assert!(matches!(error, ServeError::InvalidParameter { .. }));
+            #[cfg(not(feature = "vision"))]
+            assert!(matches!(error, ServeError::NotImplementedParameter { .. }));
         }
     }
 

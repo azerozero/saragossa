@@ -36,6 +36,7 @@ impl<'a> ForwardRuntime<'a> {
         }
     }
 
+    #[cfg(feature = "vision")]
     pub(crate) fn with_rope_positions(mut self, positions: &'a [[usize; 3]]) -> Self {
         self.rope_positions = Some(positions);
         self

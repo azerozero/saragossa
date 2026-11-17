@@ -22,6 +22,7 @@ de PIL peuvent différer de ceux du backend tenseur de torchvision.
 
 ## Interface et reproduction
 
+Avec la feature Cargo `vision` (activée par défaut),
 `saragossa::vision::preprocess` expose `RgbImage::from_rgb8(height, width,
 pixels)` et `preprocess(&image, ImageProfile)`. Les profils `Qwen38`, `Qwen36`,
 `Thx02` et `D3Flash` fixent les bornes du contrat. La sortie contient
@@ -46,7 +47,7 @@ Définir `REF_PYTHON` vers l'interpréteur existant, sans installer de paquet :
   --output tests/fixtures/vision/preprocess
 CARGO_BUILD_JOBS=4 taskpolicy -b cargo fmt --all -- --check
 CARGO_BUILD_JOBS=4 taskpolicy -b cargo clippy --all-targets --all-features -- -D warnings
-CARGO_BUILD_JOBS=4 taskpolicy -b cargo test --release --lib vision
+CARGO_BUILD_JOBS=4 taskpolicy -b cargo test --release --no-default-features --features vision --lib vision::preprocess
 ```
 
 Les tests CPU sont non ignorés. Ils vérifient chaque pixel et chaque valeur

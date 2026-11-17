@@ -1,6 +1,6 @@
 [package]
 name = "saragossa"
-version = "0.3.1"
+version = "0.3.7"
 description = "Pure-Rust Metal inference engine for Apple Silicon: Qwen dense/MoE LLMs, Whisper STT, Qwen3 TTS, OpenAI-compatible server — GPU-resident decode, 35B MoE at ~105 tok/s."
 repository = "https://github.com/azerozero/saragossa"
 keywords = ["llm", "inference", "metal", "apple-silicon", "transformer"]
@@ -34,7 +34,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "saragossa"
 path = "src/main.rs"
-required-features = ["devtools"]
 
 [[example]]
 name = "mtp_qmm_gate"
@@ -49,7 +48,15 @@ name = "quant_micro"
 required-features = ["metal", "devtools"]
 
 [features]
-default = ["metal", "devtools"]
+default = ["metal", "devtools", "stt", "tts", "diar", "vision", "denoise", "embed", "serve", "decision"]
+stt = ["dep:flate2", "dep:rustfft", "dep:hound"]
+tts = ["dep:rustfft", "dep:hound"]
+diar = ["dep:rustfft", "dep:hound"]
+vision = []
+denoise = ["dep:rustfft", "dep:hound"]
+embed = []
+serve = []
+decision = []
 metal = ["dep:metal"]
 devtools = []
 
@@ -57,13 +64,15 @@ devtools = []
 thiserror = "2"
 safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
+# Déjà présent via reqwest : `compression_ratio` Whisper (zlib, comme OpenAI).
+flate2 = { version = "1", optional = true }
 # preserve_order : ordre des questions de `decision` (déjà activé par llguidance).
 serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 rayon = "1"
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
-rustfft = "6"
-hound = "3.5"
+rustfft = { version = "6", optional = true }
+hound = { version = "3.5", optional = true }
 md5 = "0.8"
 sha2 = "0.11"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
@@ -84,3 +93,19 @@ mach-sys = "0.5"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+
+[[example]]
+name = "bench_stt"
+required-features = ["stt"]
+
+[[example]]
+name = "decision_bench"
+required-features = ["decision"]
+
+[[example]]
+name = "decision_tta_bench"
+required-features = ["decision"]
+
+[[example]]
+name = "letters_bench"
+required-features = ["decision"]

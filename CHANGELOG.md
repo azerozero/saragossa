@@ -7,6 +7,295 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7](https://github.com/azerozero/saragossa/compare/v0.3.6...v0.3.7) - 2026-11-17
+
+### Added
+
+- *(denoise)* branche DFN3 sur la feature dédiée
+- *(features)* rend les modalités optionnelles à la compilation
+
+### Fixed
+
+- *(test)* ne lancer que les tokenizers des modalités compilées
+- *(features)* fusionne main et isole le débruitage en flux
+- *(serve)* refuse les modèles des modalités non compilées
+- *(features)* conserve l’ordre de lecture du flag MTP
+
+### Other
+
+- Merge pull request #245 from azerozero/feat/features-modulaires
+- fusionne main avec les features modulaires
+- *(features)* simplifie les gardes des imports et tests TTS
+- *(features)* vérifie les réponses 501 sans modalité
+- *(configuration)* décrit les features et les profils TOML
+- *(features)* vérifie les combinaisons sur macOS
+
+## [0.3.6](https://github.com/azerozero/saragossa/compare/v0.3.5...v0.3.6) - 2026-11-16
+
+### Added
+
+- *(denoise)* débruite en flux à mémoire bornée
+
+### Fixed
+
+- *(tts)* réinjecter EOS après le filtre top-k/top-p du talker
+
+### Other
+
+- Merge pull request #244 from azerozero/feat/denoise-flux
+- Merge pull request #243 from azerozero/release-plz-2026-11-16T22-06-49Z
+- Merge pull request #242 from azerozero/fix/tts-wer
+- Merge remote-tracking branch 'origin/main' into feat/denoise-flux
+- Merge remote-tracking branch 'origin/main' into fix/tts-wer
+
+## [0.3.5](https://github.com/azerozero/saragossa/compare/v0.3.4...v0.3.5) - 2026-11-16
+
+### Added
+
+- *(denoise)* débruitage DeepFilterNet3 sur CPU, saragossa enhance et /v1/audio/enhance
+
+### Fixed
+
+- *(audio)* refuse les fréquences invalides sans panique
+- *(denoise)* borne les allocations audio avant traitement
+
+### Other
+
+- Merge pull request #240 from azerozero/release-plz-2026-11-16T21-21-17Z
+- *(docs)* une seule ligne vide entre les sections de voice-isolation.md
+- Merge remote-tracking branch 'origin/main' into feat/voix-isolation
+- *(docs)* retire les lignes vides finales de voice-isolation.md
+- Merge remote-tracking branch 'origin/main' into feat/voix-isolation
+- *(voix)* corrige la fenêtre de Vorbis
+- *(audio)* couvre les limites et les hops incomplets
+- *(serve)* fusionne main en conservant le débruitage DFN3
+- *(voix)* spécifications DFN3, MossFormer2 et RE-USE, mesures et licences
+
+## [0.3.4](https://github.com/azerozero/saragossa/compare/v0.3.3...v0.3.4) - 2026-11-16
+
+### Added
+
+- *(spec)* classe code et prose sur embeddings e5, en opt-in
+- *(spec)* cherche les indices de code en sous-chaînes, toutes langues
+- *(spec)* active le routage par classe de prompt par défaut
+- *(spec)* route le greedy vers DFlash ou MTP selon la consigne
+
+### Fixed
+
+- *(spec)* écrit l'entrée sans captures si leur recollage échoue
+- *(spec)* ne laisse la négation annuler que le radical code
+- *(spec)* limite le routage par classe de prompt au greedy
+- *(spec)* garde les captures DFlash quand MTP prolonge l'entrée
+- *(spec)* ne route vers MTP que la prose sans aucun indice de code
+
+### Other
+
+- Merge pull request #237 from azerozero/fix/lint-docs
+- *(release)* publication continue des PR release-plz, comme grob
+- *(lint)* corrige markdownlint (pipes de tableau, espaces en code) et shellcheck (shebang bash, SC2155, SC2034)
+- Merge pull request #232 from azerozero/release-plz-2026-11-16T18-41-46Z
+- Merge remote-tracking branch 'origin/main' into perf/spec-routage
+- *(spec)* compare l'historique MTP semé par le prefill DFlash
+- *(spec)* corrige la doc de l'oracle d'alternance
+- *(spec)* fusionne les deux prefills résidents avec semis MTP
+- *(spec)* sème l'historique MTP sur GPU pendant le prefill DFlash
+- Merge remote-tracking branch 'origin/main' into perf/spec-routage
+- *(perf)* mesure le routage spéculatif par classe de prompt
+
+## [0.3.3](https://github.com/azerozero/saragossa/compare/v0.3.2...v0.3.3) - 2026-11-16
+
+### Added
+
+- *(vision)* insertion des embeddings vision et M-RoPE (étape 3)
+- *(stt)* ajouter compression_ratio aux segments verbose_json
+- *(stt)* verbose_json, sortie SSE et entrée en flux pour Whisper
+- *(tokenizer)* alerte si un Qwen3.5/3.6/3.8 ne porte pas la regex Qwen3.5
+
+### Fixed
+
+- *(serve)* refuser Transfer-Encoding et tout cadrage HTTP ambigu
+- *(stt)* émettre le reste du texte final, U+FFFD compris, en fin de deltas
+- *(stt)* borner la mémoire et le calcul des sessions en flux
+- *(tokenizer)* alerte de regex dédupliquée sur le chemin canonique
+- *(tokenizer)* alerte de regex écrite sans paniquer si stderr échoue
+- *(quant)* tokenizer.json recopié à l'identique depuis la source
+- *(decision)* d3 relu avec la regex Qwen2Tokenizer de son runtime transformers 5.17
+
+### Other
+
+- Merge pull request #235 from azerozero/perf/ecart-mlx
+- Merge pull request #234 from azerozero/perf/tri-tirage
+- Merge remote-tracking branch 'origin/main' into perf/ecart-mlx
+- *(metal)* QMV micro à quatre lignes contre une ligne
+- *(metal)* MLP micro fusionné sur tous les octets d'échelle
+- Merge pull request #233 from azerozero/feat/vision-mrope-v2
+- Merge remote-tracking branch 'origin/main' into feat/stt-streaming
+- Merge remote-tracking branch 'origin/main' into perf/tri-tirage
+- *(metal)* régularité du balayage top-k jugée après softcap
+- *(metal)* cas k = vocabulaire, zéros signés gagnants et 37 groupes
+- *(metal)* l'oracle du balayage top-k vérifie le chemin exécuté
+- Merge pull request #229 from azerozero/fix/tokenizer-regex
+- Merge pull request #208 from azerozero/release-plz-2026-11-15T14-47-08Z
+- Merge pull request #225 from azerozero/dependabot/cargo/serde_json-1.0.154
+- Merge pull request #223 from azerozero/dependabot/github_actions/github/codeql-action-4
+- Merge pull request #222 from azerozero/dependabot/cargo/thiserror-2.0.21
+- Merge pull request #220 from azerozero/dependabot/github_actions/actions/setup-python-7
+- Merge pull request #217 from azerozero/dependabot/github_actions/actions/attest-build-provenance-4.2.2
+- *(stt)* valider les routes STT avant le chargement du modèle
+- *(deps)* bump serde_json from 1.0.150 to 1.0.154
+- Merge remote-tracking branch 'origin/main' into fix/tokenizer-regex
+- *(tokenizer)* alerte de regex unique, chargement poursuivi, stderr défaillant
+- *(metal)* QMV micro à quatre lignes en opt-in
+- *(stt)* envoyer le dernier morceau dès la fin de l'audio dans le client simulé
+- *(metal)* GEMM u4 déroulé, MLP fusionné et QMV 4 lignes en micro-échelles
+- *(bench)* longueurs, decode et essais de quant_micro réglables
+- *(metal)* sampler top-k GPU par balayage simdgroup
+- *(tts)* banc GPU du tirage des codebooks
+- *(sampling)* sélection top-k CPU en un balayage au lieu de select_nth
+- *(deps)* bump github/codeql-action from 3 to 4
+- *(deps)* bump thiserror from 2.0.18 to 2.0.21
+- *(deps)* bump actions/setup-python from 6 to 7
+- *(deps)* bump actions/attest-build-provenance from 3.0.0 to 4.2.2
+
+## [0.3.2](https://github.com/azerozero/saragossa/compare/v0.3.1...v0.3.2) - 2026-11-16
+
+### Added
+
+- *(vision)* valide les tenseurs et refuse les médias
+- *(loader)* fusionner un adaptateur LoRA PEFT au chargement
+- *(decision)* lecture de lettres H2O-Lightning, modes bidirectionnel et causal avec cache de préfixe exact
+- *(decision)* règles de lecture de runtime.plan par défaut pour THX-02
+- *(decision)* moyenne TTA sur les ordres d'options de THX-02
+- *(decision)* charge les modèles de décision sans tête de vocabulaire
+- *(decision)* prend en charge le format d3-code-readout-v1 de d3-flash
+- *(decision)* ajoute l'inférence des modèles de décision THX-02 en texte
+- *(quant)* charge les micro-échelles MLX sur CPU et Metal
+
+### Fixed
+
+- *(vision)* préserve le chargement texte des tours inconnues
+- *(loader)* refuser une échelle LoRA infinie en f32
+- *(loader)* refuser les dimensions LoRA nulles
+- *(loader)* identité SSD de l'adaptateur LoRA sur les octets lus
+- *(decision)* cache de préfixe borné au GEMM bf16 et au prolongement résident, cause mesurée
+- *(decision)* contrat du tokenizer H2O épinglé par son SHA-256
+- *(decision)* regex du tokenizer H2O lue par pointeur, sans indexation qui panique
+- *(tts)* vérifier les poids de la trame fusionnée avant d'encoder
+- *(tts)* garder le préfixe de l'état dans le repli streaming du codec
+- *(tts)* décoder le batch au préfixe GPU par lots de 64 trames
+- *(tts)* garder le préfixe codec CPU pour le glouton
+- *(decision)* borne de 64 questions à la validation, sans indexation
+- *(tts)* appliquer la politique QmmNaDequant TTS dans le prefill par embeddings
+- *(clippy)* lints de rustc 1.95 venus de main
+- *(decision)* refuser un format de décision inconnu
+- *(quant)* encoder les empreintes de l'exemple micro sans LowerHex
+- *(tts)* vérifier l'exactitude bf16 des tables et remonter l'erreur codec
+- *(quant)* adosse les poids micro à la mémoire unifiée sans copie
+- *(quant)* valide les entrées micro sans indexation paniquante
+- *(quant)* traite un override de couche sans mode comme affine
+- *(quant)* compare le vocabulaire KL avec des clés triées
+- *(quant)* mesure le KL micro sur les IDs fixes du protocole
+- *(quant)* masque les colonnes du GEMM micro hors multiple de 64
+- *(serve)* encoder l'empreinte du tokenizer sans LowerHex
+- *(deps)* adapter les empreintes SHA-256 à sha2 0.11
+- *(tts)* adapter l'ajout des tokens spéciaux à tokenizers 0.23
+- *(tts)* réserver l'instruction par défaut à VoiceDesign
+- *(release)* rendre le paquet visible de release-plz
+- *(serve)* utiliser Serena pour les voix inconnues
+- *(tts)* rétablir le mode glouton sans configuration
+- *(ci)* permet de taguer un commit de release précis au dispatch
+- *(quant)* conserve le repli des projections de modes mixtes
+- *(tts)* exposer la raison effective de fin de synthèse
+- *(tts)* échantillonner selon la configuration du modèle
+- *(tts)* insérer le locuteur CustomVoice demandé
+- *(ci)* attacher main avant release-plz release et permettre la relance manuelle
+- *(serve)* vérifie le préfixe émis en debug
+- *(serve)* réserve le diagnostic aux flux dégradés
+
+### Other
+
+- Merge pull request #219 from azerozero/dependabot/github_actions/release-plz/action-0.5.148
+- Merge pull request #218 from azerozero/dependabot/cargo/proptest-1.12.0
+- Merge pull request #228 from azerozero/feat/vision
+- Merge remote-tracking branch 'origin/main' into feat/lora-fusion
+- fusionne origin/main dans feat/vision
+- *(vision)* dédoublonne les fixtures et recalcule les patchs
+- *(loader)* base LoRA « non quantifiée », pas seulement bf16
+- *(loader)* chemin THX-02 du test LoRA par variable d'environnement
+- Merge pull request #216 from azerozero/feat/decision-letters
+- *(vision)* fige l’inventaire et les références Qwen
+- *(decision)* corriger les listes et le code inline signalés par markdownlint
+- *(tts)* profil codec sans indexation de HashMap
+- *(tts)* préciser les constantes de tuile et leurs limites
+- *(tts)* comparer tuiles et gather au bit sur poids synthétiques
+- *(deps)* bump release-plz/action from 0.5.131 to 0.5.148
+- *(deps)* bump proptest from 1.11.0 to 1.12.0
+- *(decision)* cache de préfixe au bit sur plusieurs morceaux et sur suffixe borné
+- *(decision)* tokens spéciaux et neutralisation partagés par les deux lecteurs
+- Merge remote-tracking branch 'origin/main' into feat/decision-letters
+- *(decision)* mesures d3-mini et H2O sous charge basse, cache de préfixe causal
+- *(tts)* convolutions du codec GPU en tuiles, conv2 et résiduel fusionnés
+- *(tts)* resserrer l'écart du préfixe codec GPU à un pas int16
+- *(decision)* oracle d3-mini sur poids réels, tolérance bf16 figée
+- Merge remote-tracking branch 'origin/main' into perf/tts-cp-fusion
+- Merge pull request #214 from azerozero/feat/decision-tta
+- Merge pull request #213 from azerozero/fix/tts-prefill-extend-identity
+- Merge remote-tracking branch 'origin/main' into feat/decision-tta
+- *(prefill)* oracle synthétique de l'empaquetage des décisions
+- *(decision)* exiger l'égalité au bit des lectures empaquetées
+- *(tts)* sélectionner les 64 premiers rangs du tirage sans tri complet
+- *(tts)* décoder le préfixe du codec sur GPU
+- *(tts)* encoder les couches du code predictor en 8 dispatches
+- *(tts)* compter les dispatches par site source et par phase
+- Merge pull request #212 from azerozero/feat/decision-d3
+- Merge pull request #211 from azerozero/perf/tts-frame-batch
+- Merge remote-tracking branch 'origin/main' into feat/decision-d3
+- *(decision)* parcourt le GEMM bf16 des décisions par tuiles N d'abord
+- Merge remote-tracking branch 'origin/main' into feat/quant-mxfp
+- Merge remote-tracking branch 'origin/main' into perf/tts-frame-batch
+- *(decision)* référence f32 d3-flash et tolérance bf16 figée
+- *(tts)* décoder le codec streaming en recouvrement des trames
+- *(tts)* enchaîner les 16 pas du code predictor dans un command buffer
+- *(tts)* profiler chaque trame par phase avec horodatage GPU
+- Merge remote-tracking branch 'origin/main' into feat/decision-models
+- *(decision)* documenter la neutralisation élargie des tokens spéciaux
+- *(quant)* décode l'échelle micro par bloc dans la tuile GEMM
+- *(quant)* décode l'échelle micro une fois par mot dans le QMV
+- Merge pull request #207 from azerozero/fix/tts-customvoice-sampling
+- Merge remote-tracking branch 'origin/main' into fix/tts-customvoice-sampling
+- Merge remote-tracking branch 'origin/main' into fix/deps-sha2-0.11-msrv
+- Merge pull request #189 from azerozero/dependabot/cargo/tokenizers-0.23.2
+- *(tts)* projeter les têtes échantillonnées dans le pas résident
+- Merge pull request #184 from azerozero/dependabot/cargo/metal-0.33.0
+- *(deps)* verrouiller sha2 0.11.0 pour conserver la MSRV 1.85
+- Merge pull request #206 from azerozero/test/qualimetrie
+- *(deps)* bump metal from 0.29.0 to 0.33.0
+- Merge pull request #204 from azerozero/fix/release-plz-dispatch-sha
+- Merge pull request #203 from azerozero/perf/serve-detok-incremental
+- Merge remote-tracking branch 'origin/main' into test/qualimetrie
+- *(ci)* partage le verrou GPU et tolère l'absence de CustomVoice
+- Merge remote-tracking branch 'origin/main' into fix/tts-customvoice-sampling
+- *(quant)* vérifie les produits E8M0 sous-normaux sur CPU
+- *(quant)* décrit les micro-échelles MLX et leur validation
+- *(quant)* ajoute les mesures corpus et vitesse locales
+- *(mutants)* contrôler les tirages et la conversion PCM
+- *(proptest)* versionner le journal des régressions
+- *(embeddings)* ajouter un oracle synthétique CPU et HTTP
+- Merge pull request #201 from azerozero/fix/release-plz-tag-branch
+- *(tts)* couvrir les options de voix et de graine
+- Merge remote-tracking branch 'origin/main' into perf/serve-detok-incremental
+- *(whisper)* couvrir les fenêtres longues et le silence
+- *(tests)* relier les contrats aux preuves de qualité
+- *(fuzz)* exercer les parseurs publics en nightly CPU
+- *(nightly)* exiger les modèles réels sous verrou GPU
+- *(e2e)* mesurer la durée audio et les erreurs de mots
+- *(serve)* reprend ByteLevel après une frontière stable
+- *(tokenizer)* couvre les added tokens ordinaires
+- *(deps)* bump sha2 from 0.10.9 to 0.11.1
+- Merge remote-tracking branch 'origin/main' into perf/serve-detok-incremental
+- *(deps)* bump tokenizers from 0.22.2 to 0.23.2
+- *(serve)* détokenise les flux ByteLevel de façon incrémentale
+
 ## [0.3.1](https://github.com/azerozero/saragossa/compare/v0.3.0...v0.3.1) - 2026-11-15
 
 ### Added

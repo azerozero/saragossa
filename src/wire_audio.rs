@@ -137,6 +137,20 @@ fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Décode un WAV en échantillons mono f32 @ 16 kHz (format Whisper).
 pub fn wav_to_mono_16k(bytes: &[u8]) -> Result<Vec<f32>> {
+    let (mono, rate) = wav_to_mono(bytes)?;
+    downsample(&mono, rate, WHISPER_SAMPLE_RATE)
+}
+
+/// Décode et valide un WAV en échantillons mono f32, à sa fréquence d'origine.
+pub fn wav_to_mono(bytes: &[u8]) -> Result<(Vec<f32>, u32)> {
+    wav_to_mono_validated(bytes, |_, _| Ok(()))
+}
+
+/// Applique une limite métier avant toute allocation des échantillons décodés.
+pub(crate) fn wav_to_mono_validated(
+    bytes: &[u8],
+    validate: impl FnOnce(u64, u32) -> Result<()>,
+) -> Result<(Vec<f32>, u32)> {
     let invalid_wav = |e| AudioParseError(format!("WAV invalide: {e}"));
     let mut cursor = Cursor::new(bytes);
     let file_len = hound::read_wave_header(&mut cursor).map_err(invalid_wav)?;
@@ -163,6 +177,10 @@ pub fn wav_to_mono_16k(bytes: &[u8]) -> Result<Vec<f32>> {
         ));
     }
     validate_wav_limits(spec.sample_rate, spec.channels, samples_len)?;
+    validate(
+        samples_len.div_ceil(u64::from(spec.channels)),
+        spec.sample_rate,
+    )?;
     let mut reader = WavReader::new(Cursor::new(bytes)).map_err(invalid_wav)?;
     let samples: Vec<f32> = match spec.sample_format {
         SampleFormat::Int => match spec.bits_per_sample {
@@ -187,8 +205,7 @@ pub fn wav_to_mono_16k(bytes: &[u8]) -> Result<Vec<f32>> {
         SampleFormat::Float => reader.samples::<f32>().collect(),
     }
     .map_err(invalid_wav)?;
-    let mono = to_mono(&samples, spec.channels as usize);
-    downsample(&mono, spec.sample_rate, WHISPER_SAMPLE_RATE)
+    Ok((to_mono(&samples, spec.channels as usize), spec.sample_rate))
 }
 
 pub fn validate_wav_limits(sample_rate: u32, channels: u16, samples: u64) -> Result<()> {

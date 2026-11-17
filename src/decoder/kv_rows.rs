@@ -126,6 +126,7 @@ pub(super) fn rows_from<'a>(
 impl KvRows {
     /// Copie les seules lignes vivantes, sans retenir la réserve de decode ni
     /// le reste d'un buffer partagé. Le bf16 reste en bf16, sans réarrondi.
+    #[cfg(any(feature = "tts", test))]
     pub(super) fn compact_snapshot(&self) -> Self {
         let segments = self
             .segments
@@ -351,6 +352,7 @@ impl KvRows {
         }
     }
 
+    #[cfg(any(feature = "tts", test))]
     pub(super) fn to_vec(&self) -> Vec<f32> {
         self.f32_segments()
             .iter()

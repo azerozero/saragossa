@@ -698,6 +698,8 @@ impl MetalExecutor {
         let im2col_f32 = pipeline(&library, &device, "im2col_f32")?;
         let rms_norm_mrope_heads_f32 = pipeline(&library, &device, "rms_norm_mrope_heads_f32")?;
         let rms_norm_rope_heads_f32 = pipeline(&library, &device, "rms_norm_rope_heads_f32")?;
+        #[cfg(feature = "diar")]
+        let rope_heads_inplace_f32 = pipeline(&library, &device, "rope_heads_inplace_f32")?;
         let rms_norm_heads_no_scale_f32 =
             pipeline(&library, &device, "rms_norm_heads_no_scale_f32")?;
         let causal_attention_prefill_f32 =
@@ -843,6 +845,10 @@ impl MetalExecutor {
         let sample_gumbel_blocks_f32 = pipeline(&library, &device, "sample_gumbel_blocks_f32")?;
         let sample_topk_blocks_f32 = pipeline(&library, &device, "sample_topk_blocks_f32")?;
         let sample_topk_finalize_f32 = pipeline(&library, &device, "sample_topk_finalize_f32")?;
+        let sample_topk_scan_blocks_f32 =
+            pipeline(&library, &device, "sample_topk_scan_blocks_f32")?;
+        let sample_topk_scan_finalize_f32 =
+            pipeline(&library, &device, "sample_topk_scan_finalize_f32")?;
         let argmax_blocks_f32 = pipeline(&library, &device, "argmax_blocks_f32")?;
         let argmax_finalize_f32 = pipeline(&library, &device, "argmax_finalize_f32")?;
         let talker_greedy_argmax_f32 = pipeline(&library, &device, "talker_greedy_argmax_f32")?;
@@ -850,7 +856,12 @@ impl MetalExecutor {
         let dequant_u5_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u5_to_bf16_t_gs64")?;
         let dequant_u6_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u6_to_bf16_t_gs64")?;
         let dequant_u8_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u8_to_bf16_t_gs64")?;
-        let na_source = sources.na_gemm.as_ref();
+        let na_source = format!(
+            "{}{}",
+            super::flags::nax_source_prelude(),
+            sources.na_gemm.as_ref()
+        );
+        let na_source = na_source.as_str();
         let compile_na = |name: &str| compile_na_gemm_named(&device, na_source, name);
         let na_gemm_bf16 = compile_na_gemm(&device, na_source);
         let na_gemm_bf16_bn128 = compile_na("gemm_nax_bf16_bn128");
@@ -1046,6 +1057,8 @@ impl MetalExecutor {
             whisper_attn_decode_vec64_f32,
             im2col_f32,
             rms_norm_rope_heads_f32,
+            #[cfg(feature = "diar")]
+            rope_heads_inplace_f32,
             rms_norm_mrope_heads_f32,
             rms_norm_heads_no_scale_f32,
             causal_attention_prefill_f32,
@@ -1094,6 +1107,8 @@ impl MetalExecutor {
             sample_gumbel_blocks_f32,
             sample_topk_blocks_f32,
             sample_topk_finalize_f32,
+            sample_topk_scan_blocks_f32,
+            sample_topk_scan_finalize_f32,
             argmax_blocks_f32,
             argmax_finalize_f32,
             talker_greedy_argmax_f32,
@@ -1140,6 +1155,7 @@ impl MetalExecutor {
             concat_buffers: Mutex::new(HashMap::new()),
             library: library.clone(),
             micro_library: Mutex::new(None),
+            micro_fast_library: Mutex::new(None),
             qmvt_pipelines: Mutex::new(HashMap::new()),
             preserve_weight_caches: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

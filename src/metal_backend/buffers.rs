@@ -703,6 +703,7 @@ impl MetalExecutor {
     /// Utilisé pour les scales/biases quantifiés : les kernels qmv/swiglu/gather/argmax
     /// les lisent en `bfloat` (accumulation `float` inchangée), divisant par deux leur
     /// trafic mémoire (≈ 8 % du trafic poids decode) et alignant les numériques sur mlx.
+    #[cfg(any(feature = "stt", feature = "tts", test))]
     pub(crate) fn cached_buffer_from_f32_as_bf16(
         &self,
         data: &[f32],

@@ -9,14 +9,22 @@
 
 pub mod activation;
 pub mod assets;
+#[cfg(any(feature = "stt", feature = "diar"))]
+mod audio_attention;
+#[cfg(any(feature = "tts", feature = "denoise", all(test, feature = "stt")))]
+mod audio_resample;
 pub mod catalog;
 pub mod chat_template;
 pub mod config;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) mod decode_resident;
 pub mod decoder;
+#[cfg(feature = "denoise")]
+pub mod denoise;
 #[cfg(feature = "devtools")]
 pub mod devtools;
+#[cfg(feature = "diar")]
+pub mod diarization;
 pub mod embedding;
 pub mod error;
 #[cfg(test)]
@@ -41,21 +49,39 @@ pub mod runtime_flags;
 pub mod runtime_preset;
 pub mod safetensor;
 pub mod sampling;
+pub mod spec_route;
 #[doc(hidden)]
 pub mod sse;
 pub mod tensor;
+#[cfg(feature = "embed")]
 pub mod text_embedder;
 pub mod tokenizer;
+#[cfg(feature = "tts")]
 pub mod tts;
+#[cfg(feature = "tts")]
 pub mod tts_clone;
+#[cfg(feature = "tts")]
 pub(crate) mod tts_codec;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(feature = "tts")]
 pub(crate) mod tts_codec_gpu;
+#[cfg(feature = "tts")]
 pub mod tts_mimi;
+#[cfg(feature = "tts")]
 pub mod tts_speaker;
+#[cfg(feature = "vision")]
 pub mod vision;
+#[cfg(not(feature = "vision"))]
+pub(crate) mod vision;
+#[cfg(feature = "stt")]
 pub mod whisper;
 #[doc(hidden)]
+#[cfg(any(
+    feature = "stt",
+    feature = "tts",
+    feature = "diar",
+    feature = "denoise"
+))]
 pub mod wire_audio;
 
 #[cfg(test)]
@@ -127,15 +153,20 @@ pub use runtime_preset::{
 pub use safetensor::{load_f32_tensor, load_f32_tensors, load_float_tensor, load_float_tensors};
 pub use sampling::{argmax, sample_token, sample_token_top_k_top_p, softmax, DeterministicSampler};
 pub use tensor::Tensor;
+#[cfg(feature = "embed")]
 pub use text_embedder::{TextEmbedError, TextEmbedder, DEFAULT_TEXT_EMBED_REPO, TEXT_EMBED_DIM};
 pub use tokenizer::RustTokenizer;
+#[cfg(feature = "tts")]
 pub use tts::{
     TtsAssets, TtsCodecCatalog, TtsForwardOutput, TtsModel, TtsModelConfig, TtsModelKind,
     TtsPayloadSummary, TtsStopReason, TtsSynthesisOutput, TtsTalkerCatalog,
 };
+#[cfg(feature = "stt")]
 pub use whisper::{
     log_mel_spectrogram, WhisperConfig, WhisperDecoder, WhisperEncoder, WhisperModel,
+    WhisperSegment, WhisperStream, WhisperStreamUpdate, WhisperTranscript,
 };
+#[cfg(feature = "decision")]
 pub mod decision;
 
 /// Encode une empreinte en hexadécimal minuscule.

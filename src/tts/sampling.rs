@@ -1,5 +1,8 @@
 use super::TtsSampleParams;
-use crate::sampling::{sample_token_top_k_top_p, DeterministicSampler};
+use crate::sampling::{
+    sample_from_token_distribution, sample_token_top_k_top_p, token_distribution_top_k_top_p,
+    DeterministicSampler,
+};
 use crate::{InferError, Result};
 
 pub(super) fn sample_talker_token(
@@ -24,14 +27,60 @@ pub(super) fn sample_talker_token(
         }
     }
     apply_talker_repetition_penalty(&mut adjusted, history, eos, params.repetition_penalty);
-    let sampled = sample_token_top_k_top_p(
-        &adjusted,
-        params.temperature,
-        params.top_p,
-        params.top_k,
-        sampler,
-    )?;
+    let filtered = params.temperature > f32::EPSILON
+        && ((params.top_k > 0 && params.top_k < adjusted.len()) || params.top_p < 1.0);
+    let eos_idx = eos
+        .and_then(|token| usize::try_from(token).ok())
+        .filter(|idx| filtered && *idx < adjusted.len());
+    let sampled = match eos_idx {
+        // NOTE: la référence Qwen3-TTS (mlx_audio `_sample_token`) réinjecte le
+        // logit EOS après top-k/top-p. Sans cela, un EOS hors du top-k n'est
+        // jamais tiré et la génération court jusqu'au plafond de trames.
+        Some(eos_idx) => {
+            let mut distribution = token_distribution_top_k_top_p(
+                &adjusted,
+                params.temperature,
+                params.top_p,
+                params.top_k,
+            )?;
+            keep_eos_in_distribution(&mut distribution, &adjusted, eos_idx, params.temperature);
+            sample_from_token_distribution(&distribution, sampler)?
+        }
+        None => sample_token_top_k_top_p(
+            &adjusted,
+            params.temperature,
+            params.top_p,
+            params.top_k,
+            sampler,
+        )?,
+    };
     i32::try_from(sampled).map_err(|_| InferError::Config(format!("token TTS hors i32: {sampled}")))
+}
+
+/// Ajoute EOS à une distribution filtrée normalisée, avec le poids qu'il aurait
+/// dans un softmax restreint au filtre plus EOS (même température).
+fn keep_eos_in_distribution(
+    distribution: &mut Vec<(usize, f32)>,
+    logits: &[f32],
+    eos: usize,
+    temperature: f32,
+) {
+    if distribution.iter().any(|(token, _)| *token == eos) {
+        return;
+    }
+    let max = distribution
+        .iter()
+        .map(|(token, _)| logits[*token])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let kept = distribution
+        .iter()
+        .map(|(token, _)| ((logits[*token] - max) / temperature).exp())
+        .sum::<f32>();
+    let eos_weight = ((logits[eos] - max) / temperature).exp();
+    if kept > 0.0 && eos_weight.is_finite() && eos_weight > 0.0 {
+        // La distribution reçue somme à 1 : le poids EOS est relatif au filtre.
+        distribution.push((eos, eos_weight / kept));
+    }
 }
 
 fn apply_talker_repetition_penalty(
@@ -129,6 +178,37 @@ mod penalty_tests {
         assert_eq!(logits, [2.0, -8.0, 3.0, 2.0]);
         apply_talker_repetition_penalty(&mut logits, &[0, 1], Some(3), 0.5);
         assert_eq!(logits, [4.0, -4.0, 3.0, 2.0]);
+    }
+
+    #[test]
+    fn eos_outside_top_k_keeps_its_softmax_weight() -> Result<()> {
+        let params = TtsSampleParams {
+            temperature: 1.0,
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            seed: 3,
+        };
+        // Filtre {0} plus EOS (2) : P(EOS) = e^-1 / (1 + e^-1) ≈ 0,27.
+        let logits = [10.0, 9.5, 9.0];
+        let mut distribution = token_distribution_top_k_top_p(&logits, 1.0, 1.0, 1)?;
+        keep_eos_in_distribution(&mut distribution, &logits, 2, 1.0);
+        assert_eq!(distribution.len(), 2);
+        assert!((distribution[1].1 - (-1.0_f32).exp()).abs() < 1e-6);
+        let mut sampler = DeterministicSampler::new(params.seed);
+        let draws = (0..400)
+            .map(|_| sample_talker_token(&logits, &params, &[], &[], Some(2), &mut sampler))
+            .collect::<Result<Vec<_>>>()?;
+        let eos = draws.iter().filter(|token| **token == 2).count();
+        assert!(draws.iter().all(|token| *token == 0 || *token == 2));
+        assert!((70..150).contains(&eos), "EOS tiré {eos} fois sur 400");
+        // Sans EOS désigné, le top-k reste strict.
+        let mut sampler = DeterministicSampler::new(params.seed);
+        assert_eq!(
+            sample_talker_token(&logits, &params, &[], &[], None, &mut sampler)?,
+            0
+        );
+        Ok(())
     }
 
     #[test]
