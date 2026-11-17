@@ -13,6 +13,19 @@ fn max_abs_gap(left: &[f32], right: &[f32]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+fn top_margin(logits: &[f32]) -> f32 {
+    let (mut best, mut second) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for &value in logits {
+        if value > best {
+            second = best;
+            best = value;
+        } else if value > second {
+            second = value;
+        }
+    }
+    best - second
+}
+
 fn first_divergence(left: &[usize], right: &[usize]) -> Option<usize> {
     left.iter()
         .zip(right)
@@ -145,6 +158,7 @@ fn prefix_extension_matches_cold_prefill_real_model() -> Result<()> {
                     model.logits_from_final_state(&cold.final_state)?.data(),
                     model.logits_from_final_state(&warm.1)?.data(),
                 );
+                let cold_logits = model.logits_from_final_state(&cold.final_state)?;
                 let warm = CausalDecoderPromptState::new(warm.0, warm.1);
                 let cold_tokens = model
                     .generate_greedy_timed_from_prompt_state_with_options(
@@ -163,8 +177,18 @@ fn prefix_extension_matches_cold_prefill_real_model() -> Result<()> {
                     )?
                     .tokens;
                 let divergence = first_divergence(&cold_tokens, &warm_tokens);
+                // Marge top-1/top-2 du froid au token divergent : une
+                // quasi-égalité, ou un vrai changement de choix ?
+                let margin = match divergence {
+                    None => None,
+                    Some(0) => Some(top_margin(cold_logits.data())),
+                    Some(index) => model
+                        .resident_forced_logits_for_test(full, &cold_tokens, false)?
+                        .get(index - 1)
+                        .map(|row| top_margin(row)),
+                };
                 println!(
-                    "ar\t{name}\t{p}\t{s}\t{final_gap:e}\t{logits_gap:e}\tfroid_scindé={split_gap:e}\t{divergence:?}"
+                    "ar\t{name}\t{p}\t{s}\t{final_gap:e}\t{logits_gap:e}\tfroid_scindé={split_gap:e}\t{divergence:?}\tmarge={margin:?}"
                 );
                 if final_gap != 0.0 || split_gap != 0.0 || divergence.is_some() {
                     failures.push(format!("ar {name} {p}:{s}"));
