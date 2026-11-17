@@ -31,6 +31,8 @@ condition = "AND"
 paths = ['''^tests/fixtures/vision/[^/]+/llm-calibration\.json$''']
 regexTarget = "line"
 regexes = ['''^\s*"[^"]+": "[0-9a-f]{64}",?\s*$''']
+
+[[allowlists]]
 description = "SHA256 publics en tête des fixtures tokenizer JSONL"
 condition = "AND"
 paths = ['''^tests/fixtures/tokenizer/[^/]+\.jsonl$''']
