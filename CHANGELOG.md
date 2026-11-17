@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7](https://github.com/azerozero/saragossa/compare/v0.3.6...v0.3.7) - 2026-11-17
+
+### Added
+
+- *(denoise)* branche DFN3 sur la feature dédiée
+- *(features)* rend les modalités optionnelles à la compilation
+
+### Fixed
+
+- *(test)* ne lancer que les tokenizers des modalités compilées
+- *(features)* fusionne main et isole le débruitage en flux
+- *(serve)* refuse les modèles des modalités non compilées
+- *(features)* conserve l’ordre de lecture du flag MTP
+
+### Other
+
+- Merge pull request #245 from azerozero/feat/features-modulaires
+- fusionne main avec les features modulaires
+- *(features)* simplifie les gardes des imports et tests TTS
+- *(features)* vérifie les réponses 501 sans modalité
+- *(configuration)* décrit les features et les profils TOML
+- *(features)* vérifie les combinaisons sur macOS
+
 ## [0.3.6](https://github.com/azerozero/saragossa/compare/v0.3.5...v0.3.6) - 2026-11-16
 
 ### Added
