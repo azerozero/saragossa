@@ -212,7 +212,7 @@ pub(crate) struct LinearAttentionCache {
 }
 
 /// Capture les frontières numériques d'une couche Gated DeltaNet.
-#[cfg(test)]
+#[cfg(all(test, feature = "devtools"))]
 pub(crate) struct LinearAttentionPrecisionCapture {
     pub q_proj: Tensor,
     pub k_proj: Tensor,
@@ -356,7 +356,7 @@ impl LinearAttention {
     }
 
     /// Capture les sous-étapes CPU sans modifier le chemin de production.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "devtools"))]
     pub(crate) fn precision_capture_cached(
         &self,
         config: LinearAttentionConfig,

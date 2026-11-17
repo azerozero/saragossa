@@ -7,6 +7,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6](https://github.com/azerozero/saragossa/compare/v0.3.5...v0.3.6) - 2026-11-16
+
+### Added
+
+- *(denoise)* débruite en flux à mémoire bornée
+
+### Fixed
+
+- *(tts)* réinjecter EOS après le filtre top-k/top-p du talker
+
+### Other
+
+- Merge pull request #244 from azerozero/feat/denoise-flux
+- Merge pull request #243 from azerozero/release-plz-2026-11-16T22-06-49Z
+- Merge pull request #242 from azerozero/fix/tts-wer
+- Merge remote-tracking branch 'origin/main' into feat/denoise-flux
+- Merge remote-tracking branch 'origin/main' into fix/tts-wer
+
+## [0.3.5](https://github.com/azerozero/saragossa/compare/v0.3.4...v0.3.5) - 2026-11-16
+
+### Added
+
+- *(denoise)* débruitage DeepFilterNet3 sur CPU, saragossa enhance et /v1/audio/enhance
+
+### Fixed
+
+- *(audio)* refuse les fréquences invalides sans panique
+- *(denoise)* borne les allocations audio avant traitement
+
+### Other
+
+- Merge pull request #240 from azerozero/release-plz-2026-11-16T21-21-17Z
+- *(docs)* une seule ligne vide entre les sections de voice-isolation.md
+- Merge remote-tracking branch 'origin/main' into feat/voix-isolation
+- *(docs)* retire les lignes vides finales de voice-isolation.md
+- Merge remote-tracking branch 'origin/main' into feat/voix-isolation
+- *(voix)* corrige la fenêtre de Vorbis
+- *(audio)* couvre les limites et les hops incomplets
+- *(serve)* fusionne main en conservant le débruitage DFN3
+- *(voix)* spécifications DFN3, MossFormer2 et RE-USE, mesures et licences
+
+## [0.3.4](https://github.com/azerozero/saragossa/compare/v0.3.3...v0.3.4) - 2026-11-16
+
+### Added
+
+- *(spec)* classe code et prose sur embeddings e5, en opt-in
+- *(spec)* cherche les indices de code en sous-chaînes, toutes langues
+- *(spec)* active le routage par classe de prompt par défaut
+- *(spec)* route le greedy vers DFlash ou MTP selon la consigne
+
+### Fixed
+
+- *(spec)* écrit l'entrée sans captures si leur recollage échoue
+- *(spec)* ne laisse la négation annuler que le radical code
+- *(spec)* limite le routage par classe de prompt au greedy
+- *(spec)* garde les captures DFlash quand MTP prolonge l'entrée
+- *(spec)* ne route vers MTP que la prose sans aucun indice de code
+
+### Other
+
+- Merge pull request #237 from azerozero/fix/lint-docs
+- *(release)* publication continue des PR release-plz, comme grob
+- *(lint)* corrige markdownlint (pipes de tableau, espaces en code) et shellcheck (shebang bash, SC2155, SC2034)
+- Merge pull request #232 from azerozero/release-plz-2026-11-16T18-41-46Z
+- Merge remote-tracking branch 'origin/main' into perf/spec-routage
+- *(spec)* compare l'historique MTP semé par le prefill DFlash
+- *(spec)* corrige la doc de l'oracle d'alternance
+- *(spec)* fusionne les deux prefills résidents avec semis MTP
+- *(spec)* sème l'historique MTP sur GPU pendant le prefill DFlash
+- Merge remote-tracking branch 'origin/main' into perf/spec-routage
+- *(perf)* mesure le routage spéculatif par classe de prompt
+
+## [0.3.3](https://github.com/azerozero/saragossa/compare/v0.3.2...v0.3.3) - 2026-11-16
+
+### Added
+
+- *(vision)* insertion des embeddings vision et M-RoPE (étape 3)
+- *(stt)* ajouter compression_ratio aux segments verbose_json
+- *(stt)* verbose_json, sortie SSE et entrée en flux pour Whisper
+- *(tokenizer)* alerte si un Qwen3.5/3.6/3.8 ne porte pas la regex Qwen3.5
+
+### Fixed
+
+- *(serve)* refuser Transfer-Encoding et tout cadrage HTTP ambigu
+- *(stt)* émettre le reste du texte final, U+FFFD compris, en fin de deltas
+- *(stt)* borner la mémoire et le calcul des sessions en flux
+- *(tokenizer)* alerte de regex dédupliquée sur le chemin canonique
+- *(tokenizer)* alerte de regex écrite sans paniquer si stderr échoue
+- *(quant)* tokenizer.json recopié à l'identique depuis la source
+- *(decision)* d3 relu avec la regex Qwen2Tokenizer de son runtime transformers 5.17
+
+### Other
+
+- Merge pull request #235 from azerozero/perf/ecart-mlx
+- Merge pull request #234 from azerozero/perf/tri-tirage
+- Merge remote-tracking branch 'origin/main' into perf/ecart-mlx
+- *(metal)* QMV micro à quatre lignes contre une ligne
+- *(metal)* MLP micro fusionné sur tous les octets d'échelle
+- Merge pull request #233 from azerozero/feat/vision-mrope-v2
+- Merge remote-tracking branch 'origin/main' into feat/stt-streaming
+- Merge remote-tracking branch 'origin/main' into perf/tri-tirage
+- *(metal)* régularité du balayage top-k jugée après softcap
+- *(metal)* cas k = vocabulaire, zéros signés gagnants et 37 groupes
+- *(metal)* l'oracle du balayage top-k vérifie le chemin exécuté
+- Merge pull request #229 from azerozero/fix/tokenizer-regex
+- Merge pull request #208 from azerozero/release-plz-2026-11-15T14-47-08Z
+- Merge pull request #225 from azerozero/dependabot/cargo/serde_json-1.0.154
+- Merge pull request #223 from azerozero/dependabot/github_actions/github/codeql-action-4
+- Merge pull request #222 from azerozero/dependabot/cargo/thiserror-2.0.21
+- Merge pull request #220 from azerozero/dependabot/github_actions/actions/setup-python-7
+- Merge pull request #217 from azerozero/dependabot/github_actions/actions/attest-build-provenance-4.2.2
+- *(stt)* valider les routes STT avant le chargement du modèle
+- *(deps)* bump serde_json from 1.0.150 to 1.0.154
+- Merge remote-tracking branch 'origin/main' into fix/tokenizer-regex
+- *(tokenizer)* alerte de regex unique, chargement poursuivi, stderr défaillant
+- *(metal)* QMV micro à quatre lignes en opt-in
+- *(stt)* envoyer le dernier morceau dès la fin de l'audio dans le client simulé
+- *(metal)* GEMM u4 déroulé, MLP fusionné et QMV 4 lignes en micro-échelles
+- *(bench)* longueurs, decode et essais de quant_micro réglables
+- *(metal)* sampler top-k GPU par balayage simdgroup
+- *(tts)* banc GPU du tirage des codebooks
+- *(sampling)* sélection top-k CPU en un balayage au lieu de select_nth
+- *(deps)* bump github/codeql-action from 3 to 4
+- *(deps)* bump thiserror from 2.0.18 to 2.0.21
+- *(deps)* bump actions/setup-python from 6 to 7
+- *(deps)* bump actions/attest-build-provenance from 3.0.0 to 4.2.2
+
 ## [0.3.2](https://github.com/azerozero/saragossa/compare/v0.3.1...v0.3.2) - 2026-11-16
 
 ### Added

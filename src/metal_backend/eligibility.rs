@@ -335,8 +335,10 @@ thread_local! {
 }
 
 /// Garde RAII restaurant le choix précédent du kernel skinny à sa sortie de portée.
+#[cfg(any(feature = "devtools", test))]
 pub(crate) struct SkinnyBf16ScopeGuard(Option<SkinnyKernel>);
 
+#[cfg(any(feature = "devtools", test))]
 impl Drop for SkinnyBf16ScopeGuard {
     fn drop(&mut self) {
         SKINNY_OVERRIDE.with(|slot| slot.set(self.0));
@@ -346,6 +348,7 @@ impl Drop for SkinnyBf16ScopeGuard {
 /// Force le kernel skinny bf16 (`enabled`) ou la variante précise (`!enabled` :
 /// `x2`/`x3` de `SARAGOSSA_RUST_QMM_SKINNY_KERNEL`, sinon le défaut) pour les
 /// matmuls encodés sur ce thread tant que la garde vit.
+#[cfg(any(feature = "devtools", test))]
 pub(crate) fn install_qmm_skinny_bf16_scope(enabled: bool) -> SkinnyBf16ScopeGuard {
     let kernel = if enabled {
         SkinnyKernel::Bf16
@@ -356,6 +359,7 @@ pub(crate) fn install_qmm_skinny_bf16_scope(enabled: bool) -> SkinnyBf16ScopeGua
 }
 
 /// Force une variante skinny sur ce thread (tests de précision croisés).
+#[cfg(any(feature = "devtools", test))]
 pub(super) fn install_qmm_skinny_kernel_scope(kernel: SkinnyKernel) -> SkinnyBf16ScopeGuard {
     SKINNY_OVERRIDE.with(|slot| SkinnyBf16ScopeGuard(slot.replace(Some(kernel))))
 }
@@ -372,6 +376,7 @@ fn env_skinny_kernel() -> Option<SkinnyKernel> {
     })
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn precise_skinny_kernel() -> SkinnyKernel {
     match env_skinny_kernel() {
         Some(kernel @ (SkinnyKernel::X2 | SkinnyKernel::X3)) => kernel,

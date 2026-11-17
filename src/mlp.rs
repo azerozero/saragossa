@@ -224,7 +224,7 @@ pub struct MoeMlp {
 }
 
 /// Capture les projections des experts routés d'une ligne MoE.
-#[cfg(test)]
+#[cfg(all(test, feature = "devtools"))]
 pub(crate) struct MoePrecisionCapture {
     pub expert_indices: Vec<usize>,
     pub gate: Tensor,
@@ -334,7 +334,7 @@ impl MoeMlp {
     }
 
     /// Capture gate/up/down des experts sélectionnés, triés par indice.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "devtools"))]
     pub(crate) fn precision_capture(&self, x: &Tensor) -> Result<MoePrecisionCapture> {
         let input = Tensor::row(x.as_row()?.to_vec())?;
         let router_input = match &self.router_norm {
@@ -382,7 +382,7 @@ impl MoeMlp {
     }
 
     /// Calcule la contribution routée seule sur CPU.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "devtools"))]
     pub(crate) fn routed_only_for_test(&self, x: &Tensor) -> Result<Tensor> {
         let (rows, hidden) = x.as_matrix()?;
         let router_logits = self.router.forward(x)?;

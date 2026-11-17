@@ -1,5 +1,9 @@
 //! Encodage et décodage des tokens via tokenizers.
 
+/// Expression Qwen2 partagée par les classifieurs et les tests du tokenizer.
+#[cfg(any(feature = "decision", test))]
+pub(crate) const QWEN2_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 use crate::{InferError, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -365,7 +369,7 @@ mod tests {
         };
         // Sans regex (Whitespace) ou avec celle de Qwen2 : avertissement.
         assert!(warning(&inner, "qwen3_5").is_some());
-        let qwen2 = crate::decision::letters::QWEN2_REGEX;
+        let qwen2 = super::QWEN2_REGEX;
         for (regex, warns) in [(qwen2, true), (QWEN35_REGEX, false)] {
             let split = Split::new(
                 SplitPattern::Regex(regex.into()),
@@ -416,7 +420,7 @@ mod tests {
         save_test_tokenizer(&path);
         let mut inner = Tokenizer::from_file(&path).expect("tokenizer");
         let split = Split::new(
-            SplitPattern::Regex(crate::decision::letters::QWEN2_REGEX.into()),
+            SplitPattern::Regex(super::QWEN2_REGEX.into()),
             SplitDelimiterBehavior::Isolated,
             false,
         )

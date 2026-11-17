@@ -13,7 +13,7 @@ use crate::metal_backend::{commit_and_wait, read_f32_buffer, read_u32_buffer, Me
 use crate::DFlashDraft;
 
 /// Le loader valide les types et le nombre de couches avant cette décision.
-fn drafter_window(types: &[String], window: Option<usize>) -> Option<usize> {
+pub(in crate::decoder) fn drafter_window(types: &[String], window: Option<usize>) -> Option<usize> {
     types
         .iter()
         .all(|kind| kind == "sliding_attention")

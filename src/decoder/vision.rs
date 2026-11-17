@@ -1,9 +1,11 @@
 //! Oracle interne image → LLM, sans ouverture des transports média.
 
 use super::*;
+#[cfg(feature = "vision")]
 use crate::vision::prompt::{insert_embeddings, SuppliedImage};
 
 #[cfg(test)]
+#[cfg(feature = "vision")]
 pub(super) mod tests;
 
 impl CausalDecoderCache {
@@ -18,6 +20,7 @@ impl CausalDecoderCache {
     }
 }
 
+#[cfg(feature = "vision")]
 impl CausalDecoder {
     #[cfg(all(test, target_os = "macos", feature = "metal"))]
     pub(crate) fn vision_forced_logits(

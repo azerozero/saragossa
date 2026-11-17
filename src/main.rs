@@ -2,13 +2,18 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(feature = "serve")]
 mod bench_serve;
+#[cfg(feature = "devtools")]
 mod convert_cli;
+#[cfg(feature = "decision")]
 mod decide_cli;
 mod hf_cache;
 mod hf_resolve;
 mod run_repl;
 mod serve;
+#[cfg(feature = "denoise")]
+mod voice_cli;
 
 use std::env;
 use std::error::Error;
@@ -32,13 +37,16 @@ struct CliArgs {
     model_dir: PathBuf,
     prompt: Option<String>,
     prompt_tokens: Option<usize>,
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
     prompt_b: Option<String>,
     max_tokens: usize,
     temperature: f32,
     seed: u64,
     check_only: bool,
     load_only: bool,
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
     kl_record: Option<PathBuf>,
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
     kl_compare: Option<PathBuf>,
     prefill_only: bool,
     prefill_repeat: Option<usize>,
@@ -102,12 +110,24 @@ fn run() -> CliResult<()> {
     if let Some(command) = raw_args.first() {
         match command.as_str() {
             "doctor" => return doctor_bench::run_doctor(raw_args.into_iter().skip(1)),
+            #[cfg(feature = "decision")]
             "decide" => return decide_cli::run(raw_args.into_iter().skip(1)),
+            #[cfg(feature = "denoise")]
+            "enhance" => return voice_cli::run_enhance(raw_args.into_iter().skip(1)),
+            #[cfg(not(feature = "denoise"))]
+            "enhance" => {
+                return Err(cli_error(
+                    "débruitage absent : recompiler avec --features denoise",
+                ));
+            }
             "bench" => return doctor_bench::run_bench(raw_args.into_iter().skip(1)),
+            #[cfg(feature = "serve")]
             "bench-serve" => return bench_serve::run(raw_args.into_iter().skip(1)),
+            #[cfg(feature = "devtools")]
             "convert-qwen4exp" => return convert_cli::run(raw_args.into_iter().skip(1)),
             "list" => return hf_resolve::run_list(raw_args.into_iter().skip(1)),
             "run" => return run_repl::run(raw_args.into_iter().skip(1)),
+            #[cfg(feature = "serve")]
             "serve" => return serve::run(raw_args.into_iter().skip(1)),
             _ if command.starts_with('-') => {}
             other => {
@@ -131,6 +151,7 @@ fn run() -> CliResult<()> {
     if args.check_only {
         let contract = verify_decoder_contract(&assets)?;
         print_contract(&contract);
+        #[cfg(feature = "devtools")]
         if let Some(draft_dir) =
             saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR")
         {
@@ -145,10 +166,12 @@ fn run() -> CliResult<()> {
     }
     let load_started = Instant::now();
     let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
+    #[cfg(feature = "devtools")]
     if let Some(path) = args.kl_compare.as_deref() {
         saragossa::devtools::kl_ref::compare(&decoder, path)?;
         return Ok(());
     }
+    #[cfg(feature = "devtools")]
     if let Some(path) = args.kl_record.as_deref() {
         let prompt = match args.prompt_tokens {
             Some(n) => generate_benchmark_prompt(&assets, n, args.raw)?,
@@ -167,7 +190,11 @@ fn run() -> CliResult<()> {
             serve::mtp::sampled_for(&assets.config),
         );
     // Charger avant la chauffe ; l'oracle explicite conserve son erreur sans tête.
-    if saragossa::devtools::mtp_acceptance_enabled() || mtp_active {
+    #[cfg(feature = "devtools")]
+    let load_mtp = saragossa::devtools::mtp_acceptance_enabled() || mtp_active;
+    #[cfg(not(feature = "devtools"))]
+    let load_mtp = mtp_active;
+    if load_mtp {
         let path =
             assets.mtp.path.as_ref().ok_or_else(|| {
                 cli_error("decode/oracle MTP demandé mais aucun sidecar MTP détecté")
@@ -228,6 +255,7 @@ fn run() -> CliResult<()> {
     } else {
         warmup_elapsed
     };
+    #[cfg(feature = "devtools")]
     if saragossa::devtools::lightbatch_acceptance_enabled() {
         let prompt_b = args.prompt_b.as_ref().ok_or_else(|| {
             cli_error("SARAGOSSA_RUST_LIGHTBATCH_ACCEPTANCE=1 requiert --prompt-b")
@@ -329,6 +357,7 @@ fn run() -> CliResult<()> {
         );
         return Ok(());
     }
+    #[cfg(feature = "devtools")]
     if saragossa::devtools::mtp_acceptance_enabled() {
         let options = generation_options(&args, &assets, 1.0)?;
         return Ok(saragossa::devtools::run_mtp_acceptance(
@@ -341,6 +370,7 @@ fn run() -> CliResult<()> {
             warmup_elapsed,
         )?);
     }
+    #[cfg(feature = "devtools")]
     if saragossa::devtools::dflash_acceptance_enabled() {
         let draft_dir = saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR")
             .ok_or_else(|| {
@@ -366,6 +396,7 @@ fn run() -> CliResult<()> {
         )?);
     }
     #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(feature = "devtools")]
     if saragossa::devtools::resident_linear_xray_enabled() {
         let options = generation_options(&args, &assets, args.top_p)?;
         return Ok(saragossa::devtools::run_resident_linear_xray(
@@ -410,11 +441,13 @@ fn run() -> CliResult<()> {
                 pass_started.elapsed().as_millis()
             );
         }
-        let spec = decoder.generate_greedy_mtp_batched_with_options(
+        let spec = decoder.generate_greedy_mtp_routed(
             &prompt_ids,
             args.max_tokens,
             &options,
             max_draft,
+            saragossa::spec_route::allows_dflash([("user", prompt)], false),
+            |_| true,
         )?;
         let loop_duration = spec.loop_duration;
         let prefill = generate_started.elapsed().saturating_sub(loop_duration);
@@ -712,7 +745,9 @@ impl CliArgs {
         let mut seed = 0_u64;
         let mut check_only = false;
         let mut load_only = false;
+        #[allow(unused_mut)]
         let mut kl_record = None;
+        #[allow(unused_mut)]
         let mut kl_compare = None;
         let mut prefill_only = false;
         let mut prefill_repeat = None;
@@ -743,9 +778,11 @@ impl CliArgs {
                 }
                 "--check" => check_only = true,
                 "--load-only" => load_only = true,
+                #[cfg(feature = "devtools")]
                 "--kl-record" => {
                     kl_record = Some(PathBuf::from(next_value(&mut iter, "--kl-record")?))
                 }
+                #[cfg(feature = "devtools")]
                 "--kl-compare" => {
                     kl_compare = Some(PathBuf::from(next_value(&mut iter, "--kl-compare")?))
                 }
@@ -892,10 +929,38 @@ fn cli_error(message: impl Into<String>) -> Box<dyn Error> {
     Box::new(CliError(message.into()))
 }
 
+fn help_text() -> String {
+    let mut help = "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa <doctor|bench|serve|bench-serve|decide> [options]\n       saragossa convert-qwen4exp --src <fp8> --dst <sortie> --source-revision <sha> [--source-repo <org/nom>] [--converter-commit <sha>] [--only <unité,…>] [--verify] [--plan]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--stop TEXT]... [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N] [--kl-record PATH | --kl-compare PATH]\nKL : run <chemin local> accepte aussi ces deux modes ; --max-tokens fixe n, --kl-compare relit le prompt enregistré.\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet SARAGOSSA_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 with SARAGOSSA_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance.".to_string();
+    let commands = [
+        Some("doctor"),
+        Some("bench"),
+        cfg!(feature = "denoise").then_some("enhance"),
+        cfg!(feature = "serve").then_some("serve"),
+        cfg!(feature = "serve").then_some("bench-serve"),
+        cfg!(feature = "decision").then_some("decide"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("|");
+    help = help.replace("doctor|bench|serve|bench-serve|decide", &commands);
+    if !cfg!(feature = "devtools") {
+        help = help
+            .lines()
+            .filter(|line| {
+                !line.contains("convert-qwen4exp")
+                    && !line.starts_with("KL :")
+                    && !line.starts_with("Set SARAGOSSA_RUST_DFLASH")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace(" [--kl-record PATH | --kl-compare PATH]", "");
+    }
+    help
+}
+
 fn print_help() {
-    println!(
-        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa <doctor|bench|serve|bench-serve|decide> [options]\n       saragossa convert-qwen4exp --src <fp8> --dst <sortie> --source-revision <sha> [--source-repo <org/nom>] [--converter-commit <sha>] [--only <unité,…>] [--verify] [--plan]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--stop TEXT]... [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N] [--kl-record PATH | --kl-compare PATH]\nKL : run <chemin local> accepte aussi ces deux modes ; --max-tokens fixe n, --kl-compare relit le prompt enregistré.\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet SARAGOSSA_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 with SARAGOSSA_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance."
-    );
+    println!("{}", help_text());
 }
 
 fn load_decoder_with_runtime(
@@ -959,6 +1024,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "devtools")]
     fn cli_kl_modes_are_exclusive_and_compare_needs_no_prompt() {
         let parse = |args: &[&str]| CliArgs::parse(args.iter().map(|s| (*s).to_string()));
         let compare = parse(&["--model-dir", "fixture", "--kl-compare", "reference"])
@@ -995,6 +1061,20 @@ mod tests {
             .is_some());
         let repl = vec!["run".to_string(), "fixture".to_string()];
         assert_eq!(kl_run_args(repl.clone()), repl);
+    }
+
+    #[test]
+    fn cli_help_lists_only_compiled_commands() {
+        let help = help_text();
+        for (command, available) in [
+            ("bench-serve", cfg!(feature = "serve")),
+            ("decide", cfg!(feature = "decision")),
+            ("enhance", cfg!(feature = "denoise")),
+            ("convert-qwen4exp", cfg!(feature = "devtools")),
+        ] {
+            assert_eq!(help.contains(command), available, "{command}: {help}");
+        }
+        assert!(help.contains("saragossa run"));
     }
 
     #[test]

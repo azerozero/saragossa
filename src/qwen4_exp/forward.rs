@@ -170,7 +170,7 @@ impl Qwen4ExpReference {
     /// # Errors
     ///
     /// Renvoie une erreur de lecture, de forme ou si la couche n'est pas QSA.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "devtools"))]
     pub(crate) fn attention_layer(
         &self,
         index: usize,

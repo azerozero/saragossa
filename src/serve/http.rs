@@ -18,8 +18,10 @@ use serde::Serialize;
 use super::anthropic::{
     anthropic_chat, handle_anthropic_messages, send_anthropic_error, AnthropicSse,
 };
+#[cfg(feature = "tts")]
 use super::audio::handle_speech;
 use super::dispatch::{self, Front};
+#[cfg(feature = "embed")]
 use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
 use super::flint_output::FlintEvent;
@@ -30,6 +32,7 @@ use super::protocol::{
 };
 use super::state::{ServeState, ServedCompletion};
 use super::streaming::{CompletionSink, CompletionStreamEvent};
+#[cfg(feature = "stt")]
 use super::stt::{
     handle_transcription, handle_transcription_stream, StreamChunkHeaders, STT_FINAL_HEADER,
     STT_LANGUAGE_HEADER, STT_SESSION_HEADER,
@@ -275,12 +278,14 @@ fn route_engine<S: Write>(
             Ok(()) => Ok(()),
             Err(error) => send_failure(stream, &error, true),
         },
+        #[cfg(feature = "stt")]
         ("POST", "/v1/audio/transcriptions") => handle_transcription(
             stream,
             state.audio_mut(),
             request.header("content-type"),
             &request.body,
         ),
+        #[cfg(feature = "stt")]
         ("POST", "/v1/audio/transcriptions/stream") => handle_transcription_stream(
             stream,
             state.audio_mut(),
@@ -293,10 +298,36 @@ fn route_engine<S: Write>(
             },
             &request.body,
         ),
+        #[cfg(feature = "tts")]
         ("POST", "/v1/audio/speech") => handle_speech(stream, state.audio_mut(), &request.body),
+        #[cfg(feature = "embed")]
         ("POST", "/v1/embeddings") => {
             handle_embeddings(stream, state.embeddings_mut(), &request.body)
         }
+        #[cfg(not(feature = "stt"))]
+        ("POST", "/v1/audio/transcriptions" | "/v1/audio/transcriptions/stream") => send_error(
+            stream,
+            501,
+            "modalité STT absente : recompiler avec --features stt",
+        ),
+        #[cfg(not(feature = "tts"))]
+        ("POST", "/v1/audio/speech") => send_error(
+            stream,
+            501,
+            "modalité TTS absente : recompiler avec --features tts",
+        ),
+        #[cfg(not(feature = "denoise"))]
+        ("POST", "/v1/audio/enhance") => send_error(
+            stream,
+            501,
+            "modalité débruitage absente : recompiler avec --features denoise",
+        ),
+        #[cfg(not(feature = "embed"))]
+        ("POST", "/v1/embeddings") => send_error(
+            stream,
+            501,
+            "modalité embeddings absente : recompiler avec --features embed",
+        ),
         _ => send_error(stream, 404, "endpoint inconnu"),
     }
 }
@@ -795,12 +826,20 @@ pub(super) struct HttpRequest {
 }
 
 impl HttpRequest {
+    pub(super) fn is_enhance(&self) -> bool {
+        self.method == "POST" && self.route() == "/v1/audio/enhance"
+    }
+    #[cfg(feature = "denoise")]
+    pub(super) fn take_prefix(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.body)
+    }
+
     /// Chemin sans query string.
     pub(super) fn route(&self) -> &str {
         self.path.split('?').next().unwrap_or(self.path.as_str())
     }
 
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
         let target = name.to_ascii_lowercase();
         self.headers
             .iter()
@@ -862,8 +901,14 @@ pub(super) fn read_head<S: Read>(
     let header_text = str::from_utf8(header_bytes)
         .map_err(|e| ServeError::Http(format!("headers non UTF-8: {e}")))?;
     let (method, path, headers) = parse_headers(header_text)?;
-    let content_length = content_length(&headers)?;
-    if content_length > MAX_BODY_BYTES {
+    let enhance = method == "POST" && path.split('?').next() == Some("/v1/audio/enhance");
+    let chunked = enhance && enhance_chunked(&headers)?;
+    let content_length = if chunked {
+        0
+    } else {
+        content_length(&headers)?
+    };
+    if !enhance && content_length > MAX_BODY_BYTES {
         return Err(ServeError::BodyTooLarge {
             anthropic: is_anthropic_route(path.split('?').next().unwrap_or_default()),
         });
@@ -944,6 +989,26 @@ fn parse_headers(header_text: &str) -> ServeResult<ParsedHeaders> {
         ));
     }
     Ok((method, path, headers))
+}
+
+/// Le chunked n'est ouvert que pour enhance, sans ambiguïté avec Content-Length.
+fn enhance_chunked(headers: &[(String, String)]) -> ServeResult<bool> {
+    let encodings: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name == "transfer-encoding")
+        .collect();
+    if encodings.is_empty() {
+        return Ok(false);
+    }
+    if encodings.len() != 1
+        || !encodings[0].1.eq_ignore_ascii_case("chunked")
+        || headers.iter().any(|(name, _)| name == "content-length")
+    {
+        return Err(ServeError::Http(
+            "cadrage enhance ambigu ou Transfer-Encoding non supporté".into(),
+        ));
+    }
+    Ok(true)
 }
 
 /// Seul `Content-Length` cadre un corps. `Transfer-Encoding` est refusé :
@@ -1431,6 +1496,38 @@ mod tests {
         drop(peer);
     }
 
+    #[test]
+    fn missing_modalities_return_501_before_parsing_body() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        for (enabled, route, feature) in [
+            (cfg!(feature = "stt"), "/v1/audio/transcriptions", "stt"),
+            (
+                cfg!(feature = "stt"),
+                "/v1/audio/transcriptions/stream",
+                "stt",
+            ),
+            (cfg!(feature = "tts"), "/v1/audio/speech", "tts"),
+            (cfg!(feature = "embed"), "/v1/embeddings", "embed"),
+            (cfg!(feature = "denoise"), "/v1/audio/enhance", "denoise"),
+        ] {
+            if enabled {
+                continue;
+            }
+            let mut wire = Vec::new();
+            handle_job(&mut wire, &mut state, &post(route, "invalid body"))
+                .expect("invariant: réponse 501 écrite");
+            let response = response_json(wire, 501);
+            let message = response["error"]["message"]
+                .as_str()
+                .expect("invariant: message d'erreur JSON");
+            assert!(
+                message.contains(&format!("--features {feature}")),
+                "{message}"
+            );
+        }
+    }
+
     fn response_json(bytes: Vec<u8>, status: u16) -> serde_json::Value {
         let response = String::from_utf8(bytes).expect("invariant: réponse UTF-8");
         assert!(
@@ -1475,11 +1572,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "stt", feature = "tts", feature = "embed"))]
     fn auxiliary_only_startup_keeps_llm_routes_explicitly_unavailable() {
         for flags in [
+            #[cfg(feature = "embed")]
             vec!["--embed-model"],
+            #[cfg(feature = "stt")]
             vec!["--stt-model"],
+            #[cfg(feature = "tts")]
             vec!["--tts-model"],
+            #[cfg(all(feature = "stt", feature = "tts", feature = "embed"))]
             vec!["--stt-model", "--tts-model", "--embed-model"],
         ] {
             let mut args = ServeArgs::parse(
@@ -1595,6 +1697,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tts")]
     fn audio_speech_route_without_model_returns_400() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut state = ServeState::new(&args);
@@ -1616,6 +1719,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "stt")]
     fn audio_transcription_route_without_model_returns_400() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut state = ServeState::new(&args);
@@ -1647,6 +1751,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embed")]
     fn embeddings_route_without_model_returns_400() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut state = ServeState::new(&args);

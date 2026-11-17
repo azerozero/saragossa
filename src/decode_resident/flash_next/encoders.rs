@@ -20,6 +20,7 @@ pub(crate) enum Brick {
 }
 
 impl Brick {
+    #[cfg(feature = "devtools")]
     pub(crate) const ALL: [Brick; 7] = [
         Brick::Ple,
         Brick::Hc,
@@ -48,6 +49,13 @@ impl Brick {
 }
 
 /// Fournit l'encodeur de chaque brique d'un pas.
+#[cfg_attr(
+    not(feature = "devtools"),
+    allow(
+        dead_code,
+        reason = "Le profilage devtools utilise les frontières des encodeurs"
+    )
+)]
 pub(crate) struct Encoders<'a> {
     command_buffer: &'a CommandBufferRef,
     guard: Option<EncoderEndGuard<'a>>,
