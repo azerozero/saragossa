@@ -116,10 +116,14 @@ pub(super) fn abba(name: &str, mut candidate: impl FnMut() -> Timing) {
     candidate();
     let mut base = Vec::new();
     let mut other = Vec::new();
-    let blocks = std::env::var("SARAGOSSA_ABBA_BLOCKS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(6);
+    let blocks = match std::env::var("SARAGOSSA_ABBA_BLOCKS") {
+        Ok(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or_else(|| panic!("SARAGOSSA_ABBA_BLOCKS invalide ou nul: {v:?}")),
+        Err(_) => 6,
+    };
     for _ in 0..blocks {
         for is_candidate in [false, true, true, false] {
             low_load();

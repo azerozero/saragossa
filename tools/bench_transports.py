@@ -10,14 +10,18 @@ Résultat : une ligne JSON par métrique, en millisecondes (p50, p95, n).
 import argparse
 import base64
 import http.client
+import collections
 import json
+import math
 import os
 import socket
 import struct
 import sys
+import threading
 import time
 
 HOP = 480  # échantillons f32 par trame, comme le banc ABBA Rust
+HOP_SECONDS = 0.030  # 480 échantillons à 16 kHz : cadence temps réel
 
 
 def load1():
@@ -26,7 +30,10 @@ def load1():
 
 def pct(values, p):
     ordered = sorted(values)
-    return ordered[(len(ordered) - 1) * p // 100]
+    pos = (len(ordered) - 1) * p / 100
+    low = int(pos)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (pos - low)
 
 
 def report(transport, metric, values):
@@ -84,22 +91,29 @@ def recv_exact(sock, n):
     return buf
 
 
-def ws_send(sock, opcode, payload):
+def ws_send(sock, opcode, payload, lock):
     mask = os.urandom(4)
     n = len(payload)
     head = bytes([0x80 | opcode])
     head += bytes([0x80 | n]) if n < 126 else b"\xfe" + struct.pack(">H", n)
-    sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+    with lock:
+        sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
 
 
-def ws_recv(sock):
-    b0, b1 = recv_exact(sock, 2)
-    n = b1 & 0x7F
-    if n == 126:
-        n = struct.unpack(">H", recv_exact(sock, 2))[0]
-    elif n == 127:
-        n = struct.unpack(">Q", recv_exact(sock, 8))[0]
-    return b0 & 0x0F, recv_exact(sock, n)
+def ws_recv(sock, lock):
+    """Prochaine trame de données ou Close ; répond aux Ping."""
+    while True:
+        b0, b1 = recv_exact(sock, 2)
+        n = b1 & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", recv_exact(sock, 2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", recv_exact(sock, 8))[0]
+        opcode, payload = b0 & 0x0F, recv_exact(sock, n)
+        if opcode == 9:
+            ws_send(sock, 10, payload, lock)
+        elif opcode != 10:
+            return opcode, payload
 
 
 def ws_trial(args):
@@ -118,22 +132,41 @@ def ws_trial(args):
     ttfb = time.perf_counter() - start
     if b" 101 " not in head.split(b"\r\n")[0]:
         sys.exit(f"handshake refusé: {head[:120]!r}")
-    frame = b"".join(struct.pack("<f", 0.2 * __import__("math").sin(i * 0.03)) for i in range(HOP))
+    frame = b"".join(struct.pack("<f", 0.2 * math.sin(i * 0.03)) for i in range(HOP))
+    lock = threading.Lock()
+    sent = collections.deque()  # instants d'envoi, appariés FIFO aux sorties reçues
+
+    def sender():
+        t0 = time.perf_counter()
+        for hop in range(args.frames):
+            wait = t0 + hop * HOP_SECONDS - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+            sent.append(time.perf_counter())
+            ws_send(sock, 2, frame, lock)
+        ws_send(sock, 8, struct.pack(">H", 1000), lock)
+
     first_pcm, hops = None, []
     t0 = time.perf_counter()
-    for hop in range(args.frames):
-        sent = time.perf_counter()
-        ws_send(sock, 2, frame)
-        if hop < 3:  # amorçage : le débruiteur rend sa sortie avec quelques trames de retard
+    thread = threading.Thread(target=sender)
+    thread.start()
+    while True:
+        opcode, _ = ws_recv(sock, lock)
+        if opcode == 8:
+            break
+        if opcode != 2:
             continue
-        while ws_recv(sock)[0] != 2:
-            pass
-        if hop == 3:
-            first_pcm = time.perf_counter() - t0
-        else:
-            hops.append(time.perf_counter() - sent)
-    ws_send(sock, 2, b"")
+        now = time.perf_counter()
+        if first_pcm is None:
+            first_pcm = now - t0
+        # Le sorties arrivent avec le retard d'amorçage du débruiteur : le FIFO
+        # donne la latence réelle de chaque trame, amorçage compris.
+        if sent:
+            hops.append(now - sent.popleft())
+    thread.join()
     sock.close()
+    if first_pcm is None:
+        sys.exit("aucune sortie PCM reçue")
     return ttfb, first_pcm, hops
 
 
@@ -153,6 +186,7 @@ def main():
     args = ap.parse_args()
     trial = sse_trial if args.transport == "sse" else ws_trial
     for _ in range(args.warmup):
+        gate(args.max_load)
         trial(args)
     ttfb, first, per_frame = [], [], []
     for _ in range(args.reps):
