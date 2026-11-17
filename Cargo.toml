@@ -67,6 +67,8 @@ devtools = []
 thiserror = "2"
 safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
+# Profil de configuration optionnel de `serve` (`--config`).
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 # Déjà présent via reqwest : `compression_ratio` Whisper (zlib, comme OpenAI).
 flate2 = { version = "1", optional = true }
 # preserve_order : ordre des questions de `decision` (déjà activé par llguidance).
