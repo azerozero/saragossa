@@ -24,3 +24,17 @@ condition = "AND"
 paths = ['''^tests/fixtures/vision/manifest\.json$''']
 regexTarget = "line"
 regexes = ['''^\s*"tokenizer_sha256": "[0-9a-f]{64}",?\s*$''']
+
+[[allowlists]]
+description = "SHA256 publics en tête des fixtures tokenizer JSONL"
+condition = "AND"
+paths = ['''^tests/fixtures/tokenizer/[^/]+\.jsonl$''']
+regexTarget = "match"
+regexes = ['''"tokenizer_sha256":"[0-9a-f]{64}"''']
+
+[[allowlists]]
+description = "Clés de cache rust-cache des workflows, pas des secrets"
+condition = "AND"
+paths = ['''^\.github/workflows/[^/]+\.ya?ml$''']
+regexTarget = "line"
+regexes = ['''^\s*shared-key:\s*[A-Za-z0-9._-]+\s*$''']
