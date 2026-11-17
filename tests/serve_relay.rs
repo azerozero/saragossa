@@ -30,7 +30,7 @@ fn try_serve(extra: &[&str]) -> Option<(Child, u16, mpsc::Receiver<String>)> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_saragossa"))
         .args(["serve", "--port", &port.to_string(), "--api-key", "k"])
         .args(["--model", "t=/nonexistent", "--backend", "cpu"])
-        .args(["--set", "serve.drain_timeout_secs=5"])
+        .args(["--set", "serve.drain_timeout_secs=60"])
         .args(extra)
         .stderr(Stdio::piped())
         .spawn()
@@ -113,6 +113,8 @@ fn relay_hands_over_without_refusing_connections() {
         .expect("pid de l'enfant");
     let deadline = Instant::now() + Duration::from_secs(10);
     while old.try_wait().expect("try_wait").is_none() {
+        // NOTE: vidage à 60 s : sortir avant 10 s prouve que le parent n'est
+        // pas resté bloqué dans un accept pris par l'enfant.
         assert!(Instant::now() < deadline, "l'ancien processus ne sort pas");
         thread::sleep(Duration::from_millis(50));
     }

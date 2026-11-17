@@ -7,7 +7,9 @@
 //! que c'est bien une socket en écoute à la même adresse, l'adopte au lieu de
 //! la lier, puis écrit un octet sur la paire juste avant d'accepter. Le parent
 //! cesse alors d'accepter, laisse finir ses connexions en cours (une requête
-//! par connexion) et sort, au plus tard après `serve.drain_timeout_secs`.
+//! par connexion) et sort, au plus tard après `serve.drain_timeout_secs`
+//! (30 s, comme `read_timeout_secs`) : un flux plus long est coupé. Un enfant
+//! qui ne se dit pas prêt en 10 min est arrêté.
 //! Si l'enfant sort avant d'être prêt, le parent continue et journalise.
 //!
 //! Limites : les listeners enhance h2/WebTransport ne sont pas transmis ;
@@ -29,6 +31,8 @@ use super::error::{ServeError, ServeResult};
 const LISTEN_FDS_ENV: &str = "SARAGOSSA_LISTEN_FDS";
 const READY_FD_ENV: &str = "SARAGOSSA_RELAY_READY_FD";
 const DEFAULT_DRAIN_SECS: u64 = 30;
+/// Attente max du signal « prêt » ; couvre un `--preload` de gros modèles.
+const READY_TIMEOUT: Duration = Duration::from_secs(600);
 
 static DRAINING: AtomicBool = AtomicBool::new(false);
 static CONFIG: OnceLock<(PathBuf, Duration)> = OnceLock::new();
@@ -62,31 +66,31 @@ pub(super) fn inherited() -> ServeResult<Option<OwnedFd>> {
     let Some(fd) = env_fd(LISTEN_FDS_ENV)? else {
         return Ok(None);
     };
-    // NOTE: macOS n'expose pas SO_ACCEPTCONN ; on vérifie une socket flux
-    // ici, et l'appelant vérifie son adresse locale.
-    let mut kind: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: tampon et longueur valides pour un `c_int` ; un fd invalide ou
-    // qui n'est pas une socket fait seulement échouer l'appel.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_TYPE,
-            (&mut kind as *mut libc::c_int).cast(),
-            &mut len,
-        )
-    };
-    if rc != 0 || kind != libc::SOCK_STREAM {
+    // NOTE: l'appelant vérifie l'adresse locale ; SO_ACCEPTCONN est contrôlé
+    // là où le système l'expose (pas macOS, qui répond ENOPROTOOPT).
+    if option(fd, libc::SO_TYPE) != Some(libc::SOCK_STREAM) {
         return Err(ServeError::args(format!(
             "{LISTEN_FDS_ENV}={fd} n'est pas une socket flux"
+        )));
+    }
+    if option(fd, libc::SO_ACCEPTCONN) == Some(0) {
+        return Err(ServeError::args(format!(
+            "{LISTEN_FDS_ENV}={fd} n'est pas en écoute"
         )));
     }
     // SAFETY: socket flux vérifiée ci-dessus, transmise à ce seul
     // processus par le parent ; personne d'autre ici ne la ferme.
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     // SAFETY: fd possédé et valide ; rétablit FD_CLOEXEC pour les sous-processus.
-    unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    if unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+        return Err(ServeError::io(
+            "FD_CLOEXEC de la socket héritée",
+            io::Error::last_os_error(),
+        ));
+    }
+    // NOTE: les sous-processus ne doivent pas croire hériter de ce fd ; std
+    // sérialise ses propres accès à l'environnement.
+    std::env::remove_var(LISTEN_FDS_ENV);
     eprintln!("saragossa serve relais: socket d'écoute héritée (fd {fd})");
     Ok(Some(owned))
 }
@@ -100,9 +104,29 @@ pub(super) fn ready() -> ServeResult<()> {
     // SAFETY: extrémité de la paire transmise par le parent pour ce seul
     // usage ; elle est fermée au drop, après l'octet.
     let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
+    std::env::remove_var(READY_FD_ENV);
     stream
         .write_all(b"1")
         .map_err(|e| ServeError::io("signal de relais prêt", e))
+}
+
+/// Option socket entière de `fd`, `None` si l'appel échoue.
+#[allow(unsafe_code)]
+fn option(fd: RawFd, name: libc::c_int) -> Option<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: tampon et longueur valides pour un `c_int` ; un fd invalide ou
+    // qui n'est pas une socket fait seulement échouer l'appel.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            name,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(value)
 }
 
 fn env_fd(name: &str) -> ServeResult<Option<RawFd>> {
@@ -120,9 +144,10 @@ fn env_fd(name: &str) -> ServeResult<Option<RawFd>> {
 /// Connexions entrantes jusqu'au relais : attend la lisibilité de `fd` par
 /// tranches de 250 ms pour voir `DRAINING` sans dépendre d'un accept bloqué.
 ///
-/// ponytail: si l'enfant prend la connexion entre `poll` et `accept`, l'accept
-/// du parent reste bloqué jusqu'à la connexion suivante (servie normalement)
-/// ou jusqu'au délai de vidage.
+/// `fd` doit être non bloquant : parent et enfant partagent la file d'accept,
+/// et l'un peut prendre la connexion que l'autre a vue par `poll` ;
+/// `WouldBlock` renvoie alors au `poll` au lieu de bloquer dans `accept`.
+/// O_NONBLOCK est partagé par les deux processus, qui passent tous deux ici.
 pub(super) fn incoming<S>(
     fd: RawFd,
     mut accept: impl FnMut() -> io::Result<S>,
@@ -140,7 +165,10 @@ pub(super) fn incoming<S>(
         // SAFETY: un seul `pollfd` valide, vivant pendant l'appel.
         let ready = unsafe { libc::poll(&mut poll, 1, 250) };
         if ready > 0 {
-            return Some(accept());
+            match accept() {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                accepted => return Some(accepted),
+            }
         }
         if ready < 0 {
             let error = io::Error::last_os_error();
@@ -207,6 +235,9 @@ fn hand_over(binary: &PathBuf, listener: RawFd) -> ServeResult<u32> {
         .map_err(io_error("lancement du binaire de relais"))?;
     // Sans la copie du parent, la fin de l'enfant se lit comme une fin de flux.
     drop(child_end);
+    parent_end
+        .set_read_timeout(Some(READY_TIMEOUT))
+        .map_err(io_error("délai du signal prêt"))?;
     let mut byte = [0u8; 1];
     match parent_end.read(&mut byte) {
         Ok(1) => Ok(child.id()),

@@ -78,7 +78,14 @@ pub(super) fn serve_tcp(
             let fd = listener.as_raw_fd();
             super::relay::watch(fd);
             super::relay::ready()?;
-            let incoming = super::relay::incoming(fd, || listener.accept().map(|(s, _)| s));
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| ServeError::io("listener TCP non bloquant", e))?;
+            // NOTE: macOS transmet O_NONBLOCK du listener à la socket acceptée.
+            let incoming = super::relay::incoming(fd, || {
+                let (stream, _) = listener.accept()?;
+                stream.set_nonblocking(false).map(|()| stream)
+            });
             dispatcher.accept_all(incoming.map(nodelay), "accept TCP")
         }
         #[cfg(not(unix))]
@@ -151,7 +158,14 @@ pub(super) fn serve_unix(
         let fd = listener.as_raw_fd();
         super::relay::watch(fd);
         super::relay::ready()?;
-        let incoming = super::relay::incoming(fd, || listener.accept().map(|(s, _)| s));
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| ServeError::io("listener Unix non bloquant", e))?;
+        // NOTE: macOS transmet O_NONBLOCK du listener à la socket acceptée.
+        let incoming = super::relay::incoming(fd, || {
+            let (stream, _) = listener.accept()?;
+            stream.set_nonblocking(false).map(|()| stream)
+        });
         dispatcher.accept_all(incoming, "accept socket Unix")
     })
 }
