@@ -92,6 +92,7 @@ impl TtsModel {
         }
         let prefill_started = Instant::now();
         let (mut talker_cache, mut final_state) = self.prefill_talker(&prepared.input)?;
+        super::memory::checkpoint("prefill", &[("kv_cpu", talker_cache.estimated_cpu_bytes())]);
         if trace {
             eprintln!(
                 "qwen3-tts rust diag: prefill done elapsed_ms={}",
@@ -110,6 +111,12 @@ impl TtsModel {
         } else {
             None
         };
+        talker_cache.trace_tts_memory("talker_arena");
+        if let Some(cache) = cp_resident_cache.as_ref() {
+            cache.trace_tts_memory("cp_arena");
+        }
+        self.talker.trace_tts_memory("talker_buffers");
+        self.code_predictor.trace_tts_memory("cp_buffers");
         if trace {
             eprintln!(
                 "qwen3-tts rust diag: cp resident={}",
@@ -217,6 +224,14 @@ impl TtsModel {
             // Le callback streaming peut appeler un LLM sur le même thread.
             drop(qmm_scope);
             profile.time(Phase::Codec, || on_frame(&generated))?;
+            if generated.len() == 1 && super::memory::enabled() {
+                talker_cache.trace_tts_memory("talker_active");
+                if let Some(cache) = cp_resident_cache.as_ref() {
+                    cache.trace_tts_memory("cp_active");
+                }
+                self.talker.trace_tts_memory("talker_active_buffers");
+                self.code_predictor.trace_tts_memory("cp_active_buffers");
+            }
             if trace {
                 let last = generated
                     .last()
@@ -550,6 +565,7 @@ impl TtsModel {
         }
         let prefill_started = Instant::now();
         let (mut talker_cache, mut final_state) = self.prefill_talker(&prepared.input)?;
+        super::memory::checkpoint("prefill", &[("kv_cpu", talker_cache.estimated_cpu_bytes())]);
         if trace {
             eprintln!(
                 "qwen3-tts rust diag: prefill done elapsed_ms={}",
@@ -573,6 +589,12 @@ impl TtsModel {
         } else {
             None
         };
+        talker_cache.trace_tts_memory("talker_arena");
+        if let Some(cache) = cp_resident_cache.as_ref() {
+            cache.trace_tts_memory("cp_arena");
+        }
+        self.talker.trace_tts_memory("talker_buffers");
+        self.code_predictor.trace_tts_memory("cp_buffers");
         if trace {
             eprintln!(
                 "qwen3-tts rust diag: cp resident={}",
@@ -648,6 +670,14 @@ impl TtsModel {
             // causalité). No-op pour le chemin batch.
             drop(qmm_scope);
             profile.time(Phase::Codec, || on_frame(&generated))?;
+            if generated.len() == 1 && super::memory::enabled() {
+                talker_cache.trace_tts_memory("talker_active");
+                if let Some(cache) = cp_resident_cache.as_ref() {
+                    cache.trace_tts_memory("cp_active");
+                }
+                self.talker.trace_tts_memory("talker_active_buffers");
+                self.code_predictor.trace_tts_memory("cp_active_buffers");
+            }
             if trace {
                 let last = generated
                     .last()

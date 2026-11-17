@@ -258,6 +258,30 @@ impl Drop for ScratchLease {
 /// Un threadgroup par tête de requête (`q_heads` groupes, 256 threads chacun).
 /// Trois phases (port direct de la version CPU, correct pour tout `len`,
 impl DecodeResidentState {
+    #[cfg(feature = "tts")]
+    pub(crate) fn tts_memory_stats(&self) -> Vec<(&'static str, usize)> {
+        let persistent = self
+            .persistent
+            .iter()
+            .map(|b| b.allocated_size() as usize)
+            .sum();
+        let scratch = std::iter::once(&self.scratch)
+            .chain(&self.pipeline_scratch)
+            .map(|pool| {
+                pool.inner
+                    .lock()
+                    .map(|inner| {
+                        inner
+                            .slots
+                            .iter()
+                            .map(|s| s.buffer.allocated_size() as usize)
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0)
+            })
+            .sum();
+        vec![("arena_persistent", persistent), ("arena_scratch", scratch)]
+    }
     /// Crée un état résident sur le device donné (buffers en `StorageModeShared`)
     /// et compile les kernels du chemin résident.
     ///

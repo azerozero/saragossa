@@ -1500,10 +1500,24 @@ impl MetalExecutor {
 /// spéculative), le qmv garde son résultat par ligne indépendant du batch, ce
 /// qui préserve l'identité vérification/AR ; au-dessus (prefill), relire le
 /// poids par ligne bornait le débit à ~20 tok/s sur un 27B BF16.
+/// `SARAGOSSA_RUST_DENSE_BF16_GEMM_MIN_BATCH` (diagnostic seulement, de 1 à
+/// 64) abaisse le plancher pour mesurer le GEMM sur peu de lignes ; hors de
+/// cette plage, le plancher reste 64. L'alignement automatique des reprises
+/// (`runtime_flags::prefix_align_for_model`) suppose le plancher de 64.
 pub(crate) const DENSE_BF16_GEMM_MIN_BATCH: usize = 64;
 
+fn dense_bf16_gemm_min_batch() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_DENSE_BF16_GEMM_MIN_BATCH")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|min| (1..=DENSE_BF16_GEMM_MIN_BATCH).contains(min))
+            .unwrap_or(DENSE_BF16_GEMM_MIN_BATCH)
+    })
+}
+
 fn can_use_dense_bf16_gemm(batch: usize, in_dim: usize, out_dim: usize) -> bool {
-    batch >= DENSE_BF16_GEMM_MIN_BATCH
+    batch >= dense_bf16_gemm_min_batch()
         && in_dim % 64 == 0
         && out_dim % 64 == 0
         && crate::runtime_flags::dense_bf16_gemm_enabled()

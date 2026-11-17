@@ -1319,7 +1319,15 @@ impl LoadedModel {
         }
 
         let block_tokens = self.prefix_cache.block_tokens();
-        let full_block_tokens = tokens.len() / block_tokens * block_tokens;
+        // Queue effective du décodeur (alignement et seuil du prolongement
+        // résident) : elle passe par le prefill résident, comme les mêmes
+        // positions d'un prefill à froid, et non par l'extension en lignes.
+        let tail = self
+            .decoder
+            .prefix_resume_align()
+            .filter(|(align, _)| cheap_extend && block_tokens % align == 0)
+            .map_or(0, |(_, tail)| tail);
+        let full_block_tokens = tokens.len().saturating_sub(tail) / block_tokens * block_tokens;
         let root = BlockHash::for_session(session_key);
         let hit = self
             .prefix_cache

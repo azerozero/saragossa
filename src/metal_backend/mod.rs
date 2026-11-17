@@ -62,6 +62,7 @@ mod kernel_timing;
 mod lightbatch_duo;
 mod lightbatch_multi;
 mod linear_attention;
+mod memory;
 mod state_snapshot;
 pub(crate) use state_snapshot::LinearSnapshotLayout;
 mod linear_attention_encode;

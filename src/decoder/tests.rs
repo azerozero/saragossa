@@ -4602,11 +4602,16 @@ fn resident_bf16_qwen_weights(
 
 /// Parcours multi-tours par le vrai cache de préfixe du décodeur
 /// (`prefill_cache_state` → `prefix_cache_get`/`prefix_cache_put`,
-/// `PrefillKvPlacement` raccordé à `replace_prefill`) :
-/// - tour 2 prolongé en place dans l'allocation du tour 1, K/V identique au
-///   prefill à froid, snapshot du tour 1 conservé ;
-/// - entrée ancienne prolongée sur une autre branche sous une vue plus
-///   longue : copie, lignes publiées intactes, entrées remplacées libérées ;
+/// `PrefillKvPlacement` raccordé à `replace_prefill`), alignement de 64 actif
+/// et longueurs multiples de 64 :
+/// - tour 1 : ancre (1024) et prompt complet (1088) au cache, queue
+///   prolongée en place ;
+/// - tour 2 : hit sur le tour 1 (1088, aligné), nouvelle ancre (1152) puis queue,
+///   prolongés en place dans l'allocation du tour 1, K/V identique au prefill
+///   à froid, ancre du tour 1 conservée et intacte (1216, aligné, entre
+///   aussi au cache) ;
+/// - autre branche depuis l'ancre du tour 1 sous une vue plus longue (tour 2) :
+///   copie, lignes publiées intactes, entrées remplacées libérées ;
 /// - rollback (troncature du cache) puis prolongement : de nouveau en place.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
@@ -4627,23 +4632,27 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
         rope_theta: Some(10_000_000.0),
         ..CausalDecoderConfig::default()
     };
-    let model = match CausalDecoder::from_tensors(
-        resident_bf16_qwen_weights(VOCAB, HIDDEN, false)?,
-        config,
-    )?
+    // Alignement de 64 fixé au chargement : ancres et queues sur 64 lignes.
+    let model = match crate::runtime_flags::with_prefix_align_for_test(Some(64), || {
+        CausalDecoder::from_tensors(resident_bf16_qwen_weights(VOCAB, HIDDEN, false)?, config)
+    })?
     .with_metal_runtime()
     {
         Ok(model) => model,
         Err(InferError::Metal(message)) if message.contains("aucun device") => return Ok(()),
         Err(error) => return Err(error),
     };
+    if model.prefix_resume_align().map(|(align, _)| align) != Some(64) {
+        eprintln!("prolongement en place sauté : alignement de 64 indisponible");
+        return Ok(());
+    }
     let ids = |len: usize, step: usize, offset: usize| -> Vec<usize> {
         (0..len).map(|i| (i * step + offset) % VOCAB).collect()
     };
-    let tokens = ids(1200, 31, 7);
-    let (p1, p2) = (&tokens[..1100], &tokens[..1200]);
-    let branch = [p1, &ids(100, 17, 3)].concat();
-    let p3 = [&tokens[..1150], &ids(60, 13, 5)].concat();
+    let tokens = ids(1216, 31, 7);
+    let (p1, p2) = (&tokens[..1088], &tokens[..1216]);
+    let branch = [&tokens[..1024], &ids(128, 17, 3)].concat();
+    let p3 = [&tokens[..1152], &ids(64, 13, 5)].concat();
     // Vue bf16 unique de K et de V : (allocations K/V, éléments). K et V
     // doivent suivre le même placement (même allocation propre, même longueur).
     let sole_view = |cache: &CausalDecoderCache| {
@@ -4665,7 +4674,7 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
     let cold = |prompt: &[usize]| -> Result<_> {
         Ok(kv(&model.prefill_prompt_state_uncached(prompt)?.cache))
     };
-    let cached = || -> Result<Vec<Vec<usize>>> {
+    let cached = || -> Result<Vec<usize>> {
         let cache = model
             .prefix_cache
             .lock()
@@ -4673,8 +4682,19 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
         Ok(cache
             .entries
             .iter()
-            .map(|entry| entry.tokens.clone())
+            .map(|entry| entry.tokens.len())
             .collect())
+    };
+    let anchor_kv = || -> Result<_> {
+        let cache = model
+            .prefix_cache
+            .lock()
+            .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?;
+        Ok(cache
+            .entries
+            .iter()
+            .find(|entry| entry.tokens.len() == 1024)
+            .map(|entry| kv(&entry.cache)))
     };
 
     // Morceaux de 512 et stockage bf16 dès la première ligne : le chemin de
@@ -4685,25 +4705,28 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
             eprintln!("prolongement en place du décodeur sauté : K/V bf16 indisponible (NAX)");
             return Ok(());
         };
-        assert_eq!(len, 1100 * KV_DIM);
-        let turn1_kv = kv(&turn1);
+        assert_eq!(len, 1088 * KV_DIM);
+        assert_eq!(
+            cached()?,
+            vec![1088, 1024],
+            "tour 1 : prompt complet et ancre"
+        );
+        let anchor1 = anchor_kv()?;
+        // Fin de la requête : plus aucune vue au-delà de l'ancre.
+        drop(turn1);
 
-        // Tour 2 : hit sur l'entrée du tour 1, prolongée en place.
+        // Tour 2 : hit sur le prompt du tour 1 (aligné), prolongé en place.
         let (turn2, _) = model.prefill_cache_state(p2)?;
         assert_eq!(
             sole_view(&turn2),
-            Some((home, 1200 * KV_DIM)),
+            Some((home, 1216 * KV_DIM)),
             "tour 2 en place"
         );
         assert_eq!(kv(&turn2), cold(p2)?, "tour 2 : K/V vs froid");
-        assert_eq!(
-            cached()?,
-            vec![p2.to_vec(), p1.to_vec()],
-            "snapshot du tour 1 gardé"
-        );
-        assert_eq!(kv(&turn1), turn1_kv, "état du tour 1 intact");
+        assert_eq!(cached()?, vec![1216, 1152, 1088, 1024], "tours et ancres");
+        assert_eq!(anchor_kv()?, anchor1, "ancre du tour 1 intacte");
 
-        // Autre branche depuis l'entrée du tour 1 : une vue plus longue vit
+        // Autre branche depuis l'ancre du tour 1 : une vue plus longue vit
         // (tour 2), le prolongement recopie sans toucher aux lignes publiées.
         let turn2_kv = kv(&turn2);
         let (branched, _) = model.prefill_cache_state(&branch)?;
@@ -4712,27 +4735,170 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
         assert_eq!(kv(&branched), cold(&branch)?, "branche : K/V vs froid");
         assert_eq!(kv(&turn2), turn2_kv, "lignes publiées intactes");
         // Les entrées de l'allocation remplacée sont libérées.
-        assert_eq!(cached()?, vec![branch.clone()]);
-        drop((turn1, branched));
+        assert_eq!(
+            cached()?,
+            vec![1152, 1088],
+            "seules les entrées de la branche restent"
+        );
+        drop(branched);
 
-        // Rollback du tour 2 à 1150 positions, mémorisé, puis prolongé :
+        // Rollback du tour 2 à 1152 positions, mémorisé, puis prolongé :
         // plus aucune vue ne couvre au-delà, le prolongement reste en place.
         let mut rolled = turn2;
         for layer in &mut rolled.layers {
-            layer.truncate(1150)?;
+            layer.truncate(1152)?;
         }
-        rolled.position = 1150;
+        rolled.position = 1152;
         let final_state = Tensor::row(vec![0.0; HIDDEN])?;
-        model.prefix_cache_put(&p3[..1150], &(rolled, final_state), None, None)?;
+        model.prefix_cache_put(&p3[..1152], &(rolled, final_state), None, None)?;
         let (turn3, _) = model.prefill_cache_state(&p3)?;
         assert_eq!(
             sole_view(&turn3),
-            Some((home, 1210 * KV_DIM)),
+            Some((home, 1216 * KV_DIM)),
             "rollback puis prolongement en place"
         );
         assert_eq!(kv(&turn3), cold(&p3)?, "rollback : K/V vs froid");
         Ok(())
     })
+}
+
+/// Hits du cache de préfixe (ancre alignée, extension résidente) contre le
+/// prefill à froid d'un seul tenant : K/V et état final identiques au bit, y
+/// compris pour des préfixes non alignés et des suffixes de moins de 32 tokens
+/// qui prenaient avant l’extension en lignes. Seules les ancres alignées et les
+/// prompts complets entrent au cache.
+/// Projections f32 : alignement automatique de 16 (queue de 32).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn prefix_cache_aligned_hits_match_cold_prefill() -> Result<()> {
+    check_prefix_cache_aligned_hits(false)
+}
+
+/// Comme [`prefix_cache_aligned_hits_match_cold_prefill`] avec q/o en dense
+/// bf16 (GEMM NA dès 64 lignes, qmv en dessous) : alignement automatique de 64.
+/// Témoin : une queue de 40 lignes après un préfixe aligné sur 16 diffère.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn prefix_cache_aligned_hits_match_cold_prefill_dense_bf16() -> Result<()> {
+    check_prefix_cache_aligned_hits(true)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn check_prefix_cache_aligned_hits(dense_bf16: bool) -> Result<()> {
+    if !prefix_cache_enabled() || prefix_cache_capacity() < 2 {
+        return Ok(());
+    }
+    const VOCAB: usize = 97;
+    let config = CausalDecoderConfig {
+        num_attention_heads: 16,
+        num_key_value_heads: 2,
+        head_dim: Some(256),
+        rope_theta: Some(10_000_000.0),
+        ..CausalDecoderConfig::default()
+    };
+    let Some(device) = metal::Device::system_default() else {
+        return Ok(());
+    };
+    let mut tensors: HashMap<String, DecoderTensor> = resident_bf16_qwen_weights(VOCAB, 64, false)?
+        .into_iter()
+        .map(|(name, tensor)| (name, DecoderTensor::Dense(tensor)))
+        .collect();
+    if dense_bf16 {
+        for name in [
+            "layers.0.self_attn.q_proj.weight",
+            "layers.0.self_attn.o_proj.weight",
+        ] {
+            let Some(DecoderTensor::Dense(tensor)) = tensors.remove(name) else {
+                return Err(InferError::Config(format!("{name} absent")));
+            };
+            let bits: Vec<u16> = tensor
+                .data()
+                .iter()
+                .map(|value| (value.to_bits().wrapping_add(0x8000) >> 16) as u16)
+                .collect();
+            let buffer = device.new_buffer_with_data(
+                bits.as_ptr().cast(),
+                (bits.len() * 2) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            tensors.insert(
+                name.to_string(),
+                DecoderTensor::LinearWeight(crate::LinearWeight::DenseBf16(
+                    crate::DenseBf16Tensor::new(tensor.shape(), buffer)?,
+                )),
+            );
+        }
+    }
+    let model = match CausalDecoder::from_decoder_tensors(tensors, config)?.with_metal_runtime() {
+        Ok(model) => model,
+        Err(InferError::Metal(message)) if message.contains("aucun device") => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Some((align, tail)) = model.prefix_resume_align() else {
+        return Ok(());
+    };
+    if crate::runtime_flags::env_var("SARAGOSSA_RUST_PREFIX_ALIGN").is_none() {
+        let expected = if dense_bf16 { (64, 64) } else { (16, 32) };
+        assert_eq!((align, tail), expected, "alignement automatique");
+    }
+    let tokens: Vec<usize> = (0..1300).map(|i| (i * 31 + 7) % VOCAB).collect();
+    if !model.prefix_extend_as_cheap_as_cold(tokens.len()) {
+        eprintln!("extension résidente indisponible : test sauté");
+        return Ok(());
+    }
+    if dense_bf16 {
+        let cold = model.prefill_prompt_state_uncached(&tokens[..1072])?;
+        let mut warm = model.prefill_prompt_state_uncached(&tokens[..1032])?;
+        model.extend_prompt_state(&mut warm, &tokens[1032..1072])?;
+        // NOTE: témoin informatif seulement : selon le GPU, le GEMM d'une queue
+        // de 40 lignes peut coïncider avec le froid, ce qui ne prouve rien.
+        if warm.final_state.data() == cold.final_state.data() {
+            eprintln!("queue de 40 lignes identique au froid sur ce GPU : témoin muet");
+        }
+    }
+    for (prefix, len) in [
+        (1100, 1120),
+        (1037, 1200),
+        (1000, 1031),
+        (1024, 1300),
+        (1040, 1080),
+    ] {
+        model.clear_prefix_cache();
+        let cold = model.prefill_prompt_state_uncached(&tokens[..len])?;
+        model.prefill_cache_state(&tokens[..prefix])?;
+        let (warm, final_state) = model.prefill_cache_state(&tokens[..len])?;
+        let entries = model
+            .prefix_cache
+            .lock()
+            .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?
+            .entries
+            .iter()
+            .map(|entry| entry.tokens.len())
+            .collect::<Vec<_>>();
+        // Ancres alignées pour les extensions, prompts complets pour les
+        // hits exacts.
+        assert!(
+            entries.iter().any(|len| len % align == 0)
+                && entries
+                    .iter()
+                    .all(|entry| entry % align == 0 || *entry == prefix || *entry == len),
+            "{prefix}→{len} : entrées {entries:?}"
+        );
+        for layer in 0..model.layers.len() {
+            assert_eq!(
+                warm.layer_kv_for_test(layer),
+                cold.cache.layer_kv_for_test(layer),
+                "{prefix}→{len} : K/V couche {layer}"
+            );
+        }
+        assert_eq!(
+            final_state.data(),
+            cold.final_state.data(),
+            "{prefix}→{len} : état final"
+        );
+    }
+    model.clear_prefix_cache();
+    Ok(())
 }
 
 /// Seul un Qwen dense à k/v 5120→1024 (Qwen3.8 27B) ouvre ses k/v au
@@ -5726,7 +5892,11 @@ fn greedy_identity_states_real_model() -> Result<()> {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(128);
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    // Chargement de production : un modèle bf16 garde ses poids en bf16 (le
+    // chargement CPU les doublerait en f32).
+    let executor = crate::MetalExecutor::new()?;
+    let mut model =
+        crate::load_causal_decoder_for_metal(&assets, &executor)?.with_metal_executor(executor)?;
     let has_mtp = match assets.mtp.path.as_ref() {
         Some(path) => {
             model = model.with_mtp_sidecar(path)?;
