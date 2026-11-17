@@ -3836,6 +3836,7 @@ impl CausalDecoder {
         if suffix.is_empty() {
             return Ok(());
         }
+        self.ensure_prompt_within_prefill_cap(state.cache.position + suffix.len())?;
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
         let (final_states, _) =
@@ -4111,6 +4112,9 @@ impl CausalDecoder {
         prompt: &[usize],
         mode: SnapshotMode,
     ) -> Result<(CausalDecoderCache, Tensor, usize)> {
+        // NOTE: le plafond précède tout calcul GPU, y compris le prefill de
+        // l'ancre alignée et le prolongement d'une entrée du cache de préfixe.
+        self.ensure_prompt_within_prefill_cap(prompt.len())?;
         let snapshot = self.snapshot_request(prompt, mode)?;
         if super::persistent_prefix_enabled() && prefix_cache_enabled() {
             if let Some(((cache, final_state), reused)) = self.prefix_cache_get(prompt)? {
