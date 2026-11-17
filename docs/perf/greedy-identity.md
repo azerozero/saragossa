@@ -230,3 +230,164 @@ Les tokens sont identiques à l'AR dans tous ces cas.
 Sous le contrat canonique, le qmv répliqué et le qmm2 par paires sont exacts.
 À 9 lignes, le qmv répliqué coûte environ le double du skinny : gate
 17408×5120 en 0,36 ms contre 0,18 ms, down en 0,38 ms contre 0,21 ms.
+
+## Cache de préfixe : reprises alignées (16 nov. 2026)
+
+Avant ce correctif, une requête qui prolongeait une entrée du cache de préfixe
+du décodeur reprenait le prefill à la longueur exacte du prompt précédent. Le
+texte n'était identique au prefill à froid qu'au near-tie près, ce qui était
+déjà noté le 25 octobre (« Extension de préfixe et gated delta NAX » dans
+[mtp-pairwise.md](mtp-pairwise.md)). Aucune identité au bit n'avait été
+actée.
+
+Causes démontrées sur le 27B u4ls :
+
+- le gated delta NAX (`gated_delta_fused_nax`, C = 16) découpe la récurrence
+  en blocs de 16 à partir du début de chaque appel. Un préfixe non multiple de
+  16 décale tous les blocs du suffixe. P = 1040 avec S = 100 est identique au
+  bit, alors que P = 1000 ou 1037 ne l'est pas ;
+- un suffixe de moins de 32 tokens prend l'extension en lignes (noyaux de
+  decode, qmv) au lieu des GEMM du prefill ;
+- les morceaux équilibrés du prefill à froid au-delà de 4096 tokens commencent
+  à des positions quelconques (2650 pour 5300 tokens).
+
+L'attention de prefill (tuiles BQ = 64) n'est pas en cause : P = 1040 suffit.
+
+Correctif (`SARAGOSSA_RUST_PREFIX_ALIGN`, `runtime_flags::prefix_align_for_model`) :
+
+- les morceaux du prefill résident sont des multiples de 64, et le dernier
+  compte au moins 64 lignes ;
+- un prompt de L tokens se calcule en deux temps : l'ancre
+  A = ⌊(L − queue) / alignement⌋ × alignement, puis la queue. L'ancre entre
+  au cache pour les extensions. Le prompt complet y entre aussi, pour les hits
+  exacts : son état est celui du prefill à froid de L, et son insertion
+  n'évince pas l'ancre. Une extension ne repart que d'une entrée alignée, suivie d'au
+  moins une queue. Le mécanisme vaut pour l'AR, le MTP committed et DFlash
+  (captures et historique) ;
+- dans serve en AR, la dernière frontière de bloc mémorisée laisse une queue.
+
+L'alignement est choisi une fois par décodeur, au chargement
+(`CausalDecoder::prefix_resume_align`) :
+
+- 64, avec une queue de 64, si une projection du tronc est un poids dense
+  bf16 éligible au GEMM NA (`can_use_dense_bf16_gemm`). Ce GEMM change de
+  noyau sous 64 lignes, et le qmv rend alors d'autres bits ;
+- 16, avec une queue de 32, sinon. Le gated delta et le GEMM NA u4 n'ont pas
+  d'autre seuil.
+
+Une valeur explicite n (multiple de 16) remplace le choix automatique. La queue
+vaut alors max(n, 32), ou 64 pour un modèle dense bf16.
+`SARAGOSSA_RUST_PREFIX_ALIGN=0` rétablit l'ancien comportement.
+
+Une valeur invalide avertit une fois sur stderr et garde le choix
+automatique.
+
+Limites :
+
+- le choix automatique ne regarde que le tronc. Un sidecar MTP dense bf16,
+  posé sur un tronc quantifié, n'est pas compté. Sa tête ne touche ni le K/V
+  ni l'état linéaire du tronc. Mais l'historique MTP d'une reprise peut
+  différer au bit, et avec lui les drafts et la largeur des vérifications. Le
+  greedy reste celui de l'AR en mode strict ; avec les réglages par défaut, il
+  l'est au near-tie près (voir « Limites actuelles »). Pour l'éviter, imposer
+  `SARAGOSSA_RUST_PREFIX_ALIGN=64` ;
+- les entrées et instantanés antérieurs au correctif ne sont pas identiques au
+  prefill à froid actuel. C'est le cas des instantanés disque
+  (`--prefix-cache-ssd-dir`, `SARAGOSSA_RUST_STATE_SNAPSHOT`) et des entrées
+  d'un serve lancé avec `=0` : ils ont été calculés avec des morceaux non
+  alignés ou prolongés à une longueur quelconque. Un hit exact rejoue leurs
+  bits. Pour retrouver l'identité, vider ces répertoires après la mise à jour.
+
+Sur le 27B BF16 local, le choix automatique donne (64, 64). Les 12 paires
+passent par le cache de préfixe et sont identiques au bit au prefill à froid.
+La primitive d'extension montre l'effet d'une queue de 40 lignes après un
+préfixe aligné : 1,75 sur l'état final et 5,5 sur les logits (code4k-1). Avec
+64 lignes, l'écart est nul.
+
+### GEMM dense bf16 dès une ligne (mesure, 16 nov. 2026)
+
+Le kernel `gemm_nax_bf16_nt_tiled_x2` masque ses lignes. Le diagnostic
+`SARAGOSSA_RUST_DENSE_BF16_GEMM_MIN_BATCH=1` lui donne donc toutes les
+largeurs. Mesures sur le 27B BF16, M5 Max, charge de 1,7 à 2,8, 2 passes :
+
+| | plancher 64 (défaut) | plancher 1 |
+|---|---|---|
+| queue de 40 après 1024 (état final) | 1,75 | 0 |
+| `greedy_identity_states_real_model`, strict, dflash-défaut, 3 prompts | 0 écart | 0 écart |
+| prefill de 52 tokens | 2352-2364 ms | 262-263 ms |
+| prefill de 524 tokens | 1245-1267 ms | 1246-1247 ms |
+| decode | 7,35-7,39 tok/s | 5,06 tok/s (−31 %) |
+
+Le GEMM dès une ligne rend les mêmes bits par ligne quelle que soit la
+largeur. Il garde l'identité entre la vérification et l'AR, et il accélère
+9 fois un prefill court. Il coûte en revanche 31 % au decode, d'où le plancher
+gardé à 64 et l'alignement automatique. Piste : prendre le GEMM pour toute
+passe de prefill et garder le qmv au decode. L'alignement des modèles dense
+bf16 passerait alors à (16, 32).
+
+Mesures (`decoder::prefix_align_tests::prefix_extension_matches_cold_prefill_real_model`,
+32 à 48 tokens greedy, textes code4k-1 à code4k-3 et leurs concaténations) :
+
+| | avant | alignement 64 | alignement 16 |
+|---|---|---|---|
+| paires identiques au bit (état final) | 9/27 (P aligné, S ≥ 32) | 30/30, 8/8 au-delà de 4096 | 39/39, 8/8 |
+| écart max état final / logits, non aligné | 0,55 / 1,87 | 0 | 0 |
+| écart au-delà de 4096 tokens (morceaux) | 1,06 / 0,88 | 0 | 0 |
+| divergences greedy AR, MTP, DFlash | 2/27 par mode, dès le token 0 | 0 | 0 |
+
+Coût en TTFT (`x-saragossa-prefill-ms`), serve, conversation de 6 tours
+(53 à 818 tokens, 160 tokens greedy par réponse, dernier tour rejoué à
+l'identique), 27B u4ls, M5 Max, 2 passes par variante, charge < 2,6 :
+
+| chemin | tours 3 à 5 (4-5 en AR) avant | après (64) | après (16) | hit exact avant | après (64) | après (16) |
+|---|---|---|---|---|---|---|
+| AR (blocs serve) | 466-530 ms | 429-556 ms | 460-577 ms | 133-135 ms | 426-470 ms | 130-139 ms |
+| MTP | 316-369 ms | 474-511 ms | 410-466 ms | 29-30 ms | 212-216 ms | 160 ms |
+| DFlash | 347-390 ms | 518-540 ms | 437-488 ms | 59-67 ms | 244-262 ms | 189-196 ms |
+
+Le surcoût vient surtout de la queue recalculée à chaque tour (64 à 127 tokens
+avec l'alignement 64), plus une passe de prefill pour l'ancre. Les textes de la
+conversation sont identiques au prefill à froid dans toutes les variantes ; sans
+alignement, c'est le cas ici seulement faute de near-tie.
+
+Depuis le 17 nov., l'entrée du prompt complet reste au cache à côté de son
+ancre, et un hit exact la reprend sans recalculer la queue. Mesures sous charge
+vérifiée (< 2 au départ de chaque run, revérifiée après la prise du verrou),
+alignement automatique (16) contre `=0`, ABBA :
+
+| chemin | tours 3 à 5 avant | après | hit exact avant | après |
+|---|---|---|---|---|
+| MTP | 294-322 ms | 386-426 ms | 28-29 ms | 30-31 ms |
+| DFlash | 326-347 ms | 414-443 ms | 55-62 ms | 55-56 ms |
+
+Écart réel sans alignement (`=0`), 27B u4ls, 64 tokens greedy, 51 paires
+(code4k-1 à 3, concaténations jusqu'à 7023 tokens). Aucune paire n'est
+identique au bit :
+
+| | médiane | max |
+|---|---|---|
+| état final | 0,058 à 0,075 | 1,06 |
+| logits | 0,064 à 0,079 | 1,87 |
+
+4 paires sur 51 divergent en greedy dans les 64 tokens, dont une dès le premier
+token. La divergence est la même en AR, MTP et DFlash. Toutes tombent sur des
+quasi-égalités du froid : marges top-1/top-2 de 0,012, 0,021, 0,022 et 0,027
+logit.
+
+Oracles :
+
+- synthétiques, sans poids : `prefill_resident_aligned_prefix_matches_cold_nax_linear`
+  (gated delta NAX hv32 : préfixes alignés et morceaux alignés au bit, préfixe
+  non aligné différent) et `prefix_cache_aligned_hits_match_cold_prefill` (hits
+  du cache contre le prefill à froid, entrées toutes alignées), en f32
+  (alignement 16) et en dense bf16 (alignement 64, avec un témoin : une queue
+  de 40 lignes diffère) ;
+- modèle réel, ignoré :
+
+  ```sh
+  SARAGOSSA_RUST_PREFIX_ALIGN_MODEL=<Qwen3.8-27B-u4ls> \
+  SARAGOSSA_RUST_DFLASH_DRAFT_DIR=<Qwen3.8-27B-DFlash2> \
+  SARAGOSSA_RUST_PREFIX_ALIGN_MODES=ar,mtp,dflash \
+  cargo test --release --all-features --lib -- --ignored --exact \
+    decoder::prefix_align_tests::prefix_extension_matches_cold_prefill_real_model
+  ```
