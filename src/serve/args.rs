@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use super::error::{ServeError, ServeResult};
 use crate::{hf_resolve, RuntimeKind};
+use saragossa::runtime_flags::Profile;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8081;
@@ -61,8 +62,17 @@ pub(super) struct ServeModelConfig {
 }
 
 impl ServeArgs {
-    /// Parse les options de la sous-commande.
+    /// Parse les options sans profil.
+    #[cfg(test)]
     pub(super) fn parse(args: impl IntoIterator<Item = String>) -> ServeResult<Self> {
+        Self::parse_with(&Profile::default(), args)
+    }
+
+    /// Parse les options ; `profile` fournit les défauts, la CLI gagne.
+    pub(super) fn parse_with(
+        profile: &Profile,
+        args: impl IntoIterator<Item = String>,
+    ) -> ServeResult<Self> {
         let mut host = DEFAULT_HOST.to_string();
         let mut port = None;
         let mut socket = PathBuf::from(DEFAULT_SOCKET);
@@ -73,10 +83,22 @@ impl ServeArgs {
         let mut diar_model = None;
         let mut embed_model = None;
         let mut enhance_model = None;
-        let mut backend = RuntimeKind::default_backend();
-        let mut preload = false;
-        let mut read_timeout = Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS);
-        let mut max_tokens_cap = DEFAULT_MAX_TOKENS_CAP;
+        let mut backend = match &profile.engine.backend {
+            Some(name) => RuntimeKind::parse(name).map_err(|e| ServeError::args(e.to_string()))?,
+            None => RuntimeKind::default_backend(),
+        };
+        let mut preload = profile.engine.preload.unwrap_or(false);
+        let mut read_timeout = Duration::from_secs(
+            profile
+                .serve
+                .read_timeout_secs
+                .unwrap_or(DEFAULT_READ_TIMEOUT_SECS),
+        );
+        let mut max_tokens_cap = match profile.serve.max_tokens_cap {
+            Some(cap) => usize::try_from(cap)
+                .map_err(|_| ServeError::args("serve.max_tokens_cap hors plage"))?,
+            None => DEFAULT_MAX_TOKENS_CAP,
+        };
         let mut prefix_ssd = saragossa::runtime_flags::ServePrefixSsdOptions::from_env()?;
         let mut iter = args.into_iter();
 
@@ -246,7 +268,8 @@ pub(super) fn help_text() -> String {
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
          [--api-key TOKEN] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
-         {modality_options}[--backend cpu|metal] [--preload]\n\
+         {modality_options}[--backend cpu|metal] [--preload] [--config FILE.toml]\n\
+         Config: optional TOML profile (or SARAGOSSA_CONFIG); precedence CLI > env > TOML > default.\n\
          SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
          --prefix-cache-ssd-priority-tokens 4096 (0 disables priority).\n\
          Models: repeat --model to expose any supported checkpoint. A bare path \\
@@ -379,6 +402,27 @@ fn parse_positive_usize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_sets_defaults_and_cli_wins() {
+        let profile = Profile::parse(
+            "[engine]\nbackend = \"cpu\"\npreload = true\n\
+             [serve]\nread_timeout_secs = 9\nmax_tokens_cap = 100\n",
+        )
+        .expect("profil valide");
+        let from_file = ServeArgs::parse_with(&profile, Vec::new()).expect("args");
+        assert_eq!(from_file.backend, RuntimeKind::Cpu);
+        assert!(from_file.preload);
+        assert_eq!(from_file.read_timeout, Duration::from_secs(9));
+        assert_eq!(from_file.max_tokens_cap, 100);
+        let cli = ServeArgs::parse_with(
+            &profile,
+            ["--read-timeout-secs", "5", "--max-tokens-cap", "7"].map(String::from),
+        )
+        .expect("args");
+        assert_eq!(cli.read_timeout, Duration::from_secs(5));
+        assert_eq!(cli.max_tokens_cap, 7);
+    }
 
     #[test]
     fn modality_options_follow_compiled_features() {

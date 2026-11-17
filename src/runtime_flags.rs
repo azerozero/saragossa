@@ -3,6 +3,9 @@
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 pub(crate) mod pairwise;
 
+mod profile;
+pub use profile::{Profile, ProfileError};
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::cell::Cell;
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -161,8 +164,12 @@ pub fn env_var(name: &str) -> Option<String> {
         record_snapshot_ablation(name, &value);
         return Some(value);
     }
-    let legacy = legacy_alias(name)?;
-    let value = std::env::var(&legacy).ok()?;
+    let Some(legacy) = legacy_alias(name) else {
+        return profile::lookup(name);
+    };
+    let Ok(value) = std::env::var(&legacy) else {
+        return profile::lookup(name);
+    };
     warn_legacy_env_once(&legacy, name);
     record_snapshot_ablation(name, &value);
     Some(value)
@@ -206,8 +213,12 @@ pub fn env_var_os(name: &str) -> Option<std::ffi::OsString> {
         record_snapshot_ablation(name, value.to_str().unwrap_or_default());
         return Some(value);
     }
-    let legacy = legacy_alias(name)?;
-    let value = std::env::var_os(&legacy)?;
+    let Some(legacy) = legacy_alias(name) else {
+        return profile::lookup(name).map(Into::into);
+    };
+    let Some(value) = std::env::var_os(&legacy) else {
+        return profile::lookup(name).map(Into::into);
+    };
     warn_legacy_env_once(&legacy, name);
     record_snapshot_ablation(name, value.to_str().unwrap_or_default());
     Some(value)

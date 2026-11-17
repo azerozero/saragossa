@@ -83,6 +83,27 @@ use args::ServeArgs;
 #[cfg(feature = "serve")]
 use super::CliResult;
 
+#[cfg(feature = "serve")]
+/// Extrait `--config CHEMIN` (sinon `SARAGOSSA_CONFIG`) des arguments de serve.
+fn take_config_arg(args: Vec<String>) -> error::ServeResult<(Option<String>, Vec<String>)> {
+    let mut path = std::env::var("SARAGOSSA_CONFIG")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let mut rest = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--config" {
+            path = Some(
+                iter.next()
+                    .ok_or_else(|| error::ServeError::args("--config attend un chemin"))?,
+            );
+        } else {
+            rest.push(arg);
+        }
+    }
+    Ok((path, rest))
+}
+
 /// Lance le serveur OpenAI-compatible local.
 #[cfg(feature = "serve")]
 pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
@@ -94,7 +115,13 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         println!("{}", args::help_text());
         return Ok(());
     }
-    let mut args = ServeArgs::parse(raw_args).map_err(boxed_error)?;
+    let (config_path, raw_args) = take_config_arg(raw_args).map_err(boxed_error)?;
+    let profile = match config_path {
+        Some(path) => saragossa::runtime_flags::Profile::load(std::path::Path::new(&path))?,
+        None => saragossa::runtime_flags::Profile::default(),
+    };
+    profile.install();
+    let mut args = ServeArgs::parse_with(&profile, raw_args).map_err(boxed_error)?;
     if let Some(root) = &args.prefix_ssd.directory {
         saragossa::decoder::configure_prefix_disk_cache(
             root,
