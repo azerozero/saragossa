@@ -1,4 +1,5 @@
 //! Sous-commande `saragossa serve`.
+//! Les modules error, mtp et streaming sont aussi partagés avec le REPL LLM.
 //!
 //! Concurrence d'E/S seulement (voir `dispatch`) : un thread d'accept et un
 //! thread par connexion lisent les requêtes, refusent un bearer invalide avant
@@ -27,34 +28,58 @@
 //! `Transfer-Encoding` seul répond 501 ; avec `Content-Length`, ou un
 //! `Content-Length` répété ou non numérique, le cadrage ambigu répond 400.
 
+#[cfg(feature = "serve")]
 mod anthropic;
+#[cfg(feature = "serve")]
 mod args;
+#[cfg(any(feature = "stt", feature = "tts", feature = "denoise"))]
+#[cfg(feature = "serve")]
 mod audio;
+#[cfg(feature = "serve")]
 mod cache;
+#[cfg(feature = "serve")]
 mod dispatch;
+#[cfg(feature = "embed")]
+#[cfg(feature = "serve")]
 mod embeddings;
+#[cfg(all(feature = "serve", feature = "denoise"))]
 mod enhance;
+#[cfg(all(feature = "serve", feature = "denoise"))]
 mod enhance_body;
 pub(crate) mod error;
+#[cfg(feature = "serve")]
 mod flint_output;
+#[cfg(feature = "serve")]
 mod http;
+#[cfg(feature = "serve")]
 mod model_selection;
 pub(crate) mod mtp;
+#[cfg(feature = "serve")]
 mod protocol;
+#[cfg(feature = "serve")]
 mod responses;
+#[cfg(feature = "serve")]
 mod state;
 pub(crate) mod streaming;
+#[cfg(feature = "stt")]
+#[cfg(feature = "serve")]
 mod stt;
+#[cfg(feature = "serve")]
 mod tool_output;
+#[cfg(feature = "serve")]
 mod warmup;
 
+#[cfg(feature = "serve")]
 use std::error::Error;
 
+#[cfg(feature = "serve")]
 use args::ServeArgs;
 
+#[cfg(feature = "serve")]
 use super::CliResult;
 
 /// Lance le serveur OpenAI-compatible local.
+#[cfg(feature = "serve")]
 pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     let raw_args = args.into_iter().collect::<Vec<_>>();
     if raw_args
@@ -91,6 +116,7 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     }
 }
 
+#[cfg(feature = "serve")]
 fn boxed_error<E>(error: E) -> Box<dyn Error>
 where
     E: Error + 'static,

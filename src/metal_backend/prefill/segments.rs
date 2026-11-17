@@ -20,6 +20,7 @@ thread_local! {
 /// séquences consécutives de longueurs `lengths`.
 // ponytail: réglage par thread comme `with_prefill_kv_reserve`, plutôt qu'un
 // paramètre traversant décodeur et prefill.
+#[cfg(any(feature = "decision", test))]
 pub(crate) fn with_decision_segments<R>(lengths: &[usize], run: impl FnOnce() -> R) -> R {
     /// Rétablit le découpage précédent, panique comprise.
     struct Restore(Vec<usize>);

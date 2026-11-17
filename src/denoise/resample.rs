@@ -13,7 +13,7 @@ pub struct StreamResampler {
 }
 
 impl StreamResampler {
-    /// Construit le même filtre Kaiser que `tts_clone::resample`.
+    /// Construit le même filtre Kaiser que `crate::denoise::resample`.
     ///
     /// # Errors
     /// Refuse une fréquence hors de la plage WAV.
@@ -21,11 +21,11 @@ impl StreamResampler {
         for rate in [from, to] {
             crate::wire_audio::validate_wav_limits(rate, 1, 0).map_err(InferError::Audio)?;
         }
-        let gcd = crate::tts_clone::gcd(from, to);
+        let gcd = crate::audio_resample::gcd(from, to);
         let (up, down) = ((to / gcd) as usize, (from / gcd) as usize);
         let half = if up == down { 0 } else { 10 * up.max(down) };
         let mut taps =
-            crate::tts_clone::firwin_lowpass(2 * half + 1, 1.0 / up.max(down) as f64, 5.0);
+            crate::audio_resample::firwin_lowpass(2 * half + 1, 1.0 / up.max(down) as f64, 5.0);
         for h in &mut taps {
             *h *= up as f64;
         }
@@ -101,7 +101,7 @@ mod tests {
         for from in [8000, 16000, 44100, 48000, 96000, 192000] {
             for len in [0, 1, 17, 1501] {
                 let input: Vec<_> = (0..len).map(|i| (i as f32 * 0.2).sin()).collect();
-                let reference = crate::tts_clone::resample(&input, from, 48000).unwrap();
+                let reference = crate::audio_resample::resample(&input, from, 48000).unwrap();
                 let mut stream = StreamResampler::new(from, 48000).unwrap();
                 let mut out = Vec::new();
                 for chunk in input.chunks(7) {

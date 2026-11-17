@@ -12,10 +12,10 @@ const DEFAULT_MODELS_DIR: &str = "models";
 /// Sélectionne un modèle quand aucun `--model` n'a été fourni.
 pub(super) fn select_if_missing(args: &mut ServeArgs) -> ServeResult<()> {
     if !args.models.is_empty()
-        || args.embed_model.is_some()
-        || args.stt_model.is_some()
-        || args.tts_model.is_some()
-        || args.enhance_model.is_some()
+        || (cfg!(feature = "embed") && args.embed_model.is_some())
+        || (cfg!(feature = "stt") && args.stt_model.is_some())
+        || (cfg!(feature = "tts") && args.tts_model.is_some())
+        || (cfg!(feature = "denoise") && args.enhance_model.is_some())
     {
         return Ok(());
     }

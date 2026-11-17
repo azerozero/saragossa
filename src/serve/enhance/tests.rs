@@ -294,3 +294,25 @@ fn chunk_framing_is_incremental_and_rejects_truncation() {
         }
     }
 }
+
+#[test]
+fn enhance_without_model_returns_clear_error() {
+    let service = EnhanceService::new(None);
+    let (mut client, mut server) = pair();
+    let wav = output_header(Some(0)).unwrap();
+    write!(
+        client,
+        "POST /v1/audio/enhance HTTP/1.1\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\n\r\n",
+        wav.len()
+    )
+    .unwrap();
+    client.write_all(&wav).unwrap();
+    let (mut request, length) = read_head(&mut server, Instant::now() + Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    let error = service
+        .handle(&mut server, &mut request, length)
+        .unwrap_err();
+    assert!(error.to_string().contains("enhance non configuré"));
+    assert!(headers(&mut BufReader::new(client)).starts_with("HTTP/1.1 400"));
+}

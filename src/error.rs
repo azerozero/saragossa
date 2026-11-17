@@ -16,6 +16,7 @@ pub enum InferError {
     #[error("mode de quantification non supporté: {0}")]
     UnsupportedQuantization(String),
     /// Signale une entrée audio invalide avant traitement.
+    #[cfg(any(feature = "stt", feature = "tts", feature = "denoise"))]
     #[error(transparent)]
     Audio(crate::wire_audio::AudioParseError),
 

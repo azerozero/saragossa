@@ -1,10 +1,14 @@
 //! Insertion stricte et positions Qwen M-RoPE (fusion spatiale 2 × 2).
 
-use crate::{InferError, Result, Tensor};
+#[cfg(feature = "vision")]
+use crate::Tensor;
+use crate::{InferError, Result};
+#[cfg(feature = "vision")]
 use sha2::{Digest, Sha256};
 
 /// Les paramètres sont sérialisés canoniquement par le producteur : resize,
 /// normalisation, timestamps éventuels et identité des poids vision compris.
+#[cfg(feature = "vision")]
 pub(crate) struct SuppliedImage<'a> {
     pub start: usize,
     pub grid: [usize; 3],
@@ -90,6 +94,7 @@ fn invalid(message: &str) -> InferError {
 }
 
 /// Valide tout avant de copier ; aucune insertion partielle en cas d'erreur.
+#[cfg(feature = "vision")]
 pub(crate) fn insert_embeddings(
     tokens: &[usize],
     image_pad: usize,
@@ -185,4 +190,5 @@ pub(crate) fn insert_embeddings(
 }
 
 #[cfg(test)]
+#[cfg(feature = "vision")]
 mod tests;

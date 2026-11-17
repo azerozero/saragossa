@@ -427,3 +427,10 @@ Prerequisite: the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain
 ## License
 
 [Apache-2.0](https://spdx.org/licenses/Apache-2.0.html) (SPDX `Apache-2.0`).
+
+## Compilation modulaire
+
+Toutes les modalités sont actives par défaut. Le [tableau des features](docs/features.md)
+détaille les binaires LLM et STT minimaux, les réponses 501 du serveur et les
+vérifications de compilation. Les [profils TOML](docs/design/configuration.md)
+sont une proposition de conception, sans implémentation à ce stade.

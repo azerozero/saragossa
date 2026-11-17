@@ -26,6 +26,7 @@ use std::path::Path;
 use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
 
+pub use crate::audio_resample::resample;
 use dsp::{Analysis, FeatureState, Synthesis, FREQ_BINS, NB_DF, NB_ERB};
 pub use dsp::{FFT_SIZE, HOP_SIZE, SAMPLE_RATE};
 use network::{NetState, Network, ORDER};

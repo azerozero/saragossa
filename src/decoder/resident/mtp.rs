@@ -1891,7 +1891,7 @@ impl CausalDecoder {
             .next()
             .ok_or_else(|| InferError::Metal("MTP fused sans bonus".to_string()))?;
         // Oracle O2 : lignes du cycle fusionné D1 (`verify_final`, dernier bail).
-        #[cfg(test)]
+        #[cfg(all(test, feature = "devtools"))]
         if super::verify::verify_recorder_active() {
             if let Some(verify_final) = scratch.last() {
                 let states = crate::metal_backend::read_f32_buffer(
@@ -2536,7 +2536,7 @@ impl CausalDecoder {
             )?)
         };
         // Oracle O2 : lignes du cycle fusionné (entrée puis deux drafts).
-        #[cfg(test)]
+        #[cfg(all(test, feature = "devtools"))]
         if super::verify::verify_recorder_active() {
             let states = crate::metal_backend::read_f32_buffer(
                 verify_final.tensor().buffer(),

@@ -8,7 +8,7 @@ use crate::decoder::ResidentVerifyHead;
 /// première ligne, tokens d'entrée, parents de l'arbre éventuel, états finaux
 /// normés `[lignes, hidden]` et chemin réellement exécuté (`batched` : kernels
 /// en lignes ; faux pour le repli séquentiel, un pas mono par token).
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 #[derive(Clone, Debug)]
 pub(in crate::decoder) struct VerifyRecord {
     pub(in crate::decoder) base_position: usize,
@@ -20,19 +20,19 @@ pub(in crate::decoder) struct VerifyRecord {
     pub(in crate::decoder) skip_head: bool,
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 thread_local! {
     /// Enregistreur des vérifications résidentes : `Some` pendant un oracle O2.
     pub(in crate::decoder) static VERIFY_RECORDER: std::cell::RefCell<Option<Vec<VerifyRecord>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 pub(super) fn verify_recorder_active() -> bool {
     VERIFY_RECORDER.with(|slot| slot.borrow().is_some())
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 pub(super) fn record_verify(
     base_position: usize,
     tokens: &[usize],
@@ -541,7 +541,7 @@ impl CausalDecoder {
                     Tensor::from_vec(vec![batch, target_capture_cols], values)
                 })
                 .transpose()?;
-            #[cfg(test)]
+            #[cfg(all(test, feature = "devtools"))]
             record_verify(
                 base_position,
                 token_ids,
@@ -751,14 +751,14 @@ impl CausalDecoder {
         };
         encoder.end_encoding();
         crate::metal_backend::commit_and_wait(command_buffer)?;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "devtools"))]
         let base_position = *cache_position;
         *cache_position += token_ids.len();
         let output = crate::metal_backend::read_f32_buffer(
             final_states.tensor().buffer(),
             token_ids.len() * hidden,
         )?;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "devtools"))]
         record_verify(
             base_position,
             token_ids,
