@@ -352,7 +352,7 @@ pub(super) fn parse_model_registration(value: &str) -> ServeResult<ServeModelCon
 }
 
 /// Convertit une entrée `[[models]]` ; une référence HF nue est résolue au lancement.
-fn config_from_entry(entry: &ModelEntry) -> ServeResult<ServeModelConfig> {
+pub(super) fn config_from_entry(entry: &ModelEntry) -> ServeResult<ServeModelConfig> {
     if entry.id.trim().is_empty() || entry.path.trim().is_empty() {
         return Err(ServeError::args("[[models]]: id et path requis"));
     }

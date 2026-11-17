@@ -4,7 +4,11 @@
 //! `serve.max_tokens_cap` (prochaine requête) et `[[models]]` : la liste
 //! acceptée sert `/v1/models` aussitôt, le thread moteur l'applique entre deux
 //! requêtes (`ServeState::set_models`), donc une requête en cours finit sur son
-//! modèle avant qu'il soit déchargé. Le reste du profil est lu une
+//! modèle avant qu'il soit déchargé.
+//! Limites : une référence HF nue est refusée à chaud (chemin local avec
+//! `config.json` requis, sauf alias déjà servi) ; modifier un modèle (même
+//! alias, autre chemin) vide son cache de préfixe et ses sessions, comme tout
+//! déchargement. Le reste du profil est lu une
 //! fois (caches, files, pools à `OnceLock`) : si une autre clé change, tout le
 //! rechargement est refusé avec la liste des clés, rien n'est appliqué.
 //! La CLI garde sa priorité : les options sont réanalysées avec le nouveau profil.
@@ -16,7 +20,7 @@ use std::time::Duration;
 
 use saragossa::runtime_flags::{Profile, Resolved, HOT_KEYS};
 
-use super::args::{ServeArgs, ServeModelConfig};
+use super::args::{config_from_entry, ServeArgs, ServeModelConfig};
 
 // 0 = aucune valeur rechargée : on garde celle du lancement.
 static READ_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
@@ -62,9 +66,17 @@ pub(super) fn model_ids(launch: &[String]) -> Vec<String> {
     }
 }
 
-/// Liste acceptée que le moteur doit encore appliquer, une seule fois.
+/// Liste acceptée que le moteur doit encore appliquer, une seule fois. Elle
+/// devient la liste de `/v1/models` ici, quand le moteur la prend.
 pub(super) fn take_pending_models() -> Option<Vec<ServeModelConfig>> {
-    lock(&PENDING).take()
+    let models = lock(&PENDING).take()?;
+    *lock(&MODELS) = Some(models.clone());
+    Some(models)
+}
+
+/// Dernière liste acceptée, appliquée ou non : base du prochain rechargement.
+fn effective_models() -> Option<Vec<ServeModelConfig>> {
+    lock(&PENDING).clone().or_else(|| lock(&MODELS).clone())
 }
 
 /// Un même modèle : alias et chemin identiques (sinon retrait + ajout).
@@ -86,8 +98,9 @@ pub(super) fn diff_models(
     (only(old, new), only(new, old))
 }
 
-/// Valide toute la liste ; une référence HF déjà résolue garde son chemin,
-/// les autres chemins doivent être des dossiers lisibles. Toutes les erreurs
+/// Valide toute la liste ; une référence HF nue n'est jamais résolue à chaud :
+/// elle n'est acceptée que si son alias est déjà servi (chemin résolu gardé),
+/// les autres chemins doivent être des dossiers avec un `config.json` lisible. Toutes les erreurs
 /// sont listées.
 fn validate_models(
     mut wanted: Vec<ServeModelConfig>,
@@ -117,7 +130,7 @@ fn validate_models(
 }
 
 fn readable_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::read_dir(path).map(|_| ())
+    std::fs::File::open(path.join("config.json")).map(|_| ())
 }
 
 /// Nouveau profil, clés modifiées, ids de modèles retirés et ajoutés.
@@ -146,13 +159,30 @@ fn reload(
         return Err(format!("redémarrage requis pour {frozen:?}"));
     }
     let args = ServeArgs::parse_with(&next, cli.to_vec()).map_err(|e| e.to_string())?;
-    let models = validate_models(args.models, current_models)?;
+    // Base : la liste du lancement (CLI, prompt, TOML) ; sans `[[models]]` dans
+    // le profil rien ne change. Sinon les modèles venus du TOML précédent sont
+    // remplacés par ceux du nouveau, ceux de la CLI ou du prompt restent.
+    let models = if next.models.is_empty() {
+        current_models.to_vec()
+    } else {
+        let mut list: Vec<ServeModelConfig> = current_models
+            .iter()
+            .filter(|m| !current.models.iter().any(|e| e.id == m.id))
+            .cloned()
+            .collect();
+        for entry in &next.models {
+            if !list.iter().any(|m| m.id == entry.id) {
+                list.push(config_from_entry(entry).map_err(|e| e.to_string())?);
+            }
+        }
+        list
+    };
+    let models = validate_models(models, current_models)?;
     let diff = diff_models(current_models, &models);
     READ_TIMEOUT_SECS.store(args.read_timeout.as_secs(), Ordering::Relaxed);
     MAX_TOKENS_CAP.store(args.max_tokens_cap, Ordering::Relaxed);
     if !(diff.0.is_empty() && diff.1.is_empty()) {
-        *lock(&PENDING) = Some(models.clone());
-        *lock(&MODELS) = Some(models);
+        *lock(&PENDING) = Some(models);
     }
     Ok((next, changed, diff))
 }
@@ -180,7 +210,7 @@ pub(super) fn watch(source: Option<String>, sets: Vec<String>, cli: Vec<String>,
             if !HUP.swap(false, Ordering::Relaxed) {
                 continue;
             }
-            let Some(models) = lock(&MODELS).clone() else {
+            let Some(models) = effective_models() else {
                 eprintln!("saragossa serve: rechargement refusé: lancement en cours");
                 continue;
             };
@@ -261,6 +291,9 @@ mod tests {
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::create_dir_all(&a).expect("dossier a");
         std::fs::create_dir_all(&b).expect("dossier b");
+        for d in [&a, &b] {
+            std::fs::write(d.join("config.json"), "{}").expect("config");
+        }
         let file = dir.join("p.toml");
         let path = file.to_str().expect("utf8").to_string();
         let write = |text: String| std::fs::write(&file, text).expect("écriture");
@@ -295,10 +328,27 @@ mod tests {
         let (_, _, (removed, added)) =
             reload(Some(&path), &[], &[], &current, &start).expect("retrait");
         assert_eq!((removed, added), (vec!["b".to_string()], vec![]));
-        assert_eq!(model_ids(&[]), ["a"]);
+        assert_eq!(model_ids(&[]), ["a", "b"], "publié par le moteur seulement");
         let pending = take_pending_models().expect("liste en attente");
         assert_eq!(pending.len(), 1);
+        assert_eq!(model_ids(&[]), ["a"]);
         assert!(take_pending_models().is_none());
+
+        // Modèle choisi au prompt : ni CLI ni TOML, il survit aux rechargements.
+        let picked = model("p", a.to_str().expect("utf8"));
+        let launch = [start[0].clone(), picked.clone()];
+        write(String::new());
+        let bare = Resolved::resolve(Some(&path), &[]).expect("profil").profile;
+        reload(Some(&path), &[], &[], &bare, &launch).expect("sans [[models]]");
+        assert!(take_pending_models().is_none(), "liste intacte");
+        write(toml(&[("b", &b)]));
+        reload(Some(&path), &[], &[], &bare, &launch).expect("avec [[models]]");
+        let ids: Vec<_> = take_pending_models()
+            .expect("liste")
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, ["a", "p", "b"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
