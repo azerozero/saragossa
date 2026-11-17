@@ -71,6 +71,11 @@ pub struct WhisperModel {
     language_tokens: std::ops::Range<u32>,
 }
 
+/// Verdict openai : sans parole si `no_speech_prob > 0,6` et logprob moyen <= -1,0.
+fn silence_verdict(no_speech_prob: f32, avg_logprob: f64) -> bool {
+    no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob <= LOGPROB_THRESHOLD
+}
+
 /// État du decode RÉSIDENT (poids GPU + KV résident) lié à une génération.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 struct ResidentDecode<'a> {
@@ -756,6 +761,10 @@ impl WhisperModel {
     /// -1,0. Sans cela, whisper-tiny hallucine « ... » sur du silence. Le sondage
     /// du SOT est peu coûteux ; le décodage complet n'a lieu que si la fenêtre
     /// est suspecte, donc la parole garde le chemin résident inchangé.
+    ///
+    /// NOTE: le logprob est calculé sans `suppress_tokens` ni `suppress_blank`,
+    /// donc avec un petit écart par rapport à openai près du seuil. Le token de
+    /// langue n'est jamais compté : il fait partie du préfixe, même en mode auto.
     fn is_silence(
         &self,
         audio_features: &Tensor,
@@ -788,8 +797,11 @@ impl WhisperModel {
             Some(&mut plain),
             &mut |_| Ok(()),
         )?;
-        // Le logprob moyen compte l'EOT, comme `transcribe_verbose` et OpenAI.
-        Ok(plain.sum_logprob / (generated.len() + 1) as f64 <= LOGPROB_THRESHOLD)
+        // `generated` exclut l'EOT mais `select` en a cumulé le logprob : +1.
+        Ok(silence_verdict(
+            probe.no_speech_prob,
+            plain.sum_logprob / (generated.len() + 1) as f64,
+        ))
     }
 
     fn decode_text(
@@ -1228,6 +1240,14 @@ mod tests {
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     fn live_runtime() -> ForwardRuntime<'static> {
         ForwardRuntime::cpu()
+    }
+
+    #[test]
+    fn silence_verdict_needs_both_thresholds() {
+        assert!(silence_verdict(0.9, -1.5));
+        assert!(silence_verdict(0.61, -1.0));
+        assert!(!silence_verdict(0.6, -2.0));
+        assert!(!silence_verdict(0.9, -0.5));
     }
 
     fn tiny_decoder_without_layers() -> WhisperDecoder {
