@@ -22,10 +22,13 @@ appelé par le [processeur Qwen2VL](https://github.com/huggingface/transformers/
 Les tailles proviennent du `smart_resize` déjà capturé ; aucun processeur ni
 poids téléchargé depuis un checkpoint n'est exécuté.
 
-La porte reste un écart maximal d'un niveau uint8 (1/255 dans [0,1]).
-**Elle échoue actuellement contre torchvision : 2 niveaux sur `ties` et
-`tiny`**, soit 2/255 dans [0,1]. Le seuil n'est pas élargi et les tests ne
-sont pas ignorés. La parité PIL ne suffit donc pas à valider le resize HF.
+La porte spécifiée est d'un niveau uint8 (1/255 dans [0,1]). Le bicubique Rust
+reproduit torchvision **exactement** (0 niveau sur les quatre images et les six
+sondes) : poids normalisés, quantifiés sur int16 avec la plus grande précision
+commune à l'axe qui tienne sous 32 768, arrondis symétriques, passe horizontale
+puis verticale, chaque passe arrondie et saturée en uint8. PIL fixe 22 bits ;
+l'écart PIL/torchvision atteint 2 niveaux (`ties`, `tiny`). Les captures PIL ne
+sont plus qu'informatives : leurs tests n'assertent plus sur le resize.
 
 ## Interface et reproduction
 
@@ -74,9 +77,8 @@ de patch, et valident l'ordre contre les empreintes de la permutation PyTorch.
 Ils distinguent la porte f32 sans resize de la porte uint8 avec resize.
 
 Mesure locale avec Pillow 12.2.0, PyTorch 2.12.0 et Transformers 5.8.1 :
-écart maximal **0 niveau uint8** sur les 12 fixtures et les 6 sondes ;
 écart maximal **0 en f32** sur les 256 niveaux et sur les pixels/patchs des
 5 fixtures sans resize. Les 60 dimensions et les grilles/ordres des 12 images
-correspondent exactement à la référence Python. Contre torchvision 0.27.0,
-le maximum est **2 niveaux uint8** ; les portes de resize et de patchs
-redimensionnés échouent. Les captures sans resize gardent la porte f32 à 1e-6.
+correspondent exactement à la référence Python. Contre torchvision 0.27.0, le maximum est **0 niveau uint8** ; contre PIL, il
+atteint 2 niveaux sur le resize (informatif). Les captures sans resize gardent
+la porte f32 à 1e-6.
