@@ -18,6 +18,8 @@ use serde::Serialize;
 use super::anthropic::{
     anthropic_chat, handle_anthropic_messages, send_anthropic_error, AnthropicSse,
 };
+#[cfg(feature = "diar")]
+use super::audio::handle_diarization;
 #[cfg(feature = "tts")]
 use super::audio::handle_speech;
 use super::dispatch::{self, Front};
@@ -285,6 +287,13 @@ fn route_engine<S: Write>(
             request.header("content-type"),
             &request.body,
         ),
+        #[cfg(feature = "diar")]
+        ("POST", "/v1/audio/diarization") => handle_diarization(
+            stream,
+            state.audio_mut(),
+            request.header("content-type"),
+            &request.body,
+        ),
         #[cfg(feature = "stt")]
         ("POST", "/v1/audio/transcriptions/stream") => handle_transcription_stream(
             stream,
@@ -309,6 +318,12 @@ fn route_engine<S: Write>(
             stream,
             501,
             "modalité STT absente : recompiler avec --features stt",
+        ),
+        #[cfg(not(feature = "diar"))]
+        ("POST", "/v1/audio/diarization") => send_error(
+            stream,
+            501,
+            "modalité diarisation absente : recompiler avec --features diar",
         ),
         #[cfg(not(feature = "tts"))]
         ("POST", "/v1/audio/speech") => send_error(
@@ -1497,6 +1512,39 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "diar")]
+    fn diarization_route_without_model_returns_400() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        let mut wav = Cursor::new(Vec::new());
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::new(&mut wav, spec).expect("invariant: WAV mémoire");
+        writer
+            .write_sample(0_i16)
+            .expect("invariant: échantillon valide");
+        writer.finalize().expect("invariant: WAV terminé");
+        let mut body =
+            b"--BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\n"
+                .to_vec();
+        body.extend_from_slice(&wav.into_inner());
+        body.extend_from_slice(b"\r\n--BND--\r\n");
+        let mut raw = format!("POST /v1/audio/diarization HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=BND\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        raw.extend_from_slice(&body);
+        let mut stream = Cursor::new(raw);
+        let error = handle_connection(&mut stream, &mut state, None, far_deadline())
+            .expect_err("invariant: modèle non configuré");
+        assert!(error.to_string().contains("diarisation non configuré"));
+        let response = String::from_utf8_lossy(&stream.into_inner()).into_owned();
+        assert!(response.contains("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("--diar-model"));
+    }
+
+    #[test]
     fn missing_modalities_return_501_before_parsing_body() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut state = ServeState::new(&args);
@@ -1507,6 +1555,7 @@ mod tests {
                 "/v1/audio/transcriptions/stream",
                 "stt",
             ),
+            (cfg!(feature = "diar"), "/v1/audio/diarization", "diar"),
             (cfg!(feature = "tts"), "/v1/audio/speech", "tts"),
             (cfg!(feature = "embed"), "/v1/embeddings", "embed"),
             (cfg!(feature = "denoise"), "/v1/audio/enhance", "denoise"),
@@ -1572,9 +1621,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(feature = "stt", feature = "tts", feature = "embed"))]
+    #[cfg(any(feature = "stt", feature = "tts", feature = "diar", feature = "embed"))]
     fn auxiliary_only_startup_keeps_llm_routes_explicitly_unavailable() {
         for flags in [
+            #[cfg(feature = "diar")]
+            vec!["--diar-model"],
             #[cfg(feature = "embed")]
             vec!["--embed-model"],
             #[cfg(feature = "stt")]

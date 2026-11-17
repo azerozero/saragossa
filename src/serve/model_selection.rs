@@ -16,6 +16,7 @@ pub(super) fn select_if_missing(args: &mut ServeArgs) -> ServeResult<()> {
         || (cfg!(feature = "stt") && args.stt_model.is_some())
         || (cfg!(feature = "tts") && args.tts_model.is_some())
         || (cfg!(feature = "denoise") && args.enhance_model.is_some())
+        || (cfg!(feature = "diar") && args.diar_model.is_some())
     {
         return Ok(());
     }

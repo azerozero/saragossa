@@ -268,7 +268,7 @@ impl MetalExecutor {
         Ok(())
     }
 
-    #[cfg(any(feature = "stt", feature = "tts"))]
+    #[cfg(any(feature = "stt", feature = "diar", feature = "tts"))]
     /// Encode l'ajout du biais ligne à ligne (in-place) `data[r,c] += bias[c]`.
     /// `data` peut être lié à un offset (épilogue d'un append KV résident).
     pub(crate) fn encode_add_row_bias(

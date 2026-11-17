@@ -3,6 +3,9 @@
 //! - `POST /v1/audio/transcriptions` et la session incrémentale
 //!   `/v1/audio/transcriptions/stream` : voir [`super::stt`], qui emprunte le
 //!   modèle Whisper de cet état.
+//! - `POST /v1/audio/diarization` : diarisation Nemotron-3-Diarization, même
+//!   multipart (`file` = WAV, `response_format` = `json` par défaut ou `rttm`),
+//!   réponse `{"duration", "segments": [{"speaker", "start", "end"}]}`.
 //! - `POST /v1/audio/speech` : TTS Qwen3, requête JSON `{"model", "input", "voice"?}`,
 //!   réponse WAV par défaut, ou PCM s16le mono chunked avec `stream: true`.
 //!
@@ -14,35 +17,41 @@
 
 #[cfg(feature = "tts")]
 use std::io::Cursor;
-#[cfg(any(feature = "stt", feature = "tts"))]
+#[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
 use std::io::Write;
 use std::path::PathBuf;
 
+#[cfg(feature = "diar")]
+use super::http::send_json;
 #[cfg(all(test, feature = "tts"))]
 use hound::WavReader;
 #[cfg(feature = "tts")]
 use hound::{SampleFormat, WavSpec, WavWriter};
+#[cfg(feature = "diar")]
+use saragossa::wire_audio::extract_boundary;
 #[cfg(feature = "tts")]
 use serde::Deserialize;
-#[cfg(all(test, feature = "tts"))]
+#[cfg(any(feature = "diar", all(test, feature = "tts")))]
 use serde_json::json;
 
 #[cfg(feature = "tts")]
 use saragossa::tts::TTS_GENERATION_HARD_CAP;
+#[cfg(any(feature = "stt", feature = "diar"))]
+use saragossa::ForwardRuntime;
 #[cfg(all(target_os = "macos", feature = "metal"))]
-#[cfg(feature = "stt")]
+#[cfg(any(feature = "stt", feature = "diar"))]
 use saragossa::MetalExecutor;
 #[cfg(feature = "stt")]
-use saragossa::{ForwardRuntime, WhisperModel};
+use saragossa::WhisperModel;
 #[cfg(feature = "tts")]
 use saragossa::{TtsModel, TtsSynthesisOutput};
 
 use super::args::ServeArgs;
-#[cfg(any(feature = "stt", feature = "tts"))]
+#[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
 use super::error::{ServeError, ServeResult};
-#[cfg(any(feature = "stt", feature = "tts"))]
+#[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
 use super::http::write_headers;
-#[cfg(feature = "stt")]
+#[cfg(any(feature = "stt", feature = "diar"))]
 use crate::RuntimeKind;
 
 /// Budget minimal conservé pour les clauses courtes.
@@ -60,10 +69,12 @@ const TTS_NOT_CONFIGURED: &str =
 
 /// Etat audio du serveur : slots STT/TTS chargés à la demande.
 pub(super) struct AudioState {
-    #[cfg(feature = "stt")]
+    #[cfg(any(feature = "stt", feature = "diar"))]
     backend: RuntimeKind,
     #[cfg(feature = "stt")]
     stt: SttSlot,
+    #[cfg(feature = "diar")]
+    diar: DiarSlot,
     #[cfg(feature = "tts")]
     tts: TtsSlot,
     #[cfg(feature = "denoise")]
@@ -71,6 +82,14 @@ pub(super) struct AudioState {
     /// Sessions STT à entrée incrémentale, indépendantes du modèle chargé.
     #[cfg(feature = "stt")]
     pub(super) stt_sessions: super::stt::SttSessions,
+}
+
+#[cfg(feature = "diar")]
+struct DiarSlot {
+    path: Option<PathBuf>,
+    model: Option<saragossa::diarization::DiarizationModel>,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    metal: Option<MetalExecutor>,
 }
 
 #[cfg(feature = "stt")]
@@ -113,11 +132,18 @@ impl AudioState {
     /// Construit l'état audio depuis les chemins CLI, sans charger les poids.
     pub(super) fn new(args: &ServeArgs) -> Self {
         Self {
-            #[cfg(feature = "stt")]
+            #[cfg(any(feature = "stt", feature = "diar"))]
             backend: args.backend,
             #[cfg(feature = "stt")]
             stt: SttSlot {
                 path: args.stt_model.clone(),
+                model: None,
+                #[cfg(all(target_os = "macos", feature = "metal"))]
+                metal: None,
+            },
+            #[cfg(feature = "diar")]
+            diar: DiarSlot {
+                path: args.diar_model.clone(),
                 model: None,
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 metal: None,
@@ -225,6 +251,55 @@ impl AudioState {
         }
         self.stt.model = Some(model);
         Ok(())
+    }
+
+    /// Diarise des échantillons mono 16 kHz avec son exécuteur Metal.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le modèle n'est pas configuré ou si l'inférence échoue.
+    #[cfg(feature = "diar")]
+    pub(super) fn diarize(
+        &mut self,
+        samples: &[f32],
+    ) -> ServeResult<Vec<saragossa::diarization::SpeakerSegment>> {
+        if self.diar.model.is_none() {
+            let path = self.diar.path.clone().ok_or_else(|| {
+                ServeError::args(
+                    "endpoint diarisation non configuré: relancez saragossa serve avec --diar-model <dir>",
+                )
+            })?;
+            eprintln!(
+                "saragossa serve loading diarization model path={}",
+                path.display()
+            );
+            let model = saragossa::diarization::DiarizationModel::from_model_dir(&path)?;
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            if self.backend == RuntimeKind::Metal && self.diar.metal.is_none() {
+                self.diar.metal = Some(MetalExecutor::new()?);
+            }
+            self.diar.model = Some(model);
+        }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let runtime = self
+            .diar
+            .metal
+            .as_ref()
+            .map_or_else(ForwardRuntime::cpu, ForwardRuntime::metal);
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let runtime = if self.backend == RuntimeKind::Metal {
+            return Err(ServeError::args(
+                "backend metal diarisation indisponible — recompiler avec --features metal",
+            ));
+        } else {
+            ForwardRuntime::cpu()
+        };
+        let model = self
+            .diar
+            .model
+            .as_ref()
+            .ok_or_else(|| ServeError::args("modèle de diarisation absent après chargement"))?;
+        Ok(model.diarize(samples, runtime)?.segments)
     }
 
     #[cfg(feature = "tts")]
@@ -344,6 +419,39 @@ fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
                 .max(MIN_TTS_MAX_FRAMES)
         })
         .min(TTS_GENERATION_HARD_CAP)
+}
+
+/// Sert `POST /v1/audio/diarization`.
+#[cfg(feature = "diar")]
+pub(super) fn handle_diarization<S: Write>(
+    stream: &mut S,
+    audio: &mut AudioState,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> ServeResult<()> {
+    let content_type = content_type
+        .ok_or_else(|| ServeError::Http("Content-Type multipart/form-data requis".to_string()))?;
+    let boundary = extract_boundary(content_type).ok_or_else(|| {
+        ServeError::Http("boundary multipart absente du Content-Type".to_string())
+    })?;
+    let fields = parse_multipart(body, &boundary)?;
+    let file = fields
+        .iter()
+        .find(|field| field.name == "file")
+        .ok_or_else(|| ServeError::Http("champ multipart 'file' requis".to_string()))?;
+    let response_format = text_field(&fields, "response_format").unwrap_or_default();
+    let samples = wav_to_mono_16k(&file.data)?;
+    let segments = audio.diarize(&samples)?;
+    if response_format.eq_ignore_ascii_case("rttm") {
+        return send_text(stream, &saragossa::diarization::to_rttm(&segments, "audio"));
+    }
+    let duration = samples.len() as f64 / 16_000.0;
+    send_json(
+        stream,
+        200,
+        &json!({ "duration": duration, "segments": saragossa::diarization::to_json(&segments) }),
+        Vec::new(),
+    )
 }
 
 /// Sert `POST /v1/audio/speech`.
@@ -540,7 +648,7 @@ struct SpeechRequest {
     stream: bool,
 }
 
-#[cfg(feature = "stt")]
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(super) fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
     let body = text.as_bytes();
     write_headers(
@@ -560,9 +668,9 @@ pub(super) fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()>
 }
 
 // Les cibles fuzz et le serveur exécutent le même décodeur, sans copie.
-#[cfg(all(test, feature = "stt", feature = "tts"))]
+#[cfg(any(feature = "diar", all(test, feature = "stt", feature = "tts")))]
 use saragossa::wire_audio::text_field;
-#[cfg(feature = "stt")]
+#[cfg(any(feature = "stt", feature = "diar"))]
 use saragossa::wire_audio::MultipartField;
 #[cfg(all(test, feature = "stt", feature = "tts"))]
 use saragossa::wire_audio::MAX_WAV_SAMPLES;
@@ -573,12 +681,12 @@ fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult
         .map_err(|e| ServeError::Http(e.0))
 }
 
-#[cfg(feature = "stt")]
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(super) fn parse_multipart(body: &[u8], boundary: &str) -> ServeResult<Vec<MultipartField>> {
     saragossa::wire_audio::parse_multipart(body, boundary).map_err(|e| ServeError::Http(e.0))
 }
 
-#[cfg(feature = "stt")]
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(super) fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
     saragossa::wire_audio::wav_to_mono_16k(bytes).map_err(|e| ServeError::Http(e.0))
 }
