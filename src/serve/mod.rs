@@ -127,7 +127,10 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     resolved.install();
     let profile = resolved.profile.clone();
     let mut args = ServeArgs::parse_with(&profile, raw_args.clone()).map_err(boxed_error)?;
-    reload::watch(config_path, sets, raw_args, profile);
+    // Sans profil, SIGHUP garde son effet par défaut (arrêt du processus).
+    if config_path.is_some() {
+        reload::watch(config_path, sets, raw_args, profile);
+    }
     if let Some(root) = &args.prefix_ssd.directory {
         saragossa::decoder::configure_prefix_disk_cache(
             root,

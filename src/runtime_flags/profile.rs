@@ -409,7 +409,17 @@ impl Resolved {
     pub fn report(&self) -> String {
         let mut out = String::new();
         for row in self.profile.rows() {
-            let from_env = row.env.and_then(|n| Some((n, std::env::var(n).ok()?)));
+            // Nom canonique puis alias hérité ; vide ou invalide = ignoré ici.
+            let valid = |v: &String| {
+                v.parse::<u64>()
+                    .is_ok_and(|n| n > 0 || row.key == "memory.headroom_bytes")
+            };
+            let from_env = row.env.and_then(|n| {
+                let legacy = n.replacen("SARAGOSSA_", "RETI_", 1);
+                [n.to_string(), legacy]
+                    .into_iter()
+                    .find_map(|name| Some((name.clone(), std::env::var(&name).ok().filter(valid)?)))
+            });
             let (value, origin) = if has(&self.set, row.key) {
                 (row.value.clone(), "--set".to_string())
             } else if let Some((name, v)) = from_env {
