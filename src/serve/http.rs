@@ -205,6 +205,18 @@ pub(super) fn route_front<S: Write>(
             return Some(send_error(stream, 401, "authentification bearer requise"));
         }
     }
+    #[cfg(feature = "webtransport")]
+    if request.method == "GET" && path == "/v1/audio/enhance/certificate" {
+        return Some((|| match front.enhance.certificate_info()? {
+            Some(info) => send_json(
+                stream,
+                200,
+                &info,
+                vec![("Cache-Control", "no-store".into())],
+            ),
+            None => send_error(stream, 503, "listener WebTransport non activé"),
+        })());
+    }
     if request.method == "GET" && path == "/v1/models" {
         let models = ModelsResponse::from_ids(&front.model_ids);
         return Some(send_json(stream, 200, &models, Vec::new()));
@@ -776,7 +788,7 @@ fn sanitize_header_value(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
-fn error_status(error: &ServeError) -> u16 {
+pub(in crate::serve) fn error_status(error: &ServeError) -> u16 {
     match error {
         ServeError::UnknownModel(_) => 404,
         ServeError::Args(_)
@@ -804,7 +816,22 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
+pub(in crate::serve) fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
+    #[cfg(feature = "ws")]
+    if request.method == "GET"
+        && request.route() == "/v1/audio/enhance/ws"
+        && request
+            .header("sec-websocket-protocol")
+            .is_some_and(|protocols| {
+                protocols.split(',').any(|p| {
+                    p.trim().strip_prefix("bearer.").is_some_and(|token| {
+                        constant_time_eq(token.as_bytes(), expected.as_bytes())
+                    })
+                })
+            })
+    {
+        return true;
+    }
     if is_anthropic_route(request.route()) {
         if let Some(key) = request.header("x-api-key") {
             if constant_time_eq(key.as_bytes(), expected.as_bytes()) {
@@ -821,7 +848,7 @@ fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
     constant_time_eq(token.as_bytes(), expected.as_bytes())
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(super) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut diff = left.len() ^ right.len();
     let max_len = left.len().max(right.len());
     for index in 0..max_len {
@@ -841,6 +868,14 @@ pub(super) struct HttpRequest {
 }
 
 impl HttpRequest {
+    #[cfg(feature = "ws")]
+    pub(super) fn query(&self) -> &str {
+        self.path.split_once('?').map_or("", |(_, query)| query)
+    }
+    #[cfg(feature = "ws")]
+    pub(super) fn header_count(&self, name: &str) -> usize {
+        self.headers.iter().filter(|(key, _)| key == name).count()
+    }
     pub(super) fn is_enhance(&self) -> bool {
         self.method == "POST" && self.route() == "/v1/audio/enhance"
     }
@@ -985,7 +1020,9 @@ fn parse_headers(header_text: &str) -> ServeResult<ParsedHeaders> {
     let version = parts
         .next()
         .ok_or_else(|| ServeError::Http("version HTTP absente".to_string()))?;
-    if !version.starts_with("HTTP/") {
+    if !version.starts_with("HTTP/")
+        || (path.split('?').next() == Some("/v1/audio/enhance/ws") && version != "HTTP/1.1")
+    {
         return Err(ServeError::Http(format!(
             "version HTTP invalide: {version}"
         )));

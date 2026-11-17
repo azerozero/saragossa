@@ -183,6 +183,11 @@ where
             read_timeout,
         }),
     };
+    #[cfg(any(feature = "h2", feature = "webtransport"))]
+    let _transports = super::enhance::async_io::start(
+        Arc::clone(&dispatcher.front),
+        Arc::clone(&dispatcher.connections),
+    )?;
     // NOTE: thread détaché plutôt que scope : une panique moteur doit tuer le
     // process comme avant, pas attendre un accept qui ne finit jamais.
     let acceptor = thread::Builder::new()
@@ -377,6 +382,10 @@ impl<S: ServeStream> Connection<S> {
         };
         if let Some(result) = route_front(&mut stream, &self.front, &request) {
             return reply_on_error(&mut stream, result);
+        }
+        #[cfg(feature = "ws")]
+        if request.route() == "/v1/audio/enhance/ws" {
+            return self.front.enhance.handle_ws(&mut stream, &mut request);
         }
         if request.is_enhance() {
             #[cfg(not(feature = "denoise"))]
