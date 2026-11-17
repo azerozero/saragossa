@@ -480,6 +480,9 @@ pub struct MetalExecutor {
     /// GEMM tuilé à poids bf16 denses `[N,K]` et lhs f32 scindé hi + lo,
     /// pour le prefill des modèles BF16.
     na_gemm_bf16_nt_tiled_x2: Option<ComputePipelineState>,
+    /// Variante à double tampon, compilée seulement sous
+    /// `SARAGOSSA_RUST_DENSE_BF16_GEMM_DB=1`.
+    na_gemm_bf16_nt_tiled_x2_db: Option<ComputePipelineState>,
     /// matmul2d MPP A et B bf16, B `[N,K]` : réservé aux décisions THX-02.
     na_gemm_bf16_nt_bn128: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_align64: Option<ComputePipelineState>,

@@ -1638,6 +1638,16 @@ pub(crate) fn dense_bf16_gemm_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_GEMM", true))
 }
 
+/// Variante à double tampon du GEMM bf16 dense de prefill
+/// (`gemm_nax_bf16_nt_tiled_x2_db`, fiche B Herbert), bit-identique au kernel
+/// par défaut. Opt-in `SARAGOSSA_RUST_DENSE_BF16_GEMM_DB=1` tant que le gain
+/// n'est pas mesuré en ABBA.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn dense_bf16_gemm_db_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_GEMM_DB", false))
+}
+
 /// Taille cible, en tokens, d'un morceau du prefill résident. Les buffers
 /// intermédiaires sont dimensionnés sur un morceau au lieu du prompt entier ;
 /// le KV et l'état linéaire passent d'un morceau au suivant. Le prompt est

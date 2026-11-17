@@ -369,12 +369,16 @@ impl MetalExecutor {
             post_dispatch_barrier(encoder);
             return Ok(out_dim);
         }
-        if let Some(pso) = self
-            .na_gemm_bf16_nt_tiled_x2
-            .as_ref()
-            .filter(|_| can_use_dense_bf16_gemm(batch, in_dim, out_dim))
+        let tiled = match &self.na_gemm_bf16_nt_tiled_x2_db {
+            Some(db) => Some((db, "gemm_nax_bf16_nt_tiled_x2_db")),
+            None => self
+                .na_gemm_bf16_nt_tiled_x2
+                .as_ref()
+                .map(|pso| (pso, "gemm_nax_bf16_nt_tiled_x2")),
+        };
+        if let Some((pso, name)) = tiled.filter(|_| can_use_dense_bf16_gemm(batch, in_dim, out_dim))
         {
-            self.encode_dense_bf16_gemm(encoder, pso, lhs, rhs, out, batch, out_dim, in_dim)?;
+            self.encode_dense_bf16_gemm(encoder, pso, name, lhs, rhs, out, batch, out_dim, in_dim)?;
         } else {
             self.encode_dense_qmv_rhs_bf16(encoder, lhs, rhs, out, batch, out_dim, in_dim)?;
         }
@@ -382,10 +386,11 @@ impl MetalExecutor {
     }
 
     /// GEMM NA tuilé `C[M,N] = A[M,K]·B[N,K]^T`, A f32 scindé hi + lo, B bf16.
-    fn encode_dense_bf16_gemm(
+    pub(super) fn encode_dense_bf16_gemm(
         &self,
         encoder: &ComputeCommandEncoderRef,
         pso: &ComputePipelineState,
+        name: &str,
         lhs: &BufferRef,
         rhs_bf16: &BufferRef,
         out: &BufferRef,
@@ -404,7 +409,7 @@ impl MetalExecutor {
         encoder.set_buffer(1, Some(rhs_bf16), 0);
         encoder.set_buffer(2, Some(out), 0);
         encoder.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
-        trace_dispatch_path("gemm_nax_bf16_nt_tiled_x2", batch, out_dim, in_dim);
+        trace_dispatch_path(name, batch, out_dim, in_dim);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(

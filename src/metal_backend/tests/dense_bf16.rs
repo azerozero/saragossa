@@ -233,3 +233,145 @@ fn dense_bf16_embedding_matches_f32() -> Result<()> {
     }
     Ok(())
 }
+
+/// Pipelines du GEMM bf16 par défaut et de sa variante à double tampon,
+/// compilés depuis la source NA du runtime (sans dispatch).
+fn bf16_gemm_pair(device: &Device) -> Result<(ComputePipelineState, ComputePipelineState)> {
+    let source = format!(
+        "{}{}",
+        super::flags::nax_source_prelude(),
+        include_str!("../na_gemm.metal")
+    );
+    let library = device
+        .new_library_with_source(&source, &super::pipelines::compile_options(true))
+        .map_err(InferError::Metal)?;
+    let p = |name: &str| super::pipelines::pipeline(&library, device, name);
+    Ok((
+        p("gemm_nax_bf16_nt_tiled_x2")?,
+        p("gemm_nax_bf16_nt_tiled_x2_db")?,
+    ))
+}
+
+#[test]
+#[ignore = "requiert un device Metal ; compilation seule, aucun dispatch"]
+fn dense_bf16_db_compiles() -> Result<()> {
+    let device =
+        Device::system_default().ok_or_else(|| InferError::Metal("aucun device".into()))?;
+    bf16_gemm_pair(&device).map(|_| ())
+}
+
+/// Encode un GEMM bf16 et renvoie la sortie lue sur CPU.
+fn run_bf16_gemm(
+    executor: &MetalExecutor,
+    pso: &ComputePipelineState,
+    lhs: &Buffer,
+    rhs: &Buffer,
+    (m, n, k): (usize, usize, usize),
+) -> Result<Vec<f32>> {
+    let out = executor.uncached_f32_buffer(m * n, "test_bf16_db_out")?;
+    let cb = executor.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    executor.encode_dense_bf16_gemm(enc, pso, "test", lhs, rhs, &out, m, n, k)?;
+    enc.end_encoding();
+    commit_and_wait(cb)?;
+    read_f32_buffer(&out, m * n)
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; lancer sous verrou GPU ; poids synthétiques"]
+fn dense_bf16_db_bits() -> Result<()> {
+    let executor = MetalExecutor::new()?;
+    let (base, db) = bf16_gemm_pair(&executor.device)?;
+    // K=64 : un seul pas (pas de préchargement) ; 70 et 130 lignes : tuile M
+    // masquée ; K=5120 : forme du 27B, 80 pas alternant les deux tampons.
+    for (m, n, k) in [
+        (70, 128, 64),
+        (130, 256, 192),
+        (64, 64, 1024),
+        (200, 192, 5120),
+    ] {
+        // Valeurs pseudo-aléatoires non représentables en bf16 côté A.
+        let mut state = 0x9e37_79b9_u32 ^ (m * 31 + n * 7 + k) as u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let a: Vec<f32> = (0..m * k).map(|_| next()).collect();
+        let bits: Vec<u8> = (0..n * k)
+            .flat_map(|_| ((next().to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let lhs = executor.buffer_from_f32(&a, "test_bf16_db_lhs")?;
+        let rhs = executor.weight_buffer_from_bf16_bytes(&bits)?;
+        let expected = run_bf16_gemm(&executor, &base, &lhs, &rhs, (m, n, k))?;
+        let actual = run_bf16_gemm(&executor, &db, &lhs, &rhs, (m, n, k))?;
+        let first = expected
+            .iter()
+            .zip(&actual)
+            .position(|(e, a)| e.to_bits() != a.to_bits());
+        assert_eq!(
+            first, None,
+            "M={m} N={n} K={k} : double tampon non bit-identique"
+        );
+    }
+    Ok(())
+}
+
+/// Sonde ABBA du GEMM bf16 sur les formes du 27B BF16 : médiane de 7 mesures
+/// par bras, bras alternés A B B A dans le même processus.
+#[test]
+#[ignore = "sonde de performance : nécessite Metal, lancer sous verrou GPU au repos"]
+fn dense_bf16_db_probe() -> Result<()> {
+    let executor = MetalExecutor::new()?;
+    let (base, db) = bf16_gemm_pair(&executor.device)?;
+    // gate/up, down, q+gate pleine attention, in_proj qkv linéaire.
+    for (n, k) in [(17408, 5120), (5120, 17408), (12288, 5120), (10240, 5120)] {
+        let bits = vec![0x3e_u8; n * k * 2];
+        let rhs = executor.weight_buffer_from_bf16_bytes(&bits)?;
+        for m in [512, 4096] {
+            let lhs = executor.buffer_from_f32(&vec![0.125; m * k], "probe_bf16_lhs")?;
+            let out = executor.uncached_f32_buffer(m * n, "probe_bf16_out")?;
+            let time = |pso: &ComputePipelineState| -> Result<f64> {
+                let cb = executor.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                for _ in 0..4 {
+                    executor
+                        .encode_dense_bf16_gemm(enc, pso, "probe", &lhs, &rhs, &out, m, n, k)?;
+                }
+                enc.end_encoding();
+                let start = std::time::Instant::now();
+                commit_and_wait(cb)?;
+                Ok(start.elapsed().as_secs_f64() / 4.0)
+            };
+            let (mut ta, mut tb) = (Vec::new(), Vec::new());
+            for round in 0..8 {
+                // Deux tours de chauffe, puis ABBA.
+                let (x, y) = if round % 2 == 0 {
+                    (&base, &db)
+                } else {
+                    (&db, &base)
+                };
+                let (sx, sy) = (time(x)?, time(y)?);
+                if round >= 2 {
+                    let (a, b) = if round % 2 == 0 { (sx, sy) } else { (sy, sx) };
+                    ta.push(a);
+                    tb.push(b);
+                }
+            }
+            ta.sort_by(f64::total_cmp);
+            tb.sort_by(f64::total_cmp);
+            let (a, b) = (ta[ta.len() / 2], tb[tb.len() / 2]);
+            let tflops = |s: f64| 2.0 * (m * n * k) as f64 / s / 1e12;
+            eprintln!(
+                "BF16_DB M={m} N={n} K={k} base_ms={:.3} db_ms={:.3} gain_pct={:+.2} base_TFLOPS={:.2} db_TFLOPS={:.2}",
+                a * 1e3,
+                b * 1e3,
+                100.0 * (a / b - 1.0),
+                tflops(a),
+                tflops(b)
+            );
+        }
+    }
+    Ok(())
+}
