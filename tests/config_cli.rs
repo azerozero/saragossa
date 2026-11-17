@@ -43,5 +43,18 @@ fn check_and_print() {
         text.contains("serve.max_tokens_cap = 4096  # défaut"),
         "{text}"
     );
+    // Env vide ou invalide : pas d'origine env ; alias hérité valide : origine env.
+    let print_with = |name: &str, value: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_saragossa"))
+            .args(["config", "print"])
+            .env_remove("SARAGOSSA_SERVE_QUEUE")
+            .env(name, value)
+            .output()
+            .expect("lancement");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(print_with("SARAGOSSA_SERVE_QUEUE", "").contains("serve.queue = 32  # défaut"));
+    assert!(print_with("SARAGOSSA_SERVE_QUEUE", "abc").contains("serve.queue = 32  # défaut"));
+    assert!(print_with("RETI_SERVE_QUEUE", "7").contains("serve.queue = 7  # env RETI_SERVE_QUEUE"));
     let _ = std::fs::remove_dir_all(dir);
 }

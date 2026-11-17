@@ -121,6 +121,15 @@ mod tests {
     // Un seul test : les atomiques sont globales au processus.
     #[test]
     fn hot_keys_apply_and_frozen_keys_are_refused() {
+        // Les atomiques sont globales : les remettre à 0 même en cas d'échec.
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                READ_TIMEOUT_SECS.store(0, Ordering::Relaxed);
+                MAX_TOKENS_CAP.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = Reset;
         let dir = std::env::temp_dir().join(format!("saragossa-reload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dossier temporaire");
         let file = dir.join("p.toml");
