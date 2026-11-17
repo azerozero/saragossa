@@ -4572,8 +4572,9 @@ fn resident_bf16_qwen_weights(
 /// (`prefill_cache_state` → `prefix_cache_get`/`prefix_cache_put`,
 /// `PrefillKvPlacement` raccordé à `replace_prefill`), alignement de 64 actif
 /// et longueurs multiples de 64 :
-/// - tour 1 : ancre (1024) au cache, queue prolongée en place ;
-/// - tour 2 : hit sur l'ancre du tour 1, nouvelle ancre (1152) puis queue,
+/// - tour 1 : ancre (1024) et prompt complet (1088) au cache, queue
+///   prolongée en place ;
+/// - tour 2 : hit sur le tour 1 (1088, aligné), nouvelle ancre (1152) puis queue,
 ///   prolongés en place dans l'allocation du tour 1, K/V identique au prefill
 ///   à froid, ancre du tour 1 conservée et intacte (1216, aligné, entre
 ///   aussi au cache) ;
@@ -4675,14 +4676,14 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
         assert_eq!(len, 1088 * KV_DIM);
         assert_eq!(
             cached()?,
-            vec![1024],
-            "tour 1 : seule l'ancre entre au cache"
+            vec![1088, 1024],
+            "tour 1 : prompt complet et ancre"
         );
         let anchor1 = anchor_kv()?;
         // Fin de la requête : plus aucune vue au-delà de l'ancre.
         drop(turn1);
 
-        // Tour 2 : hit sur l'ancre du tour 1, prolongé en place.
+        // Tour 2 : hit sur le prompt du tour 1 (aligné), prolongé en place.
         let (turn2, _) = model.prefill_cache_state(p2)?;
         assert_eq!(
             sole_view(&turn2),
@@ -4690,8 +4691,7 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
             "tour 2 en place"
         );
         assert_eq!(kv(&turn2), cold(p2)?, "tour 2 : K/V vs froid");
-        // 1216, multiple de l'alignement, entre aussi au cache.
-        assert_eq!(cached()?, vec![1216, 1152, 1024], "tour 2 et ancres");
+        assert_eq!(cached()?, vec![1216, 1152, 1088, 1024], "tours et ancres");
         assert_eq!(anchor_kv()?, anchor1, "ancre du tour 1 intacte");
 
         // Autre branche depuis l'ancre du tour 1 : une vue plus longue vit
@@ -4733,7 +4733,8 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
 /// Hits du cache de préfixe (ancre alignée, extension résidente) contre le
 /// prefill à froid d'un seul tenant : K/V et état final identiques au bit, y
 /// compris pour des préfixes non alignés et des suffixes de moins de 32 tokens
-/// qui prenaient avant l'extension en lignes. Seules les ancres entrent au cache.
+/// qui prenaient avant l’extension en lignes. Seules les ancres alignées et les
+/// prompts complets entrent au cache.
 /// Projections f32 : alignement automatique de 16 (queue de 32).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
@@ -4842,8 +4843,13 @@ fn check_prefix_cache_aligned_hits(dense_bf16: bool) -> Result<()> {
             .iter()
             .map(|entry| entry.tokens.len())
             .collect::<Vec<_>>();
+        // Ancres alignées pour les extensions, prompts complets pour les
+        // hits exacts.
         assert!(
-            !entries.is_empty() && entries.iter().all(|len| len % align == 0),
+            entries.iter().any(|len| len % align == 0)
+                && entries
+                    .iter()
+                    .all(|entry| entry % align == 0 || *entry == prefix || *entry == len),
             "{prefix}→{len} : entrées {entries:?}"
         );
         for layer in 0..model.layers.len() {

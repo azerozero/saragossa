@@ -126,7 +126,19 @@ fn prefix_extension_matches_cold_prefill_real_model() -> Result<()> {
                 model.clear_prefix_cache();
                 model.prefill_cache_state(&full[..p])?;
                 let warm = model.prefill_cache_state(full)?;
+                // Hit exact : l'entrée du prompt complet, sans queue recalculée.
+                let (exact_cache, exact_state, exact_reused) =
+                    model.prefill_cache_state_reused(full)?;
                 model.clear_prefix_cache();
+                let exact_gap = max_abs_gap(cold.final_state.data(), exact_state.data());
+                let exact_kv = (0..model.layers.len()).all(|index| {
+                    exact_cache.layer_kv_for_test(index) == cold.cache.layer_kv_for_test(index)
+                });
+                if exact_reused != full.len() || exact_gap != 0.0 || !exact_kv {
+                    failures.push(format!(
+                        "ar exact {name} {p}:{s} repris={exact_reused} écart={exact_gap:e}"
+                    ));
+                }
                 let split_gap = max_abs_gap(cold.final_state.data(), split.1.data());
                 let final_gap = max_abs_gap(cold.final_state.data(), warm.1.data());
                 let logits_gap = max_abs_gap(
@@ -233,7 +245,12 @@ fn prefix_extension_matches_cold_prefill_real_model() -> Result<()> {
                     .map(|entry| entry.tokens.len())
                     .max();
                 let warm_tokens = run(full, new_tokens)?;
+                // Hit exact sur le prompt complet.
+                let exact_tokens = run(full, new_tokens)?;
                 model.clear_prefix_cache();
+                if first_divergence(&cold_tokens, &exact_tokens).is_some() {
+                    failures.push(format!("{mode} exact {name} {p}:{s}"));
+                }
                 let divergence = first_divergence(&cold_tokens, &warm_tokens);
                 println!("{mode}\t{name}\t{p}\t{s}\tentrée={reusable:?}\t-\t-\t{divergence:?}");
                 if reusable.is_none() {

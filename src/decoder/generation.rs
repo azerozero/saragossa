@@ -4047,7 +4047,7 @@ impl CausalDecoder {
 
     /// Comme [`Self::prefill_cache_state`], avec le nombre de tokens du prompt
     /// repris du cache de préfixe.
-    fn prefill_cache_state_reused(
+    pub(super) fn prefill_cache_state_reused(
         &self,
         prompt: &[usize],
     ) -> Result<(CausalDecoderCache, Tensor, usize)> {
@@ -4101,6 +4101,8 @@ impl CausalDecoder {
                 false,
             )?;
             state.1 = Tensor::row(final_states.last_row()?.to_vec())?;
+            // Prompt complet pour les hits exacts, sans évincer l'ancre.
+            self.prefix_cache_put_with(prompt, &state, None, None, false)?;
         } else if prefix_cache_enabled() {
             self.prefix_cache_put(prompt, &state, None, None)?;
         }
@@ -4690,7 +4692,8 @@ impl CausalDecoder {
     /// Ancre d'un prompt de `len` tokens repris depuis `from` : la plus grande
     /// longueur alignée suivie d'au moins le suffixe minimal, elle-même à au
     /// moins un suffixe minimal de `from`. Le prompt est calculé en deux temps,
-    /// ancre puis queue, et seule l'ancre entre au cache : la requête suivante
+    /// ancre puis queue. L'ancre entre au cache pour les extensions, le prompt
+    /// complet pour les hits exacts : la requête suivante
     /// qui la prolonge refait les mêmes calculs que son prefill à froid.
     fn prefix_anchor(&self, len: usize, from: usize) -> Option<usize> {
         let (align, tail) = self.prefix_align_policy(len)?;
@@ -4724,9 +4727,12 @@ impl CausalDecoder {
                 )?;
                 output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
                 covered = end;
-                // Seules les longueurs alignées entrent au cache, l'ancre comprise.
-                if policy.is_none_or(|(align, _)| end % align == 0) {
-                    self.prefix_cache_put(&prompt[..end], &output, None, None)?;
+                // Les longueurs alignées (l'ancre comprise) servent aux
+                // extensions ; le prompt complet, calculé comme à froid, aux
+                // hits exacts, sans évincer son ancre.
+                let aligned = policy.is_none_or(|(align, _)| end % align == 0);
+                if aligned || end == prompt.len() {
+                    self.prefix_cache_put_with(&prompt[..end], &output, None, None, aligned)?;
                 }
             }
         }
@@ -4828,9 +4834,17 @@ impl CausalDecoder {
             output.1 = Tensor::row(final_states.last_row()?.to_vec())?;
             captures = stitch_captures(captures, suffix_captures, covered, end, keep_rows)?;
             covered = end;
-            // Seules les longueurs alignées entrent au cache, l'ancre comprise.
-            if policy.is_none_or(|(align, _)| end % align == 0) {
-                self.prefix_cache_put(&prompt[..end], output, history.as_ref(), Some(&captures))?;
+            // Ancres et longueurs alignées pour les extensions, prompt
+            // complet pour les hits exacts (sans évincer son ancre).
+            let aligned = policy.is_none_or(|(align, _)| end % align == 0);
+            if aligned || end == prompt.len() {
+                self.prefix_cache_put_with(
+                    &prompt[..end],
+                    output,
+                    history.as_ref(),
+                    Some(&captures),
+                    aligned,
+                )?;
             }
         }
         Ok((captures, history))
@@ -5018,9 +5032,17 @@ impl CausalDecoder {
                 self.extend_mtp_history_suffix(&output.1, &final_states, suffix, &mut history)?;
                 output.1 = final_state;
                 covered = end;
-                // Seules les longueurs alignées entrent au cache, l'ancre comprise.
-                if policy.is_none_or(|(align, _)| end % align == 0) {
-                    self.prefix_cache_put(&prompt[..end], &output, Some(&history), None)?;
+                // Ancres et longueurs alignées pour les extensions, prompt
+                // complet pour les hits exacts (sans évincer son ancre).
+                let aligned = policy.is_none_or(|(align, _)| end % align == 0);
+                if aligned || end == prompt.len() {
+                    self.prefix_cache_put_with(
+                        &prompt[..end],
+                        &output,
+                        Some(&history),
+                        None,
+                        aligned,
+                    )?;
                 }
             }
         } else if !on_final_state(&output.1)? {
@@ -5431,6 +5453,21 @@ impl CausalDecoder {
         mtp_history: Option<&LayerKvCache>,
         captures: Option<&PrefixCaptures>,
     ) -> Result<()> {
+        self.prefix_cache_put_with(prompt, state, mtp_history, captures, true)
+    }
+
+    /// Comme [`Self::prefix_cache_put`] ; sans `supersede`, les entrées dont
+    /// le prompt est un préfixe restent au cache même si l'état a recopié leur
+    /// K/V : l'entrée d'un prompt complet (hits exacts) s'ajoute à son ancre
+    /// (extensions) au lieu de la remplacer.
+    fn prefix_cache_put_with(
+        &self,
+        prompt: &[usize],
+        state: &(CausalDecoderCache, Tensor),
+        mtp_history: Option<&LayerKvCache>,
+        captures: Option<&PrefixCaptures>,
+        supersede: bool,
+    ) -> Result<()> {
         let capacity = prefix_cache_capacity();
         if capacity == 0 {
             return Ok(());
@@ -5454,7 +5491,9 @@ impl CausalDecoder {
             mtp_history = mtp_history.or(previous.mtp_history);
             captures = captures.or(previous.captures);
         }
-        cache.remove_superseded(prompt, &state.0);
+        if supersede {
+            cache.remove_superseded(prompt, &state.0);
+        }
         cache.entries.insert(
             0,
             PrefixCacheEntry {

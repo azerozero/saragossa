@@ -258,8 +258,10 @@ Correctif (`SARAGOSSA_RUST_PREFIX_ALIGN`, `runtime_flags::prefix_align_for_model
 - les morceaux du prefill résident sont des multiples de 64, et le dernier
   compte au moins 64 lignes ;
 - un prompt de L tokens se calcule en deux temps : l'ancre
-  A = ⌊(L − queue) / alignement⌋ × alignement, puis la queue. Seule l'ancre
-  entre au cache. Une extension ne repart que d'une entrée alignée, suivie d'au
+  A = ⌊(L − queue) / alignement⌋ × alignement, puis la queue. L'ancre entre
+  au cache pour les extensions. Le prompt complet y entre aussi, pour les hits
+  exacts : son état est celui du prefill à froid de L, et son insertion
+  n'évince pas l'ancre. Une extension ne repart que d'une entrée alignée, suivie d'au
   moins une queue. Le mécanisme vaut pour l'AR, le MTP committed et DFlash
   (captures et historique) ;
 - dans serve en AR, la dernière frontière de bloc mémorisée laisse une queue.
