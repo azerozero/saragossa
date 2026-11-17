@@ -2,8 +2,9 @@
 //!
 //! Priorité par clé : CLI > variable d'environnement > profil > défaut. Le
 //! profil ne remplace jamais une variable d'environnement : [`lookup`] n'est
-//! consulté par `env_var` qu'après l'environnement et son alias hérité. Sans
-//! profil installé, rien ne change.
+//! consulté par `env_var` qu'après l'environnement et son alias hérité (une
+//! variable définie mais vide l'emporte donc sur le profil). Sans profil
+//! installé, rien ne change.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -72,9 +73,9 @@ pub struct EnhanceSection {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MemorySection {
-    /// `SARAGOSSA_MEMORY_CAP_BYTES`.
+    /// `SARAGOSSA_SERVE_MEMORY_CAP_BYTES`.
     pub cap_bytes: Option<u64>,
-    /// `SARAGOSSA_MEMORY_HEADROOM_BYTES`.
+    /// `SARAGOSSA_SERVE_MEMORY_HEADROOM_BYTES`.
     pub headroom_bytes: Option<u64>,
 }
 
@@ -99,7 +100,7 @@ pub struct Profile {
 impl Profile {
     /// Parse et valide un profil ; les bornes reprennent celles des lecteurs.
     pub fn parse(text: &str) -> Result<Self, ProfileError> {
-        let profile: Self = toml::from_str(text).map_err(|e| err("TOML", e.message()))?;
+        let profile: Self = toml::from_str(text).map_err(|e| err("TOML", e.to_string()))?;
         let positive = [
             ("serve.max_connections", profile.serve.max_connections),
             ("serve.queue", profile.serve.queue),
@@ -148,9 +149,9 @@ impl Profile {
                 "SARAGOSSA_ENHANCE_IDLE_TIMEOUT_SECS",
                 self.enhance.idle_timeout_secs,
             ),
-            ("SARAGOSSA_MEMORY_CAP_BYTES", self.memory.cap_bytes),
+            ("SARAGOSSA_SERVE_MEMORY_CAP_BYTES", self.memory.cap_bytes),
             (
-                "SARAGOSSA_MEMORY_HEADROOM_BYTES",
+                "SARAGOSSA_SERVE_MEMORY_HEADROOM_BYTES",
                 self.memory.headroom_bytes,
             ),
         ];
@@ -191,7 +192,7 @@ mod tests {
         let env = p.env_entries();
         assert_eq!(env["SARAGOSSA_ENHANCE_MAX_STREAMS"], "4");
         assert_eq!(env["SARAGOSSA_SERVE_QUEUE"], "3");
-        assert_eq!(env["SARAGOSSA_MEMORY_HEADROOM_BYTES"], "0");
+        assert_eq!(env["SARAGOSSA_SERVE_MEMORY_HEADROOM_BYTES"], "0");
         assert!(!env.contains_key("SARAGOSSA_SERVE_MODEL_POOL"));
     }
 
