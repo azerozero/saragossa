@@ -6,18 +6,8 @@ use super::*;
 use std::net::SocketAddr;
 use web_transport_quinn::{RecvStream, SendStream};
 
-/// Le certificat est auto-signé et l'API locale : seul le loopback est admis.
-pub(super) fn require_loopback(addr: SocketAddr) -> ServeResult<()> {
-    if addr.ip().is_loopback() {
-        Ok(())
-    } else {
-        Err(error(format!(
-            "SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR={addr} refusée : WebTransport n'écoute que sur le loopback (127.0.0.0/8 ou [::1])"
-        )))
-    }
-}
 pub(super) fn bind(addr: SocketAddr, front: &Front) -> ServeResult<quinn::Endpoint> {
-    require_loopback(addr)?;
+    super::async_io::require_loopback(addr, "SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR")?;
     let identity = super::certificate::identity(addr)?;
     let endpoint = quinn::Endpoint::server(identity.config, addr).map_err(error)?;
     let mut info = identity.info;
@@ -108,7 +98,11 @@ pub(super) async fn session(conn: quinn::Connection, front: Arc<Front>) -> Serve
     let loader = Arc::clone(&front);
     let model = match deadline(tokio::task::spawn_blocking(move || loader.enhance.model())).await? {
         Ok(model) => model,
-        Err(_) => return reject(request, http::StatusCode::BAD_REQUEST).await,
+        Err(e) => {
+            let status = http::StatusCode::from_u16(super::super::http::error_status(&e))
+                .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+            return reject(request, status).await;
+        }
     };
     let mut worker = Worker::new(model, config, slot);
     let session = deadline(request.ok()).await?;

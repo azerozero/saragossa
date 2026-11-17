@@ -3,6 +3,7 @@ use super::pcm::{invalid, Config, Pcm, MAX_FRAME};
 use super::*;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::io::Cursor;
+use std::time::{Duration, Instant};
 
 impl EnhanceService {
     pub(in crate::serve) fn handle_ws<S: ServeStream>(
@@ -10,6 +11,13 @@ impl EnhanceService {
         socket: &mut S,
         request: &mut HttpRequest,
     ) -> ServeResult<()> {
+        // Un navigateur joint toujours Origin : une page tierce ne doit pas piloter l'endpoint local.
+        if request
+            .header("origin")
+            .is_some_and(|o| !loopback_origin(o))
+        {
+            return send_error(socket, 403, "origine WebSocket non loopback refusée");
+        }
         let Some(_slot) = Reservation::acquire(&self.active, 1, enhance_max_streams()) else {
             return send_error(socket, 503, "trop de flux enhance simultanés");
         };
@@ -23,15 +31,26 @@ impl EnhanceService {
             Ok(value) => value,
             Err(error) => return reply_on_error(socket, Err(error)),
         };
-        let mut pcm = Pcm::new(&model, config)?;
+        let mut pcm = match Pcm::new(&model, config) {
+            Ok(pcm) => pcm,
+            Err(error) => return reply_on_error(socket, Err(error)),
+        };
         write!(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n")
             .map_err(|e| ServeError::io("handshake WS", e))?;
-        if request
-            .header("sec-websocket-protocol")
-            .is_some_and(|v| v.split(',').any(|p| p.trim() == "saragossa"))
-        {
-            socket
-                .write_all(b"Sec-WebSocket-Protocol: saragossa\r\n")
+        // Le navigateur exige qu'un sous-protocole proposé soit renvoyé tel quel.
+        let offered = request.header("sec-websocket-protocol").unwrap_or("");
+        let chosen = offered
+            .split(',')
+            .map(str::trim)
+            .find(|p| *p == "saragossa")
+            .or_else(|| {
+                offered
+                    .split(',')
+                    .map(str::trim)
+                    .find(|p| p.starts_with("bearer."))
+            });
+        if let Some(protocol) = chosen {
+            write!(socket, "Sec-WebSocket-Protocol: {protocol}\r\n")
                 .map_err(|e| ServeError::io("protocole WS", e))?;
         }
         socket
@@ -42,7 +61,52 @@ impl EnhanceService {
             prefix: Cursor::new(request.take_prefix()),
             socket,
         };
-        session(&mut wire, &mut pcm)
+        session(&mut wire, &mut pcm, enhance_idle_timeout())
+    }
+}
+/// Origin d'un navigateur sur la machine locale, quel que soit le port.
+fn loopback_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let (host, port) = if let Some(inner) = rest.strip_prefix('[') {
+        let Some((host, tail)) = inner.split_once(']') else {
+            return false;
+        };
+        (host, tail.strip_prefix(':').unwrap_or(tail))
+    } else {
+        rest.split_once(':').unwrap_or((rest, ""))
+    };
+    port.bytes().all(|b| b.is_ascii_digit())
+        && (host == "localhost"
+            || host == "::1"
+            || host
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| ip.is_loopback()))
+}
+/// Pings ou pongs tolérés entre deux messages de données.
+const MAX_CONTROL_RUN: usize = 32;
+/// Code de fermeture RFC 6455 pour une erreur PCM : 1007 donnée invalide, 1011 interne.
+fn close_code(error: &ServeError) -> u16 {
+    match error {
+        ServeError::Args(_) | ServeError::Http(_) | ServeError::InvalidParameter { .. } => 1007,
+        _ => 1011,
+    }
+}
+/// Lecteur dont l'échéance est fixée pour toute une trame, pas par `read()`.
+struct Until<'a, R>(&'a mut R, Instant);
+impl<R: Read> Read for Until<'_, R> {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.1 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "trame WS trop lente",
+            ));
+        }
+        self.0.read(b)
     }
 }
 fn handshake(request: &HttpRequest) -> ServeResult<String> {
@@ -101,11 +165,13 @@ impl<S: Write> Write for Wire<'_, S> {
         self.socket.flush()
     }
 }
-fn session(socket: &mut (impl Read + Write), pcm: &mut Pcm<'_>) -> ServeResult<()> {
+fn session(socket: &mut (impl Read + Write), pcm: &mut Pcm<'_>, idle: Duration) -> ServeResult<()> {
     let mut fragmented = false;
     let mut message = Vec::new();
+    let mut controls = 0;
     loop {
-        let (fin, opcode, bytes) = match read_frame(socket) {
+        let frame = read_frame(&mut Until(socket, Instant::now() + idle));
+        let (fin, opcode, bytes) = match frame {
             Ok(frame) => frame,
             Err((code, error)) => {
                 let _ = write_frame(socket, 8, &code.to_be_bytes());
@@ -120,13 +186,23 @@ fn session(socket: &mut (impl Read + Write), pcm: &mut Pcm<'_>) -> ServeResult<(
                 }
                 return write_frame(socket, 8, &bytes);
             }
-            9 => write_frame(socket, 10, &bytes)?,
-            10 => {}
+            9 | 10 => {
+                controls += 1;
+                if controls > MAX_CONTROL_RUN {
+                    write_frame(socket, 8, &1008_u16.to_be_bytes())?;
+                    return Err(invalid("trop de pings WS sans audio"));
+                }
+                if opcode == 9 {
+                    write_frame(socket, 10, &bytes)?;
+                }
+            }
             2 if !fragmented => {
+                controls = 0;
                 message.extend(bytes);
                 fragmented = !fin;
             }
             0 if fragmented => {
+                controls = 0;
                 message.extend(bytes);
                 fragmented = !fin;
             }
@@ -141,20 +217,23 @@ fn session(socket: &mut (impl Read + Write), pcm: &mut Pcm<'_>) -> ServeResult<(
         }
         if opcode <= 2 && fin {
             if message.is_empty() {
-                let output = pcm.finish()?;
+                let output = pcm.finish().inspect_err(|e| fail(socket, e))?;
                 if !output.is_empty() {
                     write_frame(socket, 2, &output)?;
                 }
                 write_frame(socket, 2, &[])?;
                 return write_frame(socket, 8, &1000_u16.to_be_bytes());
             }
-            let output = pcm.push(&message)?;
+            let output = pcm.push(&message).inspect_err(|e| fail(socket, e))?;
             if !output.is_empty() {
                 write_frame(socket, 2, &output)?;
             }
             message.clear();
         }
     }
+}
+fn fail(socket: &mut impl Write, error: &ServeError) {
+    let _ = write_frame(socket, 8, &close_code(error).to_be_bytes());
 }
 fn valid_close(bytes: &[u8]) -> bool {
     if bytes.is_empty() {

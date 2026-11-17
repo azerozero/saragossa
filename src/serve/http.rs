@@ -788,7 +788,7 @@ fn sanitize_header_value(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
-fn error_status(error: &ServeError) -> u16 {
+pub(in crate::serve) fn error_status(error: &ServeError) -> u16 {
     match error {
         ServeError::UnknownModel(_) => 404,
         ServeError::Args(_)
@@ -816,7 +816,7 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
+pub(in crate::serve) fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
     #[cfg(feature = "ws")]
     if request.method == "GET"
         && request.route() == "/v1/audio/enhance/ws"

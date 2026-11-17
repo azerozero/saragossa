@@ -205,8 +205,13 @@ sans file audio. Les limites de flux (503 avant upgrade), délais d'inactivité
 et réservations sont partagés avec le chunked.
 
 Le navigateur ne permet pas d'ajouter `Authorization` au handshake WebSocket.
-Le serveur accepte donc aussi `bearer.<clé>` dans les sous-protocoles, sans
-renvoyer cette valeur ; seul `saragossa` est négocié. La clé doit être un token
+Le serveur accepte donc aussi `bearer.<clé>` dans les sous-protocoles, et
+renvoie le sous-protocole choisi (`saragossa` s'il est proposé, sinon la valeur
+`bearer.<clé>`, que le navigateur exige). Un `Origin` non loopback (hors
+`http(s)://127.0.0.1`, `localhost`, `[::1]`, tous ports) reçoit 403 avant
+l'upgrade, avec ou sans clé. Chaque trame doit arriver en entier avant le délai
+d'inactivité, et plus de 32 pings/pongs sans audio ferment la session (1008).
+Une erreur PCM après l'upgrade ferme avec 1007 ou 1011. La clé doit être un token
 HTTP valide (par exemple une chaîne hexadécimale). Hors boucle locale, placer
 le listener derrière un proxy TLS (`wss://`) qui conserve l'upgrade.
 
@@ -239,7 +244,8 @@ ws.send(new Uint8Array()); // vider le retard avant close
 `--features h2` active les dépendances async optionnelles (hors `default`).
 Le listener dédié est explicitement activé par
 `SARAGOSSA_ENHANCE_H2_ADDR=127.0.0.1:8082` ; le listener HTTP/1 reste disponible.
-Le démarrage échoue si l'adresse ne peut pas être liée ou si aucune clé API
+Le démarrage échoue si l'adresse n'est pas loopback (127.0.0.0/8 ou `[::1]`),
+ne peut pas être liée ou si aucune clé API
 n'est configurée. Le listener accepte le **prior knowledge h2c**, sans upgrade
 HTTP/1 ni TLS intégré. Pour un navigateur, un proxy TLS avec ALPN `h2` doit
 terminer HTTPS et transmettre vers ce listener.

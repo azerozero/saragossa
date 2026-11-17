@@ -321,16 +321,3 @@ async fn unread_output_applies_backpressure_and_releases_slot() {
     }
     panic!("réservation retenue après contre-pression");
 }
-
-#[test]
-fn only_loopback_addresses_are_accepted() {
-    for ok in ["127.0.0.1:4433", "127.0.0.2:0", "[::1]:4433"] {
-        assert!(require_loopback(ok.parse().unwrap()).is_ok(), "{ok}");
-    }
-    for refused in ["0.0.0.0:4433", "192.168.1.10:4433", "[::]:4433"] {
-        assert!(
-            require_loopback(refused.parse().unwrap()).is_err(),
-            "{refused}"
-        );
-    }
-}

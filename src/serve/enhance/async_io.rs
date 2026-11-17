@@ -7,6 +7,16 @@ use tokio::sync::mpsc;
 pub(super) fn error(error: impl std::fmt::Display) -> ServeError {
     ServeError::args(format!("transport enhance: {error}"))
 }
+/// Certificat auto-signé et API locale : seuls les listeners loopback sont admis.
+pub(super) fn require_loopback(addr: std::net::SocketAddr, name: &str) -> ServeResult<()> {
+    if addr.ip().is_loopback() {
+        Ok(())
+    } else {
+        Err(error(format!(
+            "{name}={addr} refusée : l'écoute n'est admise que sur le loopback (127.0.0.0/8 ou [::1])"
+        )))
+    }
+}
 pub(super) async fn deadline<T, E: std::fmt::Display>(
     future: impl Future<Output = Result<T, E>>,
 ) -> ServeResult<T> {
@@ -103,7 +113,10 @@ pub(in crate::serve) fn start(
                         if front.api_key.is_none() {
                             return Err(error("h2 requiert SARAGOSSA_API_KEY"));
                         }
-                        let listener = tokio::net::TcpListener::bind(&addr).await.map_err(error)?;
+                        let parsed: std::net::SocketAddr = addr.parse().map_err(error)?;
+                        super::async_io::require_loopback(parsed, "SARAGOSSA_ENHANCE_H2_ADDR")?;
+                        let listener =
+                            tokio::net::TcpListener::bind(parsed).await.map_err(error)?;
                         eprintln!("enhance h2c: {}", listener.local_addr().map_err(error)?);
                         tokio::spawn(super::h2::listen(
                             listener,
@@ -147,4 +160,21 @@ pub(in crate::serve) fn start(
     };
     startup.recv().map_err(error)??;
     Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_loopback_addresses_are_accepted() {
+        for ok in ["127.0.0.1:4433", "127.0.0.2:0", "[::1]:4433"] {
+            assert!(require_loopback(ok.parse().unwrap(), "X").is_ok(), "{ok}");
+        }
+        for refused in ["0.0.0.0:4433", "192.168.1.10:4433", "[::]:4433"] {
+            assert!(
+                require_loopback(refused.parse().unwrap(), "X").is_err(),
+                "{refused}"
+            );
+        }
+    }
 }

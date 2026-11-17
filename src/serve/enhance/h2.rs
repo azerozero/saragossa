@@ -19,7 +19,15 @@ pub(super) async fn listen(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((socket, _)) = accepted else { break; };
+                let (socket, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        // NOTE: EMFILE ou ECONNABORTED sont transitoires, le listener survit.
+                        eprintln!("enhance h2c accept: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 let Some(slot) = Reservation::acquire(&connections, 1, saragossa::runtime_flags::serve_max_connections()) else {
                     // Avant SETTINGS, aucune réponse HTTP/2 ne peut être envoyée.
                     drop(socket); continue;
@@ -111,7 +119,7 @@ async fn request_stream(
     let loader = Arc::clone(&front);
     let model = match deadline(tokio::task::spawn_blocking(move || loader.enhance.model())).await? {
         Ok(model) => model,
-        Err(_) => return reject(&mut response, 400).await,
+        Err(e) => return reject(&mut response, super::super::http::error_status(&e)).await,
     };
     let mut worker = Worker::new(model, config, slot);
     let mut send = response

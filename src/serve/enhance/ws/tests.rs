@@ -166,7 +166,7 @@ fn idle_and_backpressure_close_the_socket() {
             },
         )
         .unwrap();
-        assert!(session(&mut server, &mut pcm).is_err());
+        assert!(session(&mut server, &mut pcm, Duration::from_millis(80)).is_err());
     });
     assert_eq!(frame(&mut client).0, 8);
     worker.join().unwrap();
@@ -245,4 +245,164 @@ fn invalid_handshake_and_query_precede_model_loading() {
         assert!(headers(&mut BufReader::new(client)).starts_with("HTTP/1.1 400"));
         assert!(service.model.lock().unwrap().is_none());
     }
+}
+
+struct Drip(Vec<u8>);
+impl Read for Drip {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        std::thread::sleep(Duration::from_millis(20));
+        if self.0.is_empty() {
+            return Ok(0);
+        }
+        b[0] = self.0.remove(0);
+        Ok(1)
+    }
+}
+impl Write for Drip {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+fn pcm_config(model: &DeepFilterNet3) -> Pcm<'_> {
+    Pcm::new(
+        model,
+        Config {
+            rate: 48000,
+            float: true,
+        },
+    )
+    .unwrap()
+}
+#[test]
+fn byte_per_read_client_is_evicted_by_frame_deadline() {
+    let mut wire = Vec::new();
+    masked(&mut wire, 2, &[0; 64]);
+    let model = model();
+    let mut pcm = pcm_config(&model);
+    let start = Instant::now();
+    // Chaque read() arrive avant 100 ms : seule l'échéance de trame peut expulser.
+    let result = session(&mut Drip(wire), &mut pcm, Duration::from_millis(100));
+    assert!(result.is_err());
+    assert!(start.elapsed() < Duration::from_secs(2));
+}
+#[test]
+fn ping_flood_without_audio_is_closed_1008() {
+    struct Flood(Cursor<Vec<u8>>, Vec<u8>);
+    impl Read for Flood {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            self.0.read(b)
+        }
+    }
+    impl Write for Flood {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.1.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut wire = Vec::new();
+    for _ in 0..(MAX_CONTROL_RUN + 2) {
+        masked(&mut wire, 9, b"p");
+    }
+    let model = model();
+    let mut pcm = pcm_config(&model);
+    let mut flood = Flood(Cursor::new(wire), Vec::new());
+    assert!(session(&mut flood, &mut pcm, Duration::from_secs(5)).is_err());
+    let tail = &flood.1[flood.1.len() - 4..];
+    assert_eq!(tail, [0x88, 2, 0x03, 0xf0]);
+}
+fn upgrade(service: &EnhanceService, raw: String) -> String {
+    let (mut client, mut server) = pair();
+    client.write_all(raw.as_bytes()).unwrap();
+    let (mut req, _) = read_head(&mut server, Instant::now() + Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    // Le client ferme proprement pour que la session se termine.
+    let worker = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| service.handle_ws(&mut server, &mut req));
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let head = headers(&mut reader);
+        if head.starts_with("HTTP/1.1 101") {
+            masked(&mut client, 8, &1000_u16.to_be_bytes());
+        }
+        let _ = handle.join().unwrap();
+        head
+    });
+    worker
+}
+#[test]
+fn foreign_origin_is_refused_and_loopback_origin_accepted() {
+    let service = service();
+    let with = |origin: &str| {
+        String::from_utf8(request()).unwrap().replace(
+            "Host: localhost\r\n",
+            &format!("Host: localhost\r\nOrigin: {origin}\r\n"),
+        )
+    };
+    for bad in [
+        "https://evil.example",
+        "http://127.0.0.1.evil.example",
+        "http://192.168.1.2:3000",
+        "null",
+    ] {
+        assert!(
+            upgrade(&service, with(bad)).starts_with("HTTP/1.1 403"),
+            "{bad}"
+        );
+    }
+    for good in [
+        "http://127.0.0.1:5173",
+        "http://localhost",
+        "https://localhost:8443",
+        "http://[::1]:3000",
+    ] {
+        assert!(
+            upgrade(&service, with(good)).starts_with("HTTP/1.1 101"),
+            "{good}"
+        );
+    }
+    assert!(upgrade(&service, String::from_utf8(request()).unwrap()).starts_with("HTTP/1.1 101"));
+}
+#[test]
+fn bearer_subprotocol_is_authenticated_and_echoed() {
+    let raw = |protocols: &str| {
+        String::from_utf8(request()).unwrap().replace(
+            "\r\n\r\n",
+            &format!("\r\nSec-WebSocket-Protocol: {protocols}\r\n\r\n"),
+        )
+    };
+    let parse = |raw: String| {
+        let (mut client, mut server) = pair();
+        client.write_all(raw.as_bytes()).unwrap();
+        read_head(&mut server, Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
+            .0
+    };
+    let good = parse(raw("bearer.secret"));
+    assert!(crate::serve::http::is_authorized(&good, "secret"));
+    assert!(!crate::serve::http::is_authorized(&good, "other"));
+    let none = parse(String::from_utf8(request()).unwrap());
+    assert!(!crate::serve::http::is_authorized(&none, "secret"));
+    let service = service();
+    let head = upgrade(&service, raw("bearer.secret"));
+    assert!(
+        head.contains("Sec-WebSocket-Protocol: bearer.secret"),
+        "{head}"
+    );
+    let head = upgrade(&service, raw("saragossa, bearer.secret"));
+    assert!(head.contains("Sec-WebSocket-Protocol: saragossa"), "{head}");
+}
+#[test]
+fn pcm_errors_map_to_close_codes() {
+    assert_eq!(close_code(&invalid("x")), 1007);
+    assert_eq!(
+        close_code(&ServeError::io("x", io::Error::other("x"))),
+        1011
+    );
 }
