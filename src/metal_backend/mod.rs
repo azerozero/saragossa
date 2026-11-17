@@ -136,7 +136,8 @@ mod transfer;
     expect(dead_code, reason = "arbre construit par la boucle DFlash (devtools)")
 )]
 mod verify_tree;
-#[cfg(feature = "stt")]
+#[cfg(any(feature = "stt", feature = "diar"))]
+#[cfg_attr(not(feature = "stt"), allow(dead_code))]
 mod whisper_encode;
 
 #[cfg(all(test, any(feature = "tts", feature = "denoise")))]
@@ -163,7 +164,7 @@ pub(crate) use self::linear_attention::linear_tree_journal_refusal;
 pub(crate) use self::linear_attention::{linear_tree_refusal, LinearTreeShape};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) use self::matmul::take_concat_profile;
-#[cfg(feature = "stt")]
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(crate) use self::matmul::whisper_bf16_gemm_enabled;
 pub(crate) use self::matmul::whisper_decode_bf16_qmv_enabled;
 use self::na_gemm::NA_GEMM_SRC;
@@ -191,8 +192,11 @@ pub(crate) fn qmvt_dispatches_for_test() -> usize {
 #[cfg(feature = "stt")]
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
-    WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
     WhisperStepEmit, WhisperStepOutput,
+};
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(crate) use self::whisper_encode::{
+    WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
 };
 
 fn ensure_valid_top_k(top_k: usize, expert_count: usize) -> Result<()> {
@@ -373,6 +377,8 @@ pub struct MetalExecutor {
     whisper_attn_decode_vec64_f32: ComputePipelineState,
     im2col_f32: ComputePipelineState,
     rms_norm_rope_heads_f32: ComputePipelineState,
+    #[cfg(feature = "diar")]
+    rope_heads_inplace_f32: ComputePipelineState,
     rms_norm_mrope_heads_f32: ComputePipelineState,
     rms_norm_heads_no_scale_f32: ComputePipelineState,
     causal_attention_prefill_f32: ComputePipelineState,

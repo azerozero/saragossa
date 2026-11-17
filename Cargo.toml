@@ -48,9 +48,10 @@ name = "quant_micro"
 required-features = ["metal", "devtools"]
 
 [features]
-default = ["metal", "devtools", "stt", "tts", "vision", "denoise", "embed", "serve", "decision"]
+default = ["metal", "devtools", "stt", "tts", "diar", "vision", "denoise", "embed", "serve", "decision"]
 stt = ["dep:flate2", "dep:rustfft", "dep:hound"]
 tts = ["dep:rustfft", "dep:hound"]
+diar = ["dep:rustfft", "dep:hound"]
 vision = []
 denoise = ["dep:rustfft", "dep:hound"]
 embed = []

@@ -29,6 +29,8 @@ pub(super) struct ServeArgs {
     pub(super) models: Vec<ServeModelConfig>,
     /// Répertoire du modèle STT Whisper exposé sur `/v1/audio/transcriptions`.
     pub(super) stt_model: Option<PathBuf>,
+    /// Répertoire du modèle de diarisation exposé sur `/v1/audio/diarization`.
+    pub(super) diar_model: Option<PathBuf>,
     /// Répertoire du modèle TTS Qwen3 exposé sur `/v1/audio/speech`.
     pub(super) tts_model: Option<PathBuf>,
     /// Répertoire du modèle d'embeddings e5-small exposé sur `/v1/embeddings`.
@@ -68,6 +70,7 @@ impl ServeArgs {
         let mut models = Vec::new();
         let mut stt_model = None;
         let mut tts_model = None;
+        let mut diar_model = None;
         let mut embed_model = None;
         let mut enhance_model = None;
         let mut backend = RuntimeKind::default_backend();
@@ -119,6 +122,10 @@ impl ServeArgs {
                     require_feature("--stt-model", "stt", cfg!(feature = "stt"))?;
                     stt_model = Some(next_value(&mut iter, "--stt-model")?.into());
                 }
+                "--diar-model" => {
+                    require_feature("--diar-model", "diar", cfg!(feature = "diar"))?;
+                    diar_model = Some(next_value(&mut iter, "--diar-model")?.into());
+                }
                 "--tts-model" => {
                     require_feature("--tts-model", "tts", cfg!(feature = "tts"))?;
                     tts_model = Some(next_value(&mut iter, "--tts-model")?.into());
@@ -169,6 +176,7 @@ impl ServeArgs {
             api_key,
             models,
             stt_model,
+            diar_model,
             tts_model,
             embed_model,
             enhance_model,
@@ -196,6 +204,11 @@ pub(super) fn help_text() -> String {
     let mut modality_options = String::new();
     let mut modality_help = String::new();
     for (enabled, flag, description) in [
+        (
+            cfg!(feature = "diar"),
+            "--diar-model",
+            "Nemotron-3-Diarization on /v1/audio/diarization",
+        ),
         (
             cfg!(feature = "stt"),
             "--stt-model",
@@ -249,7 +262,7 @@ pub(super) fn help_text() -> String {
          or {API_KEY_ENV}.\n\
          Endpoints: GET /v1/models, POST /v1/chat/completions, \\
          POST /v1/audio/transcriptions, POST /v1/audio/transcriptions/stream, \
-         POST /v1/audio/speech, POST /v1/audio/enhance, POST /v1/embeddings"
+         POST /v1/audio/diarization, POST /v1/audio/speech, POST /v1/audio/enhance, POST /v1/embeddings"
     )
 }
 
@@ -371,6 +384,7 @@ mod tests {
     fn modality_options_follow_compiled_features() {
         let help = help_text();
         for (enabled, flag, feature) in [
+            (cfg!(feature = "diar"), "--diar-model", "diar"),
             (cfg!(feature = "stt"), "--stt-model", "stt"),
             (cfg!(feature = "tts"), "--tts-model", "tts"),
             (cfg!(feature = "embed"), "--embed-model", "embed"),
@@ -381,6 +395,7 @@ mod tests {
             if enabled {
                 let args = parsed.expect("invariant: modalité compilée acceptée");
                 let path = match feature {
+                    "diar" => args.diar_model,
                     "stt" => args.stt_model,
                     "tts" => args.tts_model,
                     "denoise" => args.enhance_model,

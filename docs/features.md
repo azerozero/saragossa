@@ -11,6 +11,7 @@ emplacement ; les gardes portent sur leurs entrées et leurs dépendances.
 | `devtools` | Diagnostics, conversion, oracles et draft DFlash | Aucune |
 | `stt` | Whisper, transcription et sessions incrémentales | `dep:flate2`, `dep:rustfft`, `dep:hound` |
 | `tts` | Talker Qwen3, codec, Mimi, clonage et voix | `dep:rustfft`, `dep:hound` |
+| `diar` | Nemotron-3-Diarization, commande `diarize` et route `/v1/audio/diarization` | `dep:rustfft`, `dep:hound` |
 | `vision` | Entrées internes image/embeddings et oracles M-RoPE | Aucune |
 | `denoise` | DeepFilterNet3 CPU, commande `enhance` et route `/v1/audio/enhance` | `dep:rustfft`, `dep:hound` |
 | `embed` | Embedder texte e5-small | Aucune |
@@ -19,7 +20,7 @@ emplacement ; les gardes portent sur leurs entrées et leurs dépendances.
 
 Le classifieur spéculatif sur embeddings nécessite `decision` **et** `embed`.
 Sans lui, le routage heuristique du cœur LLM reste disponible. `serve` n'active
-aucune modalité implicitement. Une route STT/TTS/débruitage/embeddings non
+aucune modalité implicitement. Une route STT/TTS/diarisation/débruitage/embeddings non
 compilée répond HTTP **501** avec la feature à activer, y compris pour un corps invalide ; une
 modalité compilée mais non configurée garde son erreur **400** habituelle.
 Les commandes absentes n'apparaissent pas dans l'aide CLI.
@@ -28,6 +29,11 @@ comme les options STT/TTS/embeddings. La route `POST /v1/audio/enhance`
 répond alors **501** avant de décoder le corps. Avec `denoise`, les poids DFN3
 sont chargés à la demande depuis `--enhance-model FILE` ; une route non
 configurée conserve son erreur **400**.
+
+`diar` n'active ni `stt`, ni `tts`, ni `metal`. Sans elle, `diarize` et
+`serve --diar-model` sont refusés ; la route répond **501**. Avec elle,
+`serve --diar-model DIR` charge les poids à la demande. La commande hors ligne
+accepte `--cpu` pour fonctionner sans Metal.
 
 `denoise` n'active ni `stt`, ni `tts`, ni `metal` : le moteur DFN3 et son
 rééchantillonnage fonctionnent sur CPU. L'entrée WAV est convertie en mono
@@ -81,7 +87,7 @@ d'outil ni télécharger de dépendance :
 ```bash
 set -euo pipefail
 export CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2
-features=(devtools stt tts vision denoise embed serve decision)
+features=(devtools stt tts diar vision denoise embed serve decision)
 taskpolicy -b cargo check --all-targets --no-default-features --features metal
 for feature in "${features[@]}"; do
   taskpolicy -b cargo check --all-targets --no-default-features --features "metal,$feature"

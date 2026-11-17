@@ -8,6 +8,8 @@ mod bench_serve;
 mod convert_cli;
 #[cfg(feature = "decision")]
 mod decide_cli;
+#[cfg(feature = "diar")]
+mod diarize_cli;
 mod hf_cache;
 mod hf_resolve;
 mod run_repl;
@@ -112,6 +114,14 @@ fn run() -> CliResult<()> {
             "doctor" => return doctor_bench::run_doctor(raw_args.into_iter().skip(1)),
             #[cfg(feature = "decision")]
             "decide" => return decide_cli::run(raw_args.into_iter().skip(1)),
+            #[cfg(feature = "diar")]
+            "diarize" => return diarize_cli::run(raw_args.into_iter().skip(1)),
+            #[cfg(not(feature = "diar"))]
+            "diarize" => {
+                return Err(cli_error(
+                    "diarisation absente : recompiler avec --features diar",
+                ))
+            }
             #[cfg(feature = "denoise")]
             "enhance" => return voice_cli::run_enhance(raw_args.into_iter().skip(1)),
             #[cfg(not(feature = "denoise"))]
@@ -934,6 +944,7 @@ fn help_text() -> String {
     let commands = [
         Some("doctor"),
         Some("bench"),
+        cfg!(feature = "diar").then_some("diarize"),
         cfg!(feature = "denoise").then_some("enhance"),
         cfg!(feature = "serve").then_some("serve"),
         cfg!(feature = "serve").then_some("bench-serve"),
@@ -1070,6 +1081,7 @@ mod tests {
             ("bench-serve", cfg!(feature = "serve")),
             ("decide", cfg!(feature = "decision")),
             ("enhance", cfg!(feature = "denoise")),
+            ("diarize", cfg!(feature = "diar")),
             ("convert-qwen4exp", cfg!(feature = "devtools")),
         ] {
             assert_eq!(help.contains(command), available, "{command}: {help}");

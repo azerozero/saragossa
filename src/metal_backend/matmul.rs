@@ -112,7 +112,7 @@ fn concat_weight_key(weights: &[&LinearWeight]) -> Option<ConcatWeightKey> {
 /// par défaut si disponible. `SARAGOSSA_STT_F32=1` force l'ancien chemin f32 ;
 /// `SARAGOSSA_STT_BF16=0` garde aussi un kill-switch compatible avec les anciens benches.
 /// bf16-input / accumulation f32.
-#[cfg(feature = "stt")]
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(crate) fn whisper_bf16_gemm_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {

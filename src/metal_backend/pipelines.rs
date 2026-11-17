@@ -698,6 +698,8 @@ impl MetalExecutor {
         let im2col_f32 = pipeline(&library, &device, "im2col_f32")?;
         let rms_norm_mrope_heads_f32 = pipeline(&library, &device, "rms_norm_mrope_heads_f32")?;
         let rms_norm_rope_heads_f32 = pipeline(&library, &device, "rms_norm_rope_heads_f32")?;
+        #[cfg(feature = "diar")]
+        let rope_heads_inplace_f32 = pipeline(&library, &device, "rope_heads_inplace_f32")?;
         let rms_norm_heads_no_scale_f32 =
             pipeline(&library, &device, "rms_norm_heads_no_scale_f32")?;
         let causal_attention_prefill_f32 =
@@ -1055,6 +1057,8 @@ impl MetalExecutor {
             whisper_attn_decode_vec64_f32,
             im2col_f32,
             rms_norm_rope_heads_f32,
+            #[cfg(feature = "diar")]
+            rope_heads_inplace_f32,
             rms_norm_mrope_heads_f32,
             rms_norm_heads_no_scale_f32,
             causal_attention_prefill_f32,

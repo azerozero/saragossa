@@ -9,6 +9,8 @@
 
 pub mod activation;
 pub mod assets;
+#[cfg(any(feature = "stt", feature = "diar"))]
+mod audio_attention;
 #[cfg(any(feature = "tts", feature = "denoise", all(test, feature = "stt")))]
 mod audio_resample;
 pub mod catalog;
@@ -21,6 +23,8 @@ pub mod decoder;
 pub mod denoise;
 #[cfg(feature = "devtools")]
 pub mod devtools;
+#[cfg(feature = "diar")]
+pub mod diarization;
 pub mod embedding;
 pub mod error;
 #[cfg(test)]
@@ -69,7 +73,12 @@ pub(crate) mod vision;
 #[cfg(feature = "stt")]
 pub mod whisper;
 #[doc(hidden)]
-#[cfg(any(feature = "stt", feature = "tts", feature = "denoise"))]
+#[cfg(any(
+    feature = "stt",
+    feature = "tts",
+    feature = "diar",
+    feature = "denoise"
+))]
 pub mod wire_audio;
 
 #[cfg(test)]
