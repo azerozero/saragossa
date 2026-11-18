@@ -140,7 +140,9 @@ kernel void dense_qmv_rhs_bf16_f32(
 // en decode M=1. Ici chaque simdgroup charge un bloc de 256 poids de sa ligne
 // en uint4 (16 octets par lane), le transpose en mémoire threadgroup, puis
 // chaque lane relit ses éléments k = l + 32 i : l'ordre d'accumulation et
-// l'expression restent ceux du noyau par ligne, donc sortie identique au bit.
+// l'expression restent ceux du noyau par ligne : identité au bit par
+// construction au niveau source, vérifiée par le test
+// `dense_bf16_qmv_stage_matches_row_qmv_bitwise` (fast-math actif et coupé).
 // Quatre lignes (une par simdgroup) par threadgroup. Exige in_dim % 256 == 0.
 kernel void dense_qmv_rhs_bf16_stage_f32(
     device const float* lhs [[buffer(0)]],
@@ -151,7 +153,8 @@ kernel void dense_qmv_rhs_bf16_stage_f32(
     uint lane [[thread_index_in_simdgroup]],
     uint2 tile [[threadgroup_position_in_grid]]
 ) {
-    threadgroup bfloat stage[4][256];
+    // uint4 : alignement de 16 octets garanti pour les écritures vectorisées.
+    threadgroup uint4 stage[4][32];
     const uint batch = dims.x;
     const uint out_dim = dims.y;
     const uint in_dim = dims.z;
@@ -162,10 +165,10 @@ kernel void dense_qmv_rhs_bf16_stage_f32(
     }
     const device float* x = lhs + b * in_dim;
     const device uint4* w = (const device uint4*)(rhs + row * in_dim);
-    threadgroup bfloat* mine = stage[simd_gid];
+    threadgroup const bfloat* mine = (threadgroup const bfloat*)stage[simd_gid];
     float acc = 0.0f;
     for (uint kb = 0u; kb < in_dim; kb += 256u) {
-        ((threadgroup uint4*)mine)[lane] = w[kb / 8u + lane];
+        stage[simd_gid][lane] = w[kb / 8u + lane];
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = 0u; i < 8u; ++i) {
             acc += x[kb + lane + 32u * i] * float(mine[lane + 32u * i]);
