@@ -477,6 +477,80 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Gate + up + SwiGLU bf16 fusionnés (opt-in), identique au bit au chemin
+    /// séparé qmv + qmv + `swiglu_f32`. Renvoie `false` sans rien encoder hors
+    /// du domaine où ce chemin séparé passe par le qmv (GEMM au-delà).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde.
+    pub(crate) fn encode_gate_up_swiglu_bf16(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs: &BufferRef,
+        gate: &MetalLinearWeightBuffers,
+        up: &MetalLinearWeightBuffers,
+        out: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+    ) -> Result<bool> {
+        let (
+            MetalLinearWeightBuffers::DenseBf16 {
+                rhs: gate_rhs,
+                out_dim,
+                in_dim: gate_in,
+            },
+            MetalLinearWeightBuffers::DenseBf16 {
+                rhs: up_rhs,
+                out_dim: up_out,
+                in_dim: up_in,
+            },
+        ) = (gate, up)
+        else {
+            return Ok(false);
+        };
+        let out_dim = *out_dim;
+        if !crate::runtime_flags::dense_bf16_gate_up_swiglu_enabled()
+            || batch == 0
+            || in_dim % 256 != 0
+            || *gate_in != in_dim
+            || *up_in != in_dim
+            || *up_out != out_dim
+            || can_use_dense_bf16_gemm(batch, in_dim, out_dim)
+        {
+            return Ok(false);
+        }
+        let dims = [
+            checked_u32(batch, "bf16 gate/up batch")?,
+            checked_u32(out_dim, "bf16 gate/up out_dim")?,
+            checked_u32(in_dim, "bf16 gate/up in_dim")?,
+        ];
+        let pipeline = &self.dense_gate_up_swiglu_bf16_stage_f32;
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(lhs), 0);
+        encoder.set_buffer(1, Some(gate_rhs), 0);
+        encoder.set_buffer(2, Some(up_rhs), 0);
+        encoder.set_buffer(3, Some(out), 0);
+        set_u32_bytes(encoder, 4, &dims, "bf16_gate_up_dims")?;
+        trace_dispatch_path(
+            "dense_gate_up_swiglu_bf16_stage_f32",
+            batch,
+            out_dim,
+            in_dim,
+        );
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(out_dim.div_ceil(4), "bf16 gate/up out_dim")?,
+                checked_nsuint(batch, "bf16 gate/up batch")?,
+                1,
+            ),
+            MTLSize::new(128, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(true)
+    }
+
     /// Variante GEMM tuilée de [`Self::matmul_rhs_t_dense`] pour `batch ≫ 1`
     /// (prefill encodeur Whisper). Le kernel qmv re-lit la ligne de poids par
     /// ligne de batch (memory-bound) ; ici les tuiles 16×16 sont réutilisées en

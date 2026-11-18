@@ -351,3 +351,133 @@ fn dense_bf16_qmv_stage_bandwidth_probe() -> Result<()> {
         true,
     )
 }
+
+/// Chemin séparé (`fused = false` : stage gate, stage up, `swiglu_f32`) ou
+/// fusionné, répété `reps` fois dans un même command buffer ; renvoie le temps
+/// moyen par répétition.
+fn gate_up_swiglu_run(
+    metal: &MetalExecutor,
+    fused: bool,
+    [lhs, gate, up, gate_out, up_out, out]: [&metal::Buffer; 6],
+    dims: [u32; 3],
+    reps: usize,
+) -> Result<f64> {
+    let (batch, n) = (u64::from(dims[0]), u64::from(dims[1]));
+    let groups = MTLSize::new(n.div_ceil(4), batch, 1);
+    let cb = metal.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    for _ in 0..reps {
+        if fused {
+            enc.set_compute_pipeline_state(&metal.dense_gate_up_swiglu_bf16_stage_f32);
+            for (index, buffer) in [lhs, gate, up, out].iter().enumerate() {
+                enc.set_buffer(index as u64, Some(buffer), 0);
+            }
+            set_u32_bytes(enc, 4, &dims, "fused_dims")?;
+            enc.dispatch_thread_groups(groups, MTLSize::new(128, 1, 1));
+            post_dispatch_barrier_buffer(enc, out);
+            continue;
+        }
+        for (rhs, dst) in [(gate, gate_out), (up, up_out)] {
+            enc.set_compute_pipeline_state(&metal.dense_qmv_rhs_bf16_stage_f32);
+            for (index, buffer) in [lhs, rhs, dst].iter().enumerate() {
+                enc.set_buffer(index as u64, Some(buffer), 0);
+            }
+            set_u32_bytes(enc, 3, &dims, "stage_dims")?;
+            enc.dispatch_thread_groups(groups, MTLSize::new(128, 1, 1));
+        }
+        post_dispatch_barrier(enc);
+        metal.encode_swiglu(
+            enc,
+            &mut Vec::new(),
+            gate_out,
+            up_out,
+            out,
+            (batch * n) as usize,
+        )?;
+        post_dispatch_barrier_buffer(enc, out);
+    }
+    enc.end_encoding();
+    let start = std::time::Instant::now();
+    commit_and_wait(cb)?;
+    Ok(start.elapsed().as_secs_f64() / reps as f64)
+}
+
+/// Compare gate + up + SwiGLU fusionné au chemin séparé, au bit près, puis
+/// mesure la bande passante des deux si `probe`.
+fn gate_up_swiglu_vs_separate(shapes: &[(usize, usize, usize)], probe: bool) -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    for &(n, k, batch) in shapes {
+        let weights = |seed: usize| -> Result<metal::Buffer> {
+            let bits: Vec<u16> = (0..n * k)
+                .map(|i| {
+                    let h = (i + seed).wrapping_mul(2_654_435_761) >> 7;
+                    ((((h % 4093) as f32 / 4093.0 - 0.5) * 0.25).to_bits() >> 16) as u16
+                })
+                .collect();
+            metal.buffer_from_slice(&bits, "gate_up_rhs")
+        };
+        let (gate, up) = (weights(0)?, weights(977)?);
+        let x: Vec<f32> = (0..batch * k)
+            .map(|i| ((i * 40_503 % 997) as f32 / 997.0 - 0.5) * 1.37)
+            .collect();
+        let lhs = metal.upload_f32_buffer(&x, "gate_up_lhs")?;
+        let len = batch * n;
+        let gate_out = metal.uncached_f32_buffer(len, "gate_out")?;
+        let up_out = metal.uncached_f32_buffer(len, "up_out")?;
+        let separate = metal.uncached_f32_buffer(len, "separate_out")?;
+        let fused = metal.uncached_f32_buffer(len, "fused_out")?;
+        let dims = [batch as u32, n as u32, k as u32];
+        let sep_bufs = [&lhs, &gate, &up, &gate_out, &up_out, &separate];
+        let fused_bufs = [&lhs, &gate, &up, &gate_out, &up_out, &fused];
+        gate_up_swiglu_run(&metal, false, sep_bufs, dims, 1)?;
+        gate_up_swiglu_run(&metal, true, fused_bufs, dims, 1)?;
+        let bits_of = |buffer| -> Result<Vec<u32>> {
+            Ok(read_f32_buffer(buffer, len)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        let expected = bits_of(&separate)?;
+        assert!(expected.iter().all(|&b| b != 0), "N={n} K={k}");
+        assert_eq!(bits_of(&fused)?, expected, "N={n} K={k} M={batch}");
+        if !probe {
+            continue;
+        }
+        let reps = 8;
+        let mut samples = [Vec::new(), Vec::new()];
+        for trial in 0..9 {
+            for f in [trial % 2 == 1, trial % 2 == 0] {
+                let bufs = if f { fused_bufs } else { sep_bufs };
+                let t = gate_up_swiglu_run(&metal, f, bufs, dims, reps)?;
+                if trial >= 2 {
+                    samples[usize::from(f)].push(t);
+                }
+            }
+        }
+        for (f, values) in samples.iter_mut().enumerate() {
+            values.sort_by(f64::total_cmp);
+            eprintln!(
+                "gate+up N={n} K={k} fused={} median={:.3}ms {:.0}GB/s",
+                f == 1,
+                values[3] * 1e3,
+                (2 * n * k * 2) as f64 / values[3] / 1e9
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
+fn dense_bf16_gate_up_swiglu_matches_separate_bitwise() -> Result<()> {
+    let shapes = [(37, 512, 2), (5, 256, 1), (1024, 5120, 3), (48, 5120, 1)];
+    gate_up_swiglu_vs_separate(&shapes, false)?;
+    with_metal_fast_math_override(false, || gate_up_swiglu_vs_separate(&shapes, false))
+}
+
+// Même protocole que `dense_bf16_qmv_stage_bandwidth_probe`.
+#[test]
+#[ignore = "sonde bande passante gate + up + SwiGLU bf16, GPU au repos"]
+fn dense_bf16_gate_up_swiglu_bandwidth_probe() -> Result<()> {
+    gate_up_swiglu_vs_separate(&[(17408, 5120, 1)], true)
+}

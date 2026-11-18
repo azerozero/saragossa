@@ -181,6 +181,58 @@ kernel void dense_qmv_rhs_bf16_stage_f32(
     }
 }
 
+// Gate + up + SwiGLU bf16 fusionnés pour le decode. Chaque simdgroup traite la
+// ligne `row` de gate ET de up : mêmes blocs de 256 en uint4 et même
+// transposition que `dense_qmv_rhs_bf16_stage_f32`, donc les deux sommes
+// suivent l'ordre du noyau stage (et du qmv par ligne). L'épilogue reprend
+// l'expression de `swiglu_f32` : sortie identique au bit au chemin séparé
+// (stage + stage + swiglu), vérifiée par
+// `dense_bf16_gate_up_swiglu_matches_separate_bitwise`. Économise un dispatch
+// et l'aller-retour mémoire de gate/up. Exige in_dim % 256 == 0.
+kernel void dense_gate_up_swiglu_bf16_stage_f32(
+    device const float* lhs [[buffer(0)]],
+    device const bfloat* gate [[buffer(1)]],
+    device const bfloat* up [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint3& dims [[buffer(4)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    threadgroup uint4 stage[4][2][32];
+    const uint batch = dims.x;
+    const uint out_dim = dims.y;
+    const uint in_dim = dims.z;
+    const uint b = tile.y;
+    const uint row = tile.x * 4u + simd_gid;
+    if (b >= batch || row >= out_dim) {
+        return;
+    }
+    const device float* x = lhs + b * in_dim;
+    const device uint4* wg = (const device uint4*)(gate + row * in_dim);
+    const device uint4* wu = (const device uint4*)(up + row * in_dim);
+    threadgroup const bfloat* mg = (threadgroup const bfloat*)stage[simd_gid][0];
+    threadgroup const bfloat* mu = (threadgroup const bfloat*)stage[simd_gid][1];
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+    for (uint kb = 0u; kb < in_dim; kb += 256u) {
+        stage[simd_gid][0][lane] = wg[kb / 8u + lane];
+        stage[simd_gid][1][lane] = wu[kb / 8u + lane];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0u; i < 8u; ++i) {
+            const float xv = x[kb + lane + 32u * i];
+            acc_g += xv * float(mg[lane + 32u * i]);
+            acc_u += xv * float(mu[lane + 32u * i]);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float g = simd_sum(acc_g);
+    const float u = simd_sum(acc_u);
+    if (lane == 0u) {
+        out[b * out_dim + row] = (g / (1.0f + exp(-g))) * u;
+    }
+}
+
 // QMV dense f32 batch>=1, out_dim multiple de 8, in_dim multiple de 512.
 // Reutilise chaque bloc d'activation pour 8 lignes de poids (2 simdgroups x 4
 // lignes), utile pour les routeurs MoE denses [256, 2048]. L'ordre

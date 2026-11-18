@@ -398,6 +398,17 @@ impl MetalExecutor {
                 "gate/up partagé en lignes: batch vide".to_string(),
             ));
         }
+        if self.encode_gate_up_swiglu_bf16(
+            encoder,
+            lhs_buffer,
+            gate,
+            up,
+            output_buffer,
+            rows,
+            in_dim,
+        )? {
+            return Ok(true);
+        }
         let (
             MetalLinearWeightBuffers::AffineQuantized {
                 packed: gate_packed,
