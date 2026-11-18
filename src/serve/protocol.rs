@@ -183,6 +183,12 @@ impl ChatCompletionRequest {
     pub(super) fn validate(&self, max_tokens_cap: usize) -> ServeResult<usize> {
         for message in &self.messages {
             if message.content.as_ref().is_some_and(contains_vision_media) {
+                #[cfg(not(feature = "vision"))]
+                return Err(ServeError::NotImplementedParameter {
+                    param: "messages.content".to_string(),
+                    message: "modalité vision absente : recompiler avec --features vision",
+                });
+                #[cfg(feature = "vision")]
                 return Err(ServeError::InvalidParameter {
                     param: "messages.content",
                     message: "vision non implémentée : les images et vidéos sont refusées",
@@ -1016,7 +1022,11 @@ mod tests {
             });
             let request: ChatCompletionRequest =
                 serde_json::from_value(value).expect("invariant: requête synthétique valide");
-            assert!(request.validate(512).is_err());
+            let error = request.validate(512).expect_err("média non pris en charge");
+            #[cfg(feature = "vision")]
+            assert!(matches!(error, ServeError::InvalidParameter { .. }));
+            #[cfg(not(feature = "vision"))]
+            assert!(matches!(error, ServeError::NotImplementedParameter { .. }));
         }
     }
 

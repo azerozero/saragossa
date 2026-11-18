@@ -54,21 +54,67 @@ pub(super) fn serve_tcp(
     state: &mut ServeState,
     read_timeout: Duration,
 ) -> ServeResult<()> {
-    let listener =
-        TcpListener::bind(addr).map_err(|e| ServeError::io(format!("bind TCP {addr}"), e))?;
+    #[cfg(unix)]
+    let listener = match super::relay::inherited()? {
+        Some(fd) => adopt_tcp(TcpListener::from(fd), addr)?,
+        None => bind_tcp(addr)?,
+    };
+    #[cfg(not(unix))]
+    let listener = bind_tcp(addr)?;
     eprintln!("saragossa serve TCP listening on http://{addr}/v1");
     eprintln!("saragossa serve TCP bearer auth enabled");
     let front = Front::new(Some(api_key.to_string()), state.model_ids());
     dispatch::serve(state, front, read_timeout, move |dispatcher| {
         // NOTE: sans TCP_NODELAY, Nagle et l'ACK retardé regroupent les petits
         // événements SSE d'un flux ; un échec de réglage laisse le défaut.
-        let incoming = listener.incoming().map(|stream| {
+        let nodelay = |stream: std::io::Result<TcpStream>| {
             stream.inspect(|stream| {
                 let _ = stream.set_nodelay(true);
             })
-        });
-        dispatcher.accept_all(incoming, "accept TCP")
+        };
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = listener.as_raw_fd();
+            super::relay::watch(fd);
+            super::relay::ready()?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| ServeError::io("listener TCP non bloquant", e))?;
+            // NOTE: macOS transmet O_NONBLOCK du listener à la socket acceptée.
+            let incoming = super::relay::incoming(fd, || {
+                let (stream, _) = listener.accept()?;
+                stream.set_nonblocking(false).map(|()| stream)
+            });
+            dispatcher.accept_all(incoming.map(nodelay), "accept TCP")
+        }
+        #[cfg(not(unix))]
+        dispatcher.accept_all(listener.incoming().map(nodelay), "accept TCP")
     })
+}
+
+fn bind_tcp(addr: &str) -> ServeResult<TcpListener> {
+    TcpListener::bind(addr).map_err(|e| ServeError::io(format!("bind TCP {addr}"), e))
+}
+
+/// Refuse une socket héritée qui n'écoute pas sur l'adresse demandée.
+#[cfg(unix)]
+fn adopt_tcp(listener: TcpListener, addr: &str) -> ServeResult<TcpListener> {
+    use std::net::ToSocketAddrs;
+    let local = listener
+        .local_addr()
+        .map_err(|e| ServeError::io("adresse de la socket héritée", e))?;
+    let wanted = addr
+        .to_socket_addrs()
+        .map_err(|e| ServeError::io(format!("résolution {addr}"), e))?;
+    let mut wanted = wanted;
+    if wanted.any(|candidate| candidate == local) {
+        Ok(listener)
+    } else {
+        Err(ServeError::args(format!(
+            "socket héritée sur {local}, attendue sur {addr}"
+        )))
+    }
 }
 
 /// Sert en HTTP sur socket Unix avec permissions propriétaire.
@@ -78,19 +124,49 @@ pub(super) fn serve_unix(
     state: &mut ServeState,
     read_timeout: Duration,
 ) -> ServeResult<()> {
-    prepare_socket_path(path)?;
-    let listener = UnixListener::bind(path)
-        .map_err(|e| ServeError::io(format!("bind socket {}", path.display()), e))?;
-    let permissions = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(path, permissions)
-        .map_err(|e| ServeError::io(format!("chmod 0600 {}", path.display()), e))?;
+    let listener = match super::relay::inherited()? {
+        Some(fd) => {
+            let listener = UnixListener::from(fd);
+            let local = listener
+                .local_addr()
+                .map_err(|e| ServeError::io("adresse de la socket héritée", e))?;
+            if local.as_pathname() != Some(path) {
+                return Err(ServeError::args(format!(
+                    "socket héritée sur {local:?}, attendue sur {}",
+                    path.display()
+                )));
+            }
+            listener
+        }
+        None => {
+            prepare_socket_path(path)?;
+            let listener = UnixListener::bind(path)
+                .map_err(|e| ServeError::io(format!("bind socket {}", path.display()), e))?;
+            let permissions = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(path, permissions)
+                .map_err(|e| ServeError::io(format!("chmod 0600 {}", path.display()), e))?;
+            listener
+        }
+    };
     eprintln!(
         "saragossa serve Unix socket listening on {} (0600)",
         path.display()
     );
     let front = Front::new(None, state.model_ids());
     dispatch::serve(state, front, read_timeout, move |dispatcher| {
-        dispatcher.accept_all(listener.incoming(), "accept socket Unix")
+        use std::os::fd::AsRawFd;
+        let fd = listener.as_raw_fd();
+        super::relay::watch(fd);
+        super::relay::ready()?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| ServeError::io("listener Unix non bloquant", e))?;
+        // NOTE: macOS transmet O_NONBLOCK du listener à la socket acceptée.
+        let incoming = super::relay::incoming(fd, || {
+            let (stream, _) = listener.accept()?;
+            stream.set_nonblocking(false).map(|()| stream)
+        });
+        dispatcher.accept_all(incoming, "accept socket Unix")
     })
 }
 
@@ -205,8 +281,20 @@ pub(super) fn route_front<S: Write>(
             return Some(send_error(stream, 401, "authentification bearer requise"));
         }
     }
+    #[cfg(feature = "webtransport")]
+    if request.method == "GET" && path == "/v1/audio/enhance/certificate" {
+        return Some((|| match front.enhance.certificate_info()? {
+            Some(info) => send_json(
+                stream,
+                200,
+                &info,
+                vec![("Cache-Control", "no-store".into())],
+            ),
+            None => send_error(stream, 503, "listener WebTransport non activé"),
+        })());
+    }
     if request.method == "GET" && path == "/v1/models" {
-        let models = ModelsResponse::from_ids(&front.model_ids);
+        let models = ModelsResponse::from_ids(&super::reload::model_ids(&front.model_ids));
         return Some(send_json(stream, 200, &models, Vec::new()));
     }
     if request.method == "GET" {
@@ -215,11 +303,13 @@ pub(super) fn route_front<S: Write>(
                 Ok(id) => id,
                 Err(error) => return Some(send_failure(stream, &error, false)),
             };
-            return Some(if front.model_ids.iter().any(|model| model == &id) {
-                send_json(stream, 200, &ModelInfo::new(&id), Vec::new())
-            } else {
-                send_failure(stream, &ServeError::UnknownModel(id), false)
-            });
+            return Some(
+                if super::reload::model_ids(&front.model_ids).contains(&id) {
+                    send_json(stream, 200, &ModelInfo::new(&id), Vec::new())
+                } else {
+                    send_failure(stream, &ServeError::UnknownModel(id), false)
+                },
+            );
         }
     }
     None
@@ -776,7 +866,7 @@ fn sanitize_header_value(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
-fn error_status(error: &ServeError) -> u16 {
+pub(in crate::serve) fn error_status(error: &ServeError) -> u16 {
     match error {
         ServeError::UnknownModel(_) => 404,
         ServeError::Args(_)
@@ -804,7 +894,22 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
+pub(in crate::serve) fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
+    #[cfg(feature = "ws")]
+    if request.method == "GET"
+        && request.route() == "/v1/audio/enhance/ws"
+        && request
+            .header("sec-websocket-protocol")
+            .is_some_and(|protocols| {
+                protocols.split(',').any(|p| {
+                    p.trim().strip_prefix("bearer.").is_some_and(|token| {
+                        constant_time_eq(token.as_bytes(), expected.as_bytes())
+                    })
+                })
+            })
+    {
+        return true;
+    }
     if is_anthropic_route(request.route()) {
         if let Some(key) = request.header("x-api-key") {
             if constant_time_eq(key.as_bytes(), expected.as_bytes()) {
@@ -821,7 +926,7 @@ fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
     constant_time_eq(token.as_bytes(), expected.as_bytes())
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(super) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut diff = left.len() ^ right.len();
     let max_len = left.len().max(right.len());
     for index in 0..max_len {
@@ -841,6 +946,14 @@ pub(super) struct HttpRequest {
 }
 
 impl HttpRequest {
+    #[cfg(feature = "ws")]
+    pub(super) fn query(&self) -> &str {
+        self.path.split_once('?').map_or("", |(_, query)| query)
+    }
+    #[cfg(feature = "ws")]
+    pub(super) fn header_count(&self, name: &str) -> usize {
+        self.headers.iter().filter(|(key, _)| key == name).count()
+    }
     pub(super) fn is_enhance(&self) -> bool {
         self.method == "POST" && self.route() == "/v1/audio/enhance"
     }
@@ -985,7 +1098,9 @@ fn parse_headers(header_text: &str) -> ServeResult<ParsedHeaders> {
     let version = parts
         .next()
         .ok_or_else(|| ServeError::Http("version HTTP absente".to_string()))?;
-    if !version.starts_with("HTTP/") {
+    if !version.starts_with("HTTP/")
+        || (path.split('?').next() == Some("/v1/audio/enhance/ws") && version != "HTTP/1.1")
+    {
         return Err(ServeError::Http(format!(
             "version HTTP invalide: {version}"
         )));
@@ -1249,6 +1364,33 @@ mod tests {
             .expect_err("invariant: client au goutte-à-goutte coupé à la deadline");
 
         assert!(error.to_string().contains("délai"));
+    }
+
+    #[test]
+    fn vision_media_refusal_follows_compiled_feature() {
+        for content in [
+            serde_json::json!([{"type": "image_url", "image_url": {"url": "unused"}}]),
+            serde_json::json!([{"type": "input_video"}]),
+            serde_json::json!("<|image_pad|>"),
+        ] {
+            let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "unused", "messages": [{"role": "user", "content": content}]
+            }))
+            .expect("invariant: requête synthétique valide");
+            let error = chat.validate(512).expect_err("média non pris en charge");
+            let mut response = Vec::new();
+            send_failure(&mut response, &error, false).expect("invariant: écriture dans un Vec");
+            let response = String::from_utf8_lossy(&response);
+            let status = if cfg!(feature = "vision") { 400 } else { 501 };
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{response}"
+            );
+            assert!(response.contains("messages.content"), "{response}");
+            if !cfg!(feature = "vision") {
+                assert!(response.contains("--features vision"), "{response}");
+            }
+        }
     }
 
     #[test]

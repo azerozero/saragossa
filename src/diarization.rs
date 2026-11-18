@@ -22,6 +22,13 @@
 
 mod cache;
 mod frontend;
+mod stream;
+
+pub use stream::{DiarizationStream, StreamUpdate};
+#[cfg(all(target_os = "macos", feature = "metal"))]
+type Resident = Option<crate::metal_backend::WhisperResidentEncoder>;
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+type Resident = ();
 
 use crate::{
     gelu, layer_norm, load_float_tensors, ForwardRuntime, InferError, Linear, Result, Tensor,
@@ -215,6 +222,8 @@ struct Layer {
     q: Linear,
     k: Linear,
     v: Linear,
+    /// `[q; k; v]` empilés en un seul GEMM (opt-in, voir `with_fused_qkv`).
+    qkv: Option<Linear>,
     o: Linear,
     ln2: Norm,
     fc1: Linear,
@@ -337,6 +346,7 @@ impl DiarizationModel {
                 q: take_linear(&mut t, &format!("{l}.self_attn.q_proj"))?,
                 k: take_linear(&mut t, &format!("{l}.self_attn.k_proj"))?,
                 v: take_linear(&mut t, &format!("{l}.self_attn.v_proj"))?,
+                qkv: None,
                 o: take_linear(&mut t, &format!("{l}.self_attn.o_proj"))?,
                 ln2: take_norm(&mut t, &format!("{l}.layer_norm2"))?,
                 fc1: take_linear(&mut t, &format!("{l}.mlp.fc1"))?,
@@ -357,7 +367,8 @@ impl DiarizationModel {
         if out_proj.weight().shape() != [config.num_speakers, hh] {
             return Err(InferError::Shape("classifier.out_proj".into()));
         }
-        Ok(Self {
+        let fused = crate::runtime_flags::diar_fused_qkv();
+        let model = Self {
             embed: Linear::new(embed_w, None)?,
             input_ln: take_norm(&mut t, &format!("{p}.input_layer_norm"))?,
             layers,
@@ -368,7 +379,31 @@ impl DiarizationModel {
             out_proj,
             silence: silence.data().to_vec(),
             config,
-        })
+        };
+        if fused {
+            model.with_fused_qkv(true)
+        } else {
+            Ok(model)
+        }
+    }
+
+    /// Regroupe (ou dégroupe) les projections q, k, v de chaque couche en un
+    /// seul matmul `[3d, d]`. Opt-in : `SARAGOSSA_DIAR_FUSED_QKV=1` à la
+    /// construction. Vaut aussi pour l'encodeur Metal résident, construit après
+    /// l'appel (un GEMM `[3d, d]` puis une séparation exacte).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les formes des projections diffèrent.
+    pub fn with_fused_qkv(mut self, on: bool) -> Result<Self> {
+        for l in &mut self.layers {
+            l.qkv = if on {
+                fuse_qkv(&l.q, &l.k, &l.v)?
+            } else {
+                None
+            };
+        }
+        Ok(self)
     }
 
     /// Configuration du modèle.
@@ -423,55 +458,91 @@ impl DiarizationModel {
         }
         let embeds = embeds.data();
 
-        #[cfg(all(target_os = "macos", feature = "metal"))]
-        let resident = match runtime.metal_executor() {
-            Some(metal) => Some(self.build_resident(metal)?),
-            None => None,
-        };
-
+        let resident = self.resident_for(runtime)?;
         let mut cache = SpeakerCache::new(c.cache.clone(), d);
         let mut probs = Vec::with_capacity(frames_enc * sub * s);
         let mut start = 0;
         while start < frames_enc {
             let end = (start + c.chunk_length).min(frames_enc);
             let context_start = start.saturating_sub(c.chunk_left_context);
-            let lookback = start - context_start;
             let chunk_end = (end + c.chunk_right_context).min(frames_enc);
-            let mut input = cache.prefix();
-            let cached = input.len() / d;
-            input.extend_from_slice(&embeds[context_start * d..chunk_end * d]);
-            let rows = input.len() / d;
-            // La trame masquée, si présente, est toujours la dernière de l'entrée.
-            let key_rows = rows - chunk_end.saturating_sub(valid_enc);
-            let input = Tensor::from_vec(vec![rows, d], input)?;
-            let normed = self.input_ln.forward(&input)?;
-            #[cfg(all(target_os = "macos", feature = "metal"))]
-            let hidden = match (runtime.metal_executor(), resident.as_ref()) {
-                (Some(metal), Some(enc)) => {
-                    metal.encode_whisper_encoder_keys(&normed, enc, key_rows)?
-                }
-                _ => self.encode_cpu(normed, key_rows, runtime)?,
-            };
-            #[cfg(not(all(target_os = "macos", feature = "metal")))]
-            let hidden = self.encode_cpu(normed, key_rows, runtime)?;
-            let step_probs = self.head(&hidden, runtime)?;
-            // Moyenne des 8 sous-trames : probabilités par trame encodeur du cache.
-            let mut pooled: Vec<f32> = step_probs
-                .chunks_exact(sub * s)
-                .flat_map(|group| {
-                    (0..s)
-                        .map(move |k| (0..sub).map(|j| group[j * s + k]).sum::<f32>() / sub as f32)
-                })
-                .collect();
-            // Probabilités nulles sur la trame masquée, comme `probs * mask`.
-            pooled[key_rows * s..].fill(0.0);
-            cache.update(input.data(), &pooled, &self.silence, end - start, lookback);
-            let first = (cached + lookback) * sub * s;
-            probs.extend_from_slice(&step_probs[first..first + (end - start) * sub * s]);
+            probs.extend(self.encode_chunk(
+                &mut cache,
+                &embeds[context_start * d..chunk_end * d],
+                (start - context_start, end - start),
+                chunk_end.saturating_sub(valid_enc),
+                &resident,
+                runtime,
+            )?);
             start = end;
         }
         probs.truncate(mel.frames_valid * s);
         Tensor::from_vec(vec![mel.frames_valid, s], probs)
+    }
+
+    /// Encodeur Metal résident, ou rien sur CPU.
+    fn resident_for(&self, runtime: ForwardRuntime<'_>) -> Result<Resident> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            runtime
+                .metal_executor()
+                .map(|metal| self.build_resident(metal))
+                .transpose()
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = runtime;
+            Ok(())
+        }
+    }
+
+    /// Un morceau : `window` = embeddings `[contexte gauche, morceau, anticipation]`
+    /// (`lookback`, `new` en trames encodeur), `masked_tail` trames masquées en
+    /// fin. Met à jour le cache et renvoie les probabilités des `new` trames.
+    fn encode_chunk(
+        &self,
+        cache: &mut SpeakerCache,
+        window: &[f32],
+        (lookback, new): (usize, usize),
+        masked_tail: usize,
+        resident: &Resident,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<Vec<f32>> {
+        let c = &self.config;
+        let (d, sub, s) = (c.hidden_size, c.subsampling, c.num_speakers);
+        let mut input = cache.prefix();
+        let cached = input.len() / d;
+        input.extend_from_slice(window);
+        let rows = input.len() / d;
+        // La trame masquée, si présente, est toujours la dernière de l'entrée.
+        let key_rows = rows - masked_tail;
+        let input = Tensor::from_vec(vec![rows, d], input)?;
+        let normed = self.input_ln.forward(&input)?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let hidden = match (runtime.metal_executor(), resident.as_ref()) {
+            (Some(metal), Some(enc)) => {
+                metal.encode_whisper_encoder_keys(&normed, enc, key_rows)?
+            }
+            _ => self.encode_cpu(normed, key_rows, runtime)?,
+        };
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let hidden = {
+            let _ = resident;
+            self.encode_cpu(normed, key_rows, runtime)?
+        };
+        let step_probs = self.head(&hidden, runtime)?;
+        // Moyenne des 8 sous-trames : probabilités par trame encodeur du cache.
+        let mut pooled: Vec<f32> = step_probs
+            .chunks_exact(sub * s)
+            .flat_map(|group| {
+                (0..s).map(move |k| (0..sub).map(|j| group[j * s + k]).sum::<f32>() / sub as f32)
+            })
+            .collect();
+        // Probabilités nulles sur la trame masquée, comme `probs * mask`.
+        pooled[key_rows * s..].fill(0.0);
+        cache.update(input.data(), &pooled, &self.silence, new, lookback);
+        let first = (cached + lookback) * sub * s;
+        Ok(step_probs[first..first + new * sub * s].to_vec())
     }
 
     /// Oracle CPU des 31 couches (ou per-op Metal pour les GEMM) ; seules les
@@ -487,9 +558,14 @@ impl DiarizationModel {
         let inv_freq = crate::rope::inv_freq(head_dim, self.config.rope_theta);
         for layer in &self.layers {
             let x = layer.ln1.forward(&h)?;
-            let mut q = layer.q.forward_batched(&x, runtime)?;
-            let mut k = layer.k.forward_batched(&x, runtime)?;
-            let v = layer.v.forward_batched(&x, runtime)?;
+            let (mut q, mut k, v) = match &layer.qkv {
+                Some(qkv) => split_qkv(&qkv.forward_batched(&x, runtime)?)?,
+                None => (
+                    layer.q.forward_batched(&x, runtime)?,
+                    layer.k.forward_batched(&x, runtime)?,
+                    layer.v.forward_batched(&x, runtime)?,
+                ),
+            };
             rope_in_place(&mut q, heads, &inv_freq)?;
             rope_in_place(&mut k, heads, &inv_freq)?;
             let (rows, dim) = k.as_matrix()?;
@@ -565,6 +641,19 @@ impl DiarizationModel {
                 weight_bf16: None,
             })
         };
+        // NOTE: emplacement inerte d'un q/k/v remplacé par `qkv`.
+        static PLACEHOLDER: [f32; 1] = [0.0];
+        let separate = |linear: &Linear, fused: bool| -> Result<WhisperResidentProj> {
+            if !fused {
+                return proj(linear);
+            }
+            Ok(WhisperResidentProj {
+                weight: metal.cached_buffer_from_f32(&PLACEHOLDER, "diar_proj_unused")?,
+                bias: None,
+                weight_na: None,
+                weight_bf16: None,
+            })
+        };
         let norm = |n: &Norm| -> Result<WhisperResidentNorm> {
             Ok(WhisperResidentNorm {
                 weight: metal.cached_buffer_from_f32(n.weight.data(), "diar_ln_w")?,
@@ -577,9 +666,12 @@ impl DiarizationModel {
             .map(|l| {
                 Ok(WhisperResidentLayer {
                     self_ln: norm(&l.ln1)?,
-                    q: proj(&l.q)?,
-                    k: proj(&l.k)?,
-                    v: proj(&l.v)?,
+                    // Fusionné : q/k/v séparés ne sont jamais lus, on évite de
+                    // dupliquer ~3d² poids par couche sur le GPU.
+                    q: separate(&l.q, l.qkv.is_some())?,
+                    k: separate(&l.k, l.qkv.is_some())?,
+                    v: separate(&l.v, l.qkv.is_some())?,
+                    qkv: l.qkv.as_ref().map(proj).transpose()?,
                     o: proj(&l.o)?,
                     final_ln: norm(&l.ln2)?,
                     fc1: proj(&l.fc1)?,
@@ -597,6 +689,54 @@ impl DiarizationModel {
             rope_theta: Some(self.config.rope_theta),
         })
     }
+}
+
+/// Empile les poids denses de q, k, v (biais nuls si un seul en a un) ;
+/// `None` si une projection n'est pas dense.
+fn fuse_qkv(q: &Linear, k: &Linear, v: &Linear) -> Result<Option<Linear>> {
+    let parts = [q, k, v];
+    let mut weights = Vec::new();
+    for l in parts {
+        let crate::LinearWeight::Dense(w) = l.weight() else {
+            return Ok(None);
+        };
+        weights.push(w);
+    }
+    let (rows, cols) = weights[0].as_matrix()?;
+    if weights.iter().any(|w| w.shape() != [rows, cols]) {
+        return Err(InferError::Shape(
+            "diarisation: q/k/v de formes différentes".into(),
+        ));
+    }
+    let data: Vec<f32> = weights
+        .iter()
+        .flat_map(|w| w.data().iter().copied())
+        .collect();
+    let bias = if parts.iter().any(|l| l.bias().is_some()) {
+        let b: Vec<f32> = parts
+            .iter()
+            .flat_map(|l| l.bias().map_or(vec![0.0; rows], |b| b.data().to_vec()))
+            .collect();
+        Some(Tensor::from_vec(vec![3 * rows], b)?)
+    } else {
+        None
+    };
+    Linear::new(Tensor::from_vec(vec![3 * rows, cols], data)?, bias).map(Some)
+}
+
+/// `[rows, 3d]` → trois matrices `[rows, d]`.
+fn split_qkv(x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    let (rows, width) = x.as_matrix()?;
+    let d = width / 3;
+    let part = |i: usize| {
+        let data: Vec<f32> = x
+            .data()
+            .chunks_exact(width)
+            .flat_map(|r| r[i * d..(i + 1) * d].iter().copied())
+            .collect();
+        Tensor::from_vec(vec![rows, d], data)
+    };
+    Ok((part(0)?, part(1)?, part(2)?))
 }
 
 /// RoPE rotate-half (convention 🤗 `rotate_half`), positions `0..rows`.

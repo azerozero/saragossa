@@ -246,14 +246,10 @@ fn cache_compression_keeps_length_and_speaker_order() {
     assert!(speech.windows(2).all(|w| w[0] < w[1]), "{cached:?}");
 }
 
+/// Deux couches aléatoires pour l'encodeur Metal (d = 128, 2 têtes de 64 : Steel d64).
 #[cfg(all(target_os = "macos", feature = "metal"))]
-#[test]
-fn metal_rope_encoder_matches_cpu_oracle() -> Result<()> {
-    let Ok(metal) = crate::MetalExecutor::new() else {
-        return Ok(());
-    };
-    // Deux couches aléatoires d = 128, 2 têtes de 64 (Steel d64), 37 trames.
-    let (d, heads, ffn, rows) = (128, 2, 256, 37);
+fn metal_test_model(qkv_bias: bool) -> Result<DiarizationModel> {
+    let (d, heads, ffn) = (128, 2, 256);
     let mut seed = 11;
     let mut rnd =
         |n: usize, scale: f32| -> Vec<f32> { (0..n).map(|_| lcg(&mut seed) * scale).collect() };
@@ -287,6 +283,11 @@ fn metal_rope_encoder_matches_cpu_oracle() -> Result<()> {
             )?;
         }
         put(format!("{l}.self_attn.o_proj.bias"), vec![d], rnd(d, 0.1))?;
+        if qkv_bias {
+            for n in ["q_proj", "v_proj"] {
+                put(format!("{l}.self_attn.{n}.bias"), vec![d], rnd(d, 0.1))?;
+            }
+        }
         put(
             format!("{l}.mlp.fc1.weight"),
             vec![ffn, d],
@@ -340,8 +341,21 @@ fn metal_rope_encoder_matches_cpu_oracle() -> Result<()> {
         chunk_left_context: 0,
         cache: policy(),
     };
-    let model = DiarizationModel::from_tensors(config, t)?;
-    let input = Tensor::from_vec(vec![rows, d], rnd(rows * d, 1.0))?;
+    DiarizationModel::from_tensors(config, t)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn metal_rope_encoder_matches_cpu_oracle() -> Result<()> {
+    let Ok(metal) = crate::MetalExecutor::new() else {
+        return Ok(());
+    };
+    let rows = 37;
+    let d = 128;
+    let model = metal_test_model(false)?;
+    let mut seed = 1;
+    let data: Vec<f32> = (0..rows * d).map(|_| lcg(&mut seed) * 2.0).collect();
+    let input = Tensor::from_vec(vec![rows, d], data)?;
     let normed = model.input_ln.forward(&input)?;
     let cpu = model.encode_cpu(normed.clone(), rows - 1, ForwardRuntime::cpu())?;
     let enc = model.build_resident(&metal)?;
@@ -353,6 +367,43 @@ fn metal_rope_encoder_matches_cpu_oracle() -> Result<()> {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f32::max);
     assert!(max < 1e-3, "écart Metal/CPU {max}");
+    Ok(())
+}
+
+/// Résident fusionné contre résident séparé, biais q/v non nuls. La séparation
+/// est une copie ; seul l'ordre d'accumulation du GEMM `[3d, d]` peut différer
+/// (autre tuile sur N = 3d). 1e-4 est une borne a priori, non mesurée : l'écart
+/// observé est journalisé pour la resserrer après le run de nuit.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "GPU Metal"]
+fn metal_fused_qkv_matches_separate_projections() -> Result<()> {
+    let Ok(metal) = crate::MetalExecutor::new() else {
+        return Ok(());
+    };
+    let (d, rows) = (128, 37);
+    // Explicite : la variable d'environnement ne doit pas choisir la branche.
+    let model = metal_test_model(true)?.with_fused_qkv(false)?;
+    let mut seed = 3;
+    let data: Vec<f32> = (0..rows * d).map(|_| lcg(&mut seed)).collect();
+    let normed = model
+        .input_ln
+        .forward(&Tensor::from_vec(vec![rows, d], data)?)?;
+    let separate = model.build_resident(&metal)?;
+    assert!(separate.layers.iter().all(|l| l.qkv.is_none()));
+    let want = metal.encode_whisper_encoder_keys(&normed, &separate, rows - 1)?;
+    let model = model.with_fused_qkv(true)?;
+    let fused = model.build_resident(&metal)?;
+    assert!(fused.layers.iter().all(|l| l.qkv.is_some()));
+    let got = metal.encode_whisper_encoder_keys(&normed, &fused, rows - 1)?;
+    let max = got
+        .data()
+        .iter()
+        .zip(want.data())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    eprintln!("écart max fusionné/séparé : {max:e}");
+    assert!(max < 1e-4, "écart fusionné/séparé {max}");
     Ok(())
 }
 
@@ -432,6 +483,81 @@ fn real_weights_match_torch_reference() -> Result<()> {
     Ok(())
 }
 
+/// Poids réels, streaming : `DiarizationStream` sur l'audio golden avec plusieurs
+/// tailles de push, comparé au batch (segments identiques, même calcul) et à la
+/// référence torch (mêmes tolérances que le test batch, RTTM hors `voices8`).
+/// Mêmes variables que `real_weights_match_torch_reference`.
+#[test]
+#[ignore = "poids réels et goldens locaux"]
+fn real_weights_streaming_matches_batch_and_torch() -> Result<()> {
+    let (Some(model_dir), Some(golden)) = (
+        crate::runtime_flags::env_var_os("SARAGOSSA_DIAR_MODEL_DIR"),
+        crate::runtime_flags::env_var_os("SARAGOSSA_DIAR_GOLDEN_DIR"),
+    ) else {
+        return Ok(());
+    };
+    let golden = PathBuf::from(golden);
+    let model = DiarizationModel::from_model_dir(PathBuf::from(model_dir))?;
+    let read = |p: PathBuf| std::fs::read(&p).map_err(|source| InferError::Io { path: p, source });
+    let tolerance: serde_json::Value =
+        serde_json::from_slice(&read(golden.join("tolerance.json"))?)
+            .map_err(|e| InferError::Config(e.to_string()))?;
+    let tol = |k: &str| tolerance["tolerance"][k].as_f64().unwrap_or(0.0) as f32;
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    let metal = crate::MetalExecutor::new()?;
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    let runtime = ForwardRuntime::metal(&metal);
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let runtime = ForwardRuntime::cpu();
+    for name in ["fleurs_en_us", "fleurs_fr_fr", "voices8"] {
+        let samples =
+            crate::wire_audio::wav_to_mono_16k(&read(golden.join(format!("{name}.wav")))?)
+                .map_err(|e| InferError::Config(e.to_string()))?;
+        let batch = model.diarize(&samples, runtime)?;
+        let want: Vec<f32> = read(golden.join(format!("{name}.probs.f32")))?
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let rttm =
+            String::from_utf8_lossy(&read(golden.join(format!("{name}.rttm")))?).into_owned();
+        // 10 ms, 100 ms, valeurs non alignées sur les trames, puis tout d'un bloc.
+        for push in [160, 1_600, 4_097, 16_000 + 7, 48_000, samples.len()] {
+            let mut stream = DiarizationStream::new(&model, runtime)?;
+            let (mut probs, mut segs) = (Vec::new(), Vec::new());
+            for part in samples.chunks(push) {
+                let u = stream.push(part)?;
+                probs.extend(u.probabilities);
+                segs.extend(u.segments);
+            }
+            let u = stream.finish()?;
+            probs.extend(u.probabilities);
+            segs.extend(u.segments);
+            segs.sort_by_key(|s| (s.start_frame, s.speaker));
+            assert_eq!(probs.len(), want.len(), "{name} push {push}: trames");
+            let diffs = |a: &[f32], b: &[f32]| -> (f32, f32) {
+                let d: Vec<f32> = a.iter().zip(b).map(|(x, y)| (x - y).abs()).collect();
+                (
+                    d.iter().copied().fold(0.0, f32::max),
+                    d.iter().sum::<f32>() / d.len() as f32,
+                )
+            };
+            let (bmax, _) = diffs(&probs, batch.probabilities.data());
+            let (tmax, tmean) = diffs(&probs, &want);
+            eprintln!("{name} push {push}: batch max {bmax:e}, torch max {tmax:e} mean {tmean:e}");
+            assert!(bmax < 1e-4, "{name} push {push}: écart au batch {bmax}");
+            assert_eq!(segs, batch.segments, "{name} push {push}: segments batch");
+            assert!(
+                tmax <= tol("max_abs") && tmean <= tol("mean_abs"),
+                "{name} push {push}: hors tolérance torch"
+            );
+            if name != "voices8" {
+                assert_eq!(to_rttm(&segs, name), rttm, "{name} push {push}: RTTM");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Débit sur une heure : `voices8.wav` du dossier golden répété jusqu'à 3600 s.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
@@ -463,5 +589,143 @@ fn real_weights_hour_throughput() -> Result<()> {
         t.elapsed().as_secs_f64(),
         out.segments.len()
     );
+    Ok(())
+}
+
+/// Petit modèle f32 aléatoire (2 couches, chunk de 4 trames, contexte gauche 1).
+fn random_model() -> Result<DiarizationModel> {
+    let (d, ffn, h, sub, mels) = (16, 32, 4, 2, 4);
+    let mut seed = 5;
+    let mut t = HashMap::new();
+    let mut put = |k: String, shape: Vec<usize>, scale: f32| -> Result<()> {
+        let n = shape.iter().product();
+        let v = (0..n).map(|_| lcg(&mut seed) * scale).collect();
+        t.insert(k, Tensor::from_vec(shape, v)?);
+        Ok(())
+    };
+    let p = "model.audio_tower";
+    put(
+        format!("{p}.embedder.projection.weight"),
+        vec![d, sub * mels],
+        0.3,
+    )?;
+    for n in ["input_layer_norm", "layer_norm"] {
+        put(format!("{p}.{n}.weight"), vec![d], 1.0)?;
+        put(format!("{p}.{n}.bias"), vec![d], 0.1)?;
+    }
+    for i in 0..2 {
+        let l = format!("{p}.layers.{i}");
+        for n in ["layer_norm1", "layer_norm2"] {
+            put(format!("{l}.{n}.weight"), vec![d], 1.0)?;
+            put(format!("{l}.{n}.bias"), vec![d], 0.1)?;
+        }
+        for n in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            put(format!("{l}.self_attn.{n}.weight"), vec![d, d], 0.3)?;
+        }
+        put(format!("{l}.self_attn.q_proj.bias"), vec![d], 0.1)?;
+        put(format!("{l}.self_attn.v_proj.bias"), vec![d], 0.1)?;
+        put(format!("{l}.mlp.fc1.weight"), vec![ffn, d], 0.3)?;
+        put(format!("{l}.mlp.fc2.weight"), vec![d, ffn], 0.3)?;
+    }
+    put("model.proj.weight".into(), vec![h, d], 0.3)?;
+    put(
+        "model.upsampler.conv.weight".into(),
+        vec![h * sub, h, 3],
+        0.5,
+    )?;
+    put("model.upsampler.conv.bias".into(), vec![h * sub], 0.1)?;
+    put("classifier.dense.weight".into(), vec![h, h], 0.8)?;
+    put("classifier.out_proj.weight".into(), vec![2, h], 2.0)?;
+    put("classifier.out_proj.bias".into(), vec![2], 0.1)?;
+    put("silence_embeds".into(), vec![d], 0.1)?;
+    let config = DiarizationConfig {
+        hidden_size: d,
+        heads: 2,
+        layers: 2,
+        num_mel_bins: mels,
+        subsampling: sub,
+        rope_theta: 10_000.0,
+        head_hidden: h,
+        num_speakers: 2,
+        chunk_length: 4,
+        chunk_right_context: 2,
+        chunk_left_context: 1,
+        cache: policy(),
+    };
+    DiarizationModel::from_tensors(config, t)
+}
+
+fn noise(n: usize) -> Vec<f32> {
+    let mut seed = 99;
+    (0..n)
+        .map(|i| lcg(&mut seed) * (1.0 + (i / 4000 % 3) as f32))
+        .collect()
+}
+
+#[test]
+fn streaming_matches_batch_for_any_push_size() -> Result<()> {
+    let model = random_model()?;
+    let rt = ForwardRuntime::cpu();
+    for len in [16_000 + 77, 16_000 * 3 + 5, 161] {
+        let samples = noise(len);
+        let batch = model.diarize(&samples, rt)?;
+        let mut want = batch.segments.clone();
+        want.sort_by_key(|s| (s.start_frame, s.speaker));
+        for push in [1, 333, 4096, len] {
+            let mut stream = DiarizationStream::new(&model, rt)?;
+            let (mut probs, mut segs) = (Vec::new(), Vec::new());
+            for part in samples.chunks(push) {
+                let u = stream.push(part)?;
+                probs.extend(u.probabilities);
+                segs.extend(u.segments);
+            }
+            let u = stream.finish()?;
+            probs.extend(u.probabilities);
+            segs.extend(u.segments);
+            assert_eq!(
+                probs.len(),
+                batch.probabilities.len(),
+                "len {len} push {push}"
+            );
+            let max = probs
+                .iter()
+                .zip(batch.probabilities.data())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(max < 1e-5, "len {len} push {push}: écart {max}");
+            segs.sort_by_key(|s| (s.start_frame, s.speaker));
+            assert_eq!(segs, want, "len {len} push {push}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn streaming_rejects_audio_shorter_than_a_frame() -> Result<()> {
+    let model = random_model()?;
+    let mut stream = DiarizationStream::new(&model, ForwardRuntime::cpu())?;
+    stream.push(&noise(100))?;
+    assert!(stream.finish().is_err());
+    Ok(())
+}
+
+#[test]
+fn fused_qkv_matches_separate_projections() -> Result<()> {
+    let model = random_model()?;
+    let rt = ForwardRuntime::cpu();
+    let samples = noise(16_000 * 2);
+    let want = model.diarize(&samples, rt)?;
+    let fused = model.with_fused_qkv(true)?;
+    assert!(fused.layers.iter().all(|l| l.qkv.is_some()));
+    let got = fused.diarize(&samples, rt)?;
+    let max = got
+        .probabilities
+        .data()
+        .iter()
+        .zip(want.probabilities.data())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(max < 1e-5, "écart {max}");
+    assert_eq!(got.segments, want.segments);
     Ok(())
 }

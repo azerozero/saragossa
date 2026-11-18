@@ -12,9 +12,31 @@ impl<'a> DenoiseStream<'a> {
     /// Ouvre un état GRU/STFT indépendant, partageant les poids du modèle.
     #[must_use]
     pub fn new(model: &'a DeepFilterNet3) -> Self {
+        Self::from_stream(model.stream())
+    }
+
+    pub(crate) fn from_stream(stream: DfStream<'a>) -> Self {
         Self {
-            buffered: Buffered::new(model.stream()),
+            buffered: Buffered::new(stream),
         }
+    }
+
+    /// Comme [`Self::new`], le réseau tournant sur `threads` cœurs par blocs de
+    /// hops. La sortie reste identique bit à bit au chemin mono-cœur ; seule la
+    /// latence change, un bloc n'étant rendu qu'une fois complet.
+    #[must_use]
+    pub fn with_threads(model: &'a DeepFilterNet3, threads: usize) -> Self {
+        let mut stream = model.stream();
+        stream.threads = threads.max(1);
+        Self::from_stream(stream)
+    }
+
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "metal")),
+        allow(dead_code, reason = "seul le chemin Metal relit le flux")
+    )]
+    pub(crate) fn stream_mut(&mut self) -> &mut DfStream<'a> {
+        &mut self.buffered.processor
     }
 
     /// Fournit un morceau et restitue immédiatement les échantillons disponibles.
@@ -35,14 +57,44 @@ impl<'a> DenoiseStream<'a> {
     }
 }
 
+/// Hops traités d'un bloc en mode multi-cœur : 2,56 s de signal.
+const BLOCK_HOPS: usize = 256;
+
 trait Hops {
     fn hop(&mut self, input: &[f32], output: &mut [f32]) -> Result<()>;
     fn tail(&mut self) -> Vec<f32>;
+    /// Nombre de hops entiers que [`Self::hops`] veut traiter d'un coup (1 : hop par hop).
+    fn block(&self) -> usize {
+        1
+    }
+    /// Plusieurs hops consécutifs, même résultat que `hop` sur chacun.
+    fn hops(&mut self, input: &[f32], output: &mut [f32]) -> Result<()> {
+        let mut pairs = input
+            .chunks_exact(HOP_SIZE)
+            .zip(output.chunks_exact_mut(HOP_SIZE));
+        pairs.try_for_each(|(i, o)| self.hop(i, o))
+    }
 }
 
 impl Hops for DfStream<'_> {
     fn hop(&mut self, input: &[f32], output: &mut [f32]) -> Result<()> {
         self.process_hop(input, output)
+    }
+    fn block(&self) -> usize {
+        if self.threads > 1 {
+            BLOCK_HOPS
+        } else {
+            1
+        }
+    }
+    fn hops(&mut self, input: &[f32], output: &mut [f32]) -> Result<()> {
+        if self.threads <= 1 {
+            let mut pairs = input
+                .chunks_exact(HOP_SIZE)
+                .zip(output.chunks_exact_mut(HOP_SIZE));
+            return pairs.try_for_each(|(i, o)| self.process_hop(i, o));
+        }
+        self.process_hops(input, output)
     }
     fn tail(&mut self) -> Vec<f32> {
         self.finish()
@@ -51,7 +103,10 @@ impl Hops for DfStream<'_> {
 
 struct Buffered<P> {
     processor: P,
-    pending: [f32; HOP_SIZE],
+    /// Un bloc de `processor.block()` hops ; `used` premiers échantillons valides.
+    pending: Vec<f32>,
+    /// Sorties de `run`, réutilisées d'un appel à l'autre.
+    hops: Vec<f32>,
     used: usize,
     skip: usize,
     owed: usize,
@@ -61,8 +116,9 @@ struct Buffered<P> {
 impl<P: Hops> Buffered<P> {
     fn new(processor: P) -> Self {
         Self {
+            pending: vec![0.0; processor.block() * HOP_SIZE],
             processor,
-            pending: [0.0; HOP_SIZE],
+            hops: Vec::new(),
             used: 0,
             skip: DfStream::DELAY_SAMPLES,
             owed: 0,
@@ -78,22 +134,37 @@ impl<P: Hops> Buffered<P> {
         self.owed -= count;
     }
 
+    /// Traite des hops entiers et restitue chacun dans l'ordre.
+    fn run(&mut self, input: &[f32], out: &mut Vec<f32>) -> Result<()> {
+        let mut hops = std::mem::take(&mut self.hops);
+        hops.resize(input.len(), 0.0);
+        let result = self.processor.hops(input, &mut hops);
+        if result.is_ok() {
+            for hop in hops.chunks_exact(HOP_SIZE) {
+                self.emit(hop, out);
+            }
+        }
+        self.hops = hops;
+        result
+    }
+
     fn push(&mut self, mut input: &[f32]) -> Result<Vec<f32>> {
         if self.finished {
             return Err(InferError::Config("flux de débruitage clos".into()));
         }
         let mut out = Vec::new();
         while !input.is_empty() {
-            let n = input.len().min(HOP_SIZE - self.used);
+            let n = input.len().min(self.pending.len() - self.used);
             self.pending[self.used..self.used + n].copy_from_slice(&input[..n]);
             self.used += n;
             self.owed += n;
             input = &input[n..];
-            if self.used == HOP_SIZE {
-                let mut hop = [0.0; HOP_SIZE];
-                self.processor.hop(&self.pending, &mut hop)?;
+            if self.used == self.pending.len() {
+                let block = std::mem::take(&mut self.pending);
                 self.used = 0;
-                self.emit(&hop, &mut out);
+                let result = self.run(&block, &mut out);
+                self.pending = block;
+                result?;
             }
         }
         Ok(out)
@@ -106,15 +177,11 @@ impl<P: Hops> Buffered<P> {
         self.finished = true;
         let mut out = Vec::new();
         // Même padding que le batch historique : ceil((n + FFT_SIZE) / HOP).
-        let hops = FFT_SIZE / HOP_SIZE + usize::from(self.used > 0);
-        self.pending[self.used..].fill(0.0);
-        for _ in 0..hops {
-            let mut hop = [0.0; HOP_SIZE];
-            self.processor.hop(&self.pending, &mut hop)?;
-            self.emit(&hop, &mut out);
-            self.pending.fill(0.0);
-        }
+        let hops = FFT_SIZE / HOP_SIZE + self.used.div_ceil(HOP_SIZE);
+        let mut rest = self.pending[..self.used].to_vec();
+        rest.resize(hops * HOP_SIZE, 0.0);
         self.used = 0;
+        self.run(&rest, &mut out)?;
         let tail = self.processor.tail();
         self.emit(&tail, &mut out);
         Ok(out)

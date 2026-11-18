@@ -382,6 +382,8 @@ impl MetalExecutor {
             .map_err(|message| InferError::Metal(format!("compile kernels: {message}")))?;
         let dense_matmul_rhs_t_f32 = pipeline(&library, &device, "dense_matmul_rhs_t_f32")?;
         let dense_qmv_rhs_bf16_f32 = pipeline(&library, &device, "dense_qmv_rhs_bf16_f32")?;
+        let dense_qmv_rhs_bf16_stage_f32 =
+            pipeline(&library, &device, "dense_qmv_rhs_bf16_stage_f32")?;
         let dense_qmv_fast_f32 = pipeline(&library, &device, "dense_qmv_fast_f32")?;
         let dense_gemm_rhs_t_f32 = pipeline(&library, &device, "dense_gemm_rhs_t_f32")?;
         let affine_matmul_rhs_t_u32_f32 =
@@ -700,6 +702,8 @@ impl MetalExecutor {
         let rms_norm_rope_heads_f32 = pipeline(&library, &device, "rms_norm_rope_heads_f32")?;
         #[cfg(feature = "diar")]
         let rope_heads_inplace_f32 = pipeline(&library, &device, "rope_heads_inplace_f32")?;
+        #[cfg(feature = "diar")]
+        let split_qkv_rows_f32 = pipeline(&library, &device, "split_qkv_rows_f32")?;
         let rms_norm_heads_no_scale_f32 =
             pipeline(&library, &device, "rms_norm_heads_no_scale_f32")?;
         let causal_attention_prefill_f32 =
@@ -934,6 +938,7 @@ impl MetalExecutor {
             queue,
             dense_matmul_rhs_t_f32,
             dense_qmv_rhs_bf16_f32,
+            dense_qmv_rhs_bf16_stage_f32,
             dense_qmv_fast_f32,
             dense_gemm_rhs_t_f32,
             affine_matmul_rhs_t_u32_f32,
@@ -1059,6 +1064,8 @@ impl MetalExecutor {
             rms_norm_rope_heads_f32,
             #[cfg(feature = "diar")]
             rope_heads_inplace_f32,
+            #[cfg(feature = "diar")]
+            split_qkv_rows_f32,
             rms_norm_mrope_heads_f32,
             rms_norm_heads_no_scale_f32,
             causal_attention_prefill_f32,

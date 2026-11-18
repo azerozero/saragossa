@@ -3,6 +3,9 @@
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 pub(crate) mod pairwise;
 
+mod profile;
+pub use profile::{ModelEntry, Profile, ProfileError, Resolved, ServeSection, HOT_KEYS, PRESETS};
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::cell::Cell;
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -45,6 +48,12 @@ fn vision_flag_value(value: Option<&str>) -> crate::Result<bool> {
     }
 }
 
+/// Diarisation : q, k, v en un seul matmul (`SARAGOSSA_DIAR_FUSED_QKV=1`, défaut 0).
+#[cfg(feature = "diar")]
+pub(crate) fn diar_fused_qkv() -> bool {
+    env_flag("SARAGOSSA_DIAR_FUSED_QKV", false)
+}
+
 thread_local! {
     static DECISION_NONCAUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DECISION_HEADLESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -84,6 +93,31 @@ pub(crate) fn decision_nax_enabled() -> bool {
 pub(crate) fn decision_gemm_bf16_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     decision_noncausal() && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DECISION_GEMM_BF16", true))
+}
+
+/// Nombre de threads du débruitage (`SARAGOSSA_DENOISE_THREADS`, défaut 1 :
+/// chemin trame par trame historique). Au-delà, encodeur et décodeurs tournent
+/// en parallèle par blocs de 2,56 s, les GRU restant séquentiels : sortie
+/// identique bit à bit, latence de flux d'un bloc (opt-in).
+#[cfg(feature = "denoise")]
+pub fn denoise_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        env_var("SARAGOSSA_DENOISE_THREADS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+    })
+}
+
+/// Réseau DFN3 en lot sur GPU Metal pour `saragossa enhance`
+/// (`SARAGOSSA_DENOISE_GPU`, défaut 0). Garde le fichier entier en mémoire ;
+/// sortie identique au bit au CPU en variante `exp`/`tanh` communes, à quelques
+/// ulp près du chemin CPU historique.
+#[cfg(all(feature = "denoise", feature = "metal", target_os = "macos"))]
+pub fn denoise_gpu() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DENOISE_GPU", false))
 }
 
 /// Tokens au plus par prefill empaqueté des lectures TTA d'une décision
@@ -157,12 +191,19 @@ fn claim_legacy_warning(legacy: &str) -> bool {
 /// dépendre du nom de son consommateur (cf. ADR 0011, dette « namespace »).
 pub fn env_var(name: &str) -> Option<String> {
     environment_sha256();
+    if let Some(value) = profile::forced(name) {
+        return Some(value);
+    }
     if let Ok(value) = std::env::var(name) {
         record_snapshot_ablation(name, &value);
         return Some(value);
     }
-    let legacy = legacy_alias(name)?;
-    let value = std::env::var(&legacy).ok()?;
+    let Some(legacy) = legacy_alias(name) else {
+        return profile::lookup(name);
+    };
+    let Ok(value) = std::env::var(&legacy) else {
+        return profile::lookup(name);
+    };
     warn_legacy_env_once(&legacy, name);
     record_snapshot_ablation(name, &value);
     Some(value)
@@ -206,8 +247,12 @@ pub fn env_var_os(name: &str) -> Option<std::ffi::OsString> {
         record_snapshot_ablation(name, value.to_str().unwrap_or_default());
         return Some(value);
     }
-    let legacy = legacy_alias(name)?;
-    let value = std::env::var_os(&legacy)?;
+    let Some(legacy) = legacy_alias(name) else {
+        return profile::lookup(name).map(Into::into);
+    };
+    let Some(value) = std::env::var_os(&legacy) else {
+        return profile::lookup(name).map(Into::into);
+    };
     warn_legacy_env_once(&legacy, name);
     record_snapshot_ablation(name, value.to_str().unwrap_or_default());
     Some(value)
@@ -277,6 +322,21 @@ pub(crate) fn free_cpu_weights_moe_enabled() -> bool {
 pub(crate) fn single_copy_weights_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("RETI_RUST_SINGLE_COPY_WEIGHTS", true))
+}
+
+/// Partage les pages de poids quantifiés entre processus (opt-in).
+///
+/// `SARAGOSSA_RUST_MMAP_WEIGHTS=1` : un payload single-copy dont l'offset
+/// fichier est aligné sur 16 octets devient un buffer Metal sans copie sur un
+/// mmap lecture seule du shard. Les pages restent celles du cache de fichiers,
+/// communes au parent et à l'enfant d'un relais. Les shards MLX ont un en-tête
+/// non aligné : les réaligner d'abord (`tools/quant/safetensors_align.py`),
+/// sinon le chargement retombe sur la copie. Un shard tronqué ou réécrit en
+/// place pendant qu'il est mappé provoque un SIGBUS.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn mmap_weights_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MMAP_WEIGHTS", false))
 }
 
 /// Active la trace des résolutions de stacks MoE autour du drop CPU.
@@ -1505,6 +1565,98 @@ pub(crate) fn prefix_extend_resident_min_tokens() -> usize {
     })
 }
 
+/// Réglage `SARAGOSSA_RUST_PREFIX_ALIGN` des reprises du prefill résident.
+/// `None` : alignement automatique, choisi par modèle
+/// ([`prefix_align_for_model`]). `Some(None)` : coupé (`0`), reprises à la
+/// longueur exacte du préfixe (écart au near-tie près). `Some(Some(n))` :
+/// alignement explicite, multiple de 16. Une valeur invalide avertit une fois
+/// sur stderr et garde le choix automatique.
+fn prefix_align_setting() -> Option<Option<usize>> {
+    #[cfg(test)]
+    if let Some(align) = PREFIX_ALIGN_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return Some(align);
+    }
+    static SETTING: OnceLock<Option<Option<usize>>> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        match env_var("SARAGOSSA_RUST_PREFIX_ALIGN")
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("" | "1" | "true" | "on" | "auto") => None,
+            Some("0" | "false" | "off") => Some(None),
+            Some(value) => match value
+                .parse::<usize>()
+                .ok()
+                .filter(|rows| *rows >= 16 && rows % 16 == 0)
+            {
+                Some(rows) => Some(Some(rows)),
+                None => {
+                    // Lu une seule fois (OnceLock) : l'avertissement l'est aussi.
+                    use std::io::Write as _;
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "saragossa: SARAGOSSA_RUST_PREFIX_ALIGN={value:?} invalide \
+                         (0, ou multiple de 16 d'au moins 16) : alignement automatique"
+                    );
+                    None
+                }
+            },
+        }
+    })
+}
+
+/// Alignement et queue minimale (tokens) des frontières de morceaux du
+/// prefill résident : 64 et 64, sauf alignement coupé. Un multiple de 64 est
+/// aussi aligné pour un modèle à 16.
+#[must_use]
+pub fn prefix_align() -> Option<(usize, usize)> {
+    match prefix_align_setting() {
+        Some(None) => None,
+        _ => Some((PREFIX_ALIGN_ROWS, PREFIX_ALIGN_ROWS)),
+    }
+}
+
+/// Alignement et queue minimale (tokens) des reprises du cache de préfixe et
+/// des blocs de serve pour un modèle. Le gated delta NAX découpe la récurrence
+/// en blocs de 16 depuis le début de chaque appel, et les GEMM changent de
+/// noyau sous 32 (quantifié) ou 64 (dense bf16, `dense_bf16_gemm`) lignes :
+/// une reprise alignée suivie d'au moins `tail` lignes calcule chaque position
+/// avec les mêmes noyaux, dans le même ordre, que le prefill à froid. Auto :
+/// (64, 64) si une projection dense bf16 prend le GEMM, (16, 32) sinon ; une
+/// valeur explicite `n` donne (n, max(n, 32)).
+#[must_use]
+pub fn prefix_align_for_model(dense_bf16_gemm: bool) -> Option<(usize, usize)> {
+    let align = match prefix_align_setting() {
+        Some(explicit) => explicit?,
+        None if dense_bf16_gemm => PREFIX_ALIGN_ROWS,
+        None => 16,
+    };
+    Some((align, align.max(if dense_bf16_gemm { 64 } else { 32 })))
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREFIX_ALIGN_TEST_OVERRIDE: std::cell::Cell<Option<Option<usize>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Exécute `run` avec l'alignement `align` (`None` : reprises à la longueur
+/// exacte, comme `SARAGOSSA_RUST_PREFIX_ALIGN=0`) sur le thread courant.
+#[cfg(test)]
+pub(crate) fn with_prefix_align_for_test<R>(align: Option<usize>, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Option<usize>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREFIX_ALIGN_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(PREFIX_ALIGN_TEST_OVERRIDE.with(|cell| cell.replace(Some(align))));
+    run()
+}
+
+/// Alignement par défaut de [`prefix_align`].
+pub const PREFIX_ALIGN_ROWS: usize = 64;
+
 /// Récurrence gated delta du prefill linéaire (16/48 têtes, dk = dv =
 /// 128, état f32) sur les accélérateurs neuronaux : noyau
 /// `gated_delta_fused_nax` de MLX figé. Défaut ON depuis le 2026-10-25 (M5 Max,
@@ -1557,6 +1709,14 @@ pub(crate) fn mtp_seed_gpu_enabled() -> bool {
 pub(crate) fn prefill_kv_shared_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_SHARED", true))
+}
+
+/// QMV bf16 à lectures vectorisées et transposition threadgroup, identique au
+/// bit au qmv par ligne. Opt-in : `SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE=1`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn dense_bf16_qmv_stage_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE", false))
 }
 
 /// GEMM NA tuilé des poids bf16 denses au prefill (batch ≥ 64). Défaut ON ;
@@ -2223,6 +2383,19 @@ pub fn serve_max_connections() -> usize {
     })
 }
 
+/// Listener QUIC DFN3 opt-in (`SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR`).
+#[must_use]
+pub fn enhance_webtransport_addr() -> Option<String> {
+    env_var("SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR").filter(|s| !s.is_empty())
+}
+
+/// Listener h2c DFN3 opt-in (`SARAGOSSA_ENHANCE_H2_ADDR`, par exemple
+/// `127.0.0.1:8082`). Aucune écoute supplémentaire sans cette variable.
+#[must_use]
+pub fn enhance_h2_addr() -> Option<String> {
+    env_var("SARAGOSSA_ENHANCE_H2_ADDR").filter(|s| !s.is_empty())
+}
+
 /// Flux DFN3 simultanés (`SARAGOSSA_ENHANCE_MAX_STREAMS`, défaut 2).
 /// Une admission refusée répond 503 sans lire le corps.
 pub fn enhance_max_streams() -> usize {
@@ -2535,6 +2708,8 @@ pub(crate) fn environment_sha256() -> &'static str {
 /// Liste fermée (suffixes communs à SARAGOSSA_ et RETI_) ; les flags inconnus,
 /// le batching et la géométrie des blocs restent dans l'empreinte par prudence.
 const SNAPSHOT_OPERATIONAL_SERVE_FLAGS: &[&str] = &[
+    "ENHANCE_WEBTRANSPORT_ADDR",
+    "ENHANCE_H2_ADDR",
     "ENHANCE_MAX_STREAMS",
     "ENHANCE_IDLE_TIMEOUT_SECS",
     "SERVE_LOG_PROMPT_FINGERPRINT",
@@ -3286,6 +3461,37 @@ pub(crate) fn with_sampling_topk_scan<T>(enabled: bool, work: impl FnOnce() -> T
     let out = work();
     SAMPLING_TOPK_SCAN_OVERRIDE.with(|flag| flag.set(previous));
     out
+}
+
+/// Active les mesures mémoire TTS, séparées des mesures de latence.
+#[cfg(feature = "tts")]
+pub(crate) fn tts_memory_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_MEMORY_PROFILE", false))
+}
+
+/// Lance la sonde externe `footprint` à chaque nouvelle phase du profil mémoire.
+#[cfg(feature = "tts")]
+pub(crate) fn tts_memory_probe_enabled() -> bool {
+    env_flag("SARAGOSSA_TTS_MEMORY_PROBE", false)
+}
+
+/// Évite la copie CPU et l'upload de la table texte inutilisée par le talker.
+#[cfg(feature = "tts")]
+pub(crate) fn tts_compact_talker_embedding_enabled() -> bool {
+    env_flag("SARAGOSSA_TTS_COMPACT_TALKER_EMBEDDING", true)
+}
+
+/// Ne charge pas les poids d'encodage audio dans le décodeur de synthèse.
+#[cfg(feature = "tts")]
+pub(crate) fn tts_codec_decoder_only_enabled() -> bool {
+    env_flag("SARAGOSSA_TTS_CODEC_DECODER_ONLY", true)
+}
+
+/// Relit les poids CPU du codec à leur premier usage après l'upload Metal.
+#[cfg(feature = "tts")]
+pub(crate) fn tts_codec_lazy_cpu_enabled() -> bool {
+    env_flag("SARAGOSSA_TTS_CODEC_LAZY_CPU", true)
 }
 
 /// Force le décodage glouton TTS historique pour les oracles.

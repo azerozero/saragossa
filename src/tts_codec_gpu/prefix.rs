@@ -309,6 +309,12 @@ pub(super) struct GpuKv {
     len: usize,
 }
 
+impl GpuKv {
+    pub(super) fn allocated_bytes(&self) -> usize {
+        (self.keys.allocated_size() + self.values.allocated_size()) as usize
+    }
+}
+
 enum Kernel {
     RmsNorm,
     LayerNorm,

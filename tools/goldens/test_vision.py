@@ -169,7 +169,14 @@ class VisionFixtures(unittest.TestCase):
         self.assertEqual(len(llm), 12)
         stored = set(FIXTURES.rglob("*.bin"))
         self.assertTrue(llm <= stored)
-        self.assertEqual(len(stored - llm), 21)
+        preprocess_dir = FIXTURES / "preprocess"
+        preprocess_manifest = json.loads((preprocess_dir / "manifest.json").read_bytes())
+        preprocess = {preprocess_dir / entry["file"]
+                      for entry in preprocess_manifest["fixtures"] + preprocess_manifest["filter_probes"]}
+        preprocess.add(preprocess_dir / "normalized-f32.bin")
+        self.assertEqual(len(preprocess), 19)
+        self.assertEqual(set(preprocess_dir.glob("*.bin")), preprocess)
+        self.assertEqual(len(stored - llm - preprocess), 21)
 
     def test_llm_calibration_is_frozen(self):
         directory = FIXTURES / "Qwen3.8-27B-BF16"

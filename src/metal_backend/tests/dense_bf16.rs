@@ -233,3 +233,121 @@ fn dense_bf16_embedding_matches_f32() -> Result<()> {
     }
     Ok(())
 }
+
+fn stage_probe_run(
+    metal: &MetalExecutor,
+    stage: bool,
+    buffers: [&metal::Buffer; 3],
+    dims: [u32; 3],
+    reps: usize,
+) -> Result<f64> {
+    let (pipeline, rows) = if stage {
+        (&metal.dense_qmv_rhs_bf16_stage_f32, 4)
+    } else {
+        (&metal.dense_qmv_rhs_bf16_f32, 1)
+    };
+    let cb = metal.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    for (index, buffer) in buffers.iter().enumerate() {
+        enc.set_buffer(index as u64, Some(buffer), 0);
+    }
+    set_u32_bytes(enc, 3, &dims, "stage_dims")?;
+    for _ in 0..reps {
+        enc.dispatch_thread_groups(
+            MTLSize::new(u64::from(dims[1]).div_ceil(rows), u64::from(dims[0]), 1),
+            MTLSize::new(32 * rows, 1, 1),
+        );
+        post_dispatch_barrier_buffer(enc, buffers[2]);
+    }
+    enc.end_encoding();
+    let start = std::time::Instant::now();
+    commit_and_wait(cb)?;
+    Ok(start.elapsed().as_secs_f64() / reps as f64)
+}
+
+/// Compare le qmv bf16 à blocs de 256 au qmv par ligne, au bit près, puis
+/// mesure leur bande passante si `probe` (formes du 27B BF16).
+fn dense_bf16_stage_vs_row(shapes: &[(usize, usize, usize)], probe: bool) -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    for &(n, k, batch) in shapes {
+        let bits: Vec<u16> = (0..n * k)
+            .map(|i| {
+                let v = ((i.wrapping_mul(2_654_435_761) >> 7) % 4093) as f32 / 4093.0 - 0.5;
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let rhs = metal.buffer_from_slice(&bits, "stage_rhs")?;
+        drop(bits);
+        // Activations non représentables en bf16, signes mêlés.
+        let x: Vec<f32> = (0..batch * k)
+            .map(|i| ((i * 40_503 % 997) as f32 / 997.0 - 0.5) * 1.37)
+            .collect();
+        let lhs = metal.upload_f32_buffer(&x, "stage_lhs")?;
+        let dims = [batch as u32, n as u32, k as u32];
+        let row_out = metal.uncached_f32_buffer(batch * n, "stage_row_out")?;
+        let stage_out = metal.uncached_f32_buffer(batch * n, "stage_out")?;
+        stage_probe_run(&metal, false, [&lhs, &rhs, &row_out], dims, 1)?;
+        stage_probe_run(&metal, true, [&lhs, &rhs, &stage_out], dims, 1)?;
+        let bits_of = |buffer| -> Result<Vec<u32>> {
+            Ok(read_f32_buffer(buffer, batch * n)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        let expected = bits_of(&row_out)?;
+        assert!(expected.iter().all(|&b| b != 0), "N={n} K={k}");
+        assert_eq!(bits_of(&stage_out)?, expected, "N={n} K={k} M={batch}");
+        if !probe {
+            continue;
+        }
+        let reps = if n * k > 1 << 26 { 8 } else { 32 };
+        let mut samples = [Vec::new(), Vec::new()];
+        for trial in 0..9 {
+            for stage in [trial % 2 == 1, trial % 2 == 0] {
+                let t = stage_probe_run(&metal, stage, [&lhs, &rhs, &stage_out], dims, reps)?;
+                if trial >= 2 {
+                    samples[usize::from(stage)].push(t);
+                }
+            }
+        }
+        for (stage, values) in samples.iter_mut().enumerate() {
+            values.sort_by(f64::total_cmp);
+            eprintln!(
+                "N={n} K={k} stage={} median={:.3}ms {:.0}GB/s",
+                stage == 1,
+                values[3] * 1e3,
+                (n * k * 2) as f64 / values[3] / 1e9
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
+fn dense_bf16_qmv_stage_matches_row_qmv_bitwise() -> Result<()> {
+    let shapes = [(37, 512, 2), (5, 256, 1), (1024, 5120, 3), (48, 5120, 1)];
+    // L'identité vaut par construction au niveau source ; elle est vérifiée
+    // avec la compilation par défaut puis avec le fast-math coupé.
+    dense_bf16_stage_vs_row(&shapes, false)?;
+    with_metal_fast_math_override(false, || dense_bf16_stage_vs_row(&shapes, false))
+}
+
+// Temps commit/wait amortis sur plusieurs dispatches, ordre alterné : contrôle
+// local, pas une distribution sur GPU au repos.
+#[test]
+#[ignore = "sonde bande passante qmv bf16 par ligne contre blocs de 256, GPU au repos"]
+fn dense_bf16_qmv_stage_bandwidth_probe() -> Result<()> {
+    dense_bf16_stage_vs_row(
+        &[
+            (5120, 17408, 1),
+            (17408, 5120, 1),
+            (10240, 5120, 1),
+            (6144, 5120, 1),
+            (5120, 6144, 1),
+            (248_320, 5120, 1),
+        ],
+        true,
+    )
+}

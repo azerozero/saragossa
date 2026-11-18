@@ -41,8 +41,20 @@ pub struct WhisperTranscript {
     pub segments: Vec<WhisperSegment>,
 }
 
+/// Comment `TimestampRules` pilote le décodage d'une fenêtre.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RulesMode {
+    /// Contraintes de timestamps OpenAI (`verbose_json`).
+    Timestamps,
+    /// Lit seulement les logits du SOT ; le décodage reste l'argmax résident.
+    Probe,
+    /// Argmax sur les logits complets, sans règle, avec cumul des logprobs.
+    Plain,
+}
+
 /// Contraintes de timestamps et accumulateurs d'une fenêtre.
 pub(super) struct TimestampRules {
+    pub(super) mode: RulesMode,
     eot: u32,
     ts_begin: u32,
     nospeech: Option<u32>,
@@ -60,6 +72,7 @@ impl TimestampRules {
         languages: std::ops::Range<u32>,
     ) -> Self {
         Self {
+            mode: RulesMode::Timestamps,
             eot,
             ts_begin,
             nospeech,
@@ -67,6 +80,14 @@ impl TimestampRules {
             sum_logprob: 0.0,
             no_speech_prob: 0.0,
             language: None,
+        }
+    }
+
+    /// Règles sans timestamps : seuls `no_speech_prob` et `sum_logprob` servent.
+    pub(super) fn scoring(eot: u32, nospeech: Option<u32>, mode: RulesMode) -> Self {
+        Self {
+            mode,
+            ..Self::new(eot, u32::MAX, nospeech, 0..0)
         }
     }
 
@@ -85,6 +106,12 @@ impl TimestampRules {
 
     /// Applique les règles, choisit le token greedy et cumule son logprob.
     pub(super) fn select(&mut self, mut logits: Vec<f32>, generated: &[u32]) -> u32 {
+        if self.mode == RulesMode::Plain {
+            let next = argmax_index(&logits);
+            self.sum_logprob += f64::from(log_softmax(&logits)[next]);
+            // invariant: `next < vocab` et le vocab Whisper tient en u32.
+            return next as u32;
+        }
         let vocab = logits.len();
         let ts = (self.ts_begin as usize).min(vocab);
         let eot = (self.eot as usize).min(ts);
@@ -321,5 +348,15 @@ mod tests {
         rules.observe_sot(&logits);
         assert!(rules.no_speech_prob > 0.99);
         assert_eq!(rules.language, Some(14));
+    }
+
+    #[test]
+    fn plain_mode_is_unconstrained_argmax_with_logprob() {
+        let mut rules = TimestampRules::scoring(3, Some(12), RulesMode::Plain);
+        let mut logits = vec![0.0; VOCAB];
+        logits[7] = 4.0;
+        // Un token au-delà de l'EOT resterait supprimé en mode timestamps.
+        assert_eq!(rules.select(logits, &[]), 7);
+        assert!((rules.sum_logprob + 1.157).abs() < 0.01);
     }
 }

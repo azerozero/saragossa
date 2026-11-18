@@ -468,6 +468,41 @@ impl BufPool {
 }
 
 impl CodecGpu {
+    fn trace_stream_memory(&self, state: &CodecGpuStream, pool: &BufPool) {
+        if !crate::tts::memory::enabled() {
+            return;
+        }
+        crate::tts::memory::checkpoint(
+            "codec_stream",
+            &[
+                (
+                    "codec_scratch",
+                    pool.slots
+                        .iter()
+                        .map(|slot| slot.buffer.allocated_size() as usize)
+                        .sum(),
+                ),
+                (
+                    "codec_context",
+                    state
+                        .contexts
+                        .values()
+                        .map(|context| context.buffer.allocated_size() as usize)
+                        .sum(),
+                ),
+                (
+                    "codec_kv",
+                    state
+                        .kv
+                        .iter()
+                        .flatten()
+                        .map(prefix::GpuKv::allocated_bytes)
+                        .sum(),
+                ),
+            ],
+        );
+    }
+
     /// Bascule les convolutions en tuiles (oracles gather contre tuiles).
     #[cfg(test)]
     pub(crate) fn set_conv_tiled(&mut self, enabled: bool) {
@@ -935,6 +970,7 @@ impl CodecGpu {
         let wav = self.encode_tail_stream(state, encoder, &mut pool, input)?;
         encoder.end_encoding();
         commit_and_wait(command_buffer)?;
+        self.trace_stream_memory(state, &pool);
         read_f32_buffer(&wav.buffer, wav.len())
     }
 
@@ -965,6 +1001,7 @@ impl CodecGpu {
         let wav = self.encode_tail_stream(state, encoder, &mut pool, hidden)?;
         encoder.end_encoding();
         commit_and_wait(command_buffer)?;
+        self.trace_stream_memory(state, &pool);
         read_f32_buffer(&wav.buffer, wav.len())
     }
 

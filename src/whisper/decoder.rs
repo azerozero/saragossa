@@ -1,7 +1,9 @@
 //! Décodeur Whisper CPU, avec cross-attention sur les features audio.
 
 use super::streaming::TextDeltas;
-use super::timestamps::{parse_segments, TimestampRules, WhisperSegment, WhisperTranscript};
+use super::timestamps::{
+    parse_segments, RulesMode, TimestampRules, WhisperSegment, WhisperTranscript,
+};
 use super::{
     take, take_layer_norm, take_linear, validate_vector, whisper_weights_path, WhisperConfig,
     WhisperEncoder, WhisperLayerNorm, WhisperSelfAttention,
@@ -19,6 +21,9 @@ const NO_TIMESTAMPS_TOKEN: &str = "<|notimestamps|>";
 const TRANSLATE_TOKEN: &str = "<|translate|>";
 const FIRST_TIMESTAMP_TOKEN: &str = "<|0.00|>";
 /// `<|nospeech|>` depuis large-v3, `<|nocaptions|>` avant.
+/// Seuils par défaut d'openai-whisper (`no_speech_threshold`, `logprob_threshold`).
+const NO_SPEECH_THRESHOLD: f32 = 0.6;
+const LOGPROB_THRESHOLD: f64 = -1.0;
 const NO_SPEECH_TOKENS: [&str; 2] = ["<|nospeech|>", "<|nocaptions|>"];
 
 /// Reçoit chaque morceau de texte décodé.
@@ -64,6 +69,11 @@ pub struct WhisperModel {
     no_speech_token: Option<u32>,
     /// Tokens de langue, de SOT exclu à `<|translate|>` exclu.
     language_tokens: std::ops::Range<u32>,
+}
+
+/// Verdict openai : sans parole si `no_speech_prob > 0,6` et logprob moyen <= -1,0.
+fn silence_verdict(no_speech_prob: f32, avg_logprob: f64) -> bool {
+    no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob <= LOGPROB_THRESHOLD
 }
 
 /// État du decode RÉSIDENT (poids GPU + KV résident) lié à une génération.
@@ -195,7 +205,9 @@ impl WhisperDecoder {
         mut rules: Option<&mut TimestampRules>,
         on_token: &mut dyn FnMut(&[u32]) -> Result<()>,
     ) -> Result<Vec<u32>> {
-        let want_logits = rules.is_some();
+        let want_sot = rules.is_some();
+        // Le mode `Probe` ne relit que les logits du SOT : l'argmax GPU continue.
+        let want_logits = rules.as_deref().is_some_and(|r| r.mode != RulesMode::Probe);
         if prompt_tokens.is_empty() {
             return Err(InferError::Config("préfixe Whisper vide".to_string()));
         }
@@ -247,6 +259,7 @@ impl WhisperDecoder {
         let mut step = |token: u32,
                         position: usize,
                         emit_next: bool,
+                        want_logits: bool,
                         self_kv: &mut [LayerSelfKv]|
          -> Result<DecodeStep> {
             #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -285,8 +298,9 @@ impl WhisperDecoder {
         let mut logits = None;
         for (position, &token) in prompt_tokens.iter().enumerate() {
             let last = position + 1 == prompt_tokens.len();
-            let emit_next = last || (want_logits && position == 0);
-            match step(token, position, emit_next, &mut self_kv)? {
+            let emit_next = last || (want_sot && position == 0);
+            let wants = want_logits || (want_sot && position == 0);
+            match step(token, position, emit_next, wants, &mut self_kv)? {
                 DecodeStep::Advanced => {}
                 DecodeStep::Token(token) => next_from_resident = Some(token),
                 DecodeStep::Logits(value) => {
@@ -305,6 +319,10 @@ impl WhisperDecoder {
             return Err(InferError::Config("préfixe Whisper vide".to_string()));
         }
 
+        // Mode `Probe` : seuls les logits du SOT comptaient.
+        if rules.as_deref().is_some_and(|r| r.mode == RulesMode::Probe) {
+            return Ok(Vec::new());
+        }
         let mut generated = Vec::new();
         let budget = max_new_tokens.min(self.config.max_target_positions);
         let mut ctx_len = prompt_tokens.len();
@@ -315,7 +333,7 @@ impl WhisperDecoder {
                     let logits = logits.take().ok_or_else(|| {
                         InferError::Config("decode Whisper sans logits".to_string())
                     })?;
-                    match rules.as_deref_mut() {
+                    match rules.as_deref_mut().filter(|r| r.mode != RulesMode::Probe) {
                         Some(rules) => rules.select(logits.into_data(), &generated),
                         None => u32::try_from(argmax(logits.data())?).map_err(|_| {
                             InferError::Dimension("token argmax hors plage u32".to_string())
@@ -333,7 +351,7 @@ impl WhisperDecoder {
             if ctx_len >= self.config.max_target_positions {
                 break;
             }
-            match step(next, position, true, &mut self_kv)? {
+            match step(next, position, true, want_logits, &mut self_kv)? {
                 DecodeStep::Advanced => {}
                 DecodeStep::Token(token) => next_from_resident = Some(token),
                 DecodeStep::Logits(value) => logits = Some(value),
@@ -807,6 +825,54 @@ impl WhisperModel {
         self.decoder.config.max_target_positions.min(448)
     }
 
+    /// Règle d'openai-whisper : fenêtre sans parole si `no_speech_prob` (logits du
+    /// SOT) dépasse 0,6 ET que le logprob moyen du décodage greedy ne dépasse pas
+    /// -1,0. Sans cela, whisper-tiny hallucine « ... » sur du silence. Le sondage
+    /// du SOT est peu coûteux ; le décodage complet n'a lieu que si la fenêtre
+    /// est suspecte, donc la parole garde le chemin résident inchangé.
+    ///
+    /// NOTE: le logprob est calculé sans `suppress_tokens` ni `suppress_blank`,
+    /// donc avec un petit écart par rapport à openai près du seuil. Le token de
+    /// langue n'est jamais compté : il fait partie du préfixe, même en mode auto.
+    fn is_silence(
+        &self,
+        audio_features: &Tensor,
+        prompt: &[u32],
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<bool> {
+        if self.no_speech_token.is_none() {
+            return Ok(false);
+        }
+        let budget = (self.token_budget(), self.eot_token);
+        let mut probe =
+            TimestampRules::scoring(self.eot_token, self.no_speech_token, RulesMode::Probe);
+        self.decoder.generate(
+            audio_features,
+            prompt,
+            budget,
+            runtime,
+            Some(&mut probe),
+            &mut |_| Ok(()),
+        )?;
+        if probe.no_speech_prob <= NO_SPEECH_THRESHOLD {
+            return Ok(false);
+        }
+        let mut plain = TimestampRules::scoring(self.eot_token, None, RulesMode::Plain);
+        let generated = self.decoder.generate(
+            audio_features,
+            prompt,
+            budget,
+            runtime,
+            Some(&mut plain),
+            &mut |_| Ok(()),
+        )?;
+        // `generated` exclut l'EOT mais `select` en a cumulé le logprob : +1.
+        Ok(silence_verdict(
+            probe.no_speech_prob,
+            plain.sum_logprob / (generated.len() + 1) as f64,
+        ))
+    }
+
     fn decode_text(
         &self,
         features: AudioFeatures<'_>,
@@ -817,6 +883,10 @@ impl WhisperModel {
     ) -> Result<(String, String)> {
         let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
         let prompt = self.prompt(lang, false);
+        let effective_lang = if lang == "auto" { "auto" } else { lang }.to_string();
+        if self.is_silence(audio_features, &prompt, runtime)? {
+            return Ok((String::new(), effective_lang));
+        }
         let t_dec = std::time::Instant::now();
         let generated = match on_delta {
             None => self.decoder.generate(
@@ -861,7 +931,6 @@ impl WhisperModel {
             );
         }
         let text = decode_generated_tokens(&self.tokenizer, &generated)?;
-        let effective_lang = if lang == "auto" { "auto" } else { lang }.to_string();
         Ok((text.trim().to_string(), effective_lang))
     }
 
@@ -1241,6 +1310,14 @@ mod tests {
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     fn live_runtime() -> ForwardRuntime<'static> {
         ForwardRuntime::cpu()
+    }
+
+    #[test]
+    fn silence_verdict_needs_both_thresholds() {
+        assert!(silence_verdict(0.9, -1.5));
+        assert!(silence_verdict(0.61, -1.0));
+        assert!(!silence_verdict(0.6, -2.0));
+        assert!(!silence_verdict(0.9, -0.5));
     }
 
     fn tiny_decoder_without_layers() -> WhisperDecoder {

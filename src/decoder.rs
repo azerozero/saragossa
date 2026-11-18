@@ -86,6 +86,8 @@ mod layer_plan_tests;
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod mtp_moe_oracles;
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+mod prefix_align_tests;
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod qwen35_oracles;
 #[cfg(test)]
 mod tests;
@@ -1360,6 +1362,9 @@ pub struct CausalDecoder {
     dflash: Option<crate::DFlashDraft>,
     snapshot_sources: SnapshotSources,
     prefix_cache: Arc<Mutex<PrefixCache>>,
+    /// Alignement et queue des reprises du cache de préfixe, choisis au
+    /// chargement (`runtime_flags::prefix_align_for_model`).
+    prefix_align: Option<(usize, usize)>,
     memory_guard: Option<MemoryGuard>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     runtime: DecoderRuntime,
@@ -1569,6 +1574,31 @@ impl PrefixCache {
             })
             .map_or(self.entries.len(), |index| index.max(1));
         self.entries.truncate(keep);
+    }
+}
+
+/// Vrai si une projection du tronc est un poids dense bf16 éligible au GEMM
+/// NA (`can_use_dense_bf16_gemm` : dimensions multiples de 64, flag actif) :
+/// sous 64 lignes, elle passe par le qmv. La tête et l'embedding, appliqués
+/// ligne à ligne, n'entrent pas en compte.
+fn uses_dense_bf16_gemm(tensors: &HashMap<String, DecoderTensor>) -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        crate::runtime_flags::dense_bf16_gemm_enabled()
+            && tensors.iter().any(|(name, tensor)| {
+                !name.starts_with("lm_head")
+                    && !name.contains("embed_tokens")
+                    && matches!(
+                        tensor,
+                        DecoderTensor::LinearWeight(LinearWeight::DenseBf16(weight))
+                            if matches!(weight.shape(), [out, input] if out % 64 == 0 && input % 64 == 0)
+                    )
+            })
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    {
+        let _ = tensors;
+        false
     }
 }
 
@@ -1948,6 +1978,8 @@ impl CausalDecoder {
         mut tensors: HashMap<String, DecoderTensor>,
         config: CausalDecoderConfig,
     ) -> Result<Self> {
+        let prefix_align =
+            crate::runtime_flags::prefix_align_for_model(uses_dense_bf16_gemm(&tensors));
         let embed_tokens = take_embedding_weight(&mut tensors, "embed_tokens.weight")?;
         if config.num_hidden_layers == 0 {
             return Err(InferError::Config(
@@ -1999,10 +2031,23 @@ impl CausalDecoder {
             dflash: None,
             snapshot_sources: SnapshotSources::default(),
             prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
+            prefix_align,
             memory_guard: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             runtime: DecoderRuntime::default(),
         })
+    }
+
+    /// Alignement et queue minimale effective (tokens) des reprises de prefill
+    /// de ce modèle, `None` si l'alignement est coupé. La queue couvre aussi le
+    /// seuil du prolongement résident (`SARAGOSSA_RUST_PREFIX_EXTEND_RESIDENT_MIN`),
+    /// sous lequel l'extension passerait en lignes.
+    #[must_use]
+    pub fn prefix_resume_align(&self) -> Option<(usize, usize)> {
+        let (align, tail) = self.prefix_align?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let tail = tail.max(crate::runtime_flags::prefix_extend_resident_min_tokens());
+        Some((align, tail))
     }
 
     /// Attache une garde mémoire aux allocations résidentes de ce décodeur.

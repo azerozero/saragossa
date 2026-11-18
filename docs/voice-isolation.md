@@ -184,6 +184,230 @@ sans prétendre mesurer une heure d'inférence DFN3. Les tests TCP vérifient
 l'émission avant la fin de l'envoi, les deux cadrages HTTP, multipart, le 400,
 le 503, la contre-pression et l'inactivité en lecture/écriture.
 
+### WebSocket
+
+La feature `ws` (activée par défaut, impliquant `serve` et `denoise`) expose
+`GET /v1/audio/enhance/ws?rate=16000&format=s16` sur le même listener.
+Le handshake RFC 6455 exige HTTP/1.1, version 13 et une clé de 16 octets.
+Les messages binaires portent du PCM mono little-endian, `s16` ou `f32` ; la
+réponse utilise le même format à **48 kHz**. `rate` est obligatoire (8–192 kHz).
+Les échantillons peuvent traverser les limites de messages. Les NaN, infinis
+et échantillons tronqués sont refusés. Les trames **et messages reconstitués**
+sont limités à 16 Kio ; le dépassement ferme avec 1009. Les erreurs de cadrage
+ferment avec 1002. Les masques client, continuations, ping/pong et close sont
+contrôlés ; aucune extension de compression n'est négociée.
+
+Un **message binaire vide** termine l'entrée : le serveur vide FIR et DFN3,
+renvoie la fin audio, un message binaire vide puis close 1000. Un close client
+abandonne le traitement et reçoit son écho ; il ne remplace pas la fin d'entrée.
+Lire pendant l'envoi est indispensable : le serveur écrit avant de relire,
+sans file audio. Les limites de flux (503 avant upgrade), délais d'inactivité
+et réservations sont partagés avec le chunked.
+
+Le navigateur ne permet pas d'ajouter `Authorization` au handshake WebSocket.
+Le serveur accepte donc aussi `bearer.<clé>` dans les sous-protocoles, et
+renvoie le sous-protocole choisi (`saragossa` s'il est proposé, sinon la valeur
+`bearer.<clé>`, que le navigateur exige). Un `Origin` non loopback (hors
+`http(s)://127.0.0.1`, `localhost`, `[::1]`, tous ports) reçoit 403 avant
+l'upgrade, avec ou sans clé. Chaque trame doit arriver en entier avant le délai
+d'inactivité, et plus de 32 pings/pongs sans audio ferment la session (1008).
+Une erreur PCM après l'upgrade ferme avec 1007 ou 1011. La clé doit être un token
+HTTP valide (par exemple une chaîne hexadécimale). Hors boucle locale, placer
+le listener derrière un proxy TLS (`wss://`) qui conserve l'upgrade.
+
+```js
+// pcmChunks produit des Uint8Array de PCM s16le mono, <= 16 Kio.
+const ws = new WebSocket(
+  "ws://localhost:8080/v1/audio/enhance/ws?rate=16000&format=s16",
+  ["saragossa", `bearer.${apiKey}`],
+);
+ws.binaryType = "arraybuffer";
+ws.onmessage = ({data}) => {
+  if (data.byteLength) consumePcm48k(new Uint8Array(data));
+};
+await new Promise((resolve, reject) => {
+  ws.onopen = resolve;
+  ws.onerror = reject;
+});
+for await (const chunk of pcmChunks) {
+  while (ws.bufferedAmount > 16384) {
+    if (ws.readyState !== WebSocket.OPEN) throw new Error("flux fermé");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  ws.send(chunk);
+}
+ws.send(new Uint8Array()); // vider le retard avant close
+```
+
+### HTTP/2 h2c
+
+`--features h2` active les dépendances async optionnelles (hors `default`).
+Le listener dédié est explicitement activé par
+`SARAGOSSA_ENHANCE_H2_ADDR=127.0.0.1:8082` ; le listener HTTP/1 reste disponible.
+Le démarrage échoue si l'adresse n'est pas loopback (127.0.0.0/8 ou `[::1]`),
+ne peut pas être liée ou si aucune clé API
+n'est configurée. Le listener accepte le **prior knowledge h2c**, sans upgrade
+HTTP/1 ni TLS intégré. Pour un navigateur, un proxy TLS avec ALPN `h2` doit
+terminer HTTPS et transmettre vers ce listener.
+
+```bash
+SARAGOSSA_ENHANCE_H2_ADDR=127.0.0.1:8082 \
+  saragossa serve --port 8080 --enhance-model dfn3.safetensors
+curl --http2-prior-knowledge --no-buffer \
+  -H "Authorization: Bearer $SARAGOSSA_API_KEY" \
+  --data-binary @mono.s16le \
+  'http://localhost:8082/v1/audio/enhance/h2?rate=16000&format=s16' > propre.s16le
+```
+
+La requête est `POST`, le corps et la réponse sont du PCM brut comme en WS,
+sans préfixe WAV ; la sortie est à 48 kHz. END_STREAM termine l'entrée et vide
+le retard. L'admission partage `SARAGOSSA_ENHANCE_MAX_STREAMS` avec les autres
+transports et répond 503 avant de consommer le corps. La taille de DATA et la
+fenêtre par flux sont de 16 Kio, la fenêtre de connexion de 32 Kio ; une trame
+supérieure au maximum négocié produit FRAME_SIZE_ERROR. La capacité reçue
+n'est rendue qu'après l'émission de la sortie, et l'envoi attend WINDOW_UPDATE.
+Un worker CPU par flux admis communique par deux canaux de capacité un : les
+E/S des autres flux continuent pendant le calcul DFN3. Lectures, écritures,
+handshake et attente de capacité sont bornés par le délai enhance ; une erreur
+après les headers réinitialise le flux, sans toucher aux autres requêtes.
+
+**Limite de [Fetch](https://fetch.spec.whatwg.org/#dom-request-duplex).** Le duplex HTTP/2 est testé avec un client natif qui reçoit
+avant END_STREAM. L'API Fetch des navigateurs exige généralement
+`duplex: "half"` pour un corps ReadableStream et n'expose la réponse qu'après
+la fin de l'envoi : HTTP/2 ne lève pas cette restriction. Pour recevoir le son
+pendant une capture navigateur continue, utiliser WS ou WebTransport. Un
+exemple Fetch ne constitue donc pas une preuve de duplex navigateur.
+
+### WebTransport / HTTP/3
+
+La feature `webtransport` est opt-in et hors `default`. Elle utilise
+[web-transport-quinn](https://github.com/moq-dev/web-transport), une
+implémentation HTTP/3 WebTransport sur Quinn, et Rustls/ring. Le certificat
+est généré avec rcgen. Ces dépendances optionnelles récentes nécessitent
+Rust **1.88 ou supérieur** ; les features par défaut conservent leur périmètre.
+
+```bash
+SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR=127.0.0.1:4433 \
+  saragossa serve --port 8080 --enhance-model dfn3.safetensors
+```
+
+Le listener UDP accepte une session par connexion QUIC sur
+`/v1/audio/enhance/wt?rate=16000&format=s16&token=…`. La clé API est transmise
+uniquement dans la requête CONNECT chiffrée ; l'application ne journalise pas
+l'URL. Ne pas journaliser cette query dans un proxy. La même admission DFN3
+renvoie HTTP **503 avant acceptation** quand le plafond commun est atteint.
+La limite globale de connexions s'applique avant le handshake QUIC (refus
+QUIC à ce stade, puisqu'aucune requête HTTP n'existe encore).
+
+Chaque session accepte un stream bidirectionnel fiable. Chaque message
+applicatif est `u32le longueur + PCM`, limité à **16 Kio** ; aucune allocation
+proportionnelle à une longueur non validée. Un préfixe zéro suivi de FIN
+termine l'entrée. Le serveur renvoie le PCM à 48 kHz, puis un préfixe zéro et
+FIN. Les datagrammes ne sont pas utilisés. Les fenêtres QUIC sont bornées
+(16 Kio par stream, 64 Kio par connexion et en émission), et chaque réponse
+est écrite avant de lire la suivante. La contre-pression et les délais sont
+partagés avec le worker HTTP/2. Un message trop grand, une fin partielle ou
+une inactivité ferme le flux avec une erreur, sans marqueur de succès.
+
+Le certificat auto-signé **ECDSA P-256** vit 13 jours plus une marge de
+60 secondes au début (donc moins de 14 jours), reste en mémoire et est
+renouvelé tous les 12 jours. Aucun fichier de clé n'est écrit. L'endpoint
+HTTP authentifié `GET /v1/audio/enhance/certificate` expose l'URL, l'expiration
+et `serverCertificateHashes` (SHA-256 du DER, tableau de 32 octets), avec
+`Cache-Control: no-store`. Récupérer ces informations avant chaque connexion.
+
+```js
+const metadata = await fetch("/v1/audio/enhance/certificate", {
+  headers: {Authorization: `Bearer ${apiKey}`},
+}).then(r => {
+  if (!r.ok) throw new Error(`certificat: ${r.status}`);
+  return r.json();
+});
+const url = new URL(metadata.url);
+url.search = new URLSearchParams({rate: "16000", format: "s16", token: apiKey});
+const wt = new WebTransport(url, {
+  serverCertificateHashes: metadata.serverCertificateHashes.map(h => ({
+    algorithm: h.algorithm, value: Uint8Array.from(h.value),
+  })),
+});
+await wt.ready;
+const {readable, writable} = await wt.createBidirectionalStream();
+const writer = writable.getWriter();
+function packet(bytes) {
+  if (bytes.length > 16384) throw new Error("morceau PCM trop grand");
+  const out = new Uint8Array(4 + bytes.length);
+  new DataView(out.buffer).setUint32(0, bytes.length, true);
+  out.set(bytes, 4);
+  return out;
+}
+// Les lectures QUIC peuvent couper un préfixe ou regrouper plusieurs messages.
+const receiver = (async () => {
+  const reader = readable.getReader();
+  let pending = new Uint8Array();
+  let finished = false;
+  for (;;) {
+    const {value, done} = await reader.read();
+    if (done) {
+      if (!finished || pending.length) throw new Error("réponse tronquée");
+      return;
+    }
+    const joined = new Uint8Array(pending.length + value.length);
+    joined.set(pending); joined.set(value, pending.length); pending = joined;
+    while (pending.length >= 4) {
+      if (finished) throw new Error("données après fin");
+      const n = new DataView(pending.buffer, pending.byteOffset).getUint32(0, true);
+      if (n > 16384) throw new Error("trame réponse trop grande");
+      if (pending.length < 4 + n) break;
+      const pcm = pending.slice(4, 4 + n);
+      pending = pending.slice(4 + n);
+      if (n === 0) finished = true;
+      else consumePcm48k(pcm);
+    }
+  }
+})();
+const sender = (async () => {
+  for await (const pcm of pcmChunks) await writer.write(packet(pcm));
+  await writer.write(packet(new Uint8Array()));
+  await writer.close();
+})();
+try { await Promise.all([sender, receiver]); }
+finally { wt.close(); }
+```
+
+L'exemple exige un contexte navigateur sécurisé et une implémentation de
+WebTransport avec épinglage de certificat. `consumePcm48k` et `pcmChunks`
+sont les fonctions de capture/restitution de l'application. Les tests
+ordinaires utilisent de vraies connexions QUIC et vérifient le certificat,
+le duplex au bit contre le batch, le 503, les bornes et l'inactivité ; ils ne
+constituent pas un test de compatibilité de tous les navigateurs.
+
+### Reproduire les mesures de transport
+
+Les tests ignorés `ws_abba_latency`, `h2_abba_latency` et
+`webtransport_abba_latency` alternent six blocs ABBA contre le chunked sur
+loopback, après warm-up. Chaque essai contient 64 hops et vérifie `load1 < 2`
+avant et après ; sinon la mesure échoue et aucun résultat agrégé n'est publié.
+Ils distinguent la première réponse (handshake/headers), le premier PCM après
+les quatre hops d'amorçage, puis les allers-retours par hop (p50 et p99).
+Pour HTTP/2, la première réponse est mesurée à la disponibilité des headers
+par l'API ; pour WebTransport elle inclut TLS/QUIC/CONNECT. Les sorties WS/h2/WT
+sont en f32 dans ce banc, contre s16 pour l'endpoint WAV chunked existant.
+
+```bash
+CARGO_BUILD_JOBS=4 taskpolicy -b cargo test --release \
+  --no-default-features --features ws,h2,webtransport \
+  --bin saragossa abba_latency -- --ignored --nocapture --test-threads=1
+```
+
+`SARAGOSSA_ABBA_BLOCKS=<n>` change le nombre de blocs (6 par défaut) et la sortie
+donne p50, p95 et p99. Pour comparer HTTP/1 SSE et WebSocket contre un serveur
+déjà lancé, `python3 -I tools/bench_transports.py {sse,ws} -n 30` mesure le
+premier octet, le premier événement ou PCM et la latence par trame (p50, p95).
+
+Aucun résultat de latence sous charge n'est présenté comme une mesure valide.
+Les comparaisons de fidélité utilisent des poids récurrents synthétiques
+communs à l'oracle historique, et ne nécessitent ni téléchargement ni GPU.
+
 ### Oracle
 
 `tools/voice/dfn3_ref.py` construit la référence : les classes PyTorch
@@ -392,3 +616,60 @@ Pas de référence exécutée : le code dépend de `mamba_ssm` (noyaux CUDA), ab
 sur macOS. Un oracle demanderait d'abord un scan Mamba de référence en PyTorch
 pur. Estimation du port : 6 à 10 jours (scan bidirectionnel GPU, convs 2D
 denses, InstanceNorm, sous-pixel, iSTFT).
+
+## Débruitage multi-cœur (opt-in)
+
+`SARAGOSSA_DENOISE_THREADS=N` (défaut 1 : chemin historique hop par hop)
+traite le flux par blocs de 256 trames (2,56 s). Seuls les GRU portent un état
+d'une trame à l'autre. L'encodeur (convolutions causales sur des fenêtres
+d'entrée connues), les portes d'entrée des GRU et les décodeurs tournent donc
+en parallèle sur toutes les trames du bloc (`src/denoise/network/batch.rs`).
+La récurrence des GRU reste séquentielle, avec les GRU ERB et DF sur un cœur
+chacun. Chaque trame exécute les mêmes fonctions que le chemin hop par hop :
+la sortie est identique bit à bit pour tout N. Le traitement reste en flux à
+mémoire bornée ; la latence augmente d'un bloc.
+
+Profil mono-cœur (`sample`, 293 s d'audio) : convolutions 61 %, GRU 26 %
+(dont environ 40 % de portes d'entrée parallélisables), rééchantillonnage 3 %.
+Mesures sur `long.wav` (293 s, M-series 18 cœurs, charge < 2 au lancement),
+avec une sortie identique au mono-cœur (`cmp`) pour chaque N :
+
+| N | 1 | 2 | 4 | 8 | 18 |
+|---|---|---|---|---|---|
+| temps (s) | 13,0 | 7,4 | 4,9 | 3,8 | 3,2 |
+
+Le plafond vient des GRU séquentiels. Pour reproduire :
+
+```bash
+for n in 1 2 8; do SARAGOSSA_DENOISE_THREADS=$n cargo run --release -- enhance \
+  --model $SARAGOSSA_DFN3_DIR/dfn3.safetensors --input long.wav --output out_$n.wav; done
+cmp out_1.wav out_2.wav && cmp out_1.wav out_8.wav
+```
+
+## GPU hors ligne (opt-in)
+
+`SARAGOSSA_DENOISE_GPU=1 saragossa enhance …` calcule le réseau en lot sur
+Metal (`src/denoise/gpu.rs`) : convolutions et linéaires sur toutes les trames
+d'un morceau de 4096 pas, et chaque GRU dans un seul noyau persistant (un
+threadgroup de 768 threads, boucle temporelle complète). STFT, features et
+synthèse restent sur CPU. Le fichier entier est gardé en mémoire.
+
+La sortie est identique au bit au CPU en variante `Math::Common`
+(`enhance_common`) : chaque sortie est calculée par un thread dans l'ordre de
+sommation du CPU, sans fast-math ni FMA, et `exp`/`tanh`/sigmoïde suivent
+`exact_math` des deux côtés. Cette variante s'écarte du CPU libm historique
+(défaut inchangé) de quelques ulp.
+
+Mesures (M5 Max, clip de 292,75 s, charge 5 à 15, non publiables comme bench) :
+
+| Mesure | Valeur |
+|---|---|
+| Boucle GRU persistante | 11,4 µs/pas (une ou deux séquences côte à côte) |
+| `enhance` GPU, fichier | 1,9 s, dont 1,2 s de réseau GPU (CPU 1 thread : 12,65 s, nuit du 17) |
+| GPU vs CPU commun | 14 052 096 échantillons identiques au bit sur 14 052 096 |
+| CPU commun vs libm | 11 269 333 échantillons différents, SNR 135,0 dB, écart max 8,9e-7 |
+
+```bash
+SARAGOSSA_DFN3_DIR=… SARAGOSSA_DFN3_LONG_WAV=long.wav cargo test --release --lib \
+  dfn3_gpu_long_file_bit_exact_and_speed -- --ignored --nocapture
+```

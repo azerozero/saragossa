@@ -309,11 +309,15 @@ impl MetalExecutor {
         let gate_packed = self.cached_affine_packed(gate_w, "shared_gate_packed")?;
         let gate_packed_offset = affine_packed_offset(gate_w)?;
         let gate_scales = self.cached_affine_scales(gate_w, "shared_gate_scales")?;
+        let gate_scales_offset = affine_scales_offset(gate_w)?;
         let gate_biases = self.cached_affine_biases(gate_w, "shared_gate_biases")?;
+        let gate_biases_offset = affine_biases_offset(gate_w)?;
         let up_packed = self.cached_affine_packed(up_w, "shared_up_packed")?;
         let up_packed_offset = affine_packed_offset(up_w)?;
         let up_scales = self.cached_affine_scales(up_w, "shared_up_scales")?;
+        let up_scales_offset = affine_scales_offset(up_w)?;
         let up_biases = self.cached_affine_biases(up_w, "shared_up_biases")?;
+        let up_biases_offset = affine_biases_offset(up_w)?;
         let (pipeline, kernel_name) = if gate_bits == FAST_QMV_BITS {
             (
                 &self.affine_gate_up_swiglu_fast_u4_gs64_f32,
@@ -333,11 +337,11 @@ impl MetalExecutor {
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
         encoder.set_buffer(1, Some(&gate_packed), gate_packed_offset);
-        encoder.set_buffer(2, Some(&gate_scales), 0);
-        encoder.set_buffer(3, Some(&gate_biases), 0);
+        encoder.set_buffer(2, Some(&gate_scales), gate_scales_offset);
+        encoder.set_buffer(3, Some(&gate_biases), gate_biases_offset);
         encoder.set_buffer(4, Some(&up_packed), up_packed_offset);
-        encoder.set_buffer(5, Some(&up_scales), 0);
-        encoder.set_buffer(6, Some(&up_biases), 0);
+        encoder.set_buffer(5, Some(&up_scales), up_scales_offset);
+        encoder.set_buffer(6, Some(&up_biases), up_biases_offset);
         encoder.set_buffer(7, Some(output_buffer), 0);
         set_u32_bytes(encoder, 8, &dims, "shared_gate_up_dims")?;
         trace_dispatch_path(kernel_name, 1, out_dim, in_dim);

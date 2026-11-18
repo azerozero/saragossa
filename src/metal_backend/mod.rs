@@ -62,6 +62,7 @@ mod kernel_timing;
 mod lightbatch_duo;
 mod lightbatch_multi;
 mod linear_attention;
+mod memory;
 mod state_snapshot;
 pub(crate) use state_snapshot::LinearSnapshotLayout;
 mod linear_attention_encode;
@@ -107,6 +108,8 @@ pub(crate) use self::flags::with_flint_moe_coop_tiled_override;
 #[cfg(test)]
 pub(crate) use self::flags::with_qmm_na_u4_min_dim_override;
 #[cfg(test)]
+pub(crate) use self::flags::MMAP_WEIGHT_VIEWS;
+#[cfg(test)]
 pub(crate) use self::matmul::with_concat_vram_fraction_override;
 #[cfg(test)]
 pub(crate) use self::moe_na::moe_coop_tiled_trace_for_test;
@@ -149,7 +152,7 @@ pub(crate) use self::barriers::{
     post_dispatch_barrier, wait_for_completion, EncoderEndGuard,
 };
 pub(crate) use self::byte_helpers::read_u16_buffer;
-pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
+pub(crate) use self::byte_helpers::{read_f32_buffer, read_f32_buffer_at, read_u32_buffer};
 pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at, write_u8_buffer};
 use self::core::*;
 #[cfg(any(feature = "devtools", test))]
@@ -247,6 +250,7 @@ pub struct MetalExecutor {
     queue: CommandQueue,
     dense_matmul_rhs_t_f32: ComputePipelineState,
     dense_qmv_rhs_bf16_f32: ComputePipelineState,
+    dense_qmv_rhs_bf16_stage_f32: ComputePipelineState,
     dense_qmv_fast_f32: ComputePipelineState,
     dense_gemm_rhs_t_f32: ComputePipelineState,
     affine_matmul_rhs_t_u32_f32: ComputePipelineState,
@@ -381,6 +385,8 @@ pub struct MetalExecutor {
     rms_norm_rope_heads_f32: ComputePipelineState,
     #[cfg(feature = "diar")]
     rope_heads_inplace_f32: ComputePipelineState,
+    #[cfg(feature = "diar")]
+    split_qkv_rows_f32: ComputePipelineState,
     rms_norm_mrope_heads_f32: ComputePipelineState,
     rms_norm_heads_no_scale_f32: ComputePipelineState,
     causal_attention_prefill_f32: ComputePipelineState,

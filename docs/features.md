@@ -12,7 +12,7 @@ emplacement ; les gardes portent sur leurs entrées et leurs dépendances.
 | `stt` | Whisper, transcription et sessions incrémentales | `dep:flate2`, `dep:rustfft`, `dep:hound` |
 | `tts` | Talker Qwen3, codec, Mimi, clonage et voix | `dep:rustfft`, `dep:hound` |
 | `diar` | Nemotron-3-Diarization, commande `diarize` et route `/v1/audio/diarization` | `dep:rustfft`, `dep:hound` |
-| `vision` | Entrées internes image/embeddings et oracles M-RoPE | Aucune |
+| `vision` | Prétraitement RGB CPU, entrées internes image/embeddings et oracles M-RoPE | Aucune |
 | `denoise` | DeepFilterNet3 CPU, commande `enhance` et route `/v1/audio/enhance` | `dep:rustfft`, `dep:hound` |
 | `embed` | Embedder texte e5-small | Aucune |
 | `serve` | Serveur HTTP/Unix et commandes `serve`, `bench-serve` | Aucune |
@@ -41,7 +41,9 @@ rééchantillonnage fonctionnent sur CPU. L'entrée WAV est convertie en mono
 TTS et les fixtures STT, sans dépendance entre ces modalités.
 
 `vision` ne livre pas de transport image public ni d'encodeur complet : les
-requêtes média restent refusées comme auparavant. Les validations des en-têtes
+requêtes média restent refusées : HTTP **501** sans la feature, **400** avec
+elle tant que le transport n'est pas livré. Les options CLI image/vidéo restent
+refusées. Les validations des en-têtes
 multimodaux et les métadonnées de cache restent dans le cœur pour charger les
 modèles texte et reconnaître les snapshots sans réinterpréter leur format.
 Les pipelines Metal génériques restent partagés entre modalités.

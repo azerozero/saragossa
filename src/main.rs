@@ -4,6 +4,7 @@
 
 #[cfg(feature = "serve")]
 mod bench_serve;
+mod config_cmd;
 #[cfg(feature = "devtools")]
 mod convert_cli;
 #[cfg(feature = "decision")]
@@ -130,6 +131,7 @@ fn run() -> CliResult<()> {
                     "débruitage absent : recompiler avec --features denoise",
                 ));
             }
+            "config" => return config_cmd::run(raw_args.into_iter().skip(1)),
             "bench" => return doctor_bench::run_bench(raw_args.into_iter().skip(1)),
             #[cfg(feature = "serve")]
             "bench-serve" => return bench_serve::run(raw_args.into_iter().skip(1)),
@@ -940,7 +942,7 @@ fn cli_error(message: impl Into<String>) -> Box<dyn Error> {
 }
 
 fn help_text() -> String {
-    let mut help = "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa <doctor|bench|serve|bench-serve|decide> [options]\n       saragossa convert-qwen4exp --src <fp8> --dst <sortie> --source-revision <sha> [--source-repo <org/nom>] [--converter-commit <sha>] [--only <unité,…>] [--verify] [--plan]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--stop TEXT]... [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N] [--kl-record PATH | --kl-compare PATH]\nKL : run <chemin local> accepte aussi ces deux modes ; --max-tokens fixe n, --kl-compare relit le prompt enregistré.\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet SARAGOSSA_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 with SARAGOSSA_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance.".to_string();
+    let mut help = "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa config <check FILE|print [FILE]> [--set section.cle=valeur]\n       saragossa <doctor|bench|serve|bench-serve|decide> [options]\n       saragossa convert-qwen4exp --src <fp8> --dst <sortie> --source-revision <sha> [--source-repo <org/nom>] [--converter-commit <sha>] [--only <unité,…>] [--verify] [--plan]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--stop TEXT]... [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N] [--kl-record PATH | --kl-compare PATH]\nKL : run <chemin local> accepte aussi ces deux modes ; --max-tokens fixe n, --kl-compare relit le prompt enregistré.\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet SARAGOSSA_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 with SARAGOSSA_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance.".to_string();
     let commands = [
         Some("doctor"),
         Some("bench"),

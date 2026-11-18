@@ -5,6 +5,9 @@ use crate::{rms_norm, InferError, Result, Tensor};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+mod weights;
+use weights::CodecWeights;
+
 /// Trames par lot du décodage batch au préfixe GPU : borne la mémoire des
 /// scores d'attention sans changer le PCM (invariant au découpage).
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -14,7 +17,7 @@ const CODEC_GPU_PREFIX_LOT_FRAMES: usize = 64;
 pub(crate) struct TtsCodec {
     cfg: TtsDecoderConfig,
     sample_rate: u32,
-    weights: HashMap<String, Tensor>,
+    weights: CodecWeights,
     /// Forward GPU résident de la section chaude (`decoder.decoder.*`), construit
     /// au chargement quand Metal est dispo et `SARAGOSSA_TTS_CODEC_GPU` actif (défaut).
     /// Repli CPU (octet-identique) si absent.
@@ -96,8 +99,14 @@ impl TtsCodec {
         let mut weights = HashMap::new();
         let mut cluster = HashMap::new();
         let mut embsum = HashMap::new();
+        let decoder_only = crate::runtime_flags::tts_codec_decoder_only_enabled();
 
         for name in payload.names() {
+            // L'encodeur Mimi de clonage possède son propre chargeur. La synthèse
+            // ne lit aucun poids `encoder.*` de ce checkpoint partagé.
+            if decoder_only && name.starts_with("encoder.") {
+                continue;
+            }
             if let Some(base) = name.strip_suffix("._codebook.cluster_usage") {
                 cluster.insert(
                     format!("{base}.codebook"),
@@ -133,6 +142,15 @@ impl TtsCodec {
         }
 
         // Forward GPU résident de la section chaude : best-effort au chargement.
+        if crate::tts::memory::enabled() {
+            crate::tts::memory::checkpoint(
+                "codec_cpu",
+                &[(
+                    "codec_cpu",
+                    weights.values().map(Tensor::capacity_bytes).sum(),
+                )],
+            );
+        }
         // Échec (pas de Metal, kernel KO, poids absent) ⇒ repli CPU silencieux.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let gpu = if crate::runtime_flags::env_flag("SARAGOSSA_TTS_CODEC_GPU", true) {
@@ -146,6 +164,31 @@ impl TtsCodec {
         } else {
             None
         };
+        crate::tts::memory::checkpoint("codec_gpu", &[]);
+
+        let lazy_cpu = crate::runtime_flags::tts_codec_lazy_cpu_enabled();
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let discard = |name: &str| {
+            lazy_cpu
+                && gpu.as_ref().is_some_and(|gpu| {
+                    name.starts_with("decoder.decoder.")
+                        || (gpu.has_prefix()
+                            && name.starts_with("decoder.")
+                            && !name.starts_with("decoder.quantizer."))
+                })
+        };
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let discard = |_name: &str| {
+            let _ = lazy_cpu;
+            false
+        };
+        let weights = CodecWeights::new(weights, payload, discard);
+        if crate::tts::memory::enabled() {
+            crate::tts::memory::checkpoint(
+                "codec_retained",
+                &[("codec_cpu", weights.retained_bytes())],
+            );
+        }
 
         Ok(Self {
             cfg,
@@ -843,7 +886,7 @@ impl TtsCodec {
                 x.channels
             )));
         }
-        let bias = match self.opt(&format!("{prefix}.bias")) {
+        let bias = match self.opt(&format!("{prefix}.bias"))? {
             Some(b) => Some(channel_slice(b)?),
             None => None,
         };
@@ -915,7 +958,7 @@ impl TtsCodec {
                 weight.shape()
             )));
         }
-        let bias = match self.opt(bias_key) {
+        let bias = match self.opt(bias_key)? {
             Some(b) => Some(channel_slice(b)?),
             None => None,
         };
@@ -1007,7 +1050,7 @@ impl TtsCodec {
             )));
         }
         let out_time = x.time - kernel + 1;
-        let bias = match self.opt(bias_key) {
+        let bias = match self.opt(bias_key)? {
             Some(b) => Some(channel_slice(b)?),
             None => None,
         };
@@ -1069,7 +1112,7 @@ impl TtsCodec {
         let out_time = raw_time.checked_sub(trim).ok_or_else(|| {
             InferError::Dimension(format!("trim conv transpose invalide {weight_key}"))
         })?;
-        let bias = match self.opt(bias_key) {
+        let bias = match self.opt(bias_key)? {
             Some(b) => Some(channel_slice(b)?),
             None => None,
         };
@@ -1230,11 +1273,11 @@ impl TtsCodec {
 
     fn weight(&self, key: &str) -> Result<&Tensor> {
         self.weights
-            .get(key)
+            .get(key)?
             .ok_or_else(|| InferError::MissingWeight(key.to_string()))
     }
 
-    fn opt(&self, key: &str) -> Option<&Tensor> {
+    fn opt(&self, key: &str) -> Result<Option<&Tensor>> {
         self.weights.get(key)
     }
 }

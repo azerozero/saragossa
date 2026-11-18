@@ -13,7 +13,7 @@ use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -115,7 +115,8 @@ impl<S: ServeStream> Dispatcher<S> {
 
     /// Ne bloque jamais l'accept : au-delà du plafond, 503 immédiat.
     fn dispatch(&self, mut stream: S) {
-        if let Err(error) = stream.configure(self.limits.read_timeout) {
+        if let Err(error) = stream.configure(super::reload::read_timeout(self.limits.read_timeout))
+        {
             eprintln!("saragossa serve request error: {error}");
             return;
         }
@@ -183,6 +184,11 @@ where
             read_timeout,
         }),
     };
+    #[cfg(any(feature = "h2", feature = "webtransport"))]
+    let _transports = super::enhance::async_io::start(
+        Arc::clone(&dispatcher.front),
+        Arc::clone(&dispatcher.connections),
+    )?;
     // NOTE: thread détaché plutôt que scope : une panique moteur doit tuer le
     // process comme avant, pas attendre un accept qui ne finit jamais.
     let acceptor = thread::Builder::new()
@@ -196,6 +202,14 @@ where
     } else {
         1
     };
+    #[cfg(unix)]
+    if super::relay::await_predecessor() {
+        if let Err(error) = state.preload() {
+            // NOTE: le parent est parti ; refuser de servir couperait le
+            // service, les requêtes rechargent alors à la demande.
+            eprintln!("saragossa serve relais: préchargement différé échoué: {error}");
+        }
+    }
     run_engine(&queue, state, max_streams);
     acceptor
         .join()
@@ -238,17 +252,20 @@ fn run_engine<S: ServeStream>(
     max_streams: usize,
 ) {
     // Plafond `max_tokens` pour la validation d'admission, `None` sans lots.
-    let batching = (max_streams > 1).then(|| state.max_tokens_cap());
+    // NOTE: relu à chaque admission : un rechargement SIGHUP du plafond joue
+    // aussi sur l'éligibilité ; un job déjà en file est validé au plafond courant.
+    let batching = |state: &ServeState| (max_streams > 1).then(|| state.max_tokens_cap());
     // NOTE: les jobs de `pending` gardent leur place d'attente : canal et
     // file locale restent ensemble sous `SARAGOSSA_SERVE_QUEUE`.
     let pending_cap = serve_queue_depth();
     let mut pending: VecDeque<Queued<S>> = VecDeque::new();
     loop {
+        apply_pending_models(state);
         let leader = match pending.pop_front() {
             Some(queued) => queued,
-            None => match queue.recv() {
-                Ok(job) => Queued::new(job, batching, state),
-                Err(_) => break,
+            None => match next_job(queue, state) {
+                Some(job) => Queued::new(job, batching(state), state),
+                None => break,
             },
         };
         let Some(model) = leader
@@ -260,7 +277,7 @@ fn run_engine<S: ServeStream>(
             continue;
         };
         drain_queue(queue, &mut pending, pending_cap, |job| {
-            Queued::new(job, batching, state)
+            Queued::new(job, batching(state), state)
         });
         let others = take_batch(
             &mut pending,
@@ -275,6 +292,25 @@ fn run_engine<S: ServeStream>(
         let mut batch = vec![leader];
         batch.extend(others);
         run_batch(batch, state);
+    }
+}
+
+/// Applique la liste de modèles d'un SIGHUP ; entre deux jobs seulement.
+fn apply_pending_models(state: &mut ServeState) {
+    if let Some(models) = super::reload::take_pending_models() {
+        state.set_models(&models);
+    }
+}
+
+/// Attend le prochain job en regardant toutes les 250 ms si un SIGHUP a changé
+/// les modèles ; `None` quand tous les émetteurs ont lâché.
+fn next_job<S>(queue: &Receiver<Job<S>>, state: &mut ServeState) -> Option<Job<S>> {
+    loop {
+        match queue.recv_timeout(Duration::from_millis(250)) {
+            Ok(job) => return Some(job),
+            Err(RecvTimeoutError::Timeout) => apply_pending_models(state),
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
     }
 }
 
@@ -369,7 +405,7 @@ impl<S: ServeStream> Connection<S> {
     /// Lit les headers, sert les routes statiques et le refus bearer avant de
     /// lire le corps, puis met en file sans bloquer.
     fn handle(&self, mut stream: S) -> ServeResult<()> {
-        let deadline = Instant::now() + self.limits.read_timeout;
+        let deadline = Instant::now() + super::reload::read_timeout(self.limits.read_timeout);
         let Some((mut request, content_length)) =
             read_or_reject(&mut stream, |s| read_head(s, deadline))?
         else {
@@ -377,6 +413,10 @@ impl<S: ServeStream> Connection<S> {
         };
         if let Some(result) = route_front(&mut stream, &self.front, &request) {
             return reply_on_error(&mut stream, result);
+        }
+        #[cfg(feature = "ws")]
+        if request.route() == "/v1/audio/enhance/ws" {
+            return self.front.enhance.handle_ws(&mut stream, &mut request);
         }
         if request.is_enhance() {
             #[cfg(not(feature = "denoise"))]
@@ -728,6 +768,9 @@ mod tests {
 
     #[test]
     fn model_lookup_uses_registry_and_auth_without_engine() {
+        let _serial = super::super::reload::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (dispatcher, rx) = dispatcher_with(Some("test-key"), 2, usize::MAX, 1);
         for (path, authorized, status) in [
             ("/v1/models/alpha", false, 401),

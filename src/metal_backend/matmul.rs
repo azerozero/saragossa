@@ -465,7 +465,18 @@ impl MetalExecutor {
             checked_u32(out_dim, "bf16 qmv out_dim")?,
             checked_u32(in_dim, "bf16 qmv in_dim")?,
         ];
-        encoder.set_compute_pipeline_state(&self.dense_qmv_rhs_bf16_f32);
+        // Le noyau à blocs de 256 garde l'ordre d'accumulation du qmv par ligne.
+        let stage = in_dim % 256 == 0 && crate::runtime_flags::dense_bf16_qmv_stage_enabled();
+        let (pipeline, name, rows_per_group) = if stage {
+            (
+                &self.dense_qmv_rhs_bf16_stage_f32,
+                "dense_qmv_rhs_bf16_stage_f32",
+                4,
+            )
+        } else {
+            (&self.dense_qmv_rhs_bf16_f32, "dense_qmv_rhs_bf16_f32", 1)
+        };
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs), 0);
         encoder.set_buffer(1, Some(rhs_bf16), 0);
         encoder.set_buffer(2, Some(out), out_offset_bytes);
@@ -474,12 +485,16 @@ impl MetalExecutor {
             std::mem::size_of::<[u32; 3]>() as u64,
             dims.as_ptr().cast::<std::ffi::c_void>(),
         );
-        let threads_per_group = self.qmv_thread_group_size(&self.dense_qmv_rhs_bf16_f32);
-        trace_dispatch_path("dense_qmv_rhs_bf16_f32", batch, out_dim, in_dim);
+        let threads_per_group = if stage {
+            32 * rows_per_group as NSUInteger
+        } else {
+            self.qmv_thread_group_size(pipeline)
+        };
+        trace_dispatch_path(name, batch, out_dim, in_dim);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
-                checked_nsuint(out_dim, "bf16 qmv out_dim")?,
+                checked_nsuint(out_dim.div_ceil(rows_per_group), "bf16 qmv out_dim")?,
                 checked_nsuint(batch, "bf16 qmv batch")?,
                 1,
             ),
@@ -1527,10 +1542,24 @@ impl MetalExecutor {
 /// spéculative), le qmv garde son résultat par ligne indépendant du batch, ce
 /// qui préserve l'identité vérification/AR ; au-dessus (prefill), relire le
 /// poids par ligne bornait le débit à ~20 tok/s sur un 27B BF16.
+/// `SARAGOSSA_RUST_DENSE_BF16_GEMM_MIN_BATCH` (diagnostic seulement, de 1 à
+/// 64) abaisse le plancher pour mesurer le GEMM sur peu de lignes ; hors de
+/// cette plage, le plancher reste 64. L'alignement automatique des reprises
+/// (`runtime_flags::prefix_align_for_model`) suppose le plancher de 64.
 pub(crate) const DENSE_BF16_GEMM_MIN_BATCH: usize = 64;
 
+fn dense_bf16_gemm_min_batch() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_DENSE_BF16_GEMM_MIN_BATCH")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|min| (1..=DENSE_BF16_GEMM_MIN_BATCH).contains(min))
+            .unwrap_or(DENSE_BF16_GEMM_MIN_BATCH)
+    })
+}
+
 fn can_use_dense_bf16_gemm(batch: usize, in_dim: usize, out_dim: usize) -> bool {
-    batch >= DENSE_BF16_GEMM_MIN_BATCH
+    batch >= dense_bf16_gemm_min_batch()
         && in_dim % 64 == 0
         && out_dim % 64 == 0
         && crate::runtime_flags::dense_bf16_gemm_enabled()
