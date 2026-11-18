@@ -189,12 +189,15 @@ pub(super) fn inherited() -> ServeResult<Option<OwnedFd>> {
     adopt(main, libc::SOCK_STREAM, "d'écoute").map(Some)
 }
 
+/// Listener enhance hérité : nom, fd et type de socket.
+type Named = (&'static str, RawFd, libc::c_int);
+
 /// Découpe `principal[,nom=fd]...` : noms connus et uniques, fd uniques,
 /// distincts du fd « prêt » ; `None` sinon.
 fn parse_listen(
     value: &str,
     ready: Option<RawFd>,
-) -> Option<(RawFd, Vec<(&'static str, RawFd, libc::c_int)>)> {
+) -> Option<(RawFd, Vec<Named>)> {
     let mut parts = value.split(',');
     let main = parse_fd(parts.next()?)?;
     // NOTE: un fd en double serait possédé deux fois (double fermeture).
