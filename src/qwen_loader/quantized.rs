@@ -445,12 +445,18 @@ pub(super) fn quantized_tensor_from_entry(
                     .ok_or_else(|| {
                         InferError::Shape("offset safetensors trop grand".to_string())
                     })?;
-                let packed_buffer =
-                    metal.weight_buffer_from_u32_file(&shard.path, packed_offset, packed_bytes)?;
+                let (packed_buffer, packed_base) = metal.weight_view_from_file(
+                    &shard.path,
+                    packed_offset,
+                    packed_bytes,
+                    std::mem::size_of::<u32>(),
+                )?;
+                let packed_base = packed_base / std::mem::size_of::<u32>();
                 if is_moe_expert_weight(&spec.target) && entry.shape.len() == 3 {
                     return quantized_expert_weights_from_metal_views(
                         &entry.shape,
                         packed_buffer,
+                        packed_base,
                         packed_len,
                         scales,
                         biases,
@@ -461,15 +467,15 @@ pub(super) fn quantized_tensor_from_entry(
                 let weight = AffineQuantizedTensor::new_metal_shared_bf16(
                     &entry.shape,
                     packed_buffer,
-                    0,
+                    packed_base,
                     packed_len,
                     &scales.shape,
                     scales.buffer,
-                    0,
+                    scales.base,
                     scales.len,
                     &biases.shape,
                     biases.buffer,
-                    0,
+                    biases.base,
                     biases.len,
                     group_size,
                     bits,
@@ -558,6 +564,8 @@ pub(super) fn quantized_tensor_from_entry(
 #[cfg(all(target_os = "macos", feature = "metal"))]
 struct MetalBf16Entry {
     buffer: metal::Buffer,
+    /// Début de la vue dans `buffer`, en éléments bf16.
+    base: usize,
     shape: Vec<usize>,
     len: usize,
 }
@@ -610,8 +618,15 @@ fn bf16_entry_to_metal(
         .data_start
         .checked_add(entry.data_offsets[0] as u64)
         .ok_or_else(|| InferError::Shape(format!("offset bf16 trop grand pour {name}")))?;
+    let (buffer, base) = metal.weight_view_from_file(
+        &shard.path,
+        file_offset,
+        expected_bytes,
+        std::mem::size_of::<u16>(),
+    )?;
     Ok(MetalBf16Entry {
-        buffer: metal.weight_buffer_from_bf16_file(&shard.path, file_offset, expected_bytes)?,
+        buffer,
+        base: base / std::mem::size_of::<u16>(),
         shape: entry.shape.clone(),
         len,
     })
@@ -623,9 +638,14 @@ fn is_moe_expert_weight(target: &str) -> bool {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "vue packed (buffer, base, longueur) et paramètres affines restent explicites"
+)]
 fn quantized_expert_weights_from_metal_views(
     packed_shape: &[usize],
     packed_buffer: metal::Buffer,
+    packed_base: usize,
     packed_len: usize,
     scales: MetalBf16Entry,
     biases: MetalBf16Entry,
@@ -678,10 +698,16 @@ fn quantized_expert_weights_from_metal_views(
     for expert in 0..*experts {
         let packed_offset = expert
             .checked_mul(packed_stride)
+            .and_then(|offset| offset.checked_add(packed_base))
             .ok_or_else(|| InferError::Shape("offset expert packed trop grand".to_string()))?;
         let affine_offset = expert
             .checked_mul(affine_stride)
             .ok_or_else(|| InferError::Shape("offset expert affine trop grand".to_string()))?;
+        let affine_at = |base: usize| {
+            affine_offset
+                .checked_add(base)
+                .ok_or_else(|| InferError::Shape("offset expert affine trop grand".to_string()))
+        };
         let weight = AffineQuantizedTensor::new_metal_shared_bf16(
             &[*rows, *packed_cols],
             packed_buffer.clone(),
@@ -689,11 +715,11 @@ fn quantized_expert_weights_from_metal_views(
             packed_stride,
             &affine_shape,
             scales.buffer.clone(),
-            affine_offset,
+            affine_at(scales.base)?,
             affine_stride,
             &affine_shape,
             biases.buffer.clone(),
-            affine_offset,
+            affine_at(biases.base)?,
             affine_stride,
             group_size,
             bits,

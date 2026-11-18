@@ -60,7 +60,7 @@ denoise = ["dep:rustfft", "dep:hound"]
 embed = []
 serve = []
 decision = []
-metal = ["dep:metal"]
+metal = ["dep:metal", "dep:block"]
 devtools = []
 
 [dependencies]
@@ -109,6 +109,8 @@ libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.33", optional = true }
+# Déallocateur des buffers Metal sans copie sur mmap (`newBufferWithBytesNoCopy`).
+block = { version = "0.1", optional = true }
 mach-sys = "0.5"
 
 [dev-dependencies]
