@@ -88,7 +88,9 @@ impl PrefillKernelTiming {
             .checked_mul(96)
             .and_then(|count| count.checked_add(128))
             .ok_or_else(|| InferError::Metal("sample_count GPU timing deborde".to_string()))?;
-        let sample_count = sample_count.clamp(256, 8192);
+        // NOTE: Metal refuse un MTLCounterSampleBuffer de plus de 32 Kio, soit
+        // 4096 timestamps u64 ; 8192 faisait échouer les modèles de 64 couches.
+        let sample_count = sample_count.clamp(256, 4096);
         let descriptor = CounterSampleBufferDescriptor::new();
         descriptor.set_counter_set(&counter_set);
         descriptor.set_sample_count(u64::try_from(sample_count).map_err(|_| {
