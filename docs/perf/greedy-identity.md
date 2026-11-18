@@ -13,6 +13,10 @@ quasi-égalité top-1/top-2 :
 
 ## Limites actuelles
 
+Le noyau qmv bf16 à blocs de 256 (`dense_qmv_rhs_bf16_stage_f32`, decode dense
+BF16) est actif par défaut et identique au bit au qmv par ligne ;
+`SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE=0` rend l'ancien noyau.
+
 Deux kernels actifs par défaut ne sont pas bit-identiques au pas mono-ligne.
 
 | Kernel | Quand | Pourquoi |
