@@ -97,6 +97,8 @@ pub struct ServeSection {
     pub max_tokens_cap: Option<u64>,
     /// Délai max de vidage de l'ancien processus après un relais SIGUSR2.
     pub drain_timeout_secs: Option<u64>,
+    /// Relais SIGUSR2 : `auto` (défaut), `parallel` ou `sequential`.
+    pub relay_mode: Option<String>,
 }
 
 /// Section `[enhance]`.
@@ -191,6 +193,14 @@ impl Profile {
                 return Err(err("engine.backend", "attendu \"cpu\" ou \"metal\""));
             }
         }
+        if let Some(mode) = &self.serve.relay_mode {
+            if !matches!(mode.as_str(), "auto" | "parallel" | "sequential") {
+                return Err(err(
+                    "serve.relay_mode",
+                    "attendu \"auto\", \"parallel\" ou \"sequential\"",
+                ));
+            }
+        }
         Ok(self)
     }
 
@@ -266,6 +276,7 @@ impl Profile {
                 "30",
                 num(s.drain_timeout_secs),
             ),
+            r("serve.relay_mode", None, "auto", s.relay_mode.clone()),
             r(
                 "enhance.max_streams",
                 Some("SARAGOSSA_ENHANCE_MAX_STREAMS"),

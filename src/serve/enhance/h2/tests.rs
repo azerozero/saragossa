@@ -16,7 +16,11 @@ pub(super) async fn setup() -> (
         .unwrap();
     let (server, _) = listener.accept().await.unwrap();
     let server_front = Arc::clone(&front);
-    let server = tokio::spawn(connection(server, server_front));
+    let server = tokio::spawn(connection(
+        server,
+        server_front,
+        tokio::sync::watch::channel(false).1,
+    ));
     let (client, connection) = protocol::client::handshake(socket).await.unwrap();
     let driver = tokio::spawn(async move {
         let _ = connection.await;
@@ -167,6 +171,7 @@ async fn oversized_wire_frame_produces_frame_size_error() {
     let server = tokio::spawn(connection(
         socket,
         Arc::new(Front::new(Some("test-key".into()), vec![])),
+        tokio::sync::watch::channel(false).1,
     ));
     client
         .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")

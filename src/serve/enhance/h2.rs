@@ -1,7 +1,7 @@
 use ::h2 as protocol;
 // HTTP/2 prior knowledge h2c sur un listener opt-in, avec fenêtres bornées.
 use super::super::dispatch::Front;
-use super::async_io::{deadline, error, Worker};
+use super::async_io::{deadline, drained, error, Drain, Worker};
 use super::pcm::{Config, MAX_FRAME};
 use super::*;
 use bytes::Bytes;
@@ -10,15 +10,20 @@ use std::future::poll_fn;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
+/// Accepte jusqu'au relais, puis attend la fin des connexions (GOAWAY).
 pub(super) async fn listen(
     listener: TcpListener,
     front: Arc<Front>,
     connections: Arc<AtomicUsize>,
+    mut drain: Drain,
 ) {
     let mut tasks = JoinSet::new();
-    loop {
+    let mut draining = false;
+    // NOTE: `drain` reste emprunté par le select ; les connexions clonent celui-ci.
+    let connection_drain = drain.clone();
+    while !(draining && tasks.is_empty()) {
         tokio::select! {
-            accepted = listener.accept() => {
+            accepted = listener.accept(), if !draining => {
                 let (socket, _) = match accepted {
                     Ok(accepted) => accepted,
                     Err(e) => {
@@ -33,16 +38,22 @@ pub(super) async fn listen(
                     drop(socket); continue;
                 };
                 let front = Arc::clone(&front);
+                let drain = connection_drain.clone();
                 tasks.spawn(async move {
                     let _slot = slot;
-                    if let Err(e) = connection(socket, front).await { eprintln!("{e}"); }
+                    if let Err(e) = connection(socket, front, drain).await { eprintln!("{e}"); }
                 });
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {}
+            _ = drained(&mut drain), if !draining => draining = true,
         }
     }
 }
-pub(super) async fn connection(socket: TcpStream, front: Arc<Front>) -> ServeResult<()> {
+pub(super) async fn connection(
+    socket: TcpStream,
+    front: Arc<Front>,
+    mut drain: Drain,
+) -> ServeResult<()> {
     socket.set_nodelay(true).map_err(error)?;
     let mut conn = deadline(
         protocol::server::Builder::new()
@@ -55,15 +66,23 @@ pub(super) async fn connection(socket: TcpStream, front: Arc<Front>) -> ServeRes
     )
     .await?;
     let mut tasks = JoinSet::new();
+    let mut draining = false;
     loop {
-        let incoming = if tasks.is_empty() {
-            tokio::time::timeout(enhance_idle_timeout(), conn.accept())
-                .await
-                .map_err(error)?
+        // Sans flux en cours, une connexion inactive expire.
+        let idle = if tasks.is_empty() {
+            enhance_idle_timeout()
         } else {
-            tokio::select! {
-                request = conn.accept() => request,
-                _ = tasks.join_next() => continue,
+            std::time::Duration::MAX
+        };
+        let incoming = tokio::select! {
+            request = tokio::time::timeout(idle, conn.accept()) => request.map_err(error)?,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+            _ = drained(&mut drain), if !draining => {
+                // GOAWAY : les flux en cours finissent ici, les suivants
+                // partent sur une nouvelle connexion, chez le successeur.
+                draining = true;
+                conn.graceful_shutdown();
+                continue;
             }
         };
         let Some(incoming) = incoming else {

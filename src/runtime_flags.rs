@@ -4,7 +4,7 @@
 pub(crate) mod pairwise;
 
 mod profile;
-pub use profile::{ModelEntry, Profile, ProfileError, Resolved, HOT_KEYS, PRESETS};
+pub use profile::{ModelEntry, Profile, ProfileError, Resolved, ServeSection, HOT_KEYS, PRESETS};
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::cell::Cell;

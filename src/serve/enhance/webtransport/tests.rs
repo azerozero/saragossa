@@ -53,6 +53,7 @@ async fn setup() -> Fixture {
         endpoint.clone(),
         Arc::clone(&front),
         Arc::new(AtomicUsize::new(0)),
+        tokio::sync::watch::channel(false).1,
     ));
     Fixture {
         client,
@@ -209,7 +210,12 @@ async fn idle_client_releases_slot() {
 #[tokio::test]
 async fn certificate_metadata_is_exposed_by_authenticated_http_route() {
     let front = Front::new(Some("test-key".into()), vec![]);
-    let endpoint = bind("127.0.0.1:0".parse().unwrap(), &front).unwrap();
+    let endpoint = bind(
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+        &front,
+        false,
+    )
+    .unwrap();
     let raw =
         b"GET /v1/audio/enhance/certificate HTTP/1.1\r\nAuthorization: Bearer test-key\r\n\r\n";
     let (request, _) = crate::serve::http::read_head(

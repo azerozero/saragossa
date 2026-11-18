@@ -1,34 +1,113 @@
 //! Une session HTTP/3 WebTransport par flux DFN3, un stream bidirectionnel fiable.
 use super::super::dispatch::Front;
-use super::async_io::{deadline, error, Worker};
+use super::async_io::{announced, deadline, drained, draining, error, Drain, Worker};
 use super::pcm::{Config, MAX_FRAME};
 use super::*;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use web_transport_quinn::{RecvStream, SendStream};
 
-pub(super) fn bind(addr: SocketAddr, front: &Front) -> ServeResult<quinn::Endpoint> {
+/// Endpoint sur `socket` déjà liée, ou héritée d'un relais (`inherited`), au
+/// loopback. Une socket héritée n'est lue qu'après l'annonce « prêt » : avant,
+/// les datagrammes restent au parent. Appel depuis un runtime tokio.
+pub(super) fn bind(
+    socket: std::net::UdpSocket,
+    front: &Front,
+    inherited: bool,
+) -> ServeResult<quinn::Endpoint> {
+    let addr = socket.local_addr().map_err(error)?;
     super::async_io::require_loopback(addr, "SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR")?;
     let identity = super::certificate::identity(addr)?;
-    let endpoint = quinn::Endpoint::server(identity.config, addr).map_err(error)?;
-    let mut info = identity.info;
-    // Le port 0 est utile aux tests et aux démarrages avec allocation automatique.
-    if addr.port() == 0 {
-        info.url = info.url.replace(
-            ":0/",
-            &format!(":{}/", endpoint.local_addr().map_err(error)?.port()),
-        );
+    let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+    let socket = Arc::new(Relayed {
+        inner: runtime.wrap_udp_socket(socket).map_err(error)?,
+        gated: inherited,
+        waker: std::sync::Mutex::new(None),
+    });
+    if inherited {
+        let gate = Arc::clone(&socket);
+        tokio::spawn(async move {
+            while !announced() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            if let Some(waker) = gate.waker.lock().ok().and_then(|mut w| w.take()) {
+                waker.wake();
+            }
+        });
     }
+    let endpoint = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        Some(identity.config),
+        socket,
+        runtime,
+    )
+    .map_err(error)?;
     *front
         .enhance
         .certificate
         .lock()
-        .map_err(|_| error("verrou certificat"))? = Some(info);
+        .map_err(|_| error("verrou certificat"))? = Some(identity.info);
     Ok(endpoint)
 }
+/// Socket UDP partagée en relais. Successeur : lue seulement après son
+/// annonce « prêt ». Parent : plus lue une fois le successeur prêt (les
+/// datagrammes lui reviennent), mais émet encore ses CONNECTION_CLOSE.
+#[derive(Debug)]
+struct Relayed {
+    inner: Arc<dyn quinn::AsyncUdpSocket>,
+    gated: bool,
+    /// Réveil du driver quand l'annonce lève la barrière.
+    waker: std::sync::Mutex<Option<std::task::Waker>>,
+}
+impl quinn::AsyncUdpSocket for Relayed {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        Arc::clone(&self.inner).create_io_poller()
+    }
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> std::io::Result<()> {
+        self.inner.try_send(transmit)
+    }
+    fn poll_recv(
+        &self,
+        cx: &mut Context,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<std::io::Result<usize>> {
+        if draining() {
+            return Poll::Pending;
+        }
+        if self.gated && !announced() {
+            if let Ok(mut waker) = self.waker.lock() {
+                *waker = Some(cx.waker().clone());
+            }
+            // NOTE: relu après l'inscription du réveil, sinon une annonce
+            // entre les deux lectures serait perdue.
+            if !announced() {
+                return Poll::Pending;
+            }
+        }
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
+/// Accepte jusqu'au relais ; ferme alors toutes les sessions (H3_NO_ERROR),
+/// qui ne migrent pas : les clients se reconnectent chez le successeur.
 pub(super) async fn listen(
     endpoint: quinn::Endpoint,
     front: Arc<Front>,
     connections: Arc<AtomicUsize>,
+    mut drain: Drain,
 ) {
     let mut tasks = tokio::task::JoinSet::new();
     let rotation = tokio::time::sleep(std::time::Duration::from_secs(12 * 86400));
@@ -51,6 +130,10 @@ pub(super) async fn listen(
                 });
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {},
+            _ = drained(&mut drain) => {
+                endpoint.close(quinn::VarInt::from_u32(0x100), b"relais");
+                break;
+            }
             _ = &mut rotation => {
                 let renewed = endpoint.local_addr().map_err(error).and_then(super::certificate::identity);
                 match renewed {
@@ -65,6 +148,10 @@ pub(super) async fn listen(
                 rotation.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(12 * 86400));
             }
         }
+    }
+    if draining() {
+        // Laisse partir les CONNECTION_CLOSE avant l'arrêt du runtime.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), endpoint.wait_idle()).await;
     }
 }
 pub(super) async fn session(conn: quinn::Connection, front: Arc<Front>) -> ServeResult<()> {

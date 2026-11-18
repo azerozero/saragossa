@@ -202,6 +202,14 @@ where
     } else {
         1
     };
+    #[cfg(unix)]
+    if super::relay::await_predecessor() {
+        if let Err(error) = state.preload() {
+            // NOTE: le parent est parti ; refuser de servir couperait le
+            // service, les requêtes rechargent alors à la demande.
+            eprintln!("saragossa serve relais: préchargement différé échoué: {error}");
+        }
+    }
     run_engine(&queue, state, max_streams);
     acceptor
         .join()

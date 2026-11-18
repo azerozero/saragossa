@@ -134,7 +134,7 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     resolved.install();
     let profile = resolved.profile.clone();
     #[cfg(unix)]
-    relay::configure(&mut raw_args, profile.serve.drain_timeout_secs).map_err(boxed_error)?;
+    relay::configure(&mut raw_args, &profile.serve).map_err(boxed_error)?;
     let mut args = ServeArgs::parse_with(&profile, raw_args.clone()).map_err(boxed_error)?;
     // Sans profil, SIGHUP garde son effet par défaut (arrêt du processus).
     if config_path.is_some() {
@@ -152,7 +152,12 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     reload::set_launch_models(&args.models);
     saragossa::force_resident_full_linear_decode();
     let mut state = state::ServeState::new(&args);
-    if args.preload {
+    // NOTE: en relais séquentiel, le moteur précharge après la sortie du parent.
+    #[cfg(unix)]
+    let deferred = relay::defer_preload(args.preload);
+    #[cfg(not(unix))]
+    let deferred = false;
+    if args.preload && !deferred {
         state.preload().map_err(boxed_error)?;
     }
     if let Some(addr) = args.tcp_addr() {
