@@ -24,7 +24,7 @@ pub(crate) struct TtsCodebookWeights {
     vocab: usize,
     /// QKV concaténé par couche pour [`DecodeResidentState::encode_tts_cp_layer`] ;
     /// `None` : chemin général (kill-switch ou couche non éligible).
-    fused_qkv: Option<Vec<MetalLinearWeightBuffers>>,
+    fused_qkv: Option<Vec<Vec<MetalLinearWeightBuffers>>>,
 }
 
 /// Distributions et logits relus pour l'oracle des tests.
@@ -152,13 +152,38 @@ impl CausalDecoder {
         }))
     }
 
+    /// Fait encoder les pas embedding de `cache` (talker TTS) par la couche
+    /// fusionnée à 8 dispatches, identique au bit au chemin général. Renvoie
+    /// `false` sans rien changer si une couche sort du périmètre, sans arène
+    /// résidente ou sans Metal.
+    ///
+    /// NOTE: le QKV n'est concaténé (copie des poids libérée avec l'arène) que si
+    /// les poids ne sont pas adossés au stockage ; sinon trois qmv lisent les vues.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une forme est incohérente ou si un upload échoue.
+    pub(crate) fn enable_tts_fused_layers(&self, cache: &mut CausalDecoderCache) -> Result<bool> {
+        let Some(metal) = self.forward_runtime().metal_executor() else {
+            return Ok(false);
+        };
+        let Some(arena) = cache.resident.as_mut() else {
+            return Ok(false);
+        };
+        if self.plan.layers.iter().any(|layer| !layer.resident_full) {
+            return Ok(false);
+        }
+        arena.tts_fused_qkv = self.resolve_tts_cp_fused_qkv(metal)?;
+        Ok(arena.tts_fused_qkv.is_some())
+    }
+
     /// QKV concaténé de chaque couche si toutes relèvent de la couche TTS
     /// fusionnée : Qwen3 sans gate de sortie, sans sinks ni norme de V, MLP
     /// dense et projections u6 gs64 alignées. `None` sinon.
     fn resolve_tts_cp_fused_qkv(
         &self,
         metal: &crate::metal_backend::MetalExecutor,
-    ) -> Result<Option<Vec<MetalLinearWeightBuffers>>> {
+    ) -> Result<Option<Vec<Vec<MetalLinearWeightBuffers>>>> {
         use crate::metal_backend::MetalExecutor;
         if self.config.attn_output_gate || self.config.attention_sinks {
             return Ok(None);
@@ -178,17 +203,24 @@ impl CausalDecoder {
                 return Ok(None);
             }
             let (gate_proj, up_proj, down_proj) = mlp.projections();
-            let qkv = match metal.resolve_concat_linear_weight_buffers(
-                &[
-                    attention.q_proj.weight(),
-                    attention.k_proj.weight(),
-                    v_proj.weight(),
-                ],
-                "tts_cp_qkv_proj",
-            ) {
-                Ok(qkv) => qkv,
-                Err(InferError::Dimension(_)) => return Ok(None),
-                Err(error) => return Err(error),
+            let sources = [
+                attention.q_proj.weight(),
+                attention.k_proj.weight(),
+                v_proj.weight(),
+            ];
+            // Poids adossés au stockage : un concat les copierait (≈ 190 Mo sur le
+            // talker 1.7B), q, k, v restent donc trois vues lues sans copie.
+            let qkv = if metal.concat_would_duplicate_affine_storage(&sources) {
+                sources
+                    .iter()
+                    .map(|weight| metal.resolve_linear_weight_buffers(weight, "tts_cp_qkv_part"))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                match metal.resolve_concat_linear_weight_buffers(&sources, "tts_cp_qkv_proj") {
+                    Ok(qkv) => vec![qkv],
+                    Err(InferError::Dimension(_)) => return Ok(None),
+                    Err(error) => return Err(error),
+                }
             };
             let o_proj =
                 metal.resolve_linear_weight_buffers(attention.o_proj.weight(), "tts_cp_o")?;
@@ -197,7 +229,9 @@ impl CausalDecoder {
             let down = metal.resolve_linear_weight_buffers(down_proj.weight(), "tts_cp_down")?;
             let inter = metal.linear_weight_out_dim(&gate);
             let q_dim = metal.linear_weight_in_dim(&o_proj);
-            if !MetalExecutor::is_aligned_u6_weight(&qkv, hidden)
+            if !qkv
+                .iter()
+                .all(|part| MetalExecutor::is_aligned_u6_weight(part, hidden))
                 || !MetalExecutor::is_aligned_u6_weight(&o_proj, q_dim)
                 || !MetalExecutor::is_aligned_u6_weight(&gate, hidden)
                 || !MetalExecutor::is_aligned_u6_weight(&up, hidden)
@@ -439,13 +473,13 @@ impl CausalDecoder {
         clippy::too_many_arguments,
         reason = "routage résident: état couche + arena + ping-pong + encoder"
     )]
-    fn encode_tts_cp_fused_layer(
+    pub(in crate::decoder) fn encode_tts_cp_fused_layer(
         &self,
         metal: &crate::metal_backend::MetalExecutor,
         arena: &ResidentArena,
         layer_cache: &mut LayerKvCache,
         index: usize,
-        qkv_proj: &MetalLinearWeightBuffers,
+        qkv_proj: &[MetalLinearWeightBuffers],
         encoder: &metal::ComputeCommandEncoderRef,
         owned: &mut Vec<metal::Buffer>,
         dims: FullAttnLayerDims,

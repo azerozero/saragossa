@@ -1100,6 +1100,45 @@ impl MetalExecutor {
         matches!(aligned_u6_view(weight, in_dim), Ok(Some(_)))
     }
 
+    /// qmv u6 gs64 aligné écrit à `output_offset` octets de `output_buffer`
+    /// (une ligne `[1, out_dim]` f32). Renvoie `false` sans rien encoder si le
+    /// poids sort du périmètre. Chaque ligne est calculée comme dans la
+    /// projection seule : trois appels sur q, k, v remplacent le QKV concaténé
+    /// sans copier les poids.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde `u32`.
+    #[cfg(feature = "tts")]
+    pub(crate) fn encode_qmv_u6_at(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        weight: &MetalLinearWeightBuffers,
+        output_buffer: &BufferRef,
+        output_offset: NSUInteger,
+        in_dim: usize,
+    ) -> Result<bool> {
+        let Some((bind, dims, out_dim)) = aligned_u6_view(weight, in_dim)? else {
+            return Ok(false);
+        };
+        encoder.set_compute_pipeline_state(&self.affine_qmv_fast_aligned_u6_gs64_f32);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        for (slot, (buffer, offset)) in (1..).zip(bind) {
+            encoder.set_buffer(slot, Some(buffer), offset);
+        }
+        encoder.set_buffer(4, Some(output_buffer), output_offset);
+        set_u32_bytes(encoder, 5, &dims, "qmv_u6_at_dims")?;
+        trace_dispatch_path("affine_qmv_fast_aligned_u6_gs64_f32", 1, out_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(1, checked_nsuint(out_dim / 8, "qmv u6 at groups")?, 1),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(true)
+    }
+
     /// gate + up + SwiGLU u6 en un dispatch (trame TTS du code predictor).
     ///
     /// Chaque sortie vaut au bit près `swiglu(qmv(gate), qmv(up))` des kernels
