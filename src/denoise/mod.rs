@@ -16,7 +16,6 @@ mod gpu;
 mod gpu_probe;
 mod layers;
 mod network;
-mod parallel;
 mod resample;
 mod stream;
 pub use resample::StreamResampler;
@@ -182,6 +181,7 @@ impl DeepFilterNet3 {
             frames: 0,
             last_lsnr: 0.0,
             steps: Steps::Live,
+            threads: 1,
         }
     }
 }
@@ -216,6 +216,8 @@ pub struct DfStream<'a> {
     frames: usize,
     last_lsnr: f32,
     steps: Steps,
+    /// Cœurs de [`DfStream::process_hops`] ; 1 garde le chemin trame par trame.
+    threads: usize,
 }
 
 impl DfStream<'_> {
@@ -300,21 +302,87 @@ impl DfStream<'_> {
                 )
             }
         };
-        let center = &self.spec_ring[DF_LOOKAHEAD];
-        let inv = &self.model.net.erb_inv;
-        let mut spec = vec![Complex32::default(); FREQ_BINS];
-        for f in NB_DF..FREQ_BINS {
-            let gain: f32 = (0..NB_ERB).map(|b| mask[b] * inv[b * FREQ_BINS + f]).sum();
-            spec[f] = center[f] * gain;
-        }
-        for (f, slot) in spec.iter_mut().enumerate().take(NB_DF) {
-            let mut acc = Complex32::default();
-            for n in 0..ORDER {
-                let c = &coefs[(f * ORDER + n) * 2..][..2];
-                acc += self.spec_ring[n][f] * Complex32::new(c[0], c[1]);
-            }
-            *slot = acc;
-        }
-        self.synthesis.process(&spec, output);
+        render(
+            &self.model.net,
+            &mut self.synthesis,
+            &self.spec_ring,
+            (mask, coefs),
+            output,
+        );
     }
+
+    /// Comme `process_hop` sur chaque hop de `input`, le réseau tournant sur
+    /// `threads` cœurs (voir `network::batch`). Sortie identique bit à bit.
+    /// L'enregistrement et le rejeu du chemin GPU restent hop par hop.
+    fn process_hops(&mut self, input: &[f32], output: &mut [f32]) -> Result<()> {
+        if !matches!(self.steps, Steps::Live) {
+            let mut pairs = input
+                .chunks_exact(HOP_SIZE)
+                .zip(output.chunks_exact_mut(HOP_SIZE));
+            return pairs.try_for_each(|(i, o)| self.process_hop(i, o));
+        }
+        let (mut erbs, mut cplxs, mut rings, mut emits) = (vec![], vec![], vec![], vec![]);
+        for hop in input.chunks_exact(HOP_SIZE) {
+            self.spec_ring.rotate_left(1);
+            let (mut erb, mut cplx) = ([0.0_f32; NB_ERB], [0.0_f32; 2 * NB_DF]);
+            if let Some(slot) = self.spec_ring.last_mut() {
+                self.analysis.process(hop, slot);
+                self.features.process(slot, &mut erb, &mut cplx);
+            }
+            self.frames = (self.frames + 1).min(CONV_LOOKAHEAD + 1);
+            let emit = self.frames > CONV_LOOKAHEAD;
+            if emit {
+                erbs.extend(erb);
+                cplxs.extend(cplx);
+                rings.push(self.spec_ring.clone());
+            }
+            emits.push(emit);
+        }
+        let net = &self.model.net;
+        let steps = net.step_batch(&mut self.state, &erbs, &cplxs, self.threads);
+        let mut steps = steps.iter().zip(&rings);
+        for (out, emit) in output.chunks_exact_mut(HOP_SIZE).zip(emits) {
+            let next = if emit { steps.next() } else { None };
+            match next {
+                Some((step, ring)) => {
+                    self.last_lsnr = step.lsnr;
+                    render(
+                        net,
+                        &mut self.synthesis,
+                        ring,
+                        (&step.mask, &step.coefs),
+                        out,
+                    );
+                }
+                None => out.fill(0.0),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Applique masque ERB et filtre profond au spectre central de `ring`, puis synthétise le hop.
+fn render(
+    net: &Network,
+    synthesis: &mut Synthesis,
+    ring: &[Vec<Complex32>],
+    (mask, coefs): (&[f32], &[f32]),
+    output: &mut [f32],
+) {
+    let center = &ring[DF_LOOKAHEAD];
+    let inv = &net.erb_inv;
+    let mut spec = vec![Complex32::default(); FREQ_BINS];
+    for f in NB_DF..FREQ_BINS {
+        let gain: f32 = (0..NB_ERB).map(|b| mask[b] * inv[b * FREQ_BINS + f]).sum();
+        spec[f] = center[f] * gain;
+    }
+    for (f, slot) in spec.iter_mut().enumerate().take(NB_DF) {
+        let mut acc = Complex32::default();
+        for (n, frame) in ring.iter().enumerate().take(ORDER) {
+            let c = &coefs[(f * ORDER + n) * 2..][..2];
+            acc += frame[f] * Complex32::new(c[0], c[1]);
+        }
+        *slot = acc;
+    }
+    synthesis.process(&spec, output);
 }
