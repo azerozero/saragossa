@@ -307,14 +307,23 @@ impl Gru {
 
     /// Met à jour `h` en place à partir de l'entrée `x`.
     pub(crate) fn step(&self, x: &[f32], h: &mut [f32]) {
+        self.recur(&self.input_gates(x), h);
+    }
+
+    /// Portes d'entrée `W_ih · x + b_ih`, indépendantes de l'état : calculables d'avance.
+    pub(crate) fn input_gates(&self, x: &[f32]) -> Vec<f32> {
+        let ni = x.len();
+        (0..3 * self.hidden)
+            .map(|r| dot(x, &self.w_ih[r * ni..(r + 1) * ni]) + self.b_ih[r])
+            .collect()
+    }
+
+    /// Partie récurrente du pas, à portes d'entrée `gi` déjà calculées.
+    pub(crate) fn recur(&self, gi: &[f32], h: &mut [f32]) {
         let n = self.hidden;
-        let (ni, nh) = (x.len(), n);
-        let mut gi = vec![0.0_f32; 3 * n];
-        let mut gh = vec![0.0_f32; 3 * n];
-        for r in 0..3 * n {
-            gi[r] = dot(x, &self.w_ih[r * ni..(r + 1) * ni]) + self.b_ih[r];
-            gh[r] = dot(h, &self.w_hh[r * nh..(r + 1) * nh]) + self.b_hh[r];
-        }
+        let gh: Vec<f32> = (0..3 * n)
+            .map(|r| dot(h, &self.w_hh[r * n..(r + 1) * n]) + self.b_hh[r])
+            .collect();
         for j in 0..n {
             let r = sigmoid(gi[j] + gh[j]);
             let z = sigmoid(gi[n + j] + gh[n + j]);

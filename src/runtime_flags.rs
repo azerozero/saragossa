@@ -96,8 +96,9 @@ pub(crate) fn decision_gemm_bf16_enabled() -> bool {
 }
 
 /// Nombre de threads du débruitage (`SARAGOSSA_DENOISE_THREADS`, défaut 1 :
-/// chemin mono-cœur historique, bit-identique). Au-delà, le signal est découpé
-/// en segments avec recouvrement et recollé en fondu (opt-in, sortie proche).
+/// chemin trame par trame historique). Au-delà, encodeur et décodeurs tournent
+/// en parallèle par blocs de 2,56 s, les GRU restant séquentiels : sortie
+/// identique bit à bit, latence de flux d'un bloc (opt-in).
 #[cfg(feature = "denoise")]
 pub fn denoise_threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
