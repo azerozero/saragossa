@@ -498,6 +498,135 @@ impl MetalExecutor {
         self.weight_buffer_from_file(path, offset, len_bytes)
     }
 
+    /// Vue `(buffer, offset en octets)` sur un payload de poids de `element`
+    /// octets par valeur.
+    ///
+    /// Avec [`crate::runtime_flags::mmap_weights_enabled`] et un offset
+    /// fichier aligné sur 16 octets (exigence des kernels tuilés), le buffer
+    /// enveloppe sans copie les pages du fichier : deux processus partagent
+    /// alors le cache de fichiers. Sinon, copie dans un buffer neuf, offset 0.
+    ///
+    /// NOTE: le shard ne doit pas être réécrit ni tronqué tant qu'il est
+    /// mappé : une page devenue hors fichier lève SIGBUS au premier accès, et
+    /// une réécriture en place change les poids sous le modèle chargé.
+    pub(crate) fn weight_view_from_file(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len_bytes: usize,
+        element: usize,
+    ) -> Result<(metal::Buffer, usize)> {
+        const _: () = assert!(cfg!(target_endian = "little"));
+        if element == 0 || len_bytes % element != 0 {
+            return Err(InferError::Shape(format!(
+                "payload single-copy de {len_bytes} octets pour des éléments de {element}"
+            )));
+        }
+        if crate::runtime_flags::mmap_weights_enabled() && offset % 16 == 0 {
+            return self.weight_view_mmap(path, offset, len_bytes);
+        }
+        Ok((self.weight_buffer_from_file(path, offset, len_bytes)?, 0))
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "mmap lecture seule d'un shard enveloppé par newBufferWithBytesNoCopy"
+    )]
+    pub(super) fn weight_view_mmap(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        len_bytes: usize,
+    ) -> Result<(metal::Buffer, usize)> {
+        use metal::foreign_types::ForeignType;
+        use metal::objc::runtime::{Object, Sel};
+        use metal::objc::Message;
+        use std::os::fd::AsRawFd;
+
+        let io = |source| InferError::Io {
+            path: path.to_path_buf(),
+            source,
+        };
+        if len_bytes == 0 {
+            return Err(InferError::Shape("payload single-copy vide".to_string()));
+        }
+        let file = std::fs::File::open(path).map_err(io)?;
+        crate::safetensor::check_file_range(&file, offset, len_bytes, "poids Metal")?;
+        // SAFETY: sysconf sans effet de bord.
+        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|page| page.is_power_of_two())
+            .ok_or_else(|| InferError::Metal("taille de page invalide".to_string()))?;
+        let start = offset - offset % page;
+        let delta = usize::try_from(offset - start)
+            .map_err(|_| InferError::Shape("offset mmap trop grand".to_string()))?;
+        let map_len = delta
+            .checked_add(len_bytes)
+            .and_then(|len| len.checked_next_multiple_of(page as usize))
+            .ok_or_else(|| InferError::Shape("fenêtre mmap trop grande".to_string()))?;
+        let file_offset = libc::off_t::try_from(start)
+            .map_err(|_| InferError::Shape("offset mmap trop grand".to_string()))?;
+        let map_len_ns = checked_nsuint(map_len, "weight_mmap")?;
+        // SAFETY: fenêtre bornée par check_file_range (la dernière page
+        // partielle est complétée de zéros), fd valide pendant l'appel ; le
+        // mapping survit à la fermeture du fichier.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                file_offset,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io(std::io::Error::last_os_error()));
+        }
+        // Metal copie le bloc et l'appelle à la libération du buffer : le
+        // mapping vit exactement autant que le MTLBuffer et ses clones.
+        let unmap = block::ConcreteBlock::new(|ptr: *const std::ffi::c_void, len: NSUInteger| {
+            // SAFETY: (ptr, len) est le mapping créé ci-dessus, rendu une seule
+            // fois par Metal quand plus aucun buffer ne le référence.
+            unsafe { libc::munmap(ptr.cast_mut(), len as usize) };
+        })
+        .copy();
+        let device = self.device.as_ptr().cast::<Object>();
+        let options = MTLResourceOptions::StorageModeShared;
+        let deallocator: *const block::Block<(*const std::ffi::c_void, NSUInteger), ()> = &*unmap;
+        // SAFETY: device vivant ; arguments et retour exactement ceux de
+        // `newBufferWithBytesNoCopy:length:options:deallocator:`. Le retour
+        // brut est testé contre nil avant d'en faire un Buffer (non nul).
+        let raw = unsafe {
+            (*device).send_message::<_, *mut metal::MTLBuffer>(
+                Sel::register("newBufferWithBytesNoCopy:length:options:deallocator:"),
+                (ptr.cast_const(), map_len_ns, options, deallocator),
+            )
+        }
+        .map_err(|error| InferError::Metal(format!("newBufferWithBytesNoCopy: {error:?}")));
+        let raw = match raw {
+            Ok(raw) => raw,
+            Err(error) => {
+                // SAFETY: l'envoi a échoué, Metal ne détient pas le mapping.
+                unsafe { libc::munmap(ptr, map_len) };
+                return Err(error);
+            }
+        };
+        if raw.is_null() {
+            // SAFETY: Metal a refusé le pointeur et n'appellera pas le bloc.
+            unsafe { libc::munmap(ptr, map_len) };
+            return Err(InferError::Metal(format!(
+                "newBufferWithBytesNoCopy refusé pour {}",
+                path.display()
+            )));
+        }
+        // SAFETY: `raw` est un MTLBuffer non nul retenu (+1) par `new…`.
+        let buffer = unsafe { metal::Buffer::from_ptr(raw) };
+        #[cfg(test)]
+        super::flags::MMAP_WEIGHT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok((buffer, delta))
+    }
+
     #[expect(
         unsafe_code,
         reason = "écriture initiale d'un MTLBuffer StorageModeShared depuis le fichier de poids"

@@ -170,3 +170,22 @@ fn direct_file_shared_f32_preserves_dense_dispatch_bits() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn mmap_views_match_file_bytes_across_page_boundaries() -> Result<()> {
+    let Some(metal) = crate::test_support::metal_executor()? else {
+        return Ok(());
+    };
+    let file = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    let payload: Vec<u8> = (0..40_000_u32).map(|i| (i * 37 % 251) as u8).collect();
+    std::fs::write(file.path(), &payload).expect("invariant: fixture écrite");
+    for (offset, len) in [(0_usize, 16), (16_384, 64), (16_368, 32), (39_984, 16)] {
+        let (buffer, base) = metal.weight_view_mmap(file.path(), offset as u64, len)?;
+        let bytes = buffer_bytes(&buffer);
+        assert_eq!(&bytes[base..base + len], &payload[offset..offset + len]);
+        assert_eq!(base, offset % 16_384);
+    }
+    assert!(metal.weight_view_mmap(file.path(), 39_990, 16).is_err());
+    assert!(metal.weight_view_mmap(file.path(), 0, 0).is_err());
+    Ok(())
+}
