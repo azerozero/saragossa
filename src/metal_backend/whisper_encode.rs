@@ -481,6 +481,13 @@ impl MetalExecutor {
         let q = self.new_f32_buffer(nd, "we_q")?;
         let k = self.new_f32_buffer(nd, "we_k")?;
         let v = self.new_f32_buffer(nd, "we_v")?;
+        // Alloué seulement si une couche fusionne q/k/v.
+        #[cfg(feature = "diar")]
+        let qkv_buf = if enc.layers.iter().any(|l| l.qkv.is_some()) {
+            self.new_f32_buffer(3 * nd, "we_qkv")?
+        } else {
+            self.new_f32_buffer(1, "we_qkv")?
+        };
         let ctx = self.new_f32_buffer(nd, "we_ctx")?;
         let proj = self.new_f32_buffer(nd, "we_proj")?;
         let f1 = self.new_f32_buffer(nf, "we_f1")?;
@@ -554,42 +561,31 @@ impl MetalExecutor {
 
         for (i, layer) in enc.layers.iter().enumerate() {
             // Self-attention : q/k/v depuis `normed`.
-            self.encode_proj_gemm(
-                encoder,
-                na,
-                &normed,
-                &normed_bf16,
-                &layer.q,
-                &q,
-                seq,
-                dim,
-                dim,
-            )?;
-            self.encode_proj_bias(encoder, &q, layer.q.bias.as_ref(), seq, dim)?;
-            self.encode_proj_gemm(
-                encoder,
-                na,
-                &normed,
-                &normed_bf16,
-                &layer.k,
-                &k,
-                seq,
-                dim,
-                dim,
-            )?;
-            self.encode_proj_bias(encoder, &k, layer.k.bias.as_ref(), seq, dim)?;
-            self.encode_proj_gemm(
-                encoder,
-                na,
-                &normed,
-                &normed_bf16,
-                &layer.v,
-                &v,
-                seq,
-                dim,
-                dim,
-            )?;
-            self.encode_proj_bias(encoder, &v, layer.v.bias.as_ref(), seq, dim)?;
+            match (&layer.qkv, na) {
+                #[cfg(feature = "diar")]
+                (Some(qkv), false) => {
+                    let n3 = 3 * dim;
+                    self.encode_dense_gemm(encoder, &normed, &qkv.weight, &qkv_buf, seq, n3, dim)?;
+                    self.encode_proj_bias(encoder, &qkv_buf, qkv.bias.as_ref(), seq, n3)?;
+                    self.encode_split_qkv(encoder, &qkv_buf, [&q, &k, &v], seq, dim)?;
+                }
+                _ => {
+                    for (proj, out) in [(&layer.q, &q), (&layer.k, &k), (&layer.v, &v)] {
+                        self.encode_proj_gemm(
+                            encoder,
+                            na,
+                            &normed,
+                            &normed_bf16,
+                            proj,
+                            out,
+                            seq,
+                            dim,
+                            dim,
+                        )?;
+                        self.encode_proj_bias(encoder, out, proj.bias.as_ref(), seq, dim)?;
+                    }
+                }
+            }
             #[cfg(feature = "diar")]
             if let Some(theta) = enc.rope_theta {
                 self.encode_rope_heads_inplace(encoder, &q, seq, enc.heads, head_dim, theta)?;
@@ -696,6 +692,39 @@ impl MetalExecutor {
             rows: seq,
             cols: dim,
         })
+    }
+
+    /// `[seq, 3d]` → trois buffers `[seq, d]` (copie exacte).
+    #[cfg(feature = "diar")]
+    fn encode_split_qkv(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        qkv: &BufferRef,
+        [q, k, v]: [&BufferRef; 3],
+        seq: usize,
+        dim: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(seq, "split seq")?,
+            checked_u32(dim, "split dim")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.split_qkv_rows_f32);
+        encoder.set_buffer(0, Some(qkv), 0);
+        encoder.set_buffer(1, Some(q), 0);
+        encoder.set_buffer(2, Some(k), 0);
+        encoder.set_buffer(3, Some(v), 0);
+        set_u32_bytes(encoder, 4, &dims, "split_qkv_dims")?;
+        profile_dispatch();
+        encoder.dispatch_threads(
+            MTLSize::new(
+                checked_nsuint(dim, "split dim")?,
+                checked_nsuint(seq, "split seq")?,
+                1,
+            ),
+            MTLSize::new(32, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
     }
 
     /// RoPE rotate-half en place sur `[seq, heads * head_dim]`, positions `0..seq`.
@@ -1208,6 +1237,9 @@ pub(crate) struct WhisperResidentLayer {
     pub q: WhisperResidentProj,
     pub k: WhisperResidentProj,
     pub v: WhisperResidentProj,
+    /// `[q; k; v]` empilés `[3d, d]` (diarisation, `SARAGOSSA_DIAR_FUSED_QKV=1`) :
+    /// un seul GEMM remplace les trois. Ignoré par le chemin bf16 NA.
+    pub qkv: Option<WhisperResidentProj>,
     pub o: WhisperResidentProj,
     pub final_ln: WhisperResidentNorm,
     pub fc1: WhisperResidentProj,
