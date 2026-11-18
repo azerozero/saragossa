@@ -48,6 +48,12 @@ fn vision_flag_value(value: Option<&str>) -> crate::Result<bool> {
     }
 }
 
+/// Diarisation : q, k, v en un seul matmul (`SARAGOSSA_DIAR_FUSED_QKV=1`, défaut 0).
+#[cfg(feature = "diar")]
+pub(crate) fn diar_fused_qkv() -> bool {
+    env_flag("SARAGOSSA_DIAR_FUSED_QKV", false)
+}
+
 thread_local! {
     static DECISION_NONCAUSAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DECISION_HEADLESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

@@ -465,3 +465,141 @@ fn real_weights_hour_throughput() -> Result<()> {
     );
     Ok(())
 }
+
+/// Petit modèle f32 aléatoire (2 couches, chunk de 4 trames, contexte gauche 1).
+fn random_model() -> Result<DiarizationModel> {
+    let (d, ffn, h, sub, mels) = (16, 32, 4, 2, 4);
+    let mut seed = 5;
+    let mut t = HashMap::new();
+    let mut put = |k: String, shape: Vec<usize>, scale: f32| -> Result<()> {
+        let n = shape.iter().product();
+        let v = (0..n).map(|_| lcg(&mut seed) * scale).collect();
+        t.insert(k, Tensor::from_vec(shape, v)?);
+        Ok(())
+    };
+    let p = "model.audio_tower";
+    put(
+        format!("{p}.embedder.projection.weight"),
+        vec![d, sub * mels],
+        0.3,
+    )?;
+    for n in ["input_layer_norm", "layer_norm"] {
+        put(format!("{p}.{n}.weight"), vec![d], 1.0)?;
+        put(format!("{p}.{n}.bias"), vec![d], 0.1)?;
+    }
+    for i in 0..2 {
+        let l = format!("{p}.layers.{i}");
+        for n in ["layer_norm1", "layer_norm2"] {
+            put(format!("{l}.{n}.weight"), vec![d], 1.0)?;
+            put(format!("{l}.{n}.bias"), vec![d], 0.1)?;
+        }
+        for n in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            put(format!("{l}.self_attn.{n}.weight"), vec![d, d], 0.3)?;
+        }
+        put(format!("{l}.self_attn.q_proj.bias"), vec![d], 0.1)?;
+        put(format!("{l}.self_attn.v_proj.bias"), vec![d], 0.1)?;
+        put(format!("{l}.mlp.fc1.weight"), vec![ffn, d], 0.3)?;
+        put(format!("{l}.mlp.fc2.weight"), vec![d, ffn], 0.3)?;
+    }
+    put("model.proj.weight".into(), vec![h, d], 0.3)?;
+    put(
+        "model.upsampler.conv.weight".into(),
+        vec![h * sub, h, 3],
+        0.5,
+    )?;
+    put("model.upsampler.conv.bias".into(), vec![h * sub], 0.1)?;
+    put("classifier.dense.weight".into(), vec![h, h], 0.8)?;
+    put("classifier.out_proj.weight".into(), vec![2, h], 2.0)?;
+    put("classifier.out_proj.bias".into(), vec![2], 0.1)?;
+    put("silence_embeds".into(), vec![d], 0.1)?;
+    let config = DiarizationConfig {
+        hidden_size: d,
+        heads: 2,
+        layers: 2,
+        num_mel_bins: mels,
+        subsampling: sub,
+        rope_theta: 10_000.0,
+        head_hidden: h,
+        num_speakers: 2,
+        chunk_length: 4,
+        chunk_right_context: 2,
+        chunk_left_context: 1,
+        cache: policy(),
+    };
+    DiarizationModel::from_tensors(config, t)
+}
+
+fn noise(n: usize) -> Vec<f32> {
+    let mut seed = 99;
+    (0..n)
+        .map(|i| lcg(&mut seed) * (1.0 + (i / 4000 % 3) as f32))
+        .collect()
+}
+
+#[test]
+fn streaming_matches_batch_for_any_push_size() -> Result<()> {
+    let model = random_model()?;
+    let rt = ForwardRuntime::cpu();
+    for len in [16_000 + 77, 16_000 * 3 + 5, 161] {
+        let samples = noise(len);
+        let batch = model.diarize(&samples, rt)?;
+        let mut want = batch.segments.clone();
+        want.sort_by_key(|s| (s.start_frame, s.speaker));
+        for push in [1, 333, 4096, len] {
+            let mut stream = DiarizationStream::new(&model, rt)?;
+            let (mut probs, mut segs) = (Vec::new(), Vec::new());
+            for part in samples.chunks(push) {
+                let u = stream.push(part)?;
+                probs.extend(u.probabilities);
+                segs.extend(u.segments);
+            }
+            let u = stream.finish()?;
+            probs.extend(u.probabilities);
+            segs.extend(u.segments);
+            assert_eq!(
+                probs.len(),
+                batch.probabilities.len(),
+                "len {len} push {push}"
+            );
+            let max = probs
+                .iter()
+                .zip(batch.probabilities.data())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(max < 1e-5, "len {len} push {push}: écart {max}");
+            segs.sort_by_key(|s| (s.start_frame, s.speaker));
+            assert_eq!(segs, want, "len {len} push {push}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn streaming_rejects_audio_shorter_than_a_frame() -> Result<()> {
+    let model = random_model()?;
+    let mut stream = DiarizationStream::new(&model, ForwardRuntime::cpu())?;
+    stream.push(&noise(100))?;
+    assert!(stream.finish().is_err());
+    Ok(())
+}
+
+#[test]
+fn fused_qkv_matches_separate_projections() -> Result<()> {
+    let model = random_model()?;
+    let rt = ForwardRuntime::cpu();
+    let samples = noise(16_000 * 2);
+    let want = model.diarize(&samples, rt)?;
+    let fused = model.with_fused_qkv(true)?;
+    assert!(fused.layers.iter().all(|l| l.qkv.is_some()));
+    let got = fused.diarize(&samples, rt)?;
+    let max = got
+        .probabilities
+        .data()
+        .iter()
+        .zip(want.probabilities.data())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f32::max);
+    assert!(max < 1e-5, "écart {max}");
+    assert_eq!(got.segments, want.segments);
+    Ok(())
+}
