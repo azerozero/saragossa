@@ -3,14 +3,14 @@
 use std::collections::HashMap;
 
 use super::dsp::{NB_DF, NB_ERB};
-use super::layers::{sigmoid, take_shape, Act, Conv, ConvSpec, GroupedLinear, Gru, Linear1};
+use super::layers::{take_shape, Act, Conv, ConvSpec, GroupedLinear, Gru, Linear1, Math};
 use crate::{InferError, Result, Tensor};
 
-const CH: usize = 64;
-const EMB: usize = CH * NB_ERB / 4; // 512
-const HIDDEN: usize = 256;
+pub(super) const CH: usize = 64;
+pub(super) const EMB: usize = CH * NB_ERB / 4; // 512
+pub(super) const HIDDEN: usize = 256;
 const DF_ORDER: usize = 5;
-const DF_OUT_CH: usize = 2 * DF_ORDER;
+pub(super) const DF_OUT_CH: usize = 2 * DF_ORDER;
 const LSNR_MIN: f32 = -15.0;
 const LSNR_MAX: f32 = 35.0;
 
@@ -44,10 +44,10 @@ const fn spec(
 }
 
 /// Une couche récurrente `SqueezedGRU_S` : linéaire groupée, GRU, linéaire groupée optionnelle.
-struct SqueezedGru {
-    lin_in: GroupedLinear,
-    layers: Vec<Gru>,
-    lin_out: Option<GroupedLinear>,
+pub(super) struct SqueezedGru {
+    pub(super) lin_in: GroupedLinear,
+    pub(super) layers: Vec<Gru>,
+    pub(super) lin_out: Option<GroupedLinear>,
 }
 
 impl SqueezedGru {
@@ -86,12 +86,12 @@ impl SqueezedGru {
         })
     }
 
-    fn step(&self, x: &[f32], h: &mut [Vec<f32>], out: &mut Vec<f32>) {
+    fn step(&self, x: &[f32], h: &mut [Vec<f32>], out: &mut Vec<f32>, math: Math) {
         let mut a = vec![0.0; HIDDEN];
         self.lin_in.forward(x, &mut a);
         a.iter_mut().for_each(|v| *v = v.max(0.0));
         for (layer, state) in self.layers.iter().zip(h.iter_mut()) {
-            layer.step(&a, state);
+            layer.step(&a, state, math);
             a.copy_from_slice(state);
         }
         match &self.lin_out {
@@ -107,20 +107,20 @@ impl SqueezedGru {
 
 /// Poids DeepFilterNet3 chargés et repliés pour l'inférence CPU.
 pub struct Network {
-    erb_conv: [Conv; 4],
-    df_conv0: Conv,
-    df_conv1: Conv,
-    df_fc_emb: GroupedLinear,
-    enc_gru: SqueezedGru,
-    lsnr_fc: Linear1,
-    erb_gru: SqueezedGru,
-    convp: [Conv; 4],
-    convt: [Conv; 3],
-    conv0_out: Conv,
-    df_convp: Conv,
-    df_gru: SqueezedGru,
-    df_skip: GroupedLinear,
-    df_out: GroupedLinear,
+    pub(super) erb_conv: [Conv; 4],
+    pub(super) df_conv0: Conv,
+    pub(super) df_conv1: Conv,
+    pub(super) df_fc_emb: GroupedLinear,
+    pub(super) enc_gru: SqueezedGru,
+    pub(super) lsnr_fc: Linear1,
+    pub(super) erb_gru: SqueezedGru,
+    pub(super) convp: [Conv; 4],
+    pub(super) convt: [Conv; 3],
+    pub(super) conv0_out: Conv,
+    pub(super) df_convp: Conv,
+    pub(super) df_gru: SqueezedGru,
+    pub(super) df_skip: GroupedLinear,
+    pub(super) df_out: GroupedLinear,
     /// `[NB_ERB][481]`, matrice inverse 0/1 du masque ERB.
     pub(crate) erb_inv: Vec<f32>,
     /// `[481][NB_ERB]`, banque ERB normalisée (sert à vérifier les largeurs).
@@ -135,6 +135,7 @@ pub(crate) struct NetState {
     h_enc: Vec<Vec<f32>>,
     h_erb: Vec<Vec<f32>>,
     h_df: Vec<Vec<f32>>,
+    pub(crate) math: Math,
 }
 
 /// Sorties d'un pas du réseau.
@@ -274,6 +275,7 @@ impl Network {
             h_enc: zeros(1, HIDDEN),
             h_erb: zeros(2, HIDDEN),
             h_df: zeros(2, HIDDEN),
+            math: Math::Libm,
         }
     }
 
@@ -282,13 +284,14 @@ impl Network {
         push(&mut st.erb_hist, erb);
         push(&mut st.spec_hist, cplx);
         let (mut e0, mut e1, mut e2, mut e3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        self.erb_conv[0].forward(&hist(&st.erb_hist), NB_ERB, &mut e0);
-        self.erb_conv[1].forward(&[&e0], NB_ERB, &mut e1);
-        self.erb_conv[2].forward(&[&e1], NB_ERB / 2, &mut e2);
-        self.erb_conv[3].forward(&[&e2], NB_ERB / 4, &mut e3);
+        self.erb_conv[0].forward(&hist(&st.erb_hist), NB_ERB, &mut e0, st.math);
+        self.erb_conv[1].forward(&[&e0], NB_ERB, &mut e1, st.math);
+        self.erb_conv[2].forward(&[&e1], NB_ERB / 2, &mut e2, st.math);
+        self.erb_conv[3].forward(&[&e2], NB_ERB / 4, &mut e3, st.math);
         let (mut c0, mut c1) = (Vec::new(), Vec::new());
-        self.df_conv0.forward(&hist(&st.spec_hist), NB_DF, &mut c0);
-        self.df_conv1.forward(&[&c0], NB_DF, &mut c1);
+        self.df_conv0
+            .forward(&hist(&st.spec_hist), NB_DF, &mut c0, st.math);
+        self.df_conv1.forward(&[&c0], NB_DF, &mut c1, st.math);
 
         // [C][F] → [F][C] aplati, comme `permute(0, 2, 3, 1).flatten(2)`.
         let cemb_in = to_fc(&c1, CH, NB_DF / 2);
@@ -299,29 +302,29 @@ impl Network {
             *e += c.max(0.0);
         }
         let mut emb = Vec::new();
-        self.enc_gru.step(&emb_in, &mut st.h_enc, &mut emb);
-        let lsnr = sigmoid(self.lsnr_fc.forward(&emb)) * (LSNR_MAX - LSNR_MIN) + LSNR_MIN;
+        self.enc_gru.step(&emb_in, &mut st.h_enc, &mut emb, st.math);
+        let lsnr = st.math.sigmoid(self.lsnr_fc.forward(&emb)) * (LSNR_MAX - LSNR_MIN) + LSNR_MIN;
 
         // Décodeur ERB (U-Net) → masque [NB_ERB].
         let mut d = Vec::new();
-        self.erb_gru.step(&emb, &mut st.h_erb, &mut d);
+        self.erb_gru.step(&emb, &mut st.h_erb, &mut d, st.math);
         let f8 = NB_ERB / 4;
         let mut x = from_fc(&d, CH, f8);
         let mut tmp = Vec::new();
         let skips = [(&e3, f8), (&e2, f8), (&e1, NB_ERB / 2)];
         for (level, (skip, f)) in skips.into_iter().enumerate() {
-            self.convp[3 - level].forward(&[skip], f, &mut tmp);
+            self.convp[3 - level].forward(&[skip], f, &mut tmp, st.math);
             add(&mut tmp, &x);
-            self.convt[2 - level].forward(&[&tmp], f, &mut x);
+            self.convt[2 - level].forward(&[&tmp], f, &mut x, st.math);
         }
-        self.convp[0].forward(&[&e0], NB_ERB, &mut tmp);
+        self.convp[0].forward(&[&e0], NB_ERB, &mut tmp, st.math);
         add(&mut tmp, &x);
         let mut mask = Vec::new();
-        self.conv0_out.forward(&[&tmp], NB_ERB, &mut mask);
+        self.conv0_out.forward(&[&tmp], NB_ERB, &mut mask, st.math);
 
         // Décodeur DF → coefficients complexes [NB_DF][ordre][2].
         let mut c = Vec::new();
-        self.df_gru.step(&emb, &mut st.h_df, &mut c);
+        self.df_gru.step(&emb, &mut st.h_df, &mut c, st.math);
         let mut skip = vec![0.0; HIDDEN];
         self.df_skip.forward(&emb, &mut skip);
         add(&mut c, &skip);
@@ -330,11 +333,11 @@ impl Network {
         push(&mut st.c0_hist, &c0);
         let mut pathway = Vec::new();
         self.df_convp
-            .forward(&hist(&st.c0_hist), NB_DF, &mut pathway);
+            .forward(&hist(&st.c0_hist), NB_DF, &mut pathway, st.math);
         for f in 0..NB_DF {
             for o in 0..DF_OUT_CH {
                 let v = &mut coefs[f * DF_OUT_CH + o];
-                *v = v.tanh() + pathway[o * NB_DF + f];
+                *v = st.math.tanh(*v) + pathway[o * NB_DF + f];
             }
         }
         StepOut { mask, coefs, lsnr }

@@ -109,6 +109,16 @@ pub fn denoise_threads() -> usize {
     })
 }
 
+/// Réseau DFN3 en lot sur GPU Metal pour `saragossa enhance`
+/// (`SARAGOSSA_DENOISE_GPU`, défaut 0). Garde le fichier entier en mémoire ;
+/// sortie identique au bit au CPU en variante `exp`/`tanh` communes, à quelques
+/// ulp près du chemin CPU historique.
+#[cfg(all(feature = "denoise", feature = "metal", target_os = "macos"))]
+pub fn denoise_gpu() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DENOISE_GPU", false))
+}
+
 /// Tokens au plus par prefill empaqueté des lectures TTA d'une décision
 /// (`SARAGOSSA_DECISION_PACK_TOKENS`, 0 : un prefill par lecture). Au-delà,
 /// le GEMM est déjà saturé et l'empaquetage ne gagne plus rien (mesuré).

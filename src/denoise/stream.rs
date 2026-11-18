@@ -12,9 +12,21 @@ impl<'a> DenoiseStream<'a> {
     /// Ouvre un état GRU/STFT indépendant, partageant les poids du modèle.
     #[must_use]
     pub fn new(model: &'a DeepFilterNet3) -> Self {
+        Self::from_stream(model.stream())
+    }
+
+    pub(crate) fn from_stream(stream: DfStream<'a>) -> Self {
         Self {
-            buffered: Buffered::new(model.stream()),
+            buffered: Buffered::new(stream),
         }
+    }
+
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "metal")),
+        allow(dead_code, reason = "seul le chemin Metal relit le flux")
+    )]
+    pub(crate) fn stream_mut(&mut self) -> &mut DfStream<'a> {
+        &mut self.buffered.processor
     }
 
     /// Fournit un morceau et restitue immédiatement les échantillons disponibles.

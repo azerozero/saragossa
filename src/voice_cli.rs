@@ -132,7 +132,12 @@ fn enhance_to_writer<R: Read>(
     writer.write_all(&output_header(None)?)?;
     let mut resampler = StreamResampler::new(reader.sample_rate(), SAMPLE_RATE)?;
     let threads = saragossa::runtime_flags::denoise_threads();
-    let mut stream = (threads <= 1).then(|| DenoiseStream::new(model));
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    let gpu = saragossa::runtime_flags::denoise_gpu();
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    let gpu = false;
+    let whole_file = gpu || threads > 1;
+    let mut stream = (!whole_file).then(|| DenoiseStream::new(model));
     let mut whole = Vec::new();
     let mut count = 0_u64;
     let mut emit = |samples: &[f32]| -> CliResult<()> {
@@ -150,7 +155,7 @@ fn enhance_to_writer<R: Read>(
             break;
         }
         let samples = resampler.push(&chunk)?;
-        if threads > 1 {
+        if whole_file {
             whole.extend(samples);
         } else if let Some(stream) = stream.as_mut() {
             emit(&stream.push(&samples)?)?;
@@ -158,10 +163,18 @@ fn enhance_to_writer<R: Read>(
     }
     reader.finish_input()?;
     let tail = resampler.finish();
-    if threads > 1 {
-        // NOTE: le découpage en segments exige le signal entier en mémoire (opt-in).
+    if whole_file {
+        // NOTE: le GPU et le découpage en segments exigent le signal entier en mémoire (opt-in).
         whole.extend(tail);
-        emit(&model.enhance_parallel(&whole, threads)?)?;
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        let out = if gpu {
+            model.enhance_gpu(&whole)?
+        } else {
+            model.enhance_parallel(&whole, threads)?
+        };
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        let out = model.enhance_parallel(&whole, threads)?;
+        emit(&out)?;
     } else if let Some(stream) = stream.as_mut() {
         emit(&stream.push(&tail)?)?;
         emit(&stream.finish()?)?;

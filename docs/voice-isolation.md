@@ -637,3 +637,31 @@ for n in 1 2 4 8; do SARAGOSSA_DENOISE_THREADS=$n cargo run --release -- enhance
 ```
 
 Chaque run affiche `RTF` ; comparer `out_N.wav` à `out_1.wav` (SNR ≥ 30 dB).
+
+## GPU hors ligne (opt-in)
+
+`SARAGOSSA_DENOISE_GPU=1 saragossa enhance …` calcule le réseau en lot sur
+Metal (`src/denoise/gpu.rs`) : convolutions et linéaires sur toutes les trames
+d'un morceau de 4096 pas, et chaque GRU dans un seul noyau persistant (un
+threadgroup de 768 threads, boucle temporelle complète). STFT, features et
+synthèse restent sur CPU. Le fichier entier est gardé en mémoire.
+
+La sortie est identique au bit au CPU en variante `Math::Common`
+(`enhance_common`) : chaque sortie est calculée par un thread dans l'ordre de
+sommation du CPU, sans fast-math ni FMA, et `exp`/`tanh`/sigmoïde suivent
+`exact_math` des deux côtés. Cette variante s'écarte du CPU libm historique
+(défaut inchangé) de quelques ulp.
+
+Mesures (M5 Max, clip de 292,75 s, charge 5 à 15, non publiables comme bench) :
+
+| Mesure | Valeur |
+|---|---|
+| Boucle GRU persistante | 11,4 µs/pas (une ou deux séquences côte à côte) |
+| `enhance` GPU, fichier | 1,9 s, dont 1,2 s de réseau GPU (CPU 1 thread : 12,65 s, nuit du 17) |
+| GPU vs CPU commun | 14 052 096 échantillons identiques au bit sur 14 052 096 |
+| CPU commun vs libm | 11 269 333 échantillons différents, SNR 135,0 dB, écart max 8,9e-7 |
+
+```bash
+SARAGOSSA_DFN3_DIR=… SARAGOSSA_DFN3_LONG_WAV=long.wav cargo test --release --lib \
+  dfn3_gpu_long_file_bit_exact_and_speed -- --ignored --nocapture
+```
