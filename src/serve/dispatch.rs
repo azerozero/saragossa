@@ -13,7 +13,7 @@ use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -260,11 +260,12 @@ fn run_engine<S: ServeStream>(
     let pending_cap = serve_queue_depth();
     let mut pending: VecDeque<Queued<S>> = VecDeque::new();
     loop {
+        apply_pending_models(state);
         let leader = match pending.pop_front() {
             Some(queued) => queued,
-            None => match queue.recv() {
-                Ok(job) => Queued::new(job, batching(state), state),
-                Err(_) => break,
+            None => match next_job(queue, state) {
+                Some(job) => Queued::new(job, batching(state), state),
+                None => break,
             },
         };
         let Some(model) = leader
@@ -291,6 +292,25 @@ fn run_engine<S: ServeStream>(
         let mut batch = vec![leader];
         batch.extend(others);
         run_batch(batch, state);
+    }
+}
+
+/// Applique la liste de modèles d'un SIGHUP ; entre deux jobs seulement.
+fn apply_pending_models(state: &mut ServeState) {
+    if let Some(models) = super::reload::take_pending_models() {
+        state.set_models(&models);
+    }
+}
+
+/// Attend le prochain job en regardant toutes les 250 ms si un SIGHUP a changé
+/// les modèles ; `None` quand tous les émetteurs ont lâché.
+fn next_job<S>(queue: &Receiver<Job<S>>, state: &mut ServeState) -> Option<Job<S>> {
+    loop {
+        match queue.recv_timeout(Duration::from_millis(250)) {
+            Ok(job) => return Some(job),
+            Err(RecvTimeoutError::Timeout) => apply_pending_models(state),
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
     }
 }
 
@@ -748,6 +768,9 @@ mod tests {
 
     #[test]
     fn model_lookup_uses_registry_and_auth_without_engine() {
+        let _serial = super::super::reload::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (dispatcher, rx) = dispatcher_with(Some("test-key"), 2, usize::MAX, 1);
         for (path, authorized, status) in [
             ("/v1/models/alpha", false, 401),

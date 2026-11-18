@@ -294,7 +294,7 @@ pub(super) fn route_front<S: Write>(
         })());
     }
     if request.method == "GET" && path == "/v1/models" {
-        let models = ModelsResponse::from_ids(&front.model_ids);
+        let models = ModelsResponse::from_ids(&super::reload::model_ids(&front.model_ids));
         return Some(send_json(stream, 200, &models, Vec::new()));
     }
     if request.method == "GET" {
@@ -303,11 +303,13 @@ pub(super) fn route_front<S: Write>(
                 Ok(id) => id,
                 Err(error) => return Some(send_failure(stream, &error, false)),
             };
-            return Some(if front.model_ids.iter().any(|model| model == &id) {
-                send_json(stream, 200, &ModelInfo::new(&id), Vec::new())
-            } else {
-                send_failure(stream, &ServeError::UnknownModel(id), false)
-            });
+            return Some(
+                if super::reload::model_ids(&front.model_ids).contains(&id) {
+                    send_json(stream, 200, &ModelInfo::new(&id), Vec::new())
+                } else {
+                    send_failure(stream, &ServeError::UnknownModel(id), false)
+                },
+            );
         }
     }
     None

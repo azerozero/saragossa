@@ -4,7 +4,7 @@
 pub(crate) mod pairwise;
 
 mod profile;
-pub use profile::{Profile, ProfileError, Resolved, ServeSection, HOT_KEYS, PRESETS};
+pub use profile::{ModelEntry, Profile, ProfileError, Resolved, ServeSection, HOT_KEYS, PRESETS};
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::cell::Cell;
@@ -46,6 +46,12 @@ fn vision_flag_value(value: Option<&str>) -> crate::Result<bool> {
         Some(value) => env_flag_value(value)
             .ok_or_else(|| crate::InferError::Config("VISION : booléen invalide".into())),
     }
+}
+
+/// Diarisation : q, k, v en un seul matmul (`SARAGOSSA_DIAR_FUSED_QKV=1`, défaut 0).
+#[cfg(feature = "diar")]
+pub(crate) fn diar_fused_qkv() -> bool {
+    env_flag("SARAGOSSA_DIAR_FUSED_QKV", false)
 }
 
 thread_local! {
