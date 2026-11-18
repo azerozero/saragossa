@@ -22,13 +22,21 @@ pub(super) fn draining() -> bool {
     #[cfg(not(unix))]
     false
 }
-/// Refuse une socket héritée qui n'écoute pas sur l'adresse configurée.
+/// Vrai une fois ce processus annoncé prêt au parent (toujours hors Unix).
+pub(super) fn announced() -> bool {
+    #[cfg(unix)]
+    return super::super::relay::announced();
+    #[cfg(not(unix))]
+    true
+}
+/// Refuse une socket héritée qui n'écoute pas sur l'adresse configurée ; un
+/// port 0 configuré accepte le port réel attribué au premier lancement.
 pub(super) fn same_addr(
     local: std::io::Result<std::net::SocketAddr>,
     addr: std::net::SocketAddr,
 ) -> ServeResult<()> {
     let local = local.map_err(error)?;
-    if local == addr {
+    if local == addr || (addr.port() == 0 && local.ip() == addr.ip()) {
         Ok(())
     } else {
         Err(error(format!(
@@ -192,6 +200,7 @@ pub(in crate::serve) fn start(
                                 .map(std::net::UdpSocket::from);
                         #[cfg(not(unix))]
                         let inherited: Option<std::net::UdpSocket> = None;
+                        let adopted = inherited.is_some();
                         let socket = match inherited {
                             Some(socket) => {
                                 same_addr(socket.local_addr(), parsed)?;
@@ -201,7 +210,7 @@ pub(in crate::serve) fn start(
                         };
                         #[cfg(unix)]
                         super::super::relay::share("wt", std::os::fd::AsRawFd::as_raw_fd(&socket));
-                        let endpoint = super::webtransport::bind(socket, &front)?;
+                        let endpoint = super::webtransport::bind(socket, &front, adopted)?;
                         eprintln!(
                             "enhance WebTransport: {}",
                             endpoint.local_addr().map_err(error)?
@@ -250,6 +259,14 @@ pub(in crate::serve) fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inherited_address_matches_configured_port_zero() {
+        let real = "127.0.0.1:4433".parse().unwrap();
+        assert!(same_addr(Ok(real), real).is_ok());
+        assert!(same_addr(Ok(real), "127.0.0.1:0".parse().unwrap()).is_ok());
+        assert!(same_addr(Ok(real), "127.0.0.2:0".parse().unwrap()).is_err());
+        assert!(same_addr(Ok(real), "127.0.0.1:4434".parse().unwrap()).is_err());
+    }
     #[test]
     fn only_loopback_addresses_are_accepted() {
         for ok in ["127.0.0.1:4433", "127.0.0.2:0", "[::1]:4433"] {

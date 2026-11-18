@@ -15,7 +15,8 @@
 //! Les listeners enhance suivent dans la même variable (`7,h2=9,wt=10`).
 //! HTTP/2 : le parent cesse d'accepter, envoie GOAWAY à ses connexions et
 //! attend qu'elles finissent. QUIC : parent et enfant partagent la socket UDP ;
-//! dès l'enfant prêt, le parent ne la lit plus et ferme ses sessions
+//! l'enfant ne la lit qu'après son annonce « prêt », et dès cette annonce le
+//! parent ne la lit plus et ferme ses sessions
 //! (CONNECTION_CLOSE, H3_NO_ERROR) pour que les clients se reconnectent chez
 //! l'enfant. Une session QUIC ouverte ne migre pas, et l'enfant présente un
 //! nouveau certificat auto-signé (empreinte à relire).
@@ -58,6 +59,10 @@ static INHERITED: Mutex<Vec<(String, RawFd)>> = Mutex::new(Vec::new());
 /// Parent à attendre en relais séquentiel, 0 sinon.
 static PREDECESSOR: AtomicU32 = AtomicU32::new(0);
 static DEFERRED_PRELOAD: AtomicBool = AtomicBool::new(false);
+/// Vrai une fois l'octet « prêt » écrit (ou hors relais, au premier `ready`).
+static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+/// Listeners enhance transmissibles et leur type de socket.
+const NAMED: [(&str, libc::c_int); 2] = [("h2", libc::SOCK_STREAM), ("wt", libc::SOCK_DGRAM)];
 
 struct Config {
     binary: PathBuf,
@@ -98,12 +103,19 @@ pub(super) fn configure(args: &mut Vec<String>, serve: &ServeSection) -> ServeRe
             )))
         }
     };
+    let relayed =
+        std::env::var_os(LISTEN_FDS_ENV).is_some() || std::env::var_os(READY_FD_ENV).is_some();
     if let Ok(pid) = std::env::var(SEQUENTIAL_ENV) {
         std::env::remove_var(SEQUENTIAL_ENV);
-        let pid = pid
-            .parse()
-            .map_err(|_| ServeError::args(format!("{SEQUENTIAL_ENV}={pid} invalide")))?;
-        PREDECESSOR.store(pid, Ordering::Relaxed);
+        // NOTE: hors relais, une variable égarée bloquerait le moteur.
+        if relayed {
+            let pid = pid
+                .parse()
+                .map_err(|_| ServeError::args(format!("{SEQUENTIAL_ENV}={pid} invalide")))?;
+            PREDECESSOR.store(pid, Ordering::Relaxed);
+        } else {
+            eprintln!("saragossa serve relais: {SEQUENTIAL_ENV} ignorée hors relais");
+        }
     }
     let _ = CONFIG.set(Config {
         binary,
@@ -160,16 +172,55 @@ pub(super) fn inherited() -> ServeResult<Option<OwnedFd>> {
     // NOTE: les sous-processus ne doivent pas croire hériter de ces fd ; std
     // sérialise ses propres accès à l'environnement.
     std::env::remove_var(LISTEN_FDS_ENV);
-    let invalid = || ServeError::args(format!("{LISTEN_FDS_ENV}={value} invalide"));
-    let mut parts = value.split(',');
-    let main = parse_fd(parts.next().unwrap_or("")).ok_or_else(invalid)?;
-    let mut named = Vec::new();
-    for part in parts {
-        let (name, fd) = part.split_once('=').ok_or_else(invalid)?;
-        named.push((name.to_string(), parse_fd(fd).ok_or_else(invalid)?));
+    let (main, named) = parse_listen(&value, env_fd(READY_FD_ENV)?)
+        .ok_or_else(|| ServeError::args(format!("{LISTEN_FDS_ENV}={value} invalide")))?;
+    for (name, fd, kind) in &named {
+        if option(*fd, libc::SO_TYPE) != Some(*kind) {
+            return Err(ServeError::args(format!(
+                "socket {name} héritée (fd {fd}) de type inattendu"
+            )));
+        }
     }
+    let named = named
+        .into_iter()
+        .map(|(name, fd, _)| (name.to_string(), fd))
+        .collect();
     *lock(&INHERITED) = named;
     adopt(main, libc::SOCK_STREAM, "d'écoute").map(Some)
+}
+
+/// Découpe `principal[,nom=fd]...` : noms connus et uniques, fd uniques,
+/// distincts du fd « prêt » ; `None` sinon.
+fn parse_listen(
+    value: &str,
+    ready: Option<RawFd>,
+) -> Option<(RawFd, Vec<(&'static str, RawFd, libc::c_int)>)> {
+    let mut parts = value.split(',');
+    let main = parse_fd(parts.next()?)?;
+    // NOTE: un fd en double serait possédé deux fois (double fermeture).
+    let mut seen: Vec<RawFd> = ready.into_iter().collect();
+    if seen.contains(&main) {
+        return None;
+    }
+    seen.push(main);
+    let mut named = Vec::new();
+    for part in parts {
+        let (name, fd) = part.split_once('=')?;
+        let &(name, kind) = NAMED.iter().find(|(known, _)| *known == name)?;
+        let fd = parse_fd(fd)?;
+        if seen.contains(&fd) || named.iter().any(|(known, _, _)| *known == name) {
+            return None;
+        }
+        seen.push(fd);
+        named.push((name, fd, kind));
+    }
+    Some((main, named))
+}
+
+/// Vrai une fois ce processus annoncé prêt : il peut lire les sockets
+/// partagées sans voler les datagrammes du parent.
+pub(super) fn announced() -> bool {
+    ANNOUNCED.load(Ordering::Relaxed)
 }
 
 /// Listener enhance `name` hérité, de type `kind` (`SOCK_STREAM` ou
@@ -215,26 +266,30 @@ fn adopt(fd: RawFd, kind: libc::c_int, label: &str) -> ServeResult<OwnedFd> {
 
 /// Prévient le parent que l'enfant accepte ; sans effet hors relais.
 /// Ferme d'abord les listeners hérités que ce binaire n'a pas adoptés : une
-/// écoute orpheline accepterait des connexions jamais servies.
+/// écoute orpheline accepterait des connexions jamais servies. Seuls les fd
+/// de `INHERITED`, validés par [`inherited`] (uniques, nom et type connus),
+/// sont fermés.
 #[allow(unsafe_code)]
 pub(super) fn ready() -> ServeResult<()> {
     for (name, fd) in lock(&INHERITED).drain(..) {
-        if option(fd, libc::SO_TYPE).is_some() {
-            eprintln!("saragossa serve relais: socket {name} héritée inutilisée, fermée");
-            // SAFETY: socket transmise par le parent et jamais adoptée ici.
-            drop(unsafe { OwnedFd::from_raw_fd(fd) });
-        }
+        eprintln!("saragossa serve relais: socket {name} héritée inutilisée, fermée");
+        // SAFETY: fd validé et transmis par le parent, jamais adopté ici ;
+        // retiré de la liste, il n'est fermé qu'une fois.
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
     }
     let Some(fd) = env_fd(READY_FD_ENV)? else {
+        ANNOUNCED.store(true, Ordering::Relaxed);
         return Ok(());
     };
     // SAFETY: extrémité de la paire transmise par le parent pour ce seul
     // usage ; elle est fermée au drop, après l'octet.
     let mut stream = unsafe { UnixStream::from_raw_fd(fd) };
     std::env::remove_var(READY_FD_ENV);
-    stream
+    let written = stream
         .write_all(b"1")
-        .map_err(|e| ServeError::io("signal de relais prêt", e))
+        .map_err(|e| ServeError::io("signal de relais prêt", e));
+    ANNOUNCED.store(true, Ordering::Relaxed);
+    written
 }
 
 /// Option socket entière de `fd`, `None` si l'appel échoue.
@@ -400,6 +455,34 @@ fn hand_over(binary: &PathBuf, listener: RawFd, sequential: bool) -> ServeResult
                 "enfant {} sorti avant d'être prêt ({status}, lecture {outcome:?})",
                 child.id()
             )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listen_fds_rejects_duplicates_and_unknown_names() {
+        let (main, named) = parse_listen("3,h2=8,wt=9", Some(14)).expect("valide");
+        assert_eq!(main, 3);
+        assert_eq!(
+            named,
+            vec![("h2", 8, libc::SOCK_STREAM), ("wt", 9, libc::SOCK_DGRAM)]
+        );
+        for bad in [
+            "3,h2=3",
+            "3,h2=8,wt=8",
+            "3,h2=8,h2=9",
+            "3,ws=8",
+            "3,h2=14",
+            "14",
+            "3,h2",
+            "2",
+            "",
+        ] {
+            assert!(parse_listen(bad, Some(14)).is_none(), "{bad}");
         }
     }
 }
