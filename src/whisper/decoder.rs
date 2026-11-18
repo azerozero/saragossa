@@ -836,7 +836,7 @@ impl WhisperModel {
     /// langue n'est jamais compté : il fait partie du préfixe, même en mode auto.
     fn is_silence(
         &self,
-        audio_features: &Tensor,
+        features: AudioFeatures<'_>,
         prompt: &[u32],
         runtime: ForwardRuntime<'_>,
     ) -> Result<bool> {
@@ -847,7 +847,7 @@ impl WhisperModel {
         let mut probe =
             TimestampRules::scoring(self.eot_token, self.no_speech_token, RulesMode::Probe);
         self.decoder.generate(
-            audio_features,
+            features,
             prompt,
             budget,
             runtime,
@@ -859,7 +859,7 @@ impl WhisperModel {
         }
         let mut plain = TimestampRules::scoring(self.eot_token, None, RulesMode::Plain);
         let generated = self.decoder.generate(
-            audio_features,
+            features,
             prompt,
             budget,
             runtime,
@@ -884,7 +884,7 @@ impl WhisperModel {
         let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
         let prompt = self.prompt(lang, false);
         let effective_lang = if lang == "auto" { "auto" } else { lang }.to_string();
-        if self.is_silence(audio_features, &prompt, runtime)? {
+        if self.is_silence(features, &prompt, runtime)? {
             return Ok((String::new(), effective_lang));
         }
         let t_dec = std::time::Instant::now();
