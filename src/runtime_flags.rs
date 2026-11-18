@@ -1689,6 +1689,14 @@ pub(crate) fn prefill_kv_shared_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_SHARED", true))
 }
 
+/// QMV bf16 à lectures vectorisées et transposition threadgroup, identique au
+/// bit au qmv par ligne. Opt-in : `SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE=1`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn dense_bf16_qmv_stage_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE", false))
+}
+
 /// GEMM NA tuilé des poids bf16 denses au prefill (batch ≥ 64). Défaut ON ;
 /// `SARAGOSSA_RUST_DENSE_BF16_GEMM=0` rétablit le qmv par ligne.
 #[cfg(all(target_os = "macos", feature = "metal"))]

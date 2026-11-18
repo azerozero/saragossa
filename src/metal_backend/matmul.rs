@@ -438,7 +438,18 @@ impl MetalExecutor {
             checked_u32(out_dim, "bf16 qmv out_dim")?,
             checked_u32(in_dim, "bf16 qmv in_dim")?,
         ];
-        encoder.set_compute_pipeline_state(&self.dense_qmv_rhs_bf16_f32);
+        // Le noyau à blocs de 256 garde l'ordre d'accumulation du qmv par ligne.
+        let stage = in_dim % 256 == 0 && crate::runtime_flags::dense_bf16_qmv_stage_enabled();
+        let (pipeline, name, rows_per_group) = if stage {
+            (
+                &self.dense_qmv_rhs_bf16_stage_f32,
+                "dense_qmv_rhs_bf16_stage_f32",
+                4,
+            )
+        } else {
+            (&self.dense_qmv_rhs_bf16_f32, "dense_qmv_rhs_bf16_f32", 1)
+        };
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs), 0);
         encoder.set_buffer(1, Some(rhs_bf16), 0);
         encoder.set_buffer(2, Some(out), 0);
@@ -447,12 +458,16 @@ impl MetalExecutor {
             std::mem::size_of::<[u32; 3]>() as u64,
             dims.as_ptr().cast::<std::ffi::c_void>(),
         );
-        let threads_per_group = self.qmv_thread_group_size(&self.dense_qmv_rhs_bf16_f32);
-        trace_dispatch_path("dense_qmv_rhs_bf16_f32", batch, out_dim, in_dim);
+        let threads_per_group = if stage {
+            32 * rows_per_group as NSUInteger
+        } else {
+            self.qmv_thread_group_size(pipeline)
+        };
+        trace_dispatch_path(name, batch, out_dim, in_dim);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
-                checked_nsuint(out_dim, "bf16 qmv out_dim")?,
+                checked_nsuint(out_dim.div_ceil(rows_per_group), "bf16 qmv out_dim")?,
                 checked_nsuint(batch, "bf16 qmv batch")?,
                 1,
             ),

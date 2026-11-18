@@ -135,6 +135,52 @@ kernel void dense_qmv_rhs_bf16_f32(
     }
 }
 
+// QMV bf16 exact à lectures vectorisées. `dense_qmv_rhs_bf16_f32` lit 2 octets
+// par lane (requêtes de 64 octets par simdgroup) et plafonne vers 350-430 Go/s
+// en decode M=1. Ici chaque simdgroup charge un bloc de 256 poids de sa ligne
+// en uint4 (16 octets par lane), le transpose en mémoire threadgroup, puis
+// chaque lane relit ses éléments k = l + 32 i : l'ordre d'accumulation et
+// l'expression restent ceux du noyau par ligne : identité au bit par
+// construction au niveau source, vérifiée par le test
+// `dense_bf16_qmv_stage_matches_row_qmv_bitwise` (fast-math actif et coupé).
+// Quatre lignes (une par simdgroup) par threadgroup. Exige in_dim % 256 == 0.
+kernel void dense_qmv_rhs_bf16_stage_f32(
+    device const float* lhs [[buffer(0)]],
+    device const bfloat* rhs [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint3& dims [[buffer(3)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    // uint4 : alignement de 16 octets garanti pour les écritures vectorisées.
+    threadgroup uint4 stage[4][32];
+    const uint batch = dims.x;
+    const uint out_dim = dims.y;
+    const uint in_dim = dims.z;
+    const uint b = tile.y;
+    const uint row = tile.x * 4u + simd_gid;
+    if (b >= batch || row >= out_dim) {
+        return;
+    }
+    const device float* x = lhs + b * in_dim;
+    const device uint4* w = (const device uint4*)(rhs + row * in_dim);
+    threadgroup const bfloat* mine = (threadgroup const bfloat*)stage[simd_gid];
+    float acc = 0.0f;
+    for (uint kb = 0u; kb < in_dim; kb += 256u) {
+        stage[simd_gid][lane] = w[kb / 8u + lane];
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0u; i < 8u; ++i) {
+            acc += x[kb + lane + 32u * i] * float(mine[lane + 32u * i]);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) {
+        out[b * out_dim + row] = acc;
+    }
+}
+
 // QMV dense f32 batch>=1, out_dim multiple de 8, in_dim multiple de 512.
 // Reutilise chaque bloc d'activation pour 8 lignes de poids (2 simdgroups x 4
 // lignes), utile pour les routeurs MoE denses [256, 2048]. L'ordre
