@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.14](https://github.com/azerozero/saragossa/compare/v0.3.13...v0.3.14) - 2026-11-18
+
+### Added
+
+- *(diarisation)* fusion QKV dans l'encodeur Metal résident et test streaming sur poids réels
+
+### Fixed
+
+- *(diarisation)* pas de q/k/v séparés sur le GPU en mode fusionné, écart journalisé
+
+### Other
+
+- Merge pull request #264 from azerozero/feat/diar-metal-qkv
+- *(diarisation)* emprunt inutile signalé par clippy
+- Merge remote-tracking branch 'origin/main' into feat/diar-metal-qkv
+- *(diarisation)* branches séparée et fusionnée explicites, indépendantes de l'environnement
+
 ## [0.3.13](https://github.com/azerozero/saragossa/compare/v0.3.12...v0.3.13) - 2026-11-18
 
 ### Added
