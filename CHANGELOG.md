@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.13](https://github.com/azerozero/saragossa/compare/v0.3.12...v0.3.13) - 2026-11-18
+
+### Added
+
+- *(serve)* relais des listeners h2 et QUIC, bascule séquentielle selon la mémoire
+- *(serve)* liste de modèles rechargeable à chaud par SIGHUP
+- *(serve)* relais sans coupure du binaire sur SIGUSR2
+- *(bench)* harnais de latence des transports serve (SSE, WS, h2, WebTransport)
+- *(diar)* diarisation incrémentale et q/k/v fusionnés opt-in
+
+### Fixed
+
+- *(serve)* relais plus strict sur les fd hérités et la socket QUIC
+- *(serve)* accept non bloquant pendant le relais, délai du signal prêt
+- *(bench)* appariement FIFO des trames WS cadencées à 30 ms, p95 interpolé, blocs ABBA stricts
+- *(whisper)* ignore les fenêtres sans parole (no_speech_threshold 0,6 et logprob -1,0)
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/relais-h2-quic
+- *(serve)* rustfmt du relais
+- *(serve)* alias du type des listeners hérités
+- Merge pull request #259 from azerozero/bench/transports
+- Merge pull request #258 from azerozero/fix/whisper-silence
+- Merge pull request #257 from azerozero/feat/diar-streaming
+- Merge pull request #268 from azerozero/release-plz-2026-11-17T23-00-37Z
+- Merge remote-tracking branch 'origin/main' into feat/relais-sans-coupure
+- *(whisper)* verdict de silence isolé et limites du logprob documentées
+
 ## [0.3.12](https://github.com/azerozero/saragossa/compare/v0.3.11...v0.3.12) - 2026-11-17
 
 ### Added
