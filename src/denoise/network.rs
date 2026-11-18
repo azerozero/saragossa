@@ -292,7 +292,11 @@ impl Network {
             h_enc: zeros(1, HIDDEN),
             h_erb: zeros(2, HIDDEN),
             h_df: zeros(2, HIDDEN),
-            math: Math::Libm,
+            math: if crate::runtime_flags::denoise_libm() {
+                Math::Libm
+            } else {
+                Math::Common
+            },
         }
     }
 
