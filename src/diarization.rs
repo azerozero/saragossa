@@ -671,7 +671,7 @@ impl DiarizationModel {
                     q: separate(&l.q, l.qkv.is_some())?,
                     k: separate(&l.k, l.qkv.is_some())?,
                     v: separate(&l.v, l.qkv.is_some())?,
-                    qkv: l.qkv.as_ref().map(&proj).transpose()?,
+                    qkv: l.qkv.as_ref().map(proj).transpose()?,
                     o: proj(&l.o)?,
                     final_ln: norm(&l.ln2)?,
                     fc1: proj(&l.fc1)?,
