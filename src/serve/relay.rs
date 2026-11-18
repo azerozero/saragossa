@@ -194,10 +194,7 @@ type Named = (&'static str, RawFd, libc::c_int);
 
 /// Découpe `principal[,nom=fd]...` : noms connus et uniques, fd uniques,
 /// distincts du fd « prêt » ; `None` sinon.
-fn parse_listen(
-    value: &str,
-    ready: Option<RawFd>,
-) -> Option<(RawFd, Vec<Named>)> {
+fn parse_listen(value: &str, ready: Option<RawFd>) -> Option<(RawFd, Vec<Named>)> {
     let mut parts = value.split(',');
     let main = parse_fd(parts.next()?)?;
     // NOTE: un fd en double serait possédé deux fois (double fermeture).
