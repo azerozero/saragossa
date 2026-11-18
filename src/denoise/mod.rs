@@ -222,7 +222,8 @@ impl DfStream<'_> {
     /// Retard entrée → sortie : `N − H` (STFT) + deux trames d'anticipation.
     pub const DELAY_SAMPLES: usize = FFT_SIZE - HOP_SIZE + CONV_LOOKAHEAD * HOP_SIZE;
 
-    /// SNR local estimé (dB) de la dernière trame produite.
+    /// SNR local estimé (dB) de la dernière trame produite ; 0 sur le chemin
+    /// GPU (`DeepFilterNet3::enhance_gpu`), qui ne calcule pas le LSNR.
     #[must_use]
     pub fn last_lsnr(&self) -> f32 {
         self.last_lsnr
@@ -290,8 +291,12 @@ impl DfStream<'_> {
                 let (i, width) = (*next, NB_DF * 2 * ORDER);
                 *next += 1;
                 (
-                    &mask[i * NB_ERB..(i + 1) * NB_ERB],
-                    &coefs[i * width..(i + 1) * width],
+                    mask.get(i * NB_ERB..(i + 1) * NB_ERB).expect(
+                        "invariant: le rejeu suit les trames de l'enregistrement, même audio",
+                    ),
+                    coefs.get(i * width..(i + 1) * width).expect(
+                        "invariant: le rejeu suit les trames de l'enregistrement, même audio",
+                    ),
                 )
             }
         };

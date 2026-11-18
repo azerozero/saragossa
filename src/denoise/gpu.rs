@@ -10,9 +10,21 @@
 //! sortie est calculée par un seul thread, dans l'ordre de sommation du CPU
 //! (huit accumulateurs de `layers::dot`, boucles de `Conv::forward`), sans
 //! fast-math ni contraction FMA, et `exact_math` remplace la libm des deux côtés.
+//!
+//! NOTE: deux hypothèses ne sont garanties que par la mesure, pas par la
+//! spécification MSL : la division `/` hors fast-math est correctement arrondie
+//! comme sur CPU, et aucun sous-normal n'apparaît (le GPU pourrait les vider à
+//! zéro ; `exact_math` borne ses exposants pour cela, mais un produit
+//! activation × poids minuscule reste possible). Le test synthétique et
+//! `dfn3_gpu_long_file_bit_exact_and_speed` (293 s, identique au bit) les
+//! vérifient ; une dérive y apparaîtrait comme une différence de bits.
+//!
+//! Le LSNR n'est pas calculé : `DfStream::last_lsnr` reste à 0 sur ce chemin.
+
+use std::sync::OnceLock;
 
 use metal::{
-    Buffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device,
+    Buffer, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState, Device, Library,
     MTLResourceOptions, MTLSize,
 };
 
@@ -306,17 +318,28 @@ struct Ctx<'a> {
     df_out: GLin,
 }
 
+/// GPU et noyaux compilés une fois par processus.
+fn library() -> Result<(Device, Library)> {
+    static CACHE: OnceLock<std::result::Result<(Device, Library), String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let device = Device::system_default().ok_or("aucun GPU Metal")?;
+            let source = format!(
+                "#include <metal_stdlib>\nusing namespace metal;\n{}\n{KERNELS}",
+                super::exact_math::MSL
+            );
+            let library = device
+                .new_library_with_source(&source, &crate::metal_backend::compile_options(false))
+                .map_err(|e| format!("noyaux DFN3: {e}"))?;
+            Ok((device, library))
+        })
+        .clone()
+        .map_err(InferError::Metal)
+}
+
 impl<'a> Ctx<'a> {
     fn new(net: &'a Network) -> Result<Self> {
-        let device =
-            Device::system_default().ok_or_else(|| InferError::Metal("aucun GPU Metal".into()))?;
-        let source = format!(
-            "#include <metal_stdlib>\nusing namespace metal;\n{}\n{KERNELS}",
-            super::exact_math::MSL
-        );
-        let library = device
-            .new_library_with_source(&source, &crate::metal_backend::compile_options(false))
-            .map_err(|e| InferError::Metal(format!("noyaux DFN3: {e}")))?;
+        let (device, library) = library()?;
         let pipeline = |name: &str| -> Result<ComputePipelineState> {
             let function = library
                 .get_function(name, None)
@@ -381,14 +404,20 @@ impl<'a> Ctx<'a> {
                 b_hh: upload(&device, &g.b_hh)?,
             })
         };
-        let squeezed = |s: &SqueezedGru| -> Result<GSqueezed> {
-            if s.layers.iter().any(|l| l.hidden != HIDDEN) {
-                return Err(InferError::Shape("GRU DFN3 de largeur ≠ 256".into()));
+        // Forme attendue par l'encodage de `run` : nombre de couches, sortie linéaire.
+        let squeezed = |s: &SqueezedGru, layers: usize, out: bool| -> Result<GSqueezed> {
+            if s.layers.len() != layers
+                || s.lin_out.is_some() != out
+                || s.layers.iter().any(|l| l.hidden != HIDDEN)
+            {
+                return Err(InferError::Shape(format!(
+                    "GRU DFN3 inattendu : {layers} couche(s) de {HIDDEN}, sortie {out} attendues"
+                )));
             }
             Ok(GSqueezed {
                 lin_in: lin(&s.lin_in)?,
                 layers: s.layers.iter().map(&gru).collect::<Result<_>>()?,
-                lin_out: s.lin_out.as_ref().map(&lin).transpose()?,
+                lin_out: s.lin_out.as_ref().map(lin).transpose()?,
             })
         };
         Ok(Self {
@@ -396,9 +425,9 @@ impl<'a> Ctx<'a> {
             df_conv0: conv(&net.df_conv0)?,
             df_conv1: conv(&net.df_conv1)?,
             df_fc_emb: lin(&net.df_fc_emb)?,
-            enc: squeezed(&net.enc_gru)?,
-            erb: squeezed(&net.erb_gru)?,
-            df: squeezed(&net.df_gru)?,
+            enc: squeezed(&net.enc_gru, 1, true)?,
+            erb: squeezed(&net.erb_gru, 2, true)?,
+            df: squeezed(&net.df_gru, 2, false)?,
             convp: net.convp.iter().map(&conv).collect::<Result<_>>()?,
             convt: net.convt.iter().map(&conv).collect::<Result<_>>()?,
             conv0_out: conv(&net.conv0_out)?,
@@ -421,6 +450,9 @@ impl<'a> Ctx<'a> {
         }
     }
 }
+
+/// Couche GRU, entrées `gi`, sorties `hs`, état porté d'un morceau à l'autre.
+type Seq<'s> = (&'s GGru, &'s Buf, &'s Buf, &'s Buffer);
 
 /// Encodeur à décalage de lignes : toutes les activations sont liées à partir de `row0`.
 struct Enc<'e> {
@@ -516,11 +548,11 @@ impl Enc<'_> {
         self.grid(&p.add, a.width);
     }
 
-    /// Une ou deux séquences GRU en parallèle, une par threadgroup.
-    fn gru(&self, p: &Pipelines, seqs: &[(&GGru, &Buf, &Buf, &Buffer)]) {
+    /// Une séquence GRU, ou deux côte à côte (un threadgroup chacune).
+    fn gru(&self, p: &Pipelines, first: Seq, second: Option<Seq>) {
         self.enc.set_compute_pipeline_state(&p.gru);
-        for slot in 0..2 {
-            let (g, gi, hs, st) = seqs[slot.min(seqs.len() - 1)];
+        // Sans seconde séquence, ses liaisons répètent la première (threadgroup absent).
+        for (slot, (g, gi, hs, st)) in [first, second.unwrap_or(first)].into_iter().enumerate() {
             let base = 5 * slot as u64;
             self.bind(base, gi);
             self.enc.set_buffer(base + 1, Some(&g.w_hh_t), 0);
@@ -530,7 +562,7 @@ impl Enc<'_> {
         }
         self.params(10, &[self.rows as i32]);
         self.enc.dispatch_thread_groups(
-            MTLSize::new(seqs.len() as u64, 1, 1),
+            MTLSize::new(1 + u64::from(second.is_some()), 1, 1),
             MTLSize::new(GATES as u64, 1, 1),
         );
     }
@@ -609,7 +641,7 @@ pub(super) fn run(net: &Network, erb: &[f32], cplx: &[f32]) -> Result<(Vec<f32>,
         e.add(p, &emb_in, &cemb, true);
         e.linear(p, &c.enc.lin_in, &emb_in, &h_in, true);
         e.linear(p, &c.enc.layers[0].ih, &h_in, &gi, false);
-        e.gru(p, &[(&c.enc.layers[0], &gi, &hs, &st_enc)]);
+        e.gru(p, (&c.enc.layers[0], &gi, &hs, &st_enc), None);
         if let Some(lo) = &c.enc.lin_out {
             e.linear(p, lo, &hs, &emb, true);
         }
@@ -620,19 +652,15 @@ pub(super) fn run(net: &Network, erb: &[f32], cplx: &[f32]) -> Result<(Vec<f32>,
         e.linear(p, &c.df.layers[0].ih, &h_in2, &gi2, false);
         e.gru(
             p,
-            &[
-                (&c.erb.layers[0], &gi, &hs, &st_e0),
-                (&c.df.layers[0], &gi2, &hs2, &st_d0),
-            ],
+            (&c.erb.layers[0], &gi, &hs, &st_e0),
+            Some((&c.df.layers[0], &gi2, &hs2, &st_d0)),
         );
         e.linear(p, &c.erb.layers[1].ih, &hs, &gi, false);
         e.linear(p, &c.df.layers[1].ih, &hs2, &gi2, false);
         e.gru(
             p,
-            &[
-                (&c.erb.layers[1], &gi, &hs, &st_e1),
-                (&c.df.layers[1], &gi2, &hs3, &st_d1),
-            ],
+            (&c.erb.layers[1], &gi, &hs, &st_e1),
+            Some((&c.df.layers[1], &gi2, &hs3, &st_d1)),
         );
         if let Some(lo) = &c.erb.lin_out {
             e.linear(p, lo, &hs, &d, true);
@@ -695,7 +723,7 @@ pub(super) fn gru_probe(net: &Network, steps: usize, seqs: usize) -> Result<f64>
         upload(&ctx.device, &[0.0; HIDDEN])?,
     );
     let layer = &ctx.erb.layers[0];
-    let all = [(layer, &gi, &hs, &st), (layer, &gi, &hs2, &st2)];
+    let second = (seqs > 1).then_some((layer, &gi, &hs2, &st2));
     let mut best = f64::INFINITY;
     for _ in 0..3 {
         let cb = ctx.queue.new_command_buffer();
@@ -705,7 +733,7 @@ pub(super) fn gru_probe(net: &Network, steps: usize, seqs: usize) -> Result<f64>
             row0: 0,
             rows: steps,
         }
-        .gru(&ctx.p, &all[..seqs]);
+        .gru(&ctx.p, (layer, &gi, &hs, &st), second);
         raw.end_encoding();
         commit_and_wait(cb)?;
         let ns = crate::metal_backend::command_buffer_gpu_ns(cb) as f64;
