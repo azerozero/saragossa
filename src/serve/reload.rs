@@ -255,9 +255,11 @@ pub(super) fn watch(_: Option<String>, _: Vec<String>, _: Vec<String>, _: Profil
 mod tests {
     use super::*;
 
-    // Un seul test : les atomiques sont globales au processus.
+    // Les atomiques sont globales au processus : `reload` les écrit, donc tout
+    // test qui l'appelle ou les lit prend TEST_LOCK.
     #[test]
     fn hot_keys_apply_and_frozen_keys_are_refused() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Les atomiques sont globales : les remettre à 0 même en cas d'échec.
         struct Reset;
         impl Drop for Reset {
@@ -324,6 +326,8 @@ mod tests {
             fn drop(&mut self) {
                 *lock(&MODELS) = None;
                 *lock(&PENDING) = None;
+                READ_TIMEOUT_SECS.store(0, Ordering::Relaxed);
+                MAX_TOKENS_CAP.store(0, Ordering::Relaxed);
             }
         }
         let _reset = Reset;
