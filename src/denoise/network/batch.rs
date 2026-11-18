@@ -10,7 +10,7 @@
 
 use std::thread;
 
-use super::{Encoded, NetState, Network, StepOut};
+use super::{ConvHist, Encoded, NetState, Network, StepOut};
 use crate::denoise::dsp::{NB_DF, NB_ERB};
 
 impl Network {
@@ -24,6 +24,12 @@ impl Network {
         threads: usize,
     ) -> Vec<StepOut> {
         let (k, math) = (erb.len() / NB_ERB, st.math);
+        // Les convolutions internes à noyau temporel > 1 porteraient un état
+        // d'une trame à l'autre : ce chemin ne couvre que DFN3 standard.
+        debug_assert!(
+            self.is_std(),
+            "invariant: pas multi-cœur réservé à DFN3 standard"
+        );
         if k == 0 {
             return Vec::new();
         }
@@ -32,7 +38,12 @@ impl Network {
             let spec = window_source(&st.spec_hist, cplx, 2 * NB_DF);
             let (ke, ks) = (st.erb_hist.len(), st.spec_hist.len());
             par_map(k, threads, |t| {
-                self.encode(&erb[t..t + ke], &spec[t..t + ks], math)
+                self.encode(
+                    &erb[t..t + ke],
+                    &spec[t..t + ks],
+                    &mut ConvHist::default(),
+                    math,
+                )
             })
         };
         slide(&mut st.erb_hist, erb, NB_ERB);
@@ -83,7 +94,14 @@ impl Network {
             .collect();
         let kc = st.c0_hist.len();
         let out = par_map(k, threads, |t| {
-            self.decode(&enc[t], &c0[t..t + kc], &emb[t], (&d[t], &c[t]), math)
+            self.decode(
+                &enc[t],
+                &c0[t..t + kc],
+                &emb[t],
+                (&d[t], &c[t]),
+                &mut ConvHist::default(),
+                math,
+            )
         });
         let tail: Vec<Vec<f32>> = c0[c0.len() - kc..].iter().map(|s| s.to_vec()).collect();
         st.c0_hist = tail;

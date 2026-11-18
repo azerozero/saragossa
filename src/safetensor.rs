@@ -69,6 +69,22 @@ pub fn load_f32_tensors(path: impl AsRef<Path>) -> Result<HashMap<String, Tensor
     Ok(out)
 }
 
+/// Métadonnées texte (`__metadata__`) d'un fichier safetensors, vides si absentes.
+///
+/// # Errors
+///
+/// Renvoie une erreur si la lecture ou l'en-tête échoue.
+pub fn load_metadata(path: impl AsRef<Path>) -> Result<HashMap<String, String>> {
+    let path = path.as_ref();
+    let bytes = read_file(path)?;
+    let (_, meta) =
+        SafeTensors::read_metadata(&bytes).map_err(|source| InferError::Safetensors {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(meta.metadata().clone().unwrap_or_default())
+}
+
 /// Charge tous les tenseurs flottants d'un fichier safetensors.
 ///
 /// # Errors
