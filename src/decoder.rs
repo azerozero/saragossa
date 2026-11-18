@@ -596,7 +596,7 @@ struct ResidentArena {
     /// QKV concaténé par couche quand le pas embedding encode la couche TTS
     /// fusionnée ([`CausalDecoder::enable_tts_fused_layers`]) ; `None` sinon.
     #[cfg(feature = "tts")]
-    tts_fused_qkv: Option<Vec<MetalLinearWeightBuffers>>,
+    tts_fused_qkv: Option<Vec<Vec<MetalLinearWeightBuffers>>>,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
