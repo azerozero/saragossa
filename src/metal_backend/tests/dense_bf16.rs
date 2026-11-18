@@ -327,10 +327,11 @@ fn dense_bf16_stage_vs_row(shapes: &[(usize, usize, usize)], probe: bool) -> Res
 #[test]
 #[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
 fn dense_bf16_qmv_stage_matches_row_qmv_bitwise() -> Result<()> {
-    dense_bf16_stage_vs_row(
-        &[(37, 512, 2), (5, 256, 1), (1024, 5120, 3), (48, 5120, 1)],
-        false,
-    )
+    let shapes = [(37, 512, 2), (5, 256, 1), (1024, 5120, 3), (48, 5120, 1)];
+    // L'identité vaut par construction au niveau source ; elle est vérifiée
+    // avec la compilation par défaut puis avec le fast-math coupé.
+    dense_bf16_stage_vs_row(&shapes, false)?;
+    with_metal_fast_math_override(false, || dense_bf16_stage_vs_row(&shapes, false))
 }
 
 // Temps commit/wait amortis sur plusieurs dispatches, ordre alterné : contrôle
