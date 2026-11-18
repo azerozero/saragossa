@@ -299,8 +299,9 @@ pub(crate) fn single_copy_weights_enabled() -> bool {
 /// fichier est aligné sur 16 octets devient un buffer Metal sans copie sur un
 /// mmap lecture seule du shard. Les pages restent celles du cache de fichiers,
 /// communes au parent et à l'enfant d'un relais. Les shards MLX ont un en-tête
-/// non aligné : les réaligner d'abord (`tools/safetensors_align.py`), sinon le
-/// chargement retombe sur la copie.
+/// non aligné : les réaligner d'abord (`tools/quant/safetensors_align.py`),
+/// sinon le chargement retombe sur la copie. Un shard tronqué ou réécrit en
+/// place pendant qu'il est mappé provoque un SIGBUS.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn mmap_weights_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

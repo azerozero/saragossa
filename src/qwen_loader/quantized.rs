@@ -314,7 +314,9 @@ pub(super) fn tensor_from_entry(
         && crate::runtime_flags::single_copy_weights_enabled()
     {
         if let Some(metal) = context.metal {
-            let view = bf16_entry_to_metal(headers, entry_ref, &spec.source, metal)?;
+            // NOTE: `DenseBf16Tensor` et ses kernels lient le buffer à
+            // l'offset 0 : jamais de vue mmap décalée ici, toujours la copie.
+            let view = bf16_entry_to_metal(headers, entry_ref, &spec.source, metal, false)?;
             return Ok(DecoderTensor::LinearWeight(LinearWeight::DenseBf16(
                 crate::DenseBf16Tensor::new(&view.shape, view.buffer)?,
             )));
@@ -435,8 +437,8 @@ pub(super) fn quantized_tensor_from_entry(
             let scales_entry = named_entry(headers, entries, &scales_key)?;
             let biases_entry = named_entry(headers, entries, &biases_key)?;
             if scales_entry.entry.dtype == Dtype::BF16 && biases_entry.entry.dtype == Dtype::BF16 {
-                let scales = bf16_entry_to_metal(headers, scales_entry, &scales_key, metal)?;
-                let biases = bf16_entry_to_metal(headers, biases_entry, &biases_key, metal)?;
+                let scales = bf16_entry_to_metal(headers, scales_entry, &scales_key, metal, true)?;
+                let biases = bf16_entry_to_metal(headers, biases_entry, &biases_key, metal, true)?;
                 let packed_len = element_count(&entry.shape, &spec.source)?;
                 let packed_bytes = entry.payload_len(&spec.source)?;
                 let packed_offset = shard
@@ -585,11 +587,14 @@ fn named_entry<'a>(
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
+/// Charge un payload bf16 ; `allow_view` autorise une vue mmap décalée, que
+/// seuls les consommateurs qui lient leur offset (paramètres affines) acceptent.
 fn bf16_entry_to_metal(
     headers: &[ShardHeader],
     entry_ref: &TensorEntryRef,
     name: &str,
     metal: &crate::MetalExecutor,
+    allow_view: bool,
 ) -> Result<MetalBf16Entry> {
     let shard = headers
         .get(entry_ref.shard_index)
@@ -618,12 +623,18 @@ fn bf16_entry_to_metal(
         .data_start
         .checked_add(entry.data_offsets[0] as u64)
         .ok_or_else(|| InferError::Shape(format!("offset bf16 trop grand pour {name}")))?;
-    let (buffer, base) = metal.weight_view_from_file(
-        &shard.path,
-        file_offset,
-        expected_bytes,
-        std::mem::size_of::<u16>(),
-    )?;
+    let (buffer, base) = if allow_view {
+        metal.weight_view_from_file(
+            &shard.path,
+            file_offset,
+            expected_bytes,
+            std::mem::size_of::<u16>(),
+        )?
+    } else {
+        let buffer =
+            metal.weight_buffer_from_bf16_file(&shard.path, file_offset, expected_bytes)?;
+        (buffer, 0)
+    };
     Ok(MetalBf16Entry {
         buffer,
         base: base / std::mem::size_of::<u16>(),

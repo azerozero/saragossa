@@ -32,7 +32,9 @@ def align(source: Path, destination: Path) -> None:
 
 
 def main() -> None:
-    source, destination = map(Path, sys.argv[1:3])
+    source, destination = (Path(arg).resolve() for arg in sys.argv[1:3])
+    if destination.is_relative_to(source):
+        sys.exit(f"destination {destination} sous la source {source}")
     destination.mkdir(parents=True)
     for path in sorted(source.iterdir()):
         target = destination / path.name

@@ -1,5 +1,6 @@
 //! Encodage bas niveau des matmuls Metal.
 
+use super::matmul_select::AffineMatmulKernel;
 use super::*;
 
 const MATMUL_ROW_TG_WIDTH: u64 = 256;
@@ -459,8 +460,9 @@ impl MetalExecutor {
         {
             return Self::fused_micro_mlp_supported(batch, in_dim, inter_dim, [g, u, d]);
         }
-        // Ce chemin MLP ne sert pas les projections GDN ; le dispatch down
-        // ci-dessous reste lié à zéro, donc les vues décalées en sont exclues.
+        // Les vues décalées (poids mmap, sous-vues) passent si leurs offsets
+        // respectent l'alignement des kernels tuilés ; les trois dispatches
+        // lient chacun leurs offsets.
         let u4_gs64 = |weight: &MetalLinearWeightBuffers, expect_in: usize, expect_out: usize| {
             matches!(
                 weight,
@@ -469,14 +471,19 @@ impl MetalExecutor {
                     in_dim: weight_in,
                     group_size,
                     bits,
-                    packed_offset: 0,
-                    scales_offset: 0,
-                    biases_offset: 0,
+                    packed_offset,
+                    scales_offset,
+                    biases_offset,
                     ..
                 } if *out_dim == expect_out
                     && *weight_in == expect_in
                     && *group_size == FAST_QMV_GROUP_SIZE
                     && *bits == FAST_QMV_BITS
+                    && AffineMatmulKernel::QmmNaFusedTiledU4.supports_offsets(
+                        *packed_offset,
+                        *scales_offset,
+                        *biases_offset,
+                    )
             )
         };
         super::flags::prefill_fused_mlp_enabled()
@@ -580,7 +587,7 @@ impl MetalExecutor {
         }
         let (gp, gpo, gs, gso, gb, gbo) = quant(gate, "gate_proj")?;
         let (up_p, upo, us, uso, ub, ubo) = quant(up, "up_proj")?;
-        let (dp, _, ds, _, db, _) = quant(down, "down_proj")?;
+        let (dp, dpo, ds, dso, db, dbo) = quant(down, "down_proj")?;
         // Le prédicat de décision est réévalué par l'encodeur lui-même, avant tout
         // dispatch : une grille tronquée (dimension non multiple de 64), un poids
         // poolé (offset non nul) ou un u8/gs32 lu comme du u4 gs64 donnerait un
@@ -650,11 +657,11 @@ impl MetalExecutor {
             down_pso,
             &hidden_bf16,
             dp,
-            0,
+            dpo,
             ds,
-            0,
+            dso,
             db,
-            0,
+            dbo,
             output_buffer,
             batch,
             inter_dim,
