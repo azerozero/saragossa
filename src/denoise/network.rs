@@ -3,16 +3,16 @@
 use std::collections::HashMap;
 
 use super::dsp::{NB_DF, NB_ERB};
-use super::layers::{sigmoid, take_shape, Act, Conv, ConvSpec, GroupedLinear, Gru, Linear1};
+use super::layers::{take_shape, Act, Conv, ConvSpec, GroupedLinear, Gru, Linear1, Math};
 use crate::{InferError, Result, Tensor};
 
 mod batch;
 
-const CH: usize = 64;
-const EMB: usize = CH * NB_ERB / 4; // 512
-const HIDDEN: usize = 256;
+pub(super) const CH: usize = 64;
+pub(super) const EMB: usize = CH * NB_ERB / 4; // 512
+pub(super) const HIDDEN: usize = 256;
 const DF_ORDER: usize = 5;
-const DF_OUT_CH: usize = 2 * DF_ORDER;
+pub(super) const DF_OUT_CH: usize = 2 * DF_ORDER;
 const LSNR_MIN: f32 = -15.0;
 const LSNR_MAX: f32 = 35.0;
 
@@ -46,10 +46,10 @@ const fn spec(
 }
 
 /// Une couche récurrente `SqueezedGRU_S` : linéaire groupée, GRU, linéaire groupée optionnelle.
-struct SqueezedGru {
-    lin_in: GroupedLinear,
-    layers: Vec<Gru>,
-    lin_out: Option<GroupedLinear>,
+pub(super) struct SqueezedGru {
+    pub(super) lin_in: GroupedLinear,
+    pub(super) layers: Vec<Gru>,
+    pub(super) lin_out: Option<GroupedLinear>,
 }
 
 impl SqueezedGru {
@@ -88,8 +88,8 @@ impl SqueezedGru {
         })
     }
 
-    fn step(&self, x: &[f32], h: &mut [Vec<f32>], out: &mut Vec<f32>) {
-        self.recur(&self.input_gates(x), h, out);
+    fn step(&self, x: &[f32], h: &mut [Vec<f32>], out: &mut Vec<f32>, math: Math) {
+        self.recur(&self.input_gates(x), h, out, math);
     }
 
     /// `linear_in`, ReLU puis portes d'entrée de la première couche : sans état.
@@ -101,13 +101,13 @@ impl SqueezedGru {
     }
 
     /// Reste du pas, récurrent, à partir des portes de [`Self::input_gates`].
-    fn recur(&self, gi0: &[f32], h: &mut [Vec<f32>], out: &mut Vec<f32>) {
+    fn recur(&self, gi0: &[f32], h: &mut [Vec<f32>], out: &mut Vec<f32>, math: Math) {
         let mut a = vec![0.0; HIDDEN];
         for (l, (layer, state)) in self.layers.iter().zip(h.iter_mut()).enumerate() {
             if l == 0 {
-                layer.recur(gi0, state);
+                layer.recur(gi0, state, math);
             } else {
-                layer.step(&a, state);
+                layer.step(&a, state, math);
             }
             a.copy_from_slice(state);
         }
@@ -124,20 +124,20 @@ impl SqueezedGru {
 
 /// Poids DeepFilterNet3 chargés et repliés pour l'inférence CPU.
 pub struct Network {
-    erb_conv: [Conv; 4],
-    df_conv0: Conv,
-    df_conv1: Conv,
-    df_fc_emb: GroupedLinear,
-    enc_gru: SqueezedGru,
-    lsnr_fc: Linear1,
-    erb_gru: SqueezedGru,
-    convp: [Conv; 4],
-    convt: [Conv; 3],
-    conv0_out: Conv,
-    df_convp: Conv,
-    df_gru: SqueezedGru,
-    df_skip: GroupedLinear,
-    df_out: GroupedLinear,
+    pub(super) erb_conv: [Conv; 4],
+    pub(super) df_conv0: Conv,
+    pub(super) df_conv1: Conv,
+    pub(super) df_fc_emb: GroupedLinear,
+    pub(super) enc_gru: SqueezedGru,
+    pub(super) lsnr_fc: Linear1,
+    pub(super) erb_gru: SqueezedGru,
+    pub(super) convp: [Conv; 4],
+    pub(super) convt: [Conv; 3],
+    pub(super) conv0_out: Conv,
+    pub(super) df_convp: Conv,
+    pub(super) df_gru: SqueezedGru,
+    pub(super) df_skip: GroupedLinear,
+    pub(super) df_out: GroupedLinear,
     /// `[NB_ERB][481]`, matrice inverse 0/1 du masque ERB.
     pub(crate) erb_inv: Vec<f32>,
     /// `[481][NB_ERB]`, banque ERB normalisée (sert à vérifier les largeurs).
@@ -152,6 +152,7 @@ pub(crate) struct NetState {
     h_enc: Vec<Vec<f32>>,
     h_erb: Vec<Vec<f32>>,
     h_df: Vec<Vec<f32>>,
+    pub(crate) math: Math,
 }
 
 /// Sorties d'un pas du réseau.
@@ -291,33 +292,36 @@ impl Network {
             h_enc: zeros(1, HIDDEN),
             h_erb: zeros(2, HIDDEN),
             h_df: zeros(2, HIDDEN),
+            math: Math::Libm,
         }
     }
 
     /// Un pas du réseau sur les features décalées `s[τ] = feat[τ + conv_lookahead]`.
     pub(crate) fn step(&self, st: &mut NetState, erb: &[f32], cplx: &[f32]) -> StepOut {
+        let math = st.math;
         push(&mut st.erb_hist, erb);
         push(&mut st.spec_hist, cplx);
-        let enc = self.encode(&hist(&st.erb_hist), &hist(&st.spec_hist));
+        let enc = self.encode(&hist(&st.erb_hist), &hist(&st.spec_hist), math);
         let mut emb = Vec::new();
-        self.enc_gru.recur(&enc.gates, &mut st.h_enc, &mut emb);
+        self.enc_gru
+            .recur(&enc.gates, &mut st.h_enc, &mut emb, math);
         let (mut d, mut c) = (Vec::new(), Vec::new());
-        self.erb_gru.step(&emb, &mut st.h_erb, &mut d);
-        self.df_gru.step(&emb, &mut st.h_df, &mut c);
+        self.erb_gru.step(&emb, &mut st.h_erb, &mut d, math);
+        self.df_gru.step(&emb, &mut st.h_df, &mut c, math);
         push(&mut st.c0_hist, &enc.c0);
-        self.decode(&enc, &hist(&st.c0_hist), &emb, &d, &c)
+        self.decode(&enc, &hist(&st.c0_hist), &emb, (&d, &c), math)
     }
 
     /// Encodeur sans état récurrent : `erb` et `spec` sont les fenêtres causales des convolutions.
-    fn encode(&self, erb: &[&[f32]], spec: &[&[f32]]) -> Encoded {
+    fn encode(&self, erb: &[&[f32]], spec: &[&[f32]], math: Math) -> Encoded {
         let (mut e0, mut e1, mut e2, mut e3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        self.erb_conv[0].forward(erb, NB_ERB, &mut e0);
-        self.erb_conv[1].forward(&[&e0], NB_ERB, &mut e1);
-        self.erb_conv[2].forward(&[&e1], NB_ERB / 2, &mut e2);
-        self.erb_conv[3].forward(&[&e2], NB_ERB / 4, &mut e3);
+        self.erb_conv[0].forward(erb, NB_ERB, &mut e0, math);
+        self.erb_conv[1].forward(&[&e0], NB_ERB, &mut e1, math);
+        self.erb_conv[2].forward(&[&e1], NB_ERB / 2, &mut e2, math);
+        self.erb_conv[3].forward(&[&e2], NB_ERB / 4, &mut e3, math);
         let (mut c0, mut c1) = (Vec::new(), Vec::new());
-        self.df_conv0.forward(spec, NB_DF, &mut c0);
-        self.df_conv1.forward(&[&c0], NB_DF, &mut c1);
+        self.df_conv0.forward(spec, NB_DF, &mut c0, math);
+        self.df_conv1.forward(&[&c0], NB_DF, &mut c1, math);
 
         // [C][F] → [F][C] aplati, comme `permute(0, 2, 3, 1).flatten(2)`.
         let cemb_in = to_fc(&c1, CH, NB_DF / 2);
@@ -330,10 +334,10 @@ impl Network {
         // Branches latérales du U-Net ERB : ne dépendent que de l'encodeur.
         let f8 = NB_ERB / 4;
         let mut skips: [Vec<f32>; 4] = Default::default();
-        self.convp[0].forward(&[&e0], NB_ERB, &mut skips[0]);
-        self.convp[1].forward(&[&e1], NB_ERB / 2, &mut skips[1]);
-        self.convp[2].forward(&[&e2], f8, &mut skips[2]);
-        self.convp[3].forward(&[&e3], f8, &mut skips[3]);
+        self.convp[0].forward(&[&e0], NB_ERB, &mut skips[0], math);
+        self.convp[1].forward(&[&e1], NB_ERB / 2, &mut skips[1], math);
+        self.convp[2].forward(&[&e2], f8, &mut skips[2], math);
+        self.convp[3].forward(&[&e3], f8, &mut skips[3], math);
         Encoded {
             gates: self.enc_gru.input_gates(&emb_in),
             skips,
@@ -342,8 +346,15 @@ impl Network {
     }
 
     /// Décodeurs après les GRU : `c0` est la fenêtre causale de `df_convp`.
-    fn decode(&self, enc: &Encoded, c0: &[&[f32]], emb: &[f32], d: &[f32], c: &[f32]) -> StepOut {
-        let lsnr = sigmoid(self.lsnr_fc.forward(emb)) * (LSNR_MAX - LSNR_MIN) + LSNR_MIN;
+    fn decode(
+        &self,
+        enc: &Encoded,
+        c0: &[&[f32]],
+        emb: &[f32],
+        (d, c): (&[f32], &[f32]),
+        math: Math,
+    ) -> StepOut {
+        let lsnr = math.sigmoid(self.lsnr_fc.forward(emb)) * (LSNR_MAX - LSNR_MIN) + LSNR_MIN;
 
         // Décodeur ERB (U-Net) → masque [NB_ERB].
         let f8 = NB_ERB / 4;
@@ -352,12 +363,12 @@ impl Network {
         for (level, f) in [f8, f8, NB_ERB / 2].into_iter().enumerate() {
             tmp.clone_from(&enc.skips[3 - level]);
             add(&mut tmp, &x);
-            self.convt[2 - level].forward(&[&tmp], f, &mut x);
+            self.convt[2 - level].forward(&[&tmp], f, &mut x, math);
         }
         tmp.clone_from(&enc.skips[0]);
         add(&mut tmp, &x);
         let mut mask = Vec::new();
-        self.conv0_out.forward(&[&tmp], NB_ERB, &mut mask);
+        self.conv0_out.forward(&[&tmp], NB_ERB, &mut mask, math);
 
         // Décodeur DF → coefficients complexes [NB_DF][ordre][2].
         let mut c = c.to_vec();
@@ -367,11 +378,11 @@ impl Network {
         let mut coefs = vec![0.0; NB_DF * DF_OUT_CH];
         self.df_out.forward(&c, &mut coefs);
         let mut pathway = Vec::new();
-        self.df_convp.forward(c0, NB_DF, &mut pathway);
+        self.df_convp.forward(c0, NB_DF, &mut pathway, math);
         for f in 0..NB_DF {
             for o in 0..DF_OUT_CH {
                 let v = &mut coefs[f * DF_OUT_CH + o];
-                *v = v.tanh() + pathway[o * NB_DF + f];
+                *v = math.tanh(*v) + pathway[o * NB_DF + f];
             }
         }
         StepOut { mask, coefs, lsnr }

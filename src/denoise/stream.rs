@@ -12,8 +12,12 @@ impl<'a> DenoiseStream<'a> {
     /// Ouvre un état GRU/STFT indépendant, partageant les poids du modèle.
     #[must_use]
     pub fn new(model: &'a DeepFilterNet3) -> Self {
+        Self::from_stream(model.stream())
+    }
+
+    pub(crate) fn from_stream(stream: DfStream<'a>) -> Self {
         Self {
-            buffered: Buffered::new(model.stream()),
+            buffered: Buffered::new(stream),
         }
     }
 
@@ -24,9 +28,15 @@ impl<'a> DenoiseStream<'a> {
     pub fn with_threads(model: &'a DeepFilterNet3, threads: usize) -> Self {
         let mut stream = model.stream();
         stream.threads = threads.max(1);
-        Self {
-            buffered: Buffered::new(stream),
-        }
+        Self::from_stream(stream)
+    }
+
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "metal")),
+        allow(dead_code, reason = "seul le chemin Metal relit le flux")
+    )]
+    pub(crate) fn stream_mut(&mut self) -> &mut DfStream<'a> {
+        &mut self.buffered.processor
     }
 
     /// Fournit un morceau et restitue immédiatement les échantillons disponibles.
@@ -84,8 +94,7 @@ impl Hops for DfStream<'_> {
                 .zip(output.chunks_exact_mut(HOP_SIZE));
             return pairs.try_for_each(|(i, o)| self.process_hop(i, o));
         }
-        self.process_hops(input, output);
-        Ok(())
+        self.process_hops(input, output)
     }
     fn tail(&mut self) -> Vec<f32> {
         self.finish()
@@ -96,6 +105,8 @@ struct Buffered<P> {
     processor: P,
     /// Un bloc de `processor.block()` hops ; `used` premiers échantillons valides.
     pending: Vec<f32>,
+    /// Sorties de `run`, réutilisées d'un appel à l'autre.
+    hops: Vec<f32>,
     used: usize,
     skip: usize,
     owed: usize,
@@ -107,6 +118,7 @@ impl<P: Hops> Buffered<P> {
         Self {
             pending: vec![0.0; processor.block() * HOP_SIZE],
             processor,
+            hops: Vec::new(),
             used: 0,
             skip: DfStream::DELAY_SAMPLES,
             owed: 0,
@@ -124,12 +136,16 @@ impl<P: Hops> Buffered<P> {
 
     /// Traite des hops entiers et restitue chacun dans l'ordre.
     fn run(&mut self, input: &[f32], out: &mut Vec<f32>) -> Result<()> {
-        let mut hops = vec![0.0; input.len()];
-        self.processor.hops(input, &mut hops)?;
-        for hop in hops.chunks_exact(HOP_SIZE) {
-            self.emit(hop, out);
+        let mut hops = std::mem::take(&mut self.hops);
+        hops.resize(input.len(), 0.0);
+        let result = self.processor.hops(input, &mut hops);
+        if result.is_ok() {
+            for hop in hops.chunks_exact(HOP_SIZE) {
+                self.emit(hop, out);
+            }
         }
-        Ok(())
+        self.hops = hops;
+        result
     }
 
     fn push(&mut self, mut input: &[f32]) -> Result<Vec<f32>> {

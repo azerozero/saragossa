@@ -23,7 +23,7 @@ impl Network {
         cplx: &[f32],
         threads: usize,
     ) -> Vec<StepOut> {
-        let k = erb.len() / NB_ERB;
+        let (k, math) = (erb.len() / NB_ERB, st.math);
         if k == 0 {
             return Vec::new();
         }
@@ -32,7 +32,7 @@ impl Network {
             let spec = window_source(&st.spec_hist, cplx, 2 * NB_DF);
             let (ke, ks) = (st.erb_hist.len(), st.spec_hist.len());
             par_map(k, threads, |t| {
-                self.encode(&erb[t..t + ke], &spec[t..t + ks])
+                self.encode(&erb[t..t + ke], &spec[t..t + ks], math)
             })
         };
         slide(&mut st.erb_hist, erb, NB_ERB);
@@ -42,7 +42,7 @@ impl Network {
             .iter()
             .map(|e| {
                 let mut out = Vec::new();
-                self.enc_gru.recur(&e.gates, &mut st.h_enc, &mut out);
+                self.enc_gru.recur(&e.gates, &mut st.h_enc, &mut out, math);
                 out
             })
             .collect();
@@ -60,7 +60,7 @@ impl Network {
                     .iter()
                     .map(|(_, g)| {
                         let mut out = Vec::new();
-                        self.df_gru.recur(g, h_df, &mut out);
+                        self.df_gru.recur(g, h_df, &mut out, math);
                         out
                     })
                     .collect::<Vec<_>>()
@@ -69,7 +69,7 @@ impl Network {
                 .iter()
                 .map(|(g, _)| {
                     let mut out = Vec::new();
-                    self.erb_gru.recur(g, h_erb, &mut out);
+                    self.erb_gru.recur(g, h_erb, &mut out, math);
                     out
                 })
                 .collect();
@@ -83,7 +83,7 @@ impl Network {
             .collect();
         let kc = st.c0_hist.len();
         let out = par_map(k, threads, |t| {
-            self.decode(&enc[t], &c0[t..t + kc], &emb[t], &d[t], &c[t])
+            self.decode(&enc[t], &c0[t..t + kc], &emb[t], (&d[t], &c[t]), math)
         });
         let tail: Vec<Vec<f32>> = c0[c0.len() - kc..].iter().map(|s| s.to_vec()).collect();
         st.c0_hist = tail;

@@ -9,6 +9,9 @@
 //! de [`DfStream::DELAY_SAMPLES`] échantillons (30 ms, plus le tamponnage d'un hop).
 
 mod dsp;
+mod exact_math;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+mod gpu;
 #[cfg(all(test, target_os = "macos", feature = "metal"))]
 mod gpu_probe;
 mod layers;
@@ -29,7 +32,8 @@ use rustfft::FftPlanner;
 pub use crate::audio_resample::resample;
 use dsp::{Analysis, FeatureState, Synthesis, FREQ_BINS, NB_DF, NB_ERB};
 pub use dsp::{FFT_SIZE, HOP_SIZE, SAMPLE_RATE};
-use network::{NetState, Network, StepOut, ORDER};
+use layers::Math;
+use network::{NetState, Network, ORDER};
 
 use crate::{InferError, Result};
 
@@ -115,6 +119,54 @@ impl DeepFilterNet3 {
         Ok(out)
     }
 
+    /// Comme [`Self::enhance`], avec le réseau en lot sur GPU Metal (hors ligne).
+    ///
+    /// Sortie identique au bit à [`Self::enhance_common`] : `exp`, `tanh` et la
+    /// sigmoïde y suivent `exact_math` au lieu de la libm, ce qui l'écarte de
+    /// quelques ulp de [`Self::enhance`].
+    ///
+    /// # Errors
+    /// Erreurs Metal (pas de GPU, compilation, exécution).
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub fn enhance_gpu(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        // Passe 1 : features de chaque pas, sans réseau ; mêmes trames que le flux.
+        let mut record = self.stream();
+        record.steps = Steps::Record(Vec::new(), Vec::new());
+        let mut stream = DenoiseStream::from_stream(record);
+        stream.push(audio)?;
+        stream.finish()?;
+        let Steps::Record(erb, cplx) =
+            std::mem::replace(&mut stream.stream_mut().steps, Steps::Live)
+        else {
+            return Err(InferError::Config("enregistrement DFN3 perdu".into()));
+        };
+        let (mask, coefs) = gpu::run(&self.net, &erb, &cplx)?;
+        // Passe 2 : mêmes trames, sorties du réseau rejouées.
+        let mut replay = self.stream();
+        replay.steps = Steps::Replay {
+            mask,
+            coefs,
+            next: 0,
+        };
+        let mut stream = DenoiseStream::from_stream(replay);
+        let mut out = stream.push(audio)?;
+        out.extend(stream.finish()?);
+        Ok(out)
+    }
+
+    /// [`Self::enhance`] en variante `Math::Common` : référence CPU du chemin GPU.
+    ///
+    /// # Errors
+    /// Propage les erreurs du traitement des trames.
+    pub fn enhance_common(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        let mut inner = self.stream();
+        inner.state.math = Math::Common;
+        let mut stream = DenoiseStream::from_stream(inner);
+        let mut out = stream.push(audio)?;
+        out.extend(stream.finish()?);
+        Ok(out)
+    }
+
     /// Ouvre un flux temps réel.
     #[must_use]
     pub fn stream(&self) -> DfStream<'_> {
@@ -128,9 +180,28 @@ impl DeepFilterNet3 {
             spec_ring: vec![vec![Complex32::default(); FREQ_BINS]; 2 * DF_LOOKAHEAD + 1],
             frames: 0,
             last_lsnr: 0.0,
+            steps: Steps::Live,
             threads: 1,
         }
     }
+}
+
+/// Origine des sorties du réseau d'un flux.
+#[cfg_attr(
+    not(all(target_os = "macos", feature = "metal")),
+    allow(dead_code, reason = "seul le chemin Metal enregistre et rejoue")
+)]
+enum Steps {
+    /// Réseau CPU pas à pas.
+    Live,
+    /// Collecte les features `[pas][NB_ERB]` et `[pas][2·NB_DF]` sans calculer le réseau.
+    Record(Vec<f32>, Vec<f32>),
+    /// Rejoue des sorties calculées en lot : masques `[pas][NB_ERB]`, coefficients `[pas][NB_DF·2·ORDER]`.
+    Replay {
+        mask: Vec<f32>,
+        coefs: Vec<f32>,
+        next: usize,
+    },
 }
 
 /// Flux DeepFilterNet3 : un hop de 10 ms en entrée, un hop retardé en sortie.
@@ -144,6 +215,7 @@ pub struct DfStream<'a> {
     spec_ring: Vec<Vec<Complex32>>,
     frames: usize,
     last_lsnr: f32,
+    steps: Steps,
     /// Cœurs de [`DfStream::process_hops`] ; 1 garde le chemin trame par trame.
     threads: usize,
 }
@@ -152,7 +224,8 @@ impl DfStream<'_> {
     /// Retard entrée → sortie : `N − H` (STFT) + deux trames d'anticipation.
     pub const DELAY_SAMPLES: usize = FFT_SIZE - HOP_SIZE + CONV_LOOKAHEAD * HOP_SIZE;
 
-    /// SNR local estimé (dB) de la dernière trame produite.
+    /// SNR local estimé (dB) de la dernière trame produite ; 0 sur le chemin
+    /// GPU (`DeepFilterNet3::enhance_gpu`), qui ne calcule pas le LSNR.
     #[must_use]
     pub fn last_lsnr(&self) -> f32 {
         self.last_lsnr
@@ -202,9 +275,52 @@ impl DfStream<'_> {
         out
     }
 
+    fn emit(&mut self, erb: &[f32], cplx: &[f32], output: &mut [f32]) {
+        let live;
+        let (mask, coefs): (&[f32], &[f32]) = match &mut self.steps {
+            Steps::Live => {
+                live = self.model.net.step(&mut self.state, erb, cplx);
+                self.last_lsnr = live.lsnr;
+                (&live.mask, &live.coefs)
+            }
+            Steps::Record(e, c) => {
+                e.extend_from_slice(erb);
+                c.extend_from_slice(cplx);
+                output.fill(0.0);
+                return;
+            }
+            Steps::Replay { mask, coefs, next } => {
+                let (i, width) = (*next, NB_DF * 2 * ORDER);
+                *next += 1;
+                (
+                    mask.get(i * NB_ERB..(i + 1) * NB_ERB).expect(
+                        "invariant: le rejeu suit les trames de l'enregistrement, même audio",
+                    ),
+                    coefs.get(i * width..(i + 1) * width).expect(
+                        "invariant: le rejeu suit les trames de l'enregistrement, même audio",
+                    ),
+                )
+            }
+        };
+        render(
+            &self.model.net,
+            &mut self.synthesis,
+            &self.spec_ring,
+            (mask, coefs),
+            output,
+        );
+    }
+
     /// Comme `process_hop` sur chaque hop de `input`, le réseau tournant sur
     /// `threads` cœurs (voir `network::batch`). Sortie identique bit à bit.
-    fn process_hops(&mut self, input: &[f32], output: &mut [f32]) {
+    /// L'enregistrement et le rejeu du chemin GPU restent hop par hop.
+    fn process_hops(&mut self, input: &[f32], output: &mut [f32]) -> Result<()> {
+        if !matches!(self.steps, Steps::Live) {
+            let mut pairs = input
+                .chunks_exact(HOP_SIZE)
+                .zip(output.chunks_exact_mut(HOP_SIZE));
+            return pairs.try_for_each(|(i, o)| self.process_hop(i, o));
+        }
         let (mut erbs, mut cplxs, mut rings, mut emits) = (vec![], vec![], vec![], vec![]);
         for hop in input.chunks_exact(HOP_SIZE) {
             self.spec_ring.rotate_left(1);
@@ -230,23 +346,18 @@ impl DfStream<'_> {
             match next {
                 Some((step, ring)) => {
                     self.last_lsnr = step.lsnr;
-                    render(net, &mut self.synthesis, ring, step, out);
+                    render(
+                        net,
+                        &mut self.synthesis,
+                        ring,
+                        (&step.mask, &step.coefs),
+                        out,
+                    );
                 }
                 None => out.fill(0.0),
             }
         }
-    }
-
-    fn emit(&mut self, erb: &[f32], cplx: &[f32], output: &mut [f32]) {
-        let step = self.model.net.step(&mut self.state, erb, cplx);
-        self.last_lsnr = step.lsnr;
-        render(
-            &self.model.net,
-            &mut self.synthesis,
-            &self.spec_ring,
-            &step,
-            output,
-        );
+        Ok(())
     }
 }
 
@@ -255,22 +366,20 @@ fn render(
     net: &Network,
     synthesis: &mut Synthesis,
     ring: &[Vec<Complex32>],
-    step: &StepOut,
+    (mask, coefs): (&[f32], &[f32]),
     output: &mut [f32],
 ) {
     let center = &ring[DF_LOOKAHEAD];
     let inv = &net.erb_inv;
     let mut spec = vec![Complex32::default(); FREQ_BINS];
     for f in NB_DF..FREQ_BINS {
-        let gain: f32 = (0..NB_ERB)
-            .map(|b| step.mask[b] * inv[b * FREQ_BINS + f])
-            .sum();
+        let gain: f32 = (0..NB_ERB).map(|b| mask[b] * inv[b * FREQ_BINS + f]).sum();
         spec[f] = center[f] * gain;
     }
     for (f, slot) in spec.iter_mut().enumerate().take(NB_DF) {
         let mut acc = Complex32::default();
         for (n, frame) in ring.iter().enumerate().take(ORDER) {
-            let c = &step.coefs[(f * ORDER + n) * 2..][..2];
+            let c = &coefs[(f * ORDER + n) * 2..][..2];
             acc += frame[f] * Complex32::new(c[0], c[1]);
         }
         *slot = acc;

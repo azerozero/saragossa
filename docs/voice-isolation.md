@@ -619,21 +619,57 @@ denses, InstanceNorm, sous-pixel, iSTFT).
 
 ## Débruitage multi-cœur (opt-in)
 
-`SARAGOSSA_DENOISE_THREADS=N` (défaut 1 : chemin historique, bit-identique)
-découpe le signal en N segments, chacun chauffé sur 1 s de contexte, traités en
-parallèle puis recollés par un fondu linéaire de 0,5 s centré sur chaque
-frontière. Le fichier entier est gardé en mémoire (pas de flux borné) : environ
-0,7 Go par heure en entrée et autant en sortie (f32, 48 kHz), plus les copies par
-segment. Seuil de proximité au mono-cœur fixé avant mesure : SNR ≥ 30 dB,
-validé seulement sur le modèle synthétique, pas encore mesuré sur le vrai DFN3.
-Risque connu : quand le début d'un segment n'est pas multiple de 480, sa grille
-STFT est décalée par rapport au mono-cœur (écart borné par le fondu, non mesuré).
+`SARAGOSSA_DENOISE_THREADS=N` (défaut 1 : chemin historique hop par hop)
+traite le flux par blocs de 256 trames (2,56 s). Seuls les GRU portent un état
+d'une trame à l'autre. L'encodeur (convolutions causales sur des fenêtres
+d'entrée connues), les portes d'entrée des GRU et les décodeurs tournent donc
+en parallèle sur toutes les trames du bloc (`src/denoise/network/batch.rs`).
+La récurrence des GRU reste séquentielle, avec les GRU ERB et DF sur un cœur
+chacun. Chaque trame exécute les mêmes fonctions que le chemin hop par hop :
+la sortie est identique bit à bit pour tout N. Le traitement reste en flux à
+mémoire bornée ; la latence augmente d'un bloc.
 
-Bench de nuit, RTF 1 contre N threads sur le même clip long :
+Profil mono-cœur (`sample`, 293 s d'audio) : convolutions 61 %, GRU 26 %
+(dont environ 40 % de portes d'entrée parallélisables), rééchantillonnage 3 %.
+Mesures sur `long.wav` (293 s, M-series 18 cœurs, charge < 2 au lancement),
+avec une sortie identique au mono-cœur (`cmp`) pour chaque N :
+
+| N | 1 | 2 | 4 | 8 | 18 |
+|---|---|---|---|---|---|
+| temps (s) | 13,0 | 7,4 | 4,9 | 3,8 | 3,2 |
+
+Le plafond vient des GRU séquentiels. Pour reproduire :
 
 ```bash
-for n in 1 2 4 8; do SARAGOSSA_DENOISE_THREADS=$n cargo run --release -- enhance \
+for n in 1 2 8; do SARAGOSSA_DENOISE_THREADS=$n cargo run --release -- enhance \
   --model $SARAGOSSA_DFN3_DIR/dfn3.safetensors --input long.wav --output out_$n.wav; done
+cmp out_1.wav out_2.wav && cmp out_1.wav out_8.wav
 ```
 
-Chaque run affiche `RTF` ; comparer `out_N.wav` à `out_1.wav` (SNR ≥ 30 dB).
+## GPU hors ligne (opt-in)
+
+`SARAGOSSA_DENOISE_GPU=1 saragossa enhance …` calcule le réseau en lot sur
+Metal (`src/denoise/gpu.rs`) : convolutions et linéaires sur toutes les trames
+d'un morceau de 4096 pas, et chaque GRU dans un seul noyau persistant (un
+threadgroup de 768 threads, boucle temporelle complète). STFT, features et
+synthèse restent sur CPU. Le fichier entier est gardé en mémoire.
+
+La sortie est identique au bit au CPU en variante `Math::Common`
+(`enhance_common`) : chaque sortie est calculée par un thread dans l'ordre de
+sommation du CPU, sans fast-math ni FMA, et `exp`/`tanh`/sigmoïde suivent
+`exact_math` des deux côtés. Cette variante s'écarte du CPU libm historique
+(défaut inchangé) de quelques ulp.
+
+Mesures (M5 Max, clip de 292,75 s, charge 5 à 15, non publiables comme bench) :
+
+| Mesure | Valeur |
+|---|---|
+| Boucle GRU persistante | 11,4 µs/pas (une ou deux séquences côte à côte) |
+| `enhance` GPU, fichier | 1,9 s, dont 1,2 s de réseau GPU (CPU 1 thread : 12,65 s, nuit du 17) |
+| GPU vs CPU commun | 14 052 096 échantillons identiques au bit sur 14 052 096 |
+| CPU commun vs libm | 11 269 333 échantillons différents, SNR 135,0 dB, écart max 8,9e-7 |
+
+```bash
+SARAGOSSA_DFN3_DIR=… SARAGOSSA_DFN3_LONG_WAV=long.wav cargo test --release --lib \
+  dfn3_gpu_long_file_bit_exact_and_speed -- --ignored --nocapture
+```

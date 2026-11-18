@@ -32,6 +32,33 @@ pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Fonctions transcendantes : libm (défaut historique) ou variante commune au GPU.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Math {
+    #[default]
+    Libm,
+    /// [`super::exact_math`], reproduite au bit près par le chemin Metal.
+    Common,
+}
+
+impl Math {
+    #[inline]
+    pub(crate) fn sigmoid(self, x: f32) -> f32 {
+        match self {
+            Self::Libm => sigmoid(x),
+            Self::Common => super::exact_math::sigmoid(x),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn tanh(self, x: f32) -> f32 {
+        match self {
+            Self::Libm => x.tanh(),
+            Self::Common => super::exact_math::tanh(x),
+        }
+    }
+}
+
 /// Activation de sortie d'un bloc `Conv2dNormAct`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Act {
@@ -78,20 +105,20 @@ pub(crate) struct ConvSpec {
 
 /// Bloc conv + 1×1 éventuelle + BatchNorm (repliée) + activation.
 pub(crate) struct Conv {
-    cin: usize,
-    cout: usize,
-    groups: usize,
-    kt: usize,
-    kf: usize,
-    fstride: usize,
-    transposed: bool,
+    pub(super) cin: usize,
+    pub(super) cout: usize,
+    pub(super) groups: usize,
+    pub(super) kt: usize,
+    pub(super) kf: usize,
+    pub(super) fstride: usize,
+    pub(super) transposed: bool,
     /// Conv : `[cout][cin/g][kt][kf]`. Transposée : `[cin][cout/g][kf]` (kt = 1).
-    weight: Vec<f32>,
+    pub(super) weight: Vec<f32>,
     /// 1×1 `[cout][cout]` avec la BatchNorm repliée, sinon vide.
-    pointwise: Vec<f32>,
-    scale: Vec<f32>,
-    bias: Vec<f32>,
-    act: Act,
+    pub(super) pointwise: Vec<f32>,
+    pub(super) scale: Vec<f32>,
+    pub(super) bias: Vec<f32>,
+    pub(super) act: Act,
 }
 
 impl Conv {
@@ -159,7 +186,7 @@ impl Conv {
     }
 
     /// `hist[dt]` = trame `t - kt + 1 + dt`, chacune `[cin][fin]`. Ecrit `[cout][fout]`.
-    pub(crate) fn forward(&self, hist: &[&[f32]], fin: usize, out: &mut Vec<f32>) {
+    pub(crate) fn forward(&self, hist: &[&[f32]], fin: usize, out: &mut Vec<f32>, math: Math) {
         let fout = self.fout(fin);
         let mut y = vec![0.0_f32; self.cout * fout];
         let (cig, cog) = (self.cin / self.groups, self.cout / self.groups);
@@ -224,7 +251,7 @@ impl Conv {
                 let a = *v * s + b;
                 *v = match self.act {
                     Act::Relu => a.max(0.0),
-                    Act::Sigmoid => sigmoid(a),
+                    Act::Sigmoid => math.sigmoid(a),
                 };
             }
         }
@@ -234,11 +261,11 @@ impl Conv {
 
 /// `GroupedLinearEinsum` : `y[g·H/G + h] = Σ_i x[g·I/G + i] · W[g][i][h]`.
 pub(crate) struct GroupedLinear {
-    groups: usize,
-    ig: usize,
-    hg: usize,
+    pub(super) groups: usize,
+    pub(super) ig: usize,
+    pub(super) hg: usize,
     /// Transposé à `[g][h][i]` pour des produits scalaires contigus.
-    weight: Vec<f32>,
+    pub(super) weight: Vec<f32>,
 }
 
 impl GroupedLinear {
@@ -280,11 +307,11 @@ impl GroupedLinear {
 
 /// Couche `nn.GRU` PyTorch (portes r, z, n), un pas à la fois.
 pub(crate) struct Gru {
-    hidden: usize,
-    w_ih: Vec<f32>,
-    w_hh: Vec<f32>,
-    b_ih: Vec<f32>,
-    b_hh: Vec<f32>,
+    pub(super) hidden: usize,
+    pub(super) w_ih: Vec<f32>,
+    pub(super) w_hh: Vec<f32>,
+    pub(super) b_ih: Vec<f32>,
+    pub(super) b_hh: Vec<f32>,
 }
 
 impl Gru {
@@ -306,8 +333,8 @@ impl Gru {
     }
 
     /// Met à jour `h` en place à partir de l'entrée `x`.
-    pub(crate) fn step(&self, x: &[f32], h: &mut [f32]) {
-        self.recur(&self.input_gates(x), h);
+    pub(crate) fn step(&self, x: &[f32], h: &mut [f32], math: Math) {
+        self.recur(&self.input_gates(x), h, math);
     }
 
     /// Portes d'entrée `W_ih · x + b_ih`, indépendantes de l'état : calculables d'avance.
@@ -319,15 +346,15 @@ impl Gru {
     }
 
     /// Partie récurrente du pas, à portes d'entrée `gi` déjà calculées.
-    pub(crate) fn recur(&self, gi: &[f32], h: &mut [f32]) {
+    pub(crate) fn recur(&self, gi: &[f32], h: &mut [f32], math: Math) {
         let n = self.hidden;
         let gh: Vec<f32> = (0..3 * n)
             .map(|r| dot(h, &self.w_hh[r * n..(r + 1) * n]) + self.b_hh[r])
             .collect();
         for j in 0..n {
-            let r = sigmoid(gi[j] + gh[j]);
-            let z = sigmoid(gi[n + j] + gh[n + j]);
-            let c = (gi[2 * n + j] + r * gh[2 * n + j]).tanh();
+            let r = math.sigmoid(gi[j] + gh[j]);
+            let z = math.sigmoid(gi[n + j] + gh[n + j]);
+            let c = math.tanh(gi[2 * n + j] + r * gh[2 * n + j]);
             h[j] = (1.0 - z) * c + z * h[j];
         }
     }
@@ -335,8 +362,8 @@ impl Gru {
 
 /// `nn.Linear(n, 1)`.
 pub(crate) struct Linear1 {
-    weight: Vec<f32>,
-    bias: f32,
+    pub(super) weight: Vec<f32>,
+    pub(super) bias: f32,
 }
 
 impl Linear1 {
