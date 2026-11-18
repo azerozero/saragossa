@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.12](https://github.com/azerozero/saragossa/compare/v0.3.11...v0.3.12) - 2026-11-17
+
+### Added
+
+- *(config)* config check/print, --set, presets embarqués et rechargement SIGHUP des limites chaudes
+
+### Fixed
+
+- *(config)* isoler le test de rechargement, SIGHUP seulement avec profil, origine env valide, plafond de lot relu à l'admission
+
+## [0.3.11](https://github.com/azerozero/saragossa/compare/v0.3.10...v0.3.11) - 2026-11-17
+
+### Added
+
+- *(denoise)* débruitage multi-cœur opt-in par segments avec fondu
+
+### Other
+
+- Merge pull request #262 from azerozero/release-plz-2026-11-17T20-34-59Z
+- Merge pull request #260 from azerozero/feat/denoise-multicoeur
+- *(denoise)* seuil limité au modèle synthétique, mémoire du mode N>1, flux inutile évité
+
+## [0.3.10](https://github.com/azerozero/saragossa/compare/v0.3.9...v0.3.10) - 2026-11-17
+
+### Added
+
+- *(config)* profil TOML optionnel pour serve (--config)
+- *(vision)* ordonne les patchs dans les groupes spatiaux
+- *(vision)* normalise les pixels et répète les frames
+- *(vision)* ajoute le bicubique antialiasé sur CPU
+- *(vision)* reproduis les dimensions smart_resize de Qwen
+- *(vision)* injecte les embeddings et transporte M-RoPE
+
+### Fixed
+
+- *(config)* mémoire serve, erreur TOML localisée, lock minimal
+- *(vision)* bicubique aligné sur torchvision (poids int16), PIL informatif
+- *(vision)* budget de pixels explicite avant allocation dans normalize et into_patches
+- *(vision)* préserve la division entière de smart_resize
+- *(snapshot)* recalcule le delta au préfixe sauvegardé
+- *(mtp)* replie les cycles résidents sur les positions vision
+
+### Other
+
+- Merge pull request #256 from azerozero/feat/profils-toml
+- *(gitleaks)* en-tête de bloc perdu à la fusion
+- Merge remote-tracking branch 'origin/main' into feat/vision-preprocess
+- *(gitleaks)* exceptions ciblées pour les SHA256 des fixtures tokenizer et les clés rust-cache
+- *(gitleaks)* exception pour les SHA256 publics de la calibration vision
+- *(vision)* dimensions entre backticks pour rustdoc
+- *(vision)* oracle torchvision à côté de PIL pour le resize bicubique
+- *(vision)* fusionne main et garde le prétraitement optionnel
+- *(vision)* précise les limites du décodage image
+- fusionne origin/main dans feat/vision-mrope
+- *(vision)* explicite les invariants de lecture des flottants
+- *(vision)* fige les logits de référence et le bruit BF16
+
 ## [0.3.9](https://github.com/azerozero/saragossa/compare/v0.3.8...v0.3.9) - 2026-11-17
 
 ### Added

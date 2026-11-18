@@ -1,6 +1,6 @@
 [package]
 name = "saragossa"
-version = "0.3.9"
+version = "0.3.12"
 description = "Pure-Rust Metal inference engine for Apple Silicon: Qwen dense/MoE LLMs, Whisper STT, Qwen3 TTS, OpenAI-compatible server — GPU-resident decode, 35B MoE at ~105 tok/s."
 repository = "https://github.com/azerozero/saragossa"
 keywords = ["llm", "inference", "metal", "apple-silicon", "transformer"]
@@ -67,6 +67,8 @@ devtools = []
 thiserror = "2"
 safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
+# Profil de configuration optionnel de `serve` (`--config`).
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 # Déjà présent via reqwest : `compression_ratio` Whisper (zlib, comme OpenAI).
 flate2 = { version = "1", optional = true }
 # preserve_order : ordre des questions de `decision` (déjà activé par llguidance).
@@ -100,6 +102,10 @@ default-features = false
 
 [dependencies.toktrie]
 version = "=1.2.0"
+
+[target.'cfg(unix)'.dependencies]
+# SIGHUP de `serve` (rechargement du profil).
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { version = "0.33", optional = true }

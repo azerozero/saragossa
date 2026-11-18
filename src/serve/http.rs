@@ -54,21 +54,67 @@ pub(super) fn serve_tcp(
     state: &mut ServeState,
     read_timeout: Duration,
 ) -> ServeResult<()> {
-    let listener =
-        TcpListener::bind(addr).map_err(|e| ServeError::io(format!("bind TCP {addr}"), e))?;
+    #[cfg(unix)]
+    let listener = match super::relay::inherited()? {
+        Some(fd) => adopt_tcp(TcpListener::from(fd), addr)?,
+        None => bind_tcp(addr)?,
+    };
+    #[cfg(not(unix))]
+    let listener = bind_tcp(addr)?;
     eprintln!("saragossa serve TCP listening on http://{addr}/v1");
     eprintln!("saragossa serve TCP bearer auth enabled");
     let front = Front::new(Some(api_key.to_string()), state.model_ids());
     dispatch::serve(state, front, read_timeout, move |dispatcher| {
         // NOTE: sans TCP_NODELAY, Nagle et l'ACK retardé regroupent les petits
         // événements SSE d'un flux ; un échec de réglage laisse le défaut.
-        let incoming = listener.incoming().map(|stream| {
+        let nodelay = |stream: std::io::Result<TcpStream>| {
             stream.inspect(|stream| {
                 let _ = stream.set_nodelay(true);
             })
-        });
-        dispatcher.accept_all(incoming, "accept TCP")
+        };
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = listener.as_raw_fd();
+            super::relay::watch(fd);
+            super::relay::ready()?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| ServeError::io("listener TCP non bloquant", e))?;
+            // NOTE: macOS transmet O_NONBLOCK du listener à la socket acceptée.
+            let incoming = super::relay::incoming(fd, || {
+                let (stream, _) = listener.accept()?;
+                stream.set_nonblocking(false).map(|()| stream)
+            });
+            dispatcher.accept_all(incoming.map(nodelay), "accept TCP")
+        }
+        #[cfg(not(unix))]
+        dispatcher.accept_all(listener.incoming().map(nodelay), "accept TCP")
     })
+}
+
+fn bind_tcp(addr: &str) -> ServeResult<TcpListener> {
+    TcpListener::bind(addr).map_err(|e| ServeError::io(format!("bind TCP {addr}"), e))
+}
+
+/// Refuse une socket héritée qui n'écoute pas sur l'adresse demandée.
+#[cfg(unix)]
+fn adopt_tcp(listener: TcpListener, addr: &str) -> ServeResult<TcpListener> {
+    use std::net::ToSocketAddrs;
+    let local = listener
+        .local_addr()
+        .map_err(|e| ServeError::io("adresse de la socket héritée", e))?;
+    let wanted = addr
+        .to_socket_addrs()
+        .map_err(|e| ServeError::io(format!("résolution {addr}"), e))?;
+    let mut wanted = wanted;
+    if wanted.any(|candidate| candidate == local) {
+        Ok(listener)
+    } else {
+        Err(ServeError::args(format!(
+            "socket héritée sur {local}, attendue sur {addr}"
+        )))
+    }
 }
 
 /// Sert en HTTP sur socket Unix avec permissions propriétaire.
@@ -78,19 +124,49 @@ pub(super) fn serve_unix(
     state: &mut ServeState,
     read_timeout: Duration,
 ) -> ServeResult<()> {
-    prepare_socket_path(path)?;
-    let listener = UnixListener::bind(path)
-        .map_err(|e| ServeError::io(format!("bind socket {}", path.display()), e))?;
-    let permissions = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(path, permissions)
-        .map_err(|e| ServeError::io(format!("chmod 0600 {}", path.display()), e))?;
+    let listener = match super::relay::inherited()? {
+        Some(fd) => {
+            let listener = UnixListener::from(fd);
+            let local = listener
+                .local_addr()
+                .map_err(|e| ServeError::io("adresse de la socket héritée", e))?;
+            if local.as_pathname() != Some(path) {
+                return Err(ServeError::args(format!(
+                    "socket héritée sur {local:?}, attendue sur {}",
+                    path.display()
+                )));
+            }
+            listener
+        }
+        None => {
+            prepare_socket_path(path)?;
+            let listener = UnixListener::bind(path)
+                .map_err(|e| ServeError::io(format!("bind socket {}", path.display()), e))?;
+            let permissions = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(path, permissions)
+                .map_err(|e| ServeError::io(format!("chmod 0600 {}", path.display()), e))?;
+            listener
+        }
+    };
     eprintln!(
         "saragossa serve Unix socket listening on {} (0600)",
         path.display()
     );
     let front = Front::new(None, state.model_ids());
     dispatch::serve(state, front, read_timeout, move |dispatcher| {
-        dispatcher.accept_all(listener.incoming(), "accept socket Unix")
+        use std::os::fd::AsRawFd;
+        let fd = listener.as_raw_fd();
+        super::relay::watch(fd);
+        super::relay::ready()?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| ServeError::io("listener Unix non bloquant", e))?;
+        // NOTE: macOS transmet O_NONBLOCK du listener à la socket acceptée.
+        let incoming = super::relay::incoming(fd, || {
+            let (stream, _) = listener.accept()?;
+            stream.set_nonblocking(false).map(|()| stream)
+        });
+        dispatcher.accept_all(incoming, "accept socket Unix")
     })
 }
 
@@ -218,7 +294,7 @@ pub(super) fn route_front<S: Write>(
         })());
     }
     if request.method == "GET" && path == "/v1/models" {
-        let models = ModelsResponse::from_ids(&front.model_ids);
+        let models = ModelsResponse::from_ids(&super::reload::model_ids(&front.model_ids));
         return Some(send_json(stream, 200, &models, Vec::new()));
     }
     if request.method == "GET" {
@@ -227,11 +303,13 @@ pub(super) fn route_front<S: Write>(
                 Ok(id) => id,
                 Err(error) => return Some(send_failure(stream, &error, false)),
             };
-            return Some(if front.model_ids.iter().any(|model| model == &id) {
-                send_json(stream, 200, &ModelInfo::new(&id), Vec::new())
-            } else {
-                send_failure(stream, &ServeError::UnknownModel(id), false)
-            });
+            return Some(
+                if super::reload::model_ids(&front.model_ids).contains(&id) {
+                    send_json(stream, 200, &ModelInfo::new(&id), Vec::new())
+                } else {
+                    send_failure(stream, &ServeError::UnknownModel(id), false)
+                },
+            );
         }
     }
     None

@@ -3,6 +3,9 @@
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 pub(crate) mod pairwise;
 
+mod profile;
+pub use profile::{ModelEntry, Profile, ProfileError, Resolved, HOT_KEYS, PRESETS};
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::cell::Cell;
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -92,6 +95,20 @@ pub(crate) fn decision_gemm_bf16_enabled() -> bool {
     decision_noncausal() && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DECISION_GEMM_BF16", true))
 }
 
+/// Nombre de threads du débruitage (`SARAGOSSA_DENOISE_THREADS`, défaut 1 :
+/// chemin mono-cœur historique, bit-identique). Au-delà, le signal est découpé
+/// en segments avec recouvrement et recollé en fondu (opt-in, sortie proche).
+#[cfg(feature = "denoise")]
+pub fn denoise_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        env_var("SARAGOSSA_DENOISE_THREADS")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+    })
+}
+
 /// Tokens au plus par prefill empaqueté des lectures TTA d'une décision
 /// (`SARAGOSSA_DECISION_PACK_TOKENS`, 0 : un prefill par lecture). Au-delà,
 /// le GEMM est déjà saturé et l'empaquetage ne gagne plus rien (mesuré).
@@ -163,12 +180,19 @@ fn claim_legacy_warning(legacy: &str) -> bool {
 /// dépendre du nom de son consommateur (cf. ADR 0011, dette « namespace »).
 pub fn env_var(name: &str) -> Option<String> {
     environment_sha256();
+    if let Some(value) = profile::forced(name) {
+        return Some(value);
+    }
     if let Ok(value) = std::env::var(name) {
         record_snapshot_ablation(name, &value);
         return Some(value);
     }
-    let legacy = legacy_alias(name)?;
-    let value = std::env::var(&legacy).ok()?;
+    let Some(legacy) = legacy_alias(name) else {
+        return profile::lookup(name);
+    };
+    let Ok(value) = std::env::var(&legacy) else {
+        return profile::lookup(name);
+    };
     warn_legacy_env_once(&legacy, name);
     record_snapshot_ablation(name, &value);
     Some(value)
@@ -212,8 +236,12 @@ pub fn env_var_os(name: &str) -> Option<std::ffi::OsString> {
         record_snapshot_ablation(name, value.to_str().unwrap_or_default());
         return Some(value);
     }
-    let legacy = legacy_alias(name)?;
-    let value = std::env::var_os(&legacy)?;
+    let Some(legacy) = legacy_alias(name) else {
+        return profile::lookup(name).map(Into::into);
+    };
+    let Some(value) = std::env::var_os(&legacy) else {
+        return profile::lookup(name).map(Into::into);
+    };
     warn_legacy_env_once(&legacy, name);
     record_snapshot_ablation(name, value.to_str().unwrap_or_default());
     Some(value)

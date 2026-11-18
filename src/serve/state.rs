@@ -98,6 +98,7 @@ impl ServedCompletion {
 pub(super) struct ServeState {
     engine_thread: ThreadId,
     models: Vec<ModelSlot>,
+    backend: RuntimeKind,
     max_tokens_cap: usize,
     clock: u64,
     memory_guard: MemoryGuard,
@@ -122,6 +123,7 @@ impl ServeState {
                 .iter()
                 .map(|model| ModelSlot::new(model, args.backend))
                 .collect(),
+            backend: args.backend,
             max_tokens_cap: args.max_tokens_cap,
             clock: 0,
             memory_guard: MemoryGuard::serve(),
@@ -139,7 +141,7 @@ impl ServeState {
 
     /// Renvoie le plafond serveur du budget de génération.
     pub(super) fn max_tokens_cap(&self) -> usize {
-        self.max_tokens_cap
+        super::reload::max_tokens_cap(self.max_tokens_cap)
     }
 
     /// Renvoie l'état audio mutable pour les endpoints STT/TTS.
@@ -207,6 +209,35 @@ impl ServeState {
         self.models.iter().map(|model| model.id.clone()).collect()
     }
 
+    /// Remplace la liste des modèles (rechargement SIGHUP). Un modèle de même
+    /// alias et chemin garde son slot et ses poids ; un retrait ou une
+    /// modification décharge l'ancien, un ajout reste paresseux (chargé par
+    /// `ensure_loaded_index` à la 1re requête). Appelé entre deux requêtes sur
+    /// le thread moteur : rien n'utilise donc les modèles déchargés.
+    pub(super) fn set_models(&mut self, wanted: &[ServeModelConfig]) {
+        self.assert_engine_thread();
+        let mut old = std::mem::take(&mut self.models);
+        self.models = wanted
+            .iter()
+            .map(|model| {
+                match old
+                    .iter()
+                    .position(|slot| slot.id == model.id && slot.path == model.path)
+                {
+                    Some(index) => old.swap_remove(index),
+                    None => ModelSlot::new(model, self.backend),
+                }
+            })
+            .collect();
+        for slot in old {
+            eprintln!(
+                "saragossa serve retiré model={} loaded={}",
+                slot.id,
+                slot.loaded.is_some()
+            );
+        }
+    }
+
     /// Garde de l'invariant thread moteur (voir [`ServeState`]).
     fn assert_engine_thread(&self) {
         debug_assert_eq!(
@@ -222,7 +253,7 @@ impl ServeState {
         request: ChatCompletionRequest,
         session_key: Option<&str>,
     ) -> ServeResult<ServedCompletion> {
-        let max_tokens_cap = self.max_tokens_cap;
+        let max_tokens_cap = self.max_tokens_cap();
         let max_tokens = request.validate(max_tokens_cap)?;
         let index = self
             .models
@@ -250,7 +281,7 @@ impl ServeState {
         session_key: Option<&str>,
         mut on_event: impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<ServedCompletion> {
-        let max_tokens_cap = self.max_tokens_cap;
+        let max_tokens_cap = self.max_tokens_cap();
         let max_tokens = request.validate(max_tokens_cap)?;
         let index = self
             .models
@@ -309,7 +340,7 @@ impl ServeState {
         let Some(model) = requests.first().map(|request| request.model.clone()) else {
             return (Vec::new(), 0);
         };
-        let max_tokens_cap = self.max_tokens_cap;
+        let max_tokens_cap = self.max_tokens_cap();
         let loaded = self
             .models
             .iter()
@@ -1855,6 +1886,39 @@ fn render_chat_prompt(
 mod tests {
     use super::*;
     use saragossa::ChatTemplateMessage;
+
+    fn cfg(id: &str, path: &str) -> ServeModelConfig {
+        ServeModelConfig {
+            id: id.to_string(),
+            path: path.into(),
+            hf_repo: None,
+        }
+    }
+
+    // Le moteur applique la liste entre deux requêtes : tant qu'il ne l'a pas
+    // fait (requête simulée en cours), le modèle retiré reste en place avec ses
+    // poids ; modifié = retrait + ajout paresseux, inchangé = slot gardé.
+    #[test]
+    fn set_models_waits_for_the_engine_and_keeps_unchanged_slots() {
+        let args = ServeArgs::parse(
+            ["--model", "a=/x/a", "--model", "b=/x/b", "--backend", "cpu"].map(String::from),
+        )
+        .expect("args");
+        let mut state = ServeState::new(&args);
+        state.models[1].last_used = 7;
+        let wanted = [cfg("b", "/x/b"), cfg("c", "/x/c")];
+        assert_eq!(
+            state.model_ids(),
+            ["a", "b"],
+            "requête en cours : rien appliqué"
+        );
+        state.set_models(&wanted);
+        assert_eq!(state.model_ids(), ["b", "c"]);
+        assert_eq!(state.models[0].last_used, 7, "b garde son slot");
+        assert!(state.models.iter().all(|slot| slot.loaded.is_none()));
+        state.set_models(&[cfg("b", "/y/b")]);
+        assert_eq!(state.models[0].last_used, 0, "modifié = nouveau slot");
+    }
 
     #[test]
     fn metal_loader_passes_model_profile_to_executor() {
