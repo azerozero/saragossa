@@ -113,6 +113,60 @@ fn dense_bf16_prefill_kill_switch_selects_qmv(
     Ok(())
 }
 
+/// Rejoue le test `name` en sous-processus avec `env` : les flags sont
+/// mémorisés par `OnceLock` et ne doivent pas fuir vers les autres tests.
+fn run_flag_child(name: &str, child: &str, env: (&str, &str)) {
+    let output = std::process::Command::new(
+        std::env::current_exe().expect("invariant: binaire de test courant"),
+    )
+    .args([
+        "--exact",
+        &format!("metal_backend::tests::dense_bf16::{name}"),
+        "--ignored",
+        "--nocapture",
+    ])
+    .env(child, "1")
+    .env(env.0, env.1)
+    .output()
+    .expect("invariant: sous-processus de test lançable");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
+fn dense_bf16_prefill_n_first_matches_f32() -> Result<()> {
+    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_NFIRST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_tiled_x2");
+    }
+    run_flag_child(
+        "dense_bf16_prefill_n_first_matches_f32",
+        CHILD,
+        ("SARAGOSSA_RUST_DENSE_BF16_GEMM_NFIRST", "1"),
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
+fn dense_bf16_prefill_x1_rounds_activation_once() -> Result<()> {
+    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_X1_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_bn128");
+    }
+    run_flag_child(
+        "dense_bf16_prefill_x1_rounds_activation_once",
+        CHILD,
+        ("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1", "1"),
+    );
+    Ok(())
+}
+
 fn dense_bf16_prefill_matches_f32(expected_kernel: &str) -> Result<()> {
     let executor = MetalExecutor::new()?;
     // Sans pipeline NA, un qmv ne prouverait pas l'effet du kill-switch.

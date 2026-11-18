@@ -638,14 +638,17 @@ kernel void gemm_nax_coop_qb_tiled_u4_x3(device const float* A [[buffer(0)]],
 // hi + lo bf16 et chaque pas fait hi·B + lo·B : le poids est exact en bf16,
 // seule l'activation perd sa mantisse, ramenée vers 2⁻¹⁶ comme le qmv f32
 // qu'il remplace en prefill. Exige K%64=0 et N%64=0.
+// `mnk.w` non nul : grille N en x (tuiles voisines partageant la tuile A
+// f32), même calcul par tuile donc sortie égale au bit.
 kernel void gemm_nax_bf16_nt_tiled_x2(device const float* A  [[buffer(0)]],
                                       device const bfloat* B [[buffer(1)]],
                                       device float* C        [[buffer(2)]],
-                                      constant uint3& mnk    [[buffer(3)]],
-                                      uint2 tgid [[threadgroup_position_in_grid]],
+                                      constant uint4& mnk    [[buffer(3)]],
+                                      uint2 tgid_raw [[threadgroup_position_in_grid]],
                                       uint lid [[thread_index_in_threadgroup]],
                                       uint sgid [[simdgroup_index_in_threadgroup]]) {
   uint M = mnk.x, K = mnk.z;
+  uint2 tgid = mnk.w != 0u ? tgid_raw.yx : tgid_raw;
   constexpr uint BN = 64, BK = 64, BKP = BK + 8, WN = 2;
   threadgroup metal::vec<bfloat,8> Ws8[BN * BKP / 8];
   threadgroup bfloat* Ws = (threadgroup bfloat*)Ws8;

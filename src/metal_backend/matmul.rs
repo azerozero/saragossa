@@ -335,9 +335,11 @@ impl MetalExecutor {
             )));
         }
         // NOTE: les modèles de décision tolèrent un GEMM bf16 classique (oracle
-        // f32 figé) ; les autres modèles gardent la correction hi + lo.
+        // f32 figé) ; les autres modèles gardent la correction hi + lo, sauf
+        // opt-in `SARAGOSSA_RUST_DENSE_BF16_GEMM_X1`.
         if let Some(pso) = self.na_gemm_bf16_nt_bn128.as_ref().filter(|_| {
-            crate::runtime_flags::decision_gemm_bf16_enabled()
+            (crate::runtime_flags::decision_gemm_bf16_enabled()
+                || crate::runtime_flags::dense_bf16_gemm_x1_enabled())
                 && out_dim % 128 == 0
                 && can_use_dense_bf16_gemm(batch, in_dim, out_dim)
         }) {
@@ -393,11 +395,12 @@ impl MetalExecutor {
         out_dim: usize,
         in_dim: usize,
     ) -> Result<()> {
+        let n_first = crate::runtime_flags::dense_bf16_gemm_n_first_enabled();
         let mnk = [
             checked_u32(batch, "bf16 gemm batch")?,
             checked_u32(out_dim, "bf16 gemm out_dim")?,
             checked_u32(in_dim, "bf16 gemm in_dim")?,
-            0,
+            u32::from(n_first),
         ];
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(lhs), 0);
@@ -406,14 +409,14 @@ impl MetalExecutor {
         encoder.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
         trace_dispatch_path("gemm_nax_bf16_nt_tiled_x2", batch, out_dim, in_dim);
         profile_dispatch();
-        encoder.dispatch_thread_groups(
-            MTLSize::new(
-                checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?,
-                checked_nsuint(out_dim / 64, "bf16 gemm out tiles")?,
-                1,
-            ),
-            MTLSize::new(128, 1, 1),
-        );
+        let m_tiles = checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?;
+        let n_tiles = checked_nsuint(out_dim / 64, "bf16 gemm out tiles")?;
+        let (grid_x, grid_y) = if n_first {
+            (n_tiles, m_tiles)
+        } else {
+            (m_tiles, n_tiles)
+        };
+        encoder.dispatch_thread_groups(MTLSize::new(grid_x, grid_y, 1), MTLSize::new(128, 1, 1));
         post_dispatch_barrier_buffer(encoder, out);
         Ok(())
     }
