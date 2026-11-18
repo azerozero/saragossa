@@ -150,7 +150,7 @@ pub(crate) use self::barriers::{
     post_dispatch_barrier, wait_for_completion, EncoderEndGuard,
 };
 pub(crate) use self::byte_helpers::read_u16_buffer;
-pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
+pub(crate) use self::byte_helpers::{read_f32_buffer, read_f32_buffer_at, read_u32_buffer};
 pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at, write_u8_buffer};
 use self::core::*;
 #[cfg(any(feature = "devtools", test))]
