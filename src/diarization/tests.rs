@@ -382,7 +382,8 @@ fn metal_fused_qkv_matches_separate_projections() -> Result<()> {
         return Ok(());
     };
     let (d, rows) = (128, 37);
-    let model = metal_test_model(true)?;
+    // Explicite : la variable d'environnement ne doit pas choisir la branche.
+    let model = metal_test_model(true)?.with_fused_qkv(false)?;
     let mut seed = 3;
     let data: Vec<f32> = (0..rows * d).map(|_| lcg(&mut seed)).collect();
     let normed = model
