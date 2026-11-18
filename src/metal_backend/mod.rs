@@ -246,6 +246,7 @@ pub struct MetalExecutor {
     queue: CommandQueue,
     dense_matmul_rhs_t_f32: ComputePipelineState,
     dense_qmv_rhs_bf16_f32: ComputePipelineState,
+    dense_qmv_rhs_bf16_stage_f32: ComputePipelineState,
     dense_qmv_fast_f32: ComputePipelineState,
     dense_gemm_rhs_t_f32: ComputePipelineState,
     affine_matmul_rhs_t_u32_f32: ComputePipelineState,

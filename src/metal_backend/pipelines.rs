@@ -382,6 +382,8 @@ impl MetalExecutor {
             .map_err(|message| InferError::Metal(format!("compile kernels: {message}")))?;
         let dense_matmul_rhs_t_f32 = pipeline(&library, &device, "dense_matmul_rhs_t_f32")?;
         let dense_qmv_rhs_bf16_f32 = pipeline(&library, &device, "dense_qmv_rhs_bf16_f32")?;
+        let dense_qmv_rhs_bf16_stage_f32 =
+            pipeline(&library, &device, "dense_qmv_rhs_bf16_stage_f32")?;
         let dense_qmv_fast_f32 = pipeline(&library, &device, "dense_qmv_fast_f32")?;
         let dense_gemm_rhs_t_f32 = pipeline(&library, &device, "dense_gemm_rhs_t_f32")?;
         let affine_matmul_rhs_t_u32_f32 =
@@ -936,6 +938,7 @@ impl MetalExecutor {
             queue,
             dense_matmul_rhs_t_f32,
             dense_qmv_rhs_bf16_f32,
+            dense_qmv_rhs_bf16_stage_f32,
             dense_qmv_fast_f32,
             dense_gemm_rhs_t_f32,
             affine_matmul_rhs_t_u32_f32,
