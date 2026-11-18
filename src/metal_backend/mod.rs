@@ -108,6 +108,8 @@ pub(crate) use self::flags::with_flint_moe_coop_tiled_override;
 #[cfg(test)]
 pub(crate) use self::flags::with_qmm_na_u4_min_dim_override;
 #[cfg(test)]
+pub(crate) use self::flags::MMAP_WEIGHT_VIEWS;
+#[cfg(test)]
 pub(crate) use self::matmul::with_concat_vram_fraction_override;
 #[cfg(test)]
 pub(crate) use self::moe_na::moe_coop_tiled_trace_for_test;

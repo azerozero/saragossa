@@ -333,6 +333,11 @@ pub(crate) fn qmm_na_u4_x3_dispatches_for_test() -> usize {
     QMM_NA_U4_X3_DISPATCHES.with(std::cell::Cell::get)
 }
 
+/// Vues de poids mmap sans copie créées par le processus (tests).
+#[cfg(test)]
+pub(crate) static MMAP_WEIGHT_VIEWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub(super) fn qmm_na_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QMM_NA", true))
