@@ -2,7 +2,8 @@
 
 use super::*;
 use metal::{
-    CompileOptions, ComputePipelineState, Device, FunctionConstantValues, MTLDataType, NSUInteger,
+    CompileOptions, ComputePipelineState, Device, FunctionConstantValues, Library, MTLDataType,
+    NSUInteger,
 };
 use std::borrow::Cow;
 use std::ffi::c_void;
@@ -113,28 +114,36 @@ fn read_runtime_kernel(root: &Path, names: &[&str]) -> Result<String> {
     )))
 }
 
-/// Compile le GEMM NA dans une bibliothèque SÉPARÉE (MPP `#include`). `None` si la
-/// MetalPerformancePrimitives est absente (macOS < 26) → fallback f32.
-fn compile_na_gemm(device: &Device, source: &str) -> Option<ComputePipelineState> {
-    let options = compile_options(true);
-    let library = device.new_library_with_source(source, &options).ok()?;
-    let function = library.get_function("gemm_nax", None).ok()?;
+/// Compile la bibliothèque NA SÉPARÉE (MPP `#include`), une seule fois pour tous
+/// ses pipelines. `None` si la MetalPerformancePrimitives est absente (macOS < 26)
+/// ou si la source ne compile pas → fallback f32, signalé une fois sur stderr :
+/// un seul noyau fautif désactive sinon tous les GEMM NA sans bruit.
+fn compile_na_library(device: &Device, source: &str) -> Option<Library> {
     device
-        .new_compute_pipeline_state_with_function(&function)
+        .new_library_with_source(source, &compile_options(true))
+        .map_err(|error| warn_na_once(&format!("bibliothèque NA non compilée : {error}")))
         .ok()
 }
 
-fn compile_na_gemm_named(
+/// Pipeline `name` de la bibliothèque NA, `None` (signalé une fois) s'il manque.
+fn na_pipeline(
     device: &Device,
-    source: &str,
+    library: Option<&Library>,
     name: &str,
 ) -> Option<ComputePipelineState> {
-    let options = compile_options(true);
-    let library = device.new_library_with_source(source, &options).ok()?;
-    let function = library.get_function(name, None).ok()?;
-    device
-        .new_compute_pipeline_state_with_function(&function)
+    let library = library?;
+    library
+        .get_function(name, None)
+        .and_then(|function| device.new_compute_pipeline_state_with_function(&function))
+        .map_err(|error| warn_na_once(&format!("pipeline NA {name} indisponible : {error}")))
         .ok()
+}
+
+fn warn_na_once(message: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!("saragossa: {message} ; GEMM NA concernés désactivés (repli f32)");
+    });
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -866,8 +875,9 @@ impl MetalExecutor {
             sources.na_gemm.as_ref()
         );
         let na_source = na_source.as_str();
-        let compile_na = |name: &str| compile_na_gemm_named(&device, na_source, name);
-        let na_gemm_bf16 = compile_na_gemm(&device, na_source);
+        let na_library = compile_na_library(&device, na_source);
+        let compile_na = |name: &str| na_pipeline(&device, na_library.as_ref(), name);
+        let na_gemm_bf16 = compile_na("gemm_nax");
         let na_gemm_bf16_bn128 = compile_na("gemm_nax_bf16_bn128");
         let gated_delta_nax_hk16_hv48 = if crate::runtime_flags::prefill_linear_nax_enabled() {
             let pipeline = compile_gated_delta_nax(
