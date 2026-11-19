@@ -1,5 +1,7 @@
 //! Relais SIGUSR2 de `saragossa serve` sans modèle : aucune connexion refusée
 //! pendant la bascule, ancien processus terminé ; échec de l'enfant sans effet.
+//! Les tests se synchronisent sur des événements (lignes de journal, sortie
+//! du processus, requêtes abouties), jamais sur une attente fixe.
 #![cfg(all(unix, feature = "serve"))]
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -11,42 +13,67 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Lance `serve` en TCP ; renvoie le processus, le port et ses lignes stderr.
-/// NOTE: le port libre peut être pris entre-temps (ports source des clients de
-/// l'autre test) ; un `serve` sorti au démarrage est relancé sur un autre port.
 fn serve(extra: &[&str]) -> (Child, u16, mpsc::Receiver<String>) {
-    serve_with(extra, &[])
+    let (child, port, _, rx) = spawn_serve(extra, false);
+    (child, port, rx)
 }
 
-fn serve_with(extra: &[&str], envs: &[(&str, String)]) -> (Child, u16, mpsc::Receiver<String>) {
-    for _ in 0..5 {
-        if let Some(started) = try_serve(extra, envs) {
-            return started;
+/// Lance `serve` sur des sockets liées par le test et transmises comme par un
+/// relais (`SARAGOSSA_LISTEN_FDS`) : aucun port libéré puis repris entre-temps.
+/// Avec `enhance`, ajoute le listener h2 (et la socket WebTransport si
+/// compilée) ; renvoie aussi le port h2.
+fn spawn_serve(extra: &[&str], enhance: bool) -> (Child, u16, Option<u16>, mpsc::Receiver<String>) {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    let bind = || std::net::TcpListener::bind("127.0.0.1:0").expect("écoute");
+    let main = bind();
+    let port = main.local_addr().expect("adresse").port();
+    let mut listen = main.as_raw_fd().to_string();
+    let mut owned: Vec<OwnedFd> = vec![main.into()];
+    let mut command = Command::new(env!("CARGO_BIN_EXE_saragossa"));
+    let mut h2_port = None;
+    if enhance {
+        let h2 = bind();
+        let addr = h2.local_addr().expect("adresse h2");
+        h2_port = Some(addr.port());
+        command.env("SARAGOSSA_ENHANCE_H2_ADDR", addr.to_string());
+        listen.push_str(&format!(",h2={}", h2.as_raw_fd()));
+        owned.push(h2.into());
+        #[cfg(feature = "webtransport")]
+        {
+            let wt = std::net::UdpSocket::bind("127.0.0.1:0").expect("socket wt");
+            let addr = wt.local_addr().expect("adresse wt");
+            command.env("SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR", addr.to_string());
+            listen.push_str(&format!(",wt={}", wt.as_raw_fd()));
+            owned.push(wt.into());
         }
     }
-    panic!("serve ne démarre pas");
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("port libre")
-        .port()
-}
-
-fn try_serve(
-    extra: &[&str],
-    envs: &[(&str, String)],
-) -> Option<(Child, u16, mpsc::Receiver<String>)> {
-    let port = free_port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_saragossa"))
+    let fds: Vec<i32> = owned.iter().map(AsRawFd::as_raw_fd).collect();
+    command
         .args(["serve", "--port", &port.to_string(), "--api-key", "k"])
         .args(["--model", "t=/nonexistent", "--backend", "cpu"])
         .args(["--set", "serve.drain_timeout_secs=60"])
         .args(extra)
-        .envs(envs.iter().map(|(k, v)| (k, v)))
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("lancement");
+        .env("SARAGOSSA_LISTEN_FDS", listen)
+        // NOTE: un enfant de relais orphelin après un échec garderait sinon
+        // la sortie de cargo ouverte, et le test ne finirait jamais.
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: entre fork et exec, seul `fcntl` (async-signal-safe) retire
+    // FD_CLOEXEC aux sockets transmises, sur un vecteur déjà alloué.
+    unsafe {
+        command.pre_exec(move || {
+            for &fd in &fds {
+                if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("lancement");
+    // NOTE: le test lâche ses copies ; serve garde les sockets.
+    drop(owned);
     let (lines, rx) = mpsc::channel();
     let stderr = child.stderr.take().expect("stderr");
     thread::spawn(move || {
@@ -58,12 +85,13 @@ fn try_serve(
     let deadline = Instant::now() + Duration::from_secs(20);
     while !health(port) {
         assert!(Instant::now() < deadline, "serve ne répond pas");
-        if child.try_wait().expect("try_wait").is_some() {
-            return None;
-        }
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "serve sorti au démarrage"
+        );
         thread::sleep(Duration::from_millis(50));
     }
-    Some((child, port, rx))
+    (child, port, h2_port, rx)
 }
 
 fn health(port: u16) -> bool {
@@ -115,6 +143,15 @@ fn wait_exit(child: &mut Child, within: Duration) {
     }
 }
 
+/// Attend que `counter` dépasse `beyond` : des requêtes ont abouti depuis.
+fn wait_served(counter: &AtomicUsize, beyond: usize, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::Relaxed) <= beyond {
+        assert!(Instant::now() < deadline, "{what}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Clients `/health` en boucle jusqu'à `stop` ; renvoie (réussis, échoués).
 fn health_clients(
     port: u16,
@@ -144,14 +181,14 @@ fn relay_hands_over_without_refusing_connections() {
     let (mut old, port, rx) = serve(&[]);
     let stop = Arc::new(AtomicBool::new(false));
     let (clients, ok, failed) = health_clients(port, &stop);
-    thread::sleep(Duration::from_millis(300));
+    wait_served(&ok, 0, "clients inactifs avant le relais");
     signal("-USR2", old.id());
     let new_pid = child_pid(&rx);
     // NOTE: vidage à 60 s : sortir avant 10 s prouve que le parent n'est
     // pas resté bloqué dans un accept pris par l'enfant.
     wait_exit(&mut old, Duration::from_secs(10));
     let served_before = ok.load(Ordering::Relaxed);
-    thread::sleep(Duration::from_millis(500));
+    wait_served(&ok, served_before, "le nouveau ne sert pas");
     stop.store(true, Ordering::Relaxed);
     for client in clients {
         client.join().expect("client");
@@ -181,17 +218,22 @@ fn failed_child_keeps_parent_serving() {
 
 /// Mode séquentiel forcé : le moteur de l'enfant attend la sortie du parent,
 /// la requête reçue entre-temps attend en file au lieu d'être refusée.
+///
+/// NOTE: le test tient lui-même le parent en vie par une connexion muette et
+/// le libère en la fermant. Comparer l'arrivée de la réponse à `try_wait`
+/// serait une course : l'enfant voit son parent changer (fin de `exit`, après
+/// la libération de la mémoire) un peu avant que le zombie soit visible à
+/// `waitpid`.
 #[test]
 fn sequential_relay_queues_until_parent_exits() {
-    let (mut old, port, rx) = serve(&[
-        "--set",
-        "serve.relay_mode=sequential",
-        "--set",
-        "serve.read_timeout_secs=3",
-    ]);
-    // Connexion muette : le parent la garde jusqu'à son délai de lecture (3 s).
+    let (mut old, port, rx) = serve(&["--set", "serve.relay_mode=sequential"]);
+    // Connexion muette : le parent la sert jusqu'à sa fermeture par le test
+    // (délai de lecture 30 s, vidage 60 s).
     let idle = TcpStream::connect(("127.0.0.1", port)).expect("connexion muette");
-    thread::sleep(Duration::from_millis(300));
+    // La file d'accept est FIFO et seul le parent accepte encore : une
+    // réponse sur une connexion ouverte après prouve que la muette est chez
+    // lui (sous charge, une attente fixe la laissait à l'enfant).
+    assert!(health(port), "parent muet");
     let stop = Arc::new(AtomicBool::new(false));
     let (clients, _ok, failed) = health_clients(port, &stop);
     signal("-USR2", old.id());
@@ -206,24 +248,33 @@ fn sequential_relay_queues_until_parent_exits() {
         body.len()
     )
     .expect("requête chat");
+    // Tant que le parent vit, la requête reste en file : rien à lire.
+    chat.set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("délai");
+    let mut early = [0u8; 1];
+    let early = chat.read(&mut early);
+    let parent_alive = old.try_wait().expect("try_wait").is_none();
+    // Le parent sort une fois sa dernière connexion fermée ; la requête en
+    // file est alors servie par l'enfant.
+    drop(idle);
+    wait_line(&rx, "sorti, moteur actif");
+    wait_exit(&mut old, Duration::from_secs(10));
     chat.set_read_timeout(Some(Duration::from_secs(30)))
         .expect("délai");
     let mut reply = String::new();
     let _ = chat.read_to_string(&mut reply);
-    let parent_gone = old.try_wait().expect("try_wait").is_some();
-    wait_exit(&mut old, Duration::from_secs(10));
     stop.store(true, Ordering::Relaxed);
     for client in clients {
         client.join().expect("client");
     }
-    drop(idle);
     signal("-TERM", new_pid);
+    assert!(parent_alive, "parent sorti avant la libération du test");
+    assert!(
+        early.is_err(),
+        "le moteur de l'enfant a répondu avant la sortie du parent: {early:?}"
+    );
     assert!(reply.starts_with("HTTP/1.1 "), "réponse: {reply:?}");
     assert!(!reply.contains("file d'inférence pleine"), "{reply}");
-    assert!(
-        parent_gone,
-        "le moteur de l'enfant a répondu avant la sortie du parent"
-    );
     assert_eq!(failed.load(Ordering::Relaxed), 0, "connexions refusées");
 }
 
@@ -232,15 +283,8 @@ fn sequential_relay_queues_until_parent_exits() {
 #[cfg(feature = "h2")]
 #[test]
 fn relay_with_h2_refuses_nothing() {
-    let h2_port = free_port();
-    #[allow(unused_mut)]
-    let mut envs = vec![("SARAGOSSA_ENHANCE_H2_ADDR", format!("127.0.0.1:{h2_port}"))];
-    #[cfg(feature = "webtransport")]
-    envs.push((
-        "SARAGOSSA_ENHANCE_WEBTRANSPORT_ADDR",
-        format!("127.0.0.1:{}", free_port()),
-    ));
-    let (mut old, port, rx) = serve_with(&[], &envs);
+    let (mut old, port, h2_port, rx) = spawn_serve(&[], true);
+    let h2_port = h2_port.expect("port h2");
     // Connexion h2 tenue par le parent, pilotée sur son propre thread pour
     // répondre au PING du GOAWAY en deux temps.
     let (connected, connected_rx) = mpsc::channel();
@@ -289,14 +333,14 @@ fn relay_with_h2_refuses_nothing() {
             }
         }));
     }
-    thread::sleep(Duration::from_millis(300));
+    wait_served(&h2_ok, 0, "clients h2 inactifs avant le relais");
     signal("-USR2", old.id());
     #[cfg(feature = "webtransport")]
     wait_line(&rx, "socket wt héritée");
     let new_pid = child_pid(&rx);
     wait_exit(&mut old, Duration::from_secs(10));
     let served_before = h2_ok.load(Ordering::Relaxed);
-    thread::sleep(Duration::from_millis(500));
+    wait_served(&h2_ok, served_before, "l'enfant ne sert pas h2");
     stop.store(true, Ordering::Relaxed);
     for client in clients {
         client.join().expect("client");
