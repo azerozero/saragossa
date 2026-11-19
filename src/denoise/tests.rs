@@ -442,7 +442,7 @@ fn dfn3_gpu_long_file_bit_exact_and_speed() {
     };
     let (gpu, t_gpu) = time(&|| model.enhance_gpu(&audio).unwrap());
     let (common, t_common) = time(&|| model.enhance_common(&audio).unwrap());
-    let (libm, t_libm) = time(&|| model.enhance(&audio).unwrap());
+    let (libm, t_libm) = time(&|| model.enhance_libm(&audio).unwrap());
     let same = gpu
         .iter()
         .zip(&common)
