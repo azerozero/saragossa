@@ -98,6 +98,7 @@ restent inchangés. Un ancien run garde ses plans, sa matrice et ses empreintes.
 | Fichier | Rôle |
 |---|---|
 | `client.py` | une requête SSE chronométrée, HTTP/1.1 sur socket brut, fragments bruts conservés |
+| `campaign.py` | campagne autonome : gel, file entrelacée, portes de charge, reprise, `--dry-run` |
 | `run_matrix.py` | `env`, `plan` (graine publiée), `run` (reprise idempotente), `freeze` (règle de sélection), `reuse-freeze` (réglages sur protocole courant) |
 | `matrix.json` | configurations, grille de réglage, phases, valeurs neutres et convention EOS par moteur |
 | `prompts.py` | prompts neufs à longueur au plus la cible, empreintes attendues (bloquantes) |
@@ -194,3 +195,50 @@ avant sa création. Sans argument, leurs auto-tests utilisent la stdlib ; l’or
 négatives, sans valider l’exécution tensorielle MLX ni lancer de conversion.
 `sensors.py`, `budget.py` et `night_checks.py` ont également un auto-test sans
 argument ; les lanceurs sont vérifiés sur des copies avec exécutables factices.
+
+## Campagne autonome (une commande, une nuit)
+
+`campaign.py` enchaîne seul toute une campagne de publication et n'écrit que
+des données brutes ; l'analyse se fait ensuite, hors de la nuit. Stdlib seule
+(`python3 -I`), sauf la découpe des prompts, faite une fois avec le venv mlx-lm.
+
+```sh
+export BENCH_SCRATCH=/chemin/du/scratch   # contient ext-engines/, gpu.lock, build.lock
+python3 -I -B bench/competitors/campaign.py run "$BENCH_SCRATCH/campagne/nuit" --dry-run
+python3 -I -B bench/competitors/campaign.py run "$BENCH_SCRATCH/campagne/nuit"
+```
+
+- **Lancement** : compile `origin/main` dans le worktree détaché
+  `.claude/worktrees/campagne-bin` sous `build.lock` (`--saragossa-bin` pour
+  un binaire existant), découpe les prompts 512/4096/16384 tokens exacts
+  (template et nonce compris), calcule les SHA-256 des poids, puis écrit
+  `freeze.json` : plan figé, commits, versions, source et réglages de chaque
+  moteur, binaires, matériel, macOS. `--reps` (3), `--models`, `--configs` et
+  `--lengths` restreignent la campagne.
+- **Ordre** : par modèle (cache de pages chaud), les configurations passent en
+  round-robin, ordre inversé à chaque répétition (ABBA). Une entrée = un
+  chargement, une chauffe non comptée, une requête de 256 tokens par longueur.
+- **Portes** : chaque entrée tourne sous `tools/gpulock.py` ; avant chaque
+  requête, loadavg < 2 et aucun autre processus > 50 % CPU, sinon attente sans
+  limite. Thermique (`pmset`, macmon) et pression mémoire sont notées.
+  Refroidissement entre entrées : 45 s, puis GPU ≤ 45 °C, au plus 10 min.
+- **Watchdog** : délai de chargement (40 min), délai absolu par requête
+  (30 min), `SIGALRM` de secours. Seuls les serveurs lancés par la campagne et
+  leurs descendants sont arrêtés, y compris sur SIGINT/SIGTERM/SIGHUP.
+- **Reprise** : relancer la même commande. `journal.jsonl` est append-only ;
+  une entrée close (`entry_done`) est sautée, une entrée interrompue est
+  rejouée avec un nouvel `attempt`. Deux échecs de chargement d'une même
+  configuration sautent ses répétitions restantes.
+- **Données** : `RUN_DIR/freeze.json`, `journal.jsonl` (chargements, chauffes,
+  mesures avec événements SSE horodatés, preuves d'intégrité, portes),
+  `prompts/<modèle>.json`, `logs/` (sortie des serveurs), puis `summary.json`
+  (mesures OK/échouées, aucune conclusion) et `DONE`.
+- **`--dry-run`** (quelques secondes) : moteurs lançables (`--version`), poids
+  présents, prompts découpés, port libre, plan et durée estimée dans
+  `freeze-dryrun.json`. Un format absent est noté « non supporté » et sauté.
+
+Moteurs (dans `$BENCH_SCRATCH/ext-engines/<moteur>/`, versions officielles) :
+llama.cpp b12359 (= 1.0.0), mlx-lm 0.32.2 (venv dédié), llmd 20261114.0,
+Ollama 0.40.16 (`ollama serve` lancé et arrêté par la campagne, modèles créés
+depuis les GGUF locaux dans un `OLLAMA_MODELS` isolé), mistral.rs 0.9.5.
+La source de chaque réglage est écrite dans `freeze.json`.
