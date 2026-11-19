@@ -51,7 +51,7 @@ LENGTHS = (512, 4096, 16384)
 LOAD_TIMEOUT_S = 2400            # ISQ mistral.rs et BF16 compris
 REQUEST_DEADLINE_S = 1800
 LOAD_MAX, CPU_MAX = 2.0, 50.0
-COOLDOWN_MIN_S, COOLDOWN_MAX_S, COOLDOWN_GPU_C = 45, 600, 45
+COOLDOWN_MIN_S, COOLDOWN_MAX_S, COOLDOWN_GPU_C = 45, 300, 50
 NONCE_LINE = "Request id: {nonce}\n\n"   # 16 chiffres = 16 tokens (prompts.py)
 INSTRUCTION = ("\n\nAbove is Rust source code. Write a detailed technical review of it: "
                "explain the purpose of each main type and function, how they interact, and "
@@ -811,6 +811,16 @@ def main_run(args):
         freeze_path.write_text(json.dumps(freeze, indent=1, default=str))
         log(f"gel écrit : {len(plan)} entrées, ~{freeze['estimate_min']} min estimées")
 
+    # Un seul verrou GPU pour toute la file : rendu entre deux entrées, il laissait
+    # les autres travaux GPU s'intercaler (19 nov.). Ré-exécution sous gpulock.
+    lock = pathlib.Path(args.gpu_lock).resolve()
+    if os.environ.get("GPU_LOCK_HELD") != str(lock):
+        log(f"attente du verrou GPU {lock} (priorité {args.prio})")
+        sys.stdout.flush()
+        os.execve(sys.executable, [sys.executable, "-I", "-B", str(REPO / "tools/gpulock.py"),
+                                   "run", "--owner", "campagne", "--prio", str(args.prio), "--",
+                                   sys.executable, "-I", "-B", str(HERE / "campaign.py"),
+                                   *sys.argv[1:]], {**os.environ, "GPU_LOCK": str(lock)})
     journal = Journal(run_dir)
     child = {"proc": None}
     flag = pathlib.Path(args.busy_flag)
@@ -821,7 +831,7 @@ def main_run(args):
         child["stop"] = signum
         if child["proc"] is not None and child["proc"].returncode is None:
             try:
-                os.kill(child["proc"].pid, signal.SIGTERM)   # gpulock le transmet au groupe
+                os.kill(child["proc"].pid, signal.SIGTERM)   # l’entrée arrête son serveur
             except ProcessLookupError:
                 pass
         if child["proc"] is None:
@@ -876,10 +886,9 @@ def loop(args, run_dir, freeze, journal, child, log):
         if previous is not None:
             journal.write({"kind": "cooldown", "before": entry["id"], **cooldown()})
         log(f"entrée {entry['id']}")
-        child["proc"] = subprocess.Popen(
-            [sys.executable, "-I", "-B", str(REPO / "tools/gpulock.py"), "run", "--owner",
-             "campagne", "--prio", str(args.prio), "--", sys.executable, "-I", "-B", str(HERE / "campaign.py"),
-             "_entry", str(run_dir), entry["id"]], env={**os.environ, "GPU_LOCK": args.gpu_lock})
+        child["proc"] = subprocess.Popen(      # verrou GPU déjà tenu par la campagne
+            [sys.executable, "-I", "-B", str(HERE / "campaign.py"), "_entry", str(run_dir),
+             entry["id"]])
         child["proc"].wait()
         child["proc"] = None
         if child.get("stop"):

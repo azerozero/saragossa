@@ -218,10 +218,10 @@ python3 -I -B bench/competitors/campaign.py run "$BENCH_SCRATCH/campagne/nuit"
 - **Ordre** : par modèle (cache de pages chaud), les configurations passent en
   round-robin, ordre inversé à chaque répétition (ABBA). Une entrée = un
   chargement, une chauffe non comptée, une requête de 256 tokens par longueur.
-- **Portes** : chaque entrée tourne sous `tools/gpulock.py` ; avant chaque
+- **Portes** : la campagne tient `tools/gpulock.py` du début à la fin (priorité 2), sans laisser d’autre travail GPU s’intercaler, et crée `bench-en-cours` ; avant chaque
   requête, loadavg < 2 et aucun autre processus > 50 % CPU, sinon attente sans
   limite. Thermique (`pmset`, macmon) et pression mémoire sont notées.
-  Refroidissement entre entrées : 45 s, puis GPU ≤ 45 °C, au plus 10 min.
+  Refroidissement entre entrées : 45 s, puis GPU ≤ 50 °C, au plus 5 min.
 - **Watchdog** : délai de chargement (40 min), délai absolu par requête
   (30 min), `SIGALRM` de secours. Seuls les serveurs lancés par la campagne et
   leurs descendants sont arrêtés, y compris sur SIGINT/SIGTERM/SIGHUP.
