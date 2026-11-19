@@ -1710,6 +1710,27 @@ pub(crate) fn dense_bf16_gemm_x1_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1", true))
 }
 
+/// MLP bf16 dense fusionné au prefill : gate et up dans un seul dispatch
+/// matmul2d, SwiGLU en épilogue et H écrit en bf16, sans les trois tampons
+/// f32 intermédiaires. Même arithmétique que le chemin X1 (égalité au bit,
+/// test `dense_bf16_fused_mlp_matches_x1`). Opt-in
+/// `SARAGOSSA_RUST_DENSE_BF16_FUSED_MLP=1` ; exige le GEMM X1.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn dense_bf16_fused_mlp_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_FUSED_MLP", false))
+}
+
+/// Projections b/a de la linear attention bf16 dense au prefill : un seul
+/// GEMM hi + lo sur `[b; a]` au lieu de deux qmv par ligne (N = 48).
+/// Change l'ordre d'accumulation (KL dans docs/perf/prefill-bf16.md).
+/// Opt-in `SARAGOSSA_RUST_DENSE_BF16_LA_BA_GEMM=1`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn dense_bf16_la_ba_gemm_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_LA_BA_GEMM", false))
+}
+
 /// GEMM NA tuilé des poids bf16 denses au prefill (batch ≥ 64). Défaut ON ;
 /// `SARAGOSSA_RUST_DENSE_BF16_GEMM=0` rétablit le qmv par ligne.
 #[cfg(all(target_os = "macos", feature = "metal"))]

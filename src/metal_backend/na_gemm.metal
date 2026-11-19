@@ -75,6 +75,44 @@ kernel void gemm_nax_bf16_nt_bn128(device const bfloat* Ap [[buffer(0)]],
   auto mC = C.slice(n0, m0);
   op.run(mA, mB, mC);
 }
+// MLP bf16 dense fusionné du prefill : la tuile 64×128 de gate et celle de up
+// passent par le même matmul2d que `gemm_nax_bf16_nt_bn128`, en tenseurs
+// coopératifs, puis H = bf16(silu(g)·u) est écrit directement. Même expression
+// que `swiglu_f32` suivi de `f32_to_bf16` : égal au bit au chemin en trois
+// passes, sans les tampons f32 gate, up et hidden. Exige N%128=0.
+kernel void gemm_nax_bf16_nt_gate_up_swiglu(device const bfloat* Ap [[buffer(0)]],
+                                            device const bfloat* Gp [[buffer(1)]],
+                                            device const bfloat* Up [[buffer(2)]],
+                                            device bfloat* Hp       [[buffer(3)]],
+                                            constant uint3& mnk     [[buffer(4)]],
+                                            uint2 tgid [[threadgroup_position_in_grid]]) {
+  uint M = mnk.x, N = mnk.y, K = mnk.z;
+  auto A = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>((device bfloat*)Ap, dextents<int32_t,2>(int32_t(K), int32_t(M)));
+  auto G = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>((device bfloat*)Gp, dextents<int32_t,2>(int32_t(K), int32_t(N)));
+  auto U = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>((device bfloat*)Up, dextents<int32_t,2>(int32_t(K), int32_t(N)));
+  auto H = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>(Hp, dextents<int32_t,2>(int32_t(N), int32_t(M)));
+  constexpr auto desc = tensor_ops::matmul2d_descriptor(
+      64, 128, static_cast<int>(dynamic_extent), false, true, false);
+  tensor_ops::matmul2d<desc, execution_simdgroups<8>> op;
+  uint m0 = tgid.y * 64, n0 = tgid.x * 128;
+  auto mA = A.slice(0, m0);
+  auto mG = G.slice(0, n0);
+  auto mU = U.slice(0, n0);
+  auto mH = H.slice(n0, m0);
+  auto cG = op.get_destination_cooperative_tensor<decltype(mA), decltype(mG), float>();
+  auto cU = op.get_destination_cooperative_tensor<decltype(mA), decltype(mU), float>();
+  auto cH = op.get_destination_cooperative_tensor<decltype(mA), decltype(mG), bfloat>();
+  op.run(mA, mG, cG);
+  op.run(mA, mU, cU);
+  #pragma unroll full
+  for (uint16_t i = 0; i < cG.get_capacity(); ++i) {
+    if (cG.get_mask(i)) {
+      float g = cG[i];
+      cH[i] = bfloat((g / (1.0f + exp(-g))) * cU[i]);
+    }
+  }
+  cH.store(mH);
+}
 // ===== Port qmm_t_nax brique 1 : primitive cooperative_tensor à fragments registres.
 // Transcription de BaseNAXFrag (mlx steel/gemm/nax.h:27) : fragment 16x16, 8 élts/thread
 // (2 lignes x 4 cols, lignes espacées de 8), mapping lane->coord par bit-twiddling, MMA
@@ -124,6 +162,19 @@ struct NaxFrag {
     for (short i = 0; i < 2; i++)
       for (short j = 0; j < 4; j++)
         dst[(i * 8) * str_x + j] = src[i * 4 + j];
+  }
+  static void store_c_masked_mn(const thread metal::vec<float,8>& src, device float* dst,
+                                uint m_base, uint n_base, uint N, uint M) {
+    short2 sc = get_coord();
+    for (short i = 0; i < 2; i++) {
+      uint row = m_base + uint(sc.y) + uint(i) * 8u;
+      if (row < M) {
+        for (short j = 0; j < 4; j++) {
+          uint col = n_base + uint(sc.x) + uint(j);
+          if (col < N) { dst[row * N + col] = src[i * 4 + j]; }
+        }
+      }
+    }
   }
   static void store_c_masked(const thread metal::vec<float,8>& src, device float* dst,
                              uint m_base, uint n_base, uint N, uint M) {
@@ -638,16 +689,16 @@ kernel void gemm_nax_coop_qb_tiled_u4_x3(device const float* A [[buffer(0)]],
 // hi + lo bf16 et chaque pas fait hi·B + lo·B : le poids est exact en bf16,
 // seule l'activation perd sa mantisse, ramenée vers 2⁻¹⁶ comme le qmv f32
 // qu'il remplace en prefill. Exige K%64=0 et N%64=0.
-kernel void gemm_nax_bf16_nt_tiled_x2(device const float* A  [[buffer(0)]],
-                                      device const bfloat* B [[buffer(1)]],
-                                      device float* C        [[buffer(2)]],
-                                      constant uint3& mnk    [[buffer(3)]],
-                                      uint2 tgid [[threadgroup_position_in_grid]],
-                                      uint lid [[thread_index_in_threadgroup]],
-                                      uint sgid [[simdgroup_index_in_threadgroup]]) {
+// MASK_N : lignes de B au-delà de N lues comme zéro et colonnes de C au-delà
+// de N jamais écrites, pour les petites projections (N%64≠0) ; les tuiles
+// pleines font exactement les mêmes opérations.
+template <bool MASK_N>
+inline void gemm_nax_bf16_nt_tiled_x2_body(device const float* A, device const bfloat* B,
+                                           device float* C, uint3 mnk, uint2 tgid,
+                                           uint lid, uint sgid,
+                                           threadgroup metal::vec<bfloat,8>* Ws8) {
   uint M = mnk.x, K = mnk.z;
   constexpr uint BN = 64, BK = 64, BKP = BK + 8, WN = 2;
-  threadgroup metal::vec<bfloat,8> Ws8[BN * BKP / 8];
   threadgroup bfloat* Ws = (threadgroup bfloat*)Ws8;
   uint sg_m = sgid / WN;
   uint sg_n = sgid - sg_m * WN;
@@ -659,8 +710,9 @@ kernel void gemm_nax_bf16_nt_tiled_x2(device const float* A  [[buffer(0)]],
     // 64 lignes × 8 vecteurs de 8 bf16 = 512 vecteurs pour 128 threads.
     for (uint idx = lid; idx < BN * (BK / 8u); idx += 128u) {
       uint nl = idx >> 3u, kv = idx & 7u;
-      Ws8[nl * (BKP / 8u) + kv] =
-          *((const device metal::vec<bfloat,8>*)(B + (n0 + nl) * K + k) + kv);
+      Ws8[nl * (BKP / 8u) + kv] = (!MASK_N || n0 + nl < mnk.y)
+          ? *((const device metal::vec<bfloat,8>*)(B + (n0 + nl) * K + k) + kv)
+          : metal::vec<bfloat,8>(bfloat(0.0f));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint kk = 0; kk < BK; kk += 16u) {
@@ -677,10 +729,39 @@ kernel void gemm_nax_bf16_nt_tiled_x2(device const float* A  [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   uint N = mnk.y;
-  NaxFrag::store_c_masked(c0a, C, m0, n0 + ns, N, M);
-  NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
-  NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
-  NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+  if (MASK_N) {
+    NaxFrag::store_c_masked_mn(c0a, C, m0, n0 + ns, N, M);
+    NaxFrag::store_c_masked_mn(c0b, C, m0, n0 + ns + 16u, N, M);
+    NaxFrag::store_c_masked_mn(c1a, C, m0 + 16u, n0 + ns, N, M);
+    NaxFrag::store_c_masked_mn(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+  } else {
+    NaxFrag::store_c_masked(c0a, C, m0, n0 + ns, N, M);
+    NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
+    NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
+    NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+  }
+}
+kernel void gemm_nax_bf16_nt_tiled_x2(device const float* A  [[buffer(0)]],
+                                      device const bfloat* B [[buffer(1)]],
+                                      device float* C        [[buffer(2)]],
+                                      constant uint3& mnk    [[buffer(3)]],
+                                      uint2 tgid [[threadgroup_position_in_grid]],
+                                      uint lid [[thread_index_in_threadgroup]],
+                                      uint sgid [[simdgroup_index_in_threadgroup]]) {
+  threadgroup metal::vec<bfloat,8> Ws8[64 * 72 / 8];
+  gemm_nax_bf16_nt_tiled_x2_body<false>(A, B, C, mnk, tgid, lid, sgid, Ws8);
+}
+// Même GEMM hi + lo pour N quelconque (projections b/a de la linear attention,
+// N = 2·48) : remplace le qmv par ligne au prefill, opt-in.
+kernel void gemm_nax_bf16_nt_tiled_x2_maskn(device const float* A  [[buffer(0)]],
+                                            device const bfloat* B [[buffer(1)]],
+                                            device float* C        [[buffer(2)]],
+                                            constant uint3& mnk    [[buffer(3)]],
+                                            uint2 tgid [[threadgroup_position_in_grid]],
+                                            uint lid [[thread_index_in_threadgroup]],
+                                            uint sgid [[simdgroup_index_in_threadgroup]]) {
+  threadgroup metal::vec<bfloat,8> Ws8[64 * 72 / 8];
+  gemm_nax_bf16_nt_tiled_x2_body<true>(A, B, C, mnk, tgid, lid, sgid, Ws8);
 }
 // MLP dense fusionné gate+up+SwiGLU (prefill) : mêmes tuiles 64×64×64 et
 // fragments que `gemm_nax_coop_qb_tiled_u4`, deux tuiles B (gate, up) par pas
