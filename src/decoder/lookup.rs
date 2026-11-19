@@ -29,6 +29,8 @@ pub(super) struct NgramLookup {
     cooldown: usize,
     /// Repos à appliquer au prochain échec, doublé à chaque échec, remis à 8 au succès.
     next_cooldown: usize,
+    /// Vérifications, drafts proposés et acceptés (`SARAGOSSA_RUST_LOOKUP_STATS=1`).
+    stats: [usize; 3],
 }
 
 impl NgramLookup {
@@ -45,6 +47,7 @@ impl NgramLookup {
             consumed_generated: 0,
             cooldown: 0,
             next_cooldown: 8,
+            stats: [0; 3],
         };
         lookup.push(prompt);
         lookup
@@ -139,11 +142,31 @@ impl NgramLookup {
         if proposed == 0 {
             return;
         }
+        self.stats[0] += 1;
+        self.stats[1] += proposed;
+        self.stats[2] += accepted;
         if accepted * 4 < proposed * 3 {
             self.cooldown = self.next_cooldown;
             self.next_cooldown = (self.next_cooldown * 2).min(64);
         } else {
             self.next_cooldown = 8;
+        }
+    }
+}
+
+/// Bilan sur stderr à la fin de la génération, diagnostic opt-in des benchs.
+impl Drop for NgramLookup {
+    fn drop(&mut self) {
+        if crate::runtime_flags::env_flag("SARAGOSSA_RUST_LOOKUP_STATS", false) {
+            let [verifies, proposed, accepted] = self.stats;
+            let source = if self.suffix.is_some() {
+                "suffix"
+            } else {
+                "ngram"
+            };
+            eprintln!(
+                "lookup_stats source={source} verifies={verifies} proposed={proposed} accepted={accepted}"
+            );
         }
     }
 }
