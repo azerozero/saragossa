@@ -102,8 +102,11 @@ impl TtsModel {
         let talker_resident = self
             .talker
             .setup_resident_decode_from_prefill(&mut talker_cache, effective_max_frames)?;
+        let talker_fused = talker_resident && self.enable_talker_fused_layers(&mut talker_cache)?;
         if trace {
-            eprintln!("qwen3-tts rust diag: talker resident={talker_resident}");
+            eprintln!(
+                "qwen3-tts rust diag: talker resident={talker_resident} fused={talker_fused}"
+            );
         }
         let mut cp_resident_cache = if n_groups > 1 {
             self.code_predictor
@@ -265,6 +268,20 @@ impl TtsModel {
             codes: generated,
             stop_reason,
         })
+    }
+
+    /// Couches du talker en 8 dispatches (`SARAGOSSA_TTS_TALKER_FUSED_KERNELS`),
+    /// identiques au bit au chemin général. `false` : chemin général.
+    pub(super) fn enable_talker_fused_layers(
+        &self,
+        cache: &mut crate::CausalDecoderCache,
+    ) -> Result<bool> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if crate::runtime_flags::tts_talker_fused_kernels_enabled() {
+            return self.talker.enable_tts_fused_layers(cache);
+        }
+        let _ = cache;
+        Ok(false)
     }
 
     /// Poids de la trame fusionnée si le kill-switch et les paramètres le
@@ -578,8 +595,11 @@ impl TtsModel {
         let talker_resident = self
             .talker
             .setup_resident_decode_from_prefill(&mut talker_cache, effective_max_frames)?;
+        let talker_fused = talker_resident && self.enable_talker_fused_layers(&mut talker_cache)?;
         if trace {
-            eprintln!("qwen3-tts rust diag: talker resident={talker_resident}");
+            eprintln!(
+                "qwen3-tts rust diag: talker resident={talker_resident} fused={talker_fused}"
+            );
         }
         // Code predictor : arène résidente allouée une fois, remise à zéro par
         // frame (séquence courte de num_code_groups+1 positions).

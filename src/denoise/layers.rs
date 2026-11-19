@@ -139,6 +139,23 @@ impl Conv {
         let bn = |w: &mut HashMap<String, Tensor>, n: &str| {
             take_shape(w, &format!("{p}.{idx}.{n}"), &[s.cout])
         };
+        if !w.contains_key(&format!("{p}.{idx}.running_mean")) {
+            // BatchNorm déjà repliée dans la convolution (export ONNX) : biais seul.
+            return Ok(Self {
+                cin: s.cin,
+                cout: s.cout,
+                groups: s.groups,
+                kt: s.kt,
+                kf: s.kf,
+                fstride: s.fstride,
+                transposed: s.transposed,
+                weight,
+                pointwise,
+                scale: vec![1.0; s.cout],
+                bias: bn(w, "bias")?,
+                act: s.act,
+            });
+        }
         let (gamma, beta) = (bn(w, "weight")?, bn(w, "bias")?);
         let (mean, var) = (bn(w, "running_mean")?, bn(w, "running_var")?);
         w.remove(&format!("{p}.{idx}.num_batches_tracked"));

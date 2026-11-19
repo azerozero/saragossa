@@ -15,7 +15,7 @@ fn build(recurrent: bool) -> DeepFilterNet3 {
         .map(|(name, (shape, data))| (name, crate::Tensor::from_vec(shape, data).unwrap()))
         .collect();
     DeepFilterNet3 {
-        net: Network::load(weights, FREQ_BINS).unwrap(),
+        net: Network::load(weights, FREQ_BINS, Config::STD).unwrap(),
         widths,
         window: dsp::vorbis_window(),
     }

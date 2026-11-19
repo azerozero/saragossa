@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.15](https://github.com/azerozero/saragossa/compare/v0.3.14...v0.3.15) - 2026-11-18
+
+### Added
+
+- *(denoise)* variante faible latence DeepFilterNet3_ll, choisie par le modèle
+
+### Fixed
+
+- *(whisper)* is_silence prend AudioFeatures après fusion de main
+- *(serve)* sérialiser les tests qui écrivent les atomiques de rechargement
+- *(decode)* tampon de transposition qmv bf16 déclaré en uint4
+- *(denoise)* fusion de main, multi-cœur exact avec Math et chemin GPU
+- *(poids)* offsets des vues mmap liés partout, bf16 dense toujours copié
+- *(denoise)* invariants, gardes de forme et cache des noyaux du chemin GPU DFN3
+- *(stt)* déclarer les kill-switches dans runtime_flags et prouver l'identité résidente
+
+### Other
+
+- Merge pull request #279 from azerozero/feat/dfn3-faible-latence
+- Merge pull request #280 from azerozero/perf/bf16-stage-defaut
+- Merge pull request #252 from azerozero/perf/stt-tts-suite
+- *(decode)* noyau qmv bf16 à blocs de 256 activé par défaut
+- Merge remote-tracking branch 'origin/main' into perf/stt-tts-suite
+- Merge pull request #275 from azerozero/perf/denoise-mc-exact
+- Merge pull request #276 from azerozero/perf/decode-bf16-gemv
+- *(decode)* identité au bit du qmv bf16 aussi sans fast-math
+- Merge remote-tracking branch 'origin/main' into perf/denoise-mc-exact
+- Merge pull request #273 from azerozero/perf/poids-partages
+- *(decode)* qmv bf16 à lectures vectorisées, identique au bit, en opt-in
+- *(denoise)* multi-cœur exact au bit près, GRU séquentiels
+- Merge pull request #272 from azerozero/perf/denoise-gpu-exact
+- *(poids)* poids quantifiés partagés entre processus par mmap opt-in
+- *(denoise)* réseau DFN3 en lot sur GPU Metal pour les fichiers longs, identique au bit au CPU commun
+- *(tts)* lire le QKV du talker sans copie quand les poids sont adossés au stockage
+- *(tts)* prouver que les couches du talker fusionnées sont encodées
+- intégrer main et préserver les optimisations audio
+- fusionner les derniers correctifs audio de main
+- *(tts)* comparer les couches du talker fusionnées au bit près
+- intégrer les dernières évolutions de main
+- fusionner main dans la suite STT et TTS
+- *(stt)* garder les features sur le GPU, attention decode bf16 en opt-in
+- *(tts)* encoder les couches du talker en 8 dispatches
+- *(stt)* calculer le log-mel par trames en parallèle
+
 ## [0.3.14](https://github.com/azerozero/saragossa/compare/v0.3.13...v0.3.14) - 2026-11-18
 
 ### Added
