@@ -163,7 +163,8 @@ fn synthetic_bf16(
     let values: Vec<f32> = (0..out_dim * in_dim)
         .map(|i| {
             let v = ((i * 40_503 + seed * 7919) % 997) as f32 / 997.0 - 0.5;
-            f32::from_bits(v.to_bits() & 0xffff_0000) * 0.4
+            // Tronqué après l'échelle : la référence CPU lit exactement le poids bf16.
+            f32::from_bits((v * 0.4).to_bits() & 0xffff_0000)
         })
         .collect();
     let bits: Vec<u8> = values
