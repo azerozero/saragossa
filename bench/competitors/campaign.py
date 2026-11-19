@@ -116,7 +116,7 @@ SOURCES = {
              "--spec-draft-n-max 1, DFlash --spec-draft-n-max 3, cache de prompt coupé",
     "mlx": "night1 matrix.frozen.json : --prefill-step-size 2048, cache de prompt 0, un flux",
     "llmd": "night1 matrix.frozen.json : --token-batch-size=2048 --prefill-chunk-size=2048 "
-            "--topk=1, fractions 0,5/0,5 (4 bits) ; BF16 : 0,85/0,3 pour loger 54 Go ; "
+            "--top-k=1 (--topk retiré en 20261114), fractions 0,5/0,5 (4 bits) ; BF16 : 0,85/0,3 pour loger 54 Go ; "
             "drafter natif retenté (en échec avec 20261029)",
     "ollama": "envconfig v0.40.16 : OLLAMA_FLASH_ATTENTION=1, KV f16, NUM_PARALLEL=1, "
               "KEEP_ALIVE=-1, num_gpu 999 ; GGUF locaux par Modelfile (pas de spéculatif GGUF)",
@@ -191,7 +191,7 @@ def configs(model, w, eng, port=PORT):
             ["--gpu-memory-fraction=0.85", "--cache-memory-fraction=0.3"]
         for mode in ("ar", "native"):
             argv = [str(eng["llmd"]["bin"]), f"--model={llmd_ckpt}", f"--listen=127.0.0.1:{port}",
-                    "--batch-size=1", f"--max-context-len={CTX}", "--model-name=qwen38", "--topk=1",
+                    "--batch-size=1", f"--max-context-len={CTX}", "--model-name=qwen38", "--top-k=1",
                     "--token-batch-size=2048", "--prefill-chunk-size=2048", *frac]
             if mode == "native":
                 argv.append("--speculative-drafter-model=native")
@@ -220,9 +220,8 @@ def configs(model, w, eng, port=PORT):
                                         "argv": base + ["-m", str(w["bf16"])] + quant + extra,
                                         "files": [w["bf16"]] + files}
     else:
-        # Checkpoint MLX 4 bits (AFQ) : chargement documenté pour mlx-community, sans tête MTP.
-        out["mistralrs-ar"] = {"engine": "mistralrs", "env": {}, "model_name": None,
-                               "argv": base + ["-m", str(w["mlx"])], "files": [w["mlx"]]}
+        out["mistralrs-ar"] = {"unsupported": "mistral.rs 0.9.5 refuse le MLX 4 bits MoE "
+                                              "(shape mismatch mlp.gate, essai du 19 nov.) ; pas de BF16 local"}
         out["mistralrs-mtp"] = out["mistralrs-dflash"] = {
             "unsupported": "pas de BF16 local ; MTP/DFlash mistral.rs documentés pour Qwen3.5/3.8 dense"}
     out["mlc-ar"] = {"unsupported": "MLC-LLM : pas de release GitHub ni de brew officiel "
@@ -284,6 +283,9 @@ def build_prompts(model_dir, source_dir, out_path, lengths):
     files = sorted(pathlib.Path(source_dir).rglob("*.rs"))
     doc = "".join(f"// {f.relative_to(source_dir)}\n{f.read_text(errors='replace')}\n"
                   for f in files)
+    # Les sources citent des tokens spéciaux (<|im_end|>, <|image_pad|>…) : tokenisés
+    # comme tels, ils coupent le message ou passent pour de la vision (19 nov.).
+    doc = SPECIAL.sub("", doc)
 
     def count(chars):
         content = NONCE_LINE.format(nonce="0" * 16) + doc[:chars] + INSTRUCTION
@@ -306,6 +308,9 @@ def build_prompts(model_dir, source_dir, out_path, lengths):
         prompts[str(target)] = {"content": content, "prompt_tokens": n,
                                 "sha256": hashlib.sha256(content.encode()).hexdigest()}
     pathlib.Path(out_path).write_text(json.dumps(prompts))
+
+
+SPECIAL = re.compile(r"<\|[^|<>\s]{1,40}\|>")
 
 
 def content_with_nonce(prompt, value):
@@ -953,6 +958,7 @@ def _self_check():
     assert "--quant" in c4["mistralrs-ar"]["argv"]
     assert "--quant" not in configs("27b-bf16", inv["27b-bf16"], eng)["mistralrs-ar"]["argv"]
     assert c4["sar-ar"]["env"]["SARAGOSSA_RUST_MTP_DECODE"] == "0"
+    assert SPECIAL.sub("", "a<|im_end|>b<|image_pad|>c || x|y") == "abc || x|y"
 
 
 if __name__ == "__main__":
