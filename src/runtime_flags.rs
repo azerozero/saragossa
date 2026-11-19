@@ -1513,6 +1513,17 @@ pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM", true))
 }
 
+/// Même plancher abaissé (512) pour les Qwen et Gemma
+/// (`SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM`, défaut 0). Au prefill du 35B-A3B,
+/// l'expert partagé (2048→512→2048), k/v (2048→512) passent du qmv ligne à
+/// ligne au bf16×3. Arithmétique différente du qmv f32 : opt-in tant que le
+/// protocole KL corpus n'a pas tranché.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn qwen_small_nax_gemm_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM", false))
+}
+
 /// GEMM NA u4 tuilé bf16×3, au lieu du qmv f32, pour les seules projections
 /// k/v des couches full-attention du modèle cible quand c'est un Qwen dense
 /// (sans experts ni sinks) à k/v 5120→1024 en u4 gs64, comme Qwen3.8 27B.

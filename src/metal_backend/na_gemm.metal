@@ -16,6 +16,11 @@ using namespace mpp;
 #ifndef NAX_KK_UNROLL
 #define NAX_KK_UNROLL _Pragma("clang loop unroll(full)")
 #endif
+// Déroulement du gate+up fusionné, vide par défaut (le déroulement complet le
+// ralentit) ; la sonde `nax_kk_unroll_probe` essaie un déroulement partiel.
+#ifndef NAX_KK_UNROLL_GU
+#define NAX_KK_UNROLL_GU
+#endif
 kernel void gemm_nax(device const bfloat* Ap [[buffer(0)]],
                      device const bfloat* Bp [[buffer(1)]],
                      device float* Cp         [[buffer(2)]],
@@ -717,6 +722,7 @@ kernel void gemm_nax_coop_qb_tiled_u4_gate_up_swiglu(
     load_b_tile_quant_u4_gs64_vec(Wg, Gp, Gs, Gb, n0, k, N, K, lid);
     load_b_tile_quant_u4_gs64_vec(Wu, Up, Us, Ub, n0, k, N, K, lid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    NAX_KK_UNROLL_GU
     for (uint kk = 0; kk < BK; kk += 16u) {
       metal::vec<bfloat,8> af0, af1, b0, b1;
       if (m0 + 32u <= M) {

@@ -449,8 +449,17 @@ fn nax_kk_unroll_probe() -> Result<()> {
     let libs = [
         ("unroll", compile("")?),
         ("plain", compile("#define NAX_KK_UNROLL\n")?),
+        (
+            "gu2",
+            compile("#define NAX_KK_UNROLL_GU _Pragma(\"clang loop unroll_count(2)\")\n")?,
+        ),
     ];
-    let m = 1024_usize;
+    // NOTE: M réglable (`SARAGOSSA_TEST_UNROLL_M`) pour sonder la forme du
+    // prefill (4096) où A ne tient plus dans le SLC.
+    let m = std::env::var("SARAGOSSA_TEST_UNROLL_M")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1024);
     let time = |encode: &dyn Fn(&ComputeCommandEncoderRef)| -> Result<f64> {
         let mut times = Vec::new();
         for trial in 0..9 {
@@ -468,7 +477,14 @@ fn nax_kk_unroll_probe() -> Result<()> {
         times.sort_by(f64::total_cmp);
         Ok(times[3])
     };
-    for (n, k) in [(17408, 5120), (5120, 17408), (1024, 5120)] {
+    for (n, k) in [
+        (17408, 5120),
+        (5120, 17408),
+        (10240, 5120),
+        (6144, 5120),
+        (5120, 6144),
+        (1024, 5120),
+    ] {
         let u4 = |seed: f32| -> Result<_> {
             let w = LinearWeight::AffineQuantized(test_affine(n, k, seed)?);
             match metal.resolve_linear_weight_buffers(&w, "unroll_u4")? {
