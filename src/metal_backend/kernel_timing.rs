@@ -41,6 +41,8 @@ pub(super) struct PrefillKernelTiming {
     next_sample: usize,
     mode: SamplingMode,
     pairs: Vec<SamplePair>,
+    /// Sections encodées sans timestamps une fois le tampon plein.
+    dropped: usize,
 }
 
 impl PrefillKernelTiming {
@@ -118,6 +120,7 @@ impl PrefillKernelTiming {
             next_sample: 0,
             mode,
             pairs: Vec::new(),
+            dropped: 0,
         })
     }
 
@@ -125,16 +128,13 @@ impl PrefillKernelTiming {
         matches!(self.mode, SamplingMode::DispatchBoundary)
     }
 
-    fn reserve_pair(&mut self, label: &'static str) -> Result<SamplePair> {
-        let end = self
-            .next_sample
-            .checked_add(1)
-            .ok_or_else(|| InferError::Metal("index sample GPU timing deborde".to_string()))?;
+    /// Réserve deux échantillons ; `None` une fois le tampon plein (le profil
+    /// est alors tronqué, les sections suivantes ne sont pas chronométrées).
+    fn reserve_pair(&mut self, label: &'static str) -> Option<SamplePair> {
+        let end = self.next_sample.checked_add(1)?;
         if end >= self.sample_count {
-            return Err(InferError::Metal(format!(
-                "MTLCounterSampleBuffer trop petit: besoin index {end}, capacite {}",
-                self.sample_count
-            )));
+            self.dropped += 1;
+            return None;
         }
         let pair = SamplePair {
             label,
@@ -142,7 +142,7 @@ impl PrefillKernelTiming {
             end,
         };
         self.next_sample = end + 1;
-        Ok(pair)
+        Some(pair)
     }
 
     fn encoder_attachment(
@@ -217,10 +217,11 @@ impl PrefillKernelTiming {
         let mut sorted = rows.into_iter().collect::<Vec<_>>();
         sorted.sort_by_key(|(_, row)| std::cmp::Reverse(row.total_ns));
         eprintln!(
-            "gpu_timestamps summary mode={:?} samples={} used_pairs={} total_ms={:.3}",
+            "gpu_timestamps summary mode={:?} samples={} used_pairs={} dropped_sections={} total_ms={:.3}",
             self.mode,
             self.next_sample,
             self.pairs.len(),
+            self.dropped,
             denominator as f64 / 1.0e6
         );
         for (label, accum) in sorted {
@@ -266,7 +267,16 @@ where
         return encode(encoder);
     };
 
-    let pair = timer.reserve_pair(label)?;
+    let Some(pair) = timer.reserve_pair(label) else {
+        // Tampon plein : encode sans timestamps plutôt que d'échouer.
+        if let Some(encoder) = fallback_encoder {
+            return encode(encoder);
+        }
+        let encoder = command_buffer.new_compute_command_encoder();
+        let result = encode(encoder);
+        encoder.end_encoding();
+        return result;
+    };
     match timer.mode {
         SamplingMode::DispatchBoundary => {
             let encoder = fallback_encoder.ok_or_else(|| {

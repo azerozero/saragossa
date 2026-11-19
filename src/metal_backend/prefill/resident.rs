@@ -1059,6 +1059,11 @@ impl MetalExecutor {
                     )?;
                     current_buffer = chunk_input.clone();
                 }
+                // Portée par défaut du GEMM bf16 à un produit : couches d'un LLM
+                // Qwen dense entièrement bf16, hors tête MTP (encodée après).
+                let x1_scope = crate::runtime_flags::DenseBf16X1Scope::enter(
+                    all_dense_bf16_qwen_tails(layers),
+                );
                 for (layer_index, layer) in layers.iter().enumerate() {
                     let layer_spec = PrefillAttentionSpec {
                         seq: chunk.rows,
@@ -1205,6 +1210,7 @@ impl MetalExecutor {
                         }
                     }
                 }
+                drop(x1_scope);
                 if let Some(seed) = mtp_seed.as_deref_mut() {
                     self.run_resident_prefill_section(
                         &mut encode_context,
@@ -2314,6 +2320,21 @@ fn shared_kv_rows(
             )
         })
     }
+}
+
+/// Vrai si chaque couche porte la queue dense Qwen à poids bf16 : un modèle
+/// quantifié (tenseurs bf16 résiduels), Gemma ou MoE garde le GEMM hi + lo.
+fn all_dense_bf16_qwen_tails(layers: &[PrefillMoeLayer<'_>]) -> bool {
+    !layers.is_empty()
+        && layers.iter().all(|layer| {
+            matches!(
+                layer.tail,
+                PrefillMoeTail::Dense { gate_proj, up_proj, down_proj }
+                    if [gate_proj, up_proj, down_proj]
+                        .iter()
+                        .all(|linear| matches!(linear.weight(), crate::LinearWeight::DenseBf16(_)))
+            )
+        })
 }
 
 #[cfg(test)]

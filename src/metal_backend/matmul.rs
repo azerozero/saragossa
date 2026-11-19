@@ -346,17 +346,21 @@ impl MetalExecutor {
             )));
         }
         // NOTE: GEMM bf16 à un produit (activation arrondie une fois en bf16)
-        // pour les modèles de décision et, par défaut, le prefill LLM : KL du
-        // 27B BF16 dans docs/perf/prefill-bf16.md. `SARAGOSSA_RUST_DENSE_BF16_GEMM_X1=0`
-        // rétablit la correction hi + lo hors décision.
+        // pour les modèles de décision et, par défaut, les couches du prefill
+        // résident d'un LLM Qwen dense bf16 (`DenseBf16X1Scope`) ; ailleurs
+        // (decode, vérification, tête MTP, drafter, Gemma, modèles quantifiés)
+        // hi + lo. KL du 27B BF16 dans docs/perf/prefill-bf16.md.
         if let Some(pso) = self.na_gemm_bf16_nt_bn128.as_ref().filter(|_| {
             (crate::runtime_flags::decision_gemm_bf16_enabled()
                 || crate::runtime_flags::dense_bf16_gemm_x1_enabled())
                 && out_dim % 128 == 0
                 && can_use_dense_bf16_gemm(batch, in_dim, out_dim)
         }) {
-            let len = checked_len(batch, in_dim, "décision GEMM A bf16")?;
-            let lhs_bf16 = self.private_bf16_buffer(len, "decision_gemm_lhs_bf16")?;
+            // NOTE: scratch bf16 M×K mis en cache par longueur : un tampon par
+            // K distinct (5120, 6144, 17408 sur le 27B), soit 2·M·K octets,
+            // 142 Mo pour le down_proj à 4096 lignes et 285 Mo à 8192.
+            let len = checked_len(batch, in_dim, "GEMM bf16 un produit A bf16")?;
+            let lhs_bf16 = self.private_bf16_buffer(len, "dense_bf16_gemm_lhs_bf16")?;
             self.encode_f32_to_bf16(encoder, lhs, &lhs_bf16, len)?;
             let mnk = [
                 checked_u32(batch, "bf16 gemm batch")?,

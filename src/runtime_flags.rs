@@ -1719,16 +1719,48 @@ pub(crate) fn dense_bf16_qmv_stage_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE", true))
 }
 
-/// GEMM matmul2d bf16 à un seul produit au prefill des poids bf16 denses :
+#[cfg(all(target_os = "macos", feature = "metal"))]
+thread_local! {
+    static DENSE_BF16_X1_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// GEMM matmul2d bf16 à un seul produit sur les poids bf16 denses :
 /// l'activation est arrondie une fois en bf16 au lieu d'être scindée hi + lo,
 /// deux fois moins de MMA (prefill 27B BF16 −36 à −44 %, KL moyen ≤ 3e-5,
-/// docs/perf/prefill-bf16.md). Change l'arithmétique du prefill (voir
-/// docs/perf/greedy-identity.md). Défaut ON ; kill-switch
-/// `SARAGOSSA_RUST_DENSE_BF16_GEMM_X1=0` (GEMM hi + lo).
+/// docs/perf/prefill-bf16.md). Change l'arithmétique (voir
+/// docs/perf/greedy-identity.md). Par défaut, seulement dans la portée
+/// [`DenseBf16X1Scope`] : couches du prefill résident d'un LLM Qwen
+/// dense entièrement bf16. `SARAGOSSA_RUST_DENSE_BF16_GEMM_X1=1` le force
+/// partout (tête MTP, drafter, Gemma, tenseurs bf16 des modèles quantifiés,
+/// decode et vérification si le plancher M descend sous 64) ; `=0` le coupe
+/// partout (GEMM hi + lo).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn dense_bf16_gemm_x1_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1", true))
+    static FORCED: OnceLock<Option<bool>> = OnceLock::new();
+    FORCED
+        .get_or_init(|| {
+            env_var("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1").and_then(|v| env_flag_value(&v))
+        })
+        .unwrap_or_else(|| DENSE_BF16_X1_SCOPE.with(std::cell::Cell::get))
+}
+
+/// Portée par défaut du GEMM bf16 à un produit, refermée au `drop`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) struct DenseBf16X1Scope(bool);
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl DenseBf16X1Scope {
+    /// Ouvre (ou ferme, avec `false`) la portée sur ce thread.
+    pub(crate) fn enter(enabled: bool) -> Self {
+        Self(DENSE_BF16_X1_SCOPE.with(|value| value.replace(enabled)))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl Drop for DenseBf16X1Scope {
+    fn drop(&mut self) {
+        DENSE_BF16_X1_SCOPE.with(|value| value.set(self.0));
+    }
 }
 
 /// GEMM NA tuilé des poids bf16 denses au prefill (batch ≥ 64). Défaut ON ;
