@@ -110,13 +110,14 @@ pub fn denoise_threads() -> usize {
     })
 }
 
-/// Retour à la libm pour `exp`/`tanh`/sigmoïde du débruitage CPU
-/// (`SARAGOSSA_DENOISE_LIBM=1`, défaut 0 : variante `exact_math` commune, même
-/// sortie au bit que le multi-cœur et le GPU). Kill-switch de repli.
+/// Variante mathématique commune (`exp`/`tanh`/sigmoïde `exact_math`) pour le
+/// débruitage CPU (`SARAGOSSA_DENOISE_COMMON=1`, défaut 0 : libm). Sortie
+/// identique au bit entre CPU 1 thread, multi-cœur et GPU, pour environ 4 % de
+/// temps CPU en plus (mesuré).
 #[cfg(feature = "denoise")]
-pub fn denoise_libm() -> bool {
+pub fn denoise_common() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DENOISE_LIBM", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DENOISE_COMMON", false))
 }
 
 /// Réseau DFN3 en lot sur GPU Metal pour `saragossa enhance`

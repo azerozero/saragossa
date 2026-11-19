@@ -167,8 +167,8 @@ impl DeepFilterNet3 {
         Ok(out)
     }
 
-    /// [`Self::enhance`] en variante `Math::Libm` (historique, kill-switch
-    /// `SARAGOSSA_DENOISE_LIBM`), indépendamment du flag.
+    /// [`Self::enhance`] en variante `Math::Libm` (historique, défaut),
+    /// indépendamment de `SARAGOSSA_DENOISE_COMMON`.
     ///
     /// # Errors
     /// Propage les erreurs du traitement des trames.

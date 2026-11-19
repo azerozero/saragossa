@@ -657,12 +657,10 @@ synthèse restent sur CPU. Le fichier entier est gardé en mémoire.
 La sortie est identique au bit au CPU en variante `Math::Common`
 (`enhance_common`) : chaque sortie est calculée par un thread dans l'ordre de
 sommation du CPU, sans fast-math ni FMA, et `exp`/`tanh`/sigmoïde suivent
-`exact_math` des deux côtés. Cette variante est désormais le défaut du CPU :
-CPU 1 thread, multi-cœur et GPU donnent la même sortie. Kill-switch
-`SARAGOSSA_DENOISE_LIBM=1` : retour à la libm historique (`enhance_libm`), qui
-s'écarte de quelques ulp.
-
-Sur `long.wav`, `cmp` : CPU commun 1 thread = multi-cœur N=2 = N=8 = GPU ; la libm diffère. Oracle PyTorch inchangé (SNR 133,5 dB).
+`exact_math` des deux côtés. Le GPU utilise toujours cette variante. Le CPU garde la libm par défaut :
+pour une sortie identique entre CPU 1 thread, multi-cœur et GPU, activer
+`SARAGOSSA_DENOISE_COMMON=1` (coût mesuré : environ 4 % de temps CPU en plus).
+Sur `long.wav`, `cmp` avec le flag : CPU 1 thread = N=2 = N=8 = GPU.
 
 Mesures (M5 Max, clip de 292,75 s, charge 5 à 15, non publiables comme bench) :
 
