@@ -450,6 +450,54 @@ impl MetalExecutor {
         )
     }
 
+    /// Frontend conv puis encodeur, sortie laissée sur le GPU : supprime le
+    /// readback de la conv, son ré-upload, le readback des features et leur
+    /// ré-upload pour le KV cross. Copies f32 exactes en moins : les features
+    /// sont identiques au bit à [`Self::encode_whisper_conv`] suivi de
+    /// [`Self::encode_whisper_encoder`].
+    ///
+    /// NOTE: le buffer rendu est mémoïsé par label (`we_normed`) ; il doit être
+    /// consommé avant le prochain encodage Whisper sur cet exécuteur. Invariant
+    /// tenu par serve : `AudioState::with_stt` prend `&mut self` (src/serve/audio.rs:208)
+    /// depuis `ServeState::audio_mut(&mut self)` (src/serve/state.rs:152), tous deux
+    /// sur l'unique thread moteur (`assert_engine_thread`, src/serve/state.rs:211),
+    /// et l'exécuteur STT (src/serve/audio.rs:244) n'est partagé avec aucun autre
+    /// modèle (la diarisation a le sien, audio.rs:260) : deux STT ne se chevauchent pas.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde ou si Metal échoue.
+    pub(crate) fn encode_whisper_features_resident(
+        &self,
+        nlc: &Tensor,
+        conv: &WhisperConvWeights,
+        enc: &WhisperResidentEncoder,
+    ) -> Result<WhisperResidentMatrix> {
+        let h = self.encode_whisper_conv_resident(nlc, conv)?;
+        self.encode_whisper_encoder_buffer(&h.buffer, h.rows, h.cols, enc, h.rows)
+    }
+
+    /// KV decode depuis des features restées sur le GPU
+    /// ([`Self::encode_whisper_features_resident`]).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les formes divergent ou si Metal échoue.
+    pub(crate) fn build_whisper_decode_kv_from_resident(
+        &self,
+        features: &WhisperResidentMatrix,
+        dec: &WhisperResidentDecoder,
+        capacity: usize,
+    ) -> Result<WhisperDecodeKv> {
+        self.build_whisper_decode_kv_resident_from_buffer(
+            &features.buffer,
+            features.rows,
+            features.cols,
+            dec,
+            capacity,
+        )
+    }
+
     fn encode_whisper_encoder_buffer(
         &self,
         h: &BufferRef,
@@ -820,6 +868,46 @@ impl MetalExecutor {
         self.encode_dense_qmv(encoder, lhs, &proj.weight, out, 0, 1, out_dim, in_dim)
     }
 
+    /// QMV d'une projection d'attention decode : poids bf16 en opt-in
+    /// (`SARAGOSSA_STT_DEC_ATTN_BF16`), sinon f32 inchangé. `out_offset` sert à
+    /// l'append K/V.
+    #[expect(clippy::too_many_arguments, reason = "qmv bas niveau (dims + buffers)")]
+    fn encode_decode_attn_qmv(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs: &BufferRef,
+        proj: &WhisperResidentProj,
+        out: &BufferRef,
+        out_offset: u64,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
+        if super::whisper_decode_attn_bf16_enabled() {
+            if let Some(weight_bf16) = proj.weight_bf16.as_ref() {
+                return self.encode_dense_qmv_rhs_bf16_at(
+                    encoder,
+                    lhs,
+                    weight_bf16,
+                    out,
+                    out_offset,
+                    1,
+                    out_dim,
+                    in_dim,
+                );
+            }
+        }
+        self.encode_dense_qmv(
+            encoder,
+            lhs,
+            &proj.weight,
+            out,
+            out_offset,
+            1,
+            out_dim,
+            in_dim,
+        )
+    }
+
     /// Ajoute le biais si présent (k_proj est biasless dans Whisper).
     fn encode_proj_bias(
         &self,
@@ -916,28 +1004,10 @@ impl MetalExecutor {
             let self_keys = &kv.self_keys[i];
             let self_values = &kv.self_values[i];
             // Self-attn : q→scratch, k/v→append device-side dans le KV à la ligne `len`.
-            self.encode_dense_qmv(encoder, &normed, &layer.q.weight, &q, 0, 1, dim, dim)?;
+            self.encode_decode_attn_qmv(encoder, &normed, &layer.q, &q, 0, dim, dim)?;
             self.encode_proj_bias(encoder, &q, layer.q.bias.as_ref(), 1, dim)?;
-            self.encode_dense_qmv(
-                encoder,
-                &normed,
-                &layer.k.weight,
-                self_keys,
-                kv_off,
-                1,
-                dim,
-                dim,
-            )?;
-            self.encode_dense_qmv(
-                encoder,
-                &normed,
-                &layer.v.weight,
-                self_values,
-                kv_off,
-                1,
-                dim,
-                dim,
-            )?;
+            self.encode_decode_attn_qmv(encoder, &normed, &layer.k, self_keys, kv_off, dim, dim)?;
+            self.encode_decode_attn_qmv(encoder, &normed, &layer.v, self_values, kv_off, dim, dim)?;
             if let Some(bias) = layer.v.bias.as_ref() {
                 self.encode_add_row_bias(encoder, self_values, kv_off, bias, 1, dim)?;
             }
@@ -951,7 +1021,7 @@ impl MetalExecutor {
                 head_dim,
                 self_len,
             )?;
-            self.encode_dense_qmv(encoder, &ctx, &layer.o.weight, &proj, 0, 1, dim, dim)?;
+            self.encode_decode_attn_qmv(encoder, &ctx, &layer.o, &proj, 0, dim, dim)?;
             self.encode_proj_bias(encoder, &proj, layer.o.bias.as_ref(), 1, dim)?;
             // h += attn ; normed = cross_ln(h).
             self.encode_add_layer_norm_rows(
@@ -967,16 +1037,7 @@ impl MetalExecutor {
                 eps,
             )?;
             // Cross-attn sur le KV statique.
-            self.encode_dense_qmv(
-                encoder,
-                &normed,
-                &layer.cross_q.weight,
-                &cross_q,
-                0,
-                1,
-                dim,
-                dim,
-            )?;
+            self.encode_decode_attn_qmv(encoder, &normed, &layer.cross_q, &cross_q, 0, dim, dim)?;
             self.encode_proj_bias(encoder, &cross_q, layer.cross_q.bias.as_ref(), 1, dim)?;
             self.encode_whisper_attn_decode(
                 encoder,
@@ -988,7 +1049,7 @@ impl MetalExecutor {
                 head_dim,
                 kv.cross_len,
             )?;
-            self.encode_dense_qmv(encoder, &ctx, &layer.cross_o.weight, &proj, 0, 1, dim, dim)?;
+            self.encode_decode_attn_qmv(encoder, &ctx, &layer.cross_o, &proj, 0, dim, dim)?;
             self.encode_proj_bias(encoder, &proj, layer.cross_o.bias.as_ref(), 1, dim)?;
             // h += cross ; normed = final_ln(h).
             self.encode_add_layer_norm_rows(

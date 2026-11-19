@@ -269,6 +269,26 @@ pub fn env_flag(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Features STT relues par l'hôte au lieu de rester sur le GPU. Défaut OFF ;
+/// `SARAGOSSA_STT_FEATURES_HOST=1` rétablit le readback.
+#[cfg(all(feature = "stt", target_os = "macos", feature = "metal"))]
+pub(crate) fn stt_features_host() -> bool {
+    env_flag("SARAGOSSA_STT_FEATURES_HOST", false)
+}
+
+/// Log-mel séquentiel. Défaut OFF ; `SARAGOSSA_STT_MEL_SERIAL=1` désactive rayon.
+#[cfg(feature = "stt")]
+pub(crate) fn stt_mel_serial() -> bool {
+    env_flag("SARAGOSSA_STT_MEL_SERIAL", false)
+}
+
+/// Poids bf16 pour l'attention du decode Whisper. Défaut OFF ;
+/// `SARAGOSSA_STT_DEC_ATTN_BF16=1` l'active.
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(crate) fn stt_dec_attn_bf16() -> bool {
+    env_flag("SARAGOSSA_STT_DEC_ATTN_BF16", false)
+}
+
 pub(crate) fn env_flag_value(value: &str) -> Option<bool> {
     let value = value.trim();
     if value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on") {
@@ -863,6 +883,7 @@ thread_local! {
     static QKV_CONCAT_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
     static PREFILL_RESIDENT_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
     static ROPE_APPEND_KV_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    static TTS_TALKER_FUSED_KERNELS_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 /// Force la rotation de K fusionnée à l'append K/V sur ce thread le temps
@@ -1691,11 +1712,11 @@ pub(crate) fn prefill_kv_shared_enabled() -> bool {
 }
 
 /// QMV bf16 à lectures vectorisées et transposition threadgroup, identique au
-/// bit au qmv par ligne. Opt-in : `SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE=1`.
+/// bit au qmv par ligne. Actif par défaut ; `SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE=0` rend l'ancien noyau.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn dense_bf16_qmv_stage_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE", true))
 }
 
 /// GEMM matmul2d bf16 à un seul produit au prefill des poids bf16 denses :
@@ -3111,6 +3132,27 @@ mod tests {
         std::env::remove_var("RETI_TEST_PRIORITE");
     }
 
+    #[cfg(feature = "stt")]
+    #[test]
+    fn stt_kill_switches_honour_zero_and_one() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        for (name, read) in [
+            ("SARAGOSSA_STT_MEL_SERIAL", stt_mel_serial as fn() -> bool),
+            (
+                "SARAGOSSA_STT_DEC_ATTN_BF16",
+                stt_dec_attn_bf16 as fn() -> bool,
+            ),
+        ] {
+            std::env::remove_var(name);
+            assert!(!read(), "{name} absent");
+            std::env::set_var(name, "0");
+            assert!(!read(), "{name}=0");
+            std::env::set_var(name, "1");
+            assert!(read(), "{name}=1");
+            std::env::remove_var(name);
+        }
+    }
+
     #[test]
     fn env_var_falls_back_to_legacy_prefix() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -3274,6 +3316,36 @@ pub(crate) fn tts_cp_fused_enabled() -> bool {
 pub(crate) fn tts_cp_fused_kernels_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_CP_FUSED_KERNELS", true))
+}
+
+/// Couches du talker TTS dans la même couche fusionnée à 8 dispatches que le
+/// code predictor (QKV concaténé copié une fois, ~190 Mo en u6 sur le 1.7B).
+/// Sorties identiques au bit au chemin général. Défaut ON ;
+/// `SARAGOSSA_TTS_TALKER_FUSED_KERNELS=0` rétablit les 16 dispatches par couche.
+#[cfg(feature = "tts")]
+pub(crate) fn tts_talker_fused_kernels_enabled() -> bool {
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    if let Some(forced) = TTS_TALKER_FUSED_KERNELS_TEST_OVERRIDE.with(Cell::get) {
+        return forced;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_TALKER_FUSED_KERNELS", true))
+}
+
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "tts"))]
+thread_local! {
+    /// Couches encodées par la voie TTS fusionnée sur ce thread, pour prouver
+    /// qu'un test compare bien deux chemins distincts.
+    pub(crate) static TTS_FUSED_LAYER_ENCODES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Force les couches du talker sur ce thread, puis rétablit le réglage précédent.
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "tts"))]
+pub(crate) fn with_tts_talker_fused_kernels_override<R>(
+    enabled: bool,
+    run: impl FnOnce() -> R,
+) -> R {
+    with_test_override(&TTS_TALKER_FUSED_KERNELS_TEST_OVERRIDE, enabled, run)
 }
 
 /// Codec TTS streaming sur un thread dédié, en recouvrement de la génération

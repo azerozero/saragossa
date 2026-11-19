@@ -111,6 +111,46 @@ python3 -I -B tools/voice/convert_dfn3.py \
 saragossa enhance --model dfn3.safetensors --input bruit.wav --output propre.wav
 ```
 
+### Variante faible latence (DeepFilterNet3_ll, opt-in)
+
+Le même port charge `DeepFilterNet3_ll` (`Rikorose/DeepFilterNet`, MIT/Apache),
+choisi par le fichier de poids : sans anticipation (`conv_lookahead` et
+`df_lookahead` à 0), le retard tombe de 30 à 10 ms (`DfStream::delay_samples`,
+plus le hop en remplissage, soit 20 ms au lieu de 40). Le réseau est plus
+large : GRU de 512 au lieu de 256, trois couches pour le GRU DF, noyau
+temporel 2 sur les convolutions internes, 16 groupes pour `df_fc_emb`, soit
+9,7 M paramètres contre 2,1 M. Seul le chemin CPU mono-cœur est porté :
+`SARAGOSSA_DENOISE_GPU` renvoie une erreur et le multi-cœur retombe sur un
+cœur. Le DFN3 standard reste identique au bit (`cmp` sur `long.wav`, 1 et
+8 cœurs).
+
+Seul l'export ONNX est publié. `tools/voice/convert_dfn3_onnx.py` en lit les
+poids sans exécuter le graphe (BatchNorm déjà repliée, GRU remis dans l'ordre
+PyTorch) et range `config.ini` dans les métadonnées safetensors. Appliqué à
+l'export ONNX du DFN3 standard, il redonne au bit les poids du checkpoint
+PyTorch (BatchNorm repliée comprise).
+
+```bash
+python3 -I -B tools/voice/convert_dfn3_onnx.py DeepFilterNet3_ll_onnx/tmp/export dfn3_ll.safetensors
+saragossa enhance --model dfn3_ll.safetensors --input bruit.wav --output propre.wav
+```
+
+Oracle onnxruntime (`tools/voice/dfn3_onnx_ref.py`, test ignoré
+`denoise::tests::dfn3_ll_matches_onnxruntime`), sur les features du golden
+standard, tolérances figées avant le premier passage (masque et coefficients
+≤ 1e-3) : masque 7,8e-7, coefficients 2,5e-6, LSNR 2,6e-5 dB. Le script
+redonne le golden PyTorch standard à 9e-7 près depuis l'export ONNX standard.
+
+Qualité, mêmes 100 paires que § Qualité (SI-SDR moyen) :
+
+| SNR d'entrée | DFN3 | DFN3_ll | Écart |
+|---|---|---|---|
+| 0 dB | 10,63 dB | 10,17 dB | −0,46 dB |
+| 5 dB | 13,36 dB | 13,03 dB | −0,33 dB |
+
+Le coût par hop n'est pas encore mesuré machine calme ; le réseau fait environ
+4,5 fois plus de MAC dans les GRU.
+
 ### Débruitage continu
 
 L'entrée est moyennée en mono puis rééchantillonnée à 48 kHz, avec le même

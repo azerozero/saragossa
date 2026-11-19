@@ -84,6 +84,15 @@ struct ResidentDecode<'a> {
     kv: crate::metal_backend::WhisperDecodeKv,
 }
 
+/// Features encodeur : tenseur hôte, ou buffer resté sur le GPU depuis
+/// l'encodeur résident ([`super::WhisperEncoder::encode_samples_resident`]).
+#[derive(Clone, Copy)]
+enum AudioFeatures<'a> {
+    Host(&'a Tensor),
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    Resident(&'a crate::metal_backend::WhisperResidentMatrix),
+}
+
 enum DecodeStep {
     Advanced,
     Logits(Tensor),
@@ -174,7 +183,7 @@ impl WhisperDecoder {
         runtime: ForwardRuntime<'_>,
     ) -> Result<Vec<u32>> {
         self.generate(
-            audio_features,
+            AudioFeatures::Host(audio_features),
             prompt_tokens,
             (max_new_tokens, eot_token),
             runtime,
@@ -189,7 +198,7 @@ impl WhisperDecoder {
     /// les tokens générés après chaque ajout.
     fn generate(
         &self,
-        audio_features: &Tensor,
+        features: AudioFeatures<'_>,
         prompt_tokens: &[u32],
         (max_new_tokens, eot_token): (usize, u32),
         runtime: ForwardRuntime<'_>,
@@ -209,12 +218,20 @@ impl WhisperDecoder {
             Some(metal)
                 if crate::runtime_flags::env_var_os("SARAGOSSA_STT_DECODER_PEROP").is_none() =>
             {
+                let t_kv = std::time::Instant::now();
                 let dec = self.build_resident_decoder(metal)?;
-                let kv = metal.build_whisper_decode_kv_resident(
-                    audio_features,
-                    &dec,
-                    self.config.max_target_positions,
-                )?;
+                let capacity = self.config.max_target_positions;
+                let kv = match features {
+                    AudioFeatures::Host(audio_features) => {
+                        metal.build_whisper_decode_kv_resident(audio_features, &dec, capacity)?
+                    }
+                    AudioFeatures::Resident(matrix) => {
+                        metal.build_whisper_decode_kv_from_resident(matrix, &dec, capacity)?
+                    }
+                };
+                if crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some() {
+                    eprintln!("[dec] kv cross: {} us", t_kv.elapsed().as_micros());
+                }
                 Some(ResidentDecode { metal, dec, kv })
             }
             _ => None,
@@ -222,10 +239,17 @@ impl WhisperDecoder {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let mut resident: Option<()> = None;
 
-        let cross = if resident.is_none() {
-            self.precompute_cross_kv(audio_features, runtime)?
-        } else {
-            Vec::new()
+        let cross = match (resident.is_none(), features) {
+            (true, AudioFeatures::Host(audio_features)) => {
+                self.precompute_cross_kv(audio_features, runtime)?
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            (true, AudioFeatures::Resident(_)) => {
+                return Err(InferError::Config(
+                    "features Whisper résidentes sans décodeur résident".to_string(),
+                ));
+            }
+            (false, _) => Vec::new(),
         };
         let mut self_kv: Vec<LayerSelfKv> = (0..self.layers.len())
             .map(|_| LayerSelfKv::new(self.config.d_model))
@@ -685,15 +709,18 @@ impl WhisperModel {
         mut on_delta: Option<&mut DeltaSink<'_>>,
     ) -> Result<(String, String)> {
         if samples.len() <= super::N_SAMPLES {
-            let features = self.encode_segment(samples, runtime)?;
-            return self.decode_text(&features, lang, runtime, on_delta, false);
+            return self.decode_segment(samples, lang, runtime, on_delta, false);
         }
         let mut texts: Vec<String> = Vec::new();
         for range in super::segments::audio_segments(samples) {
-            let features = self.encode_segment(&samples[range], runtime)?;
             let separator = !texts.is_empty();
-            let (text, _) =
-                self.decode_text(&features, lang, runtime, on_delta.as_deref_mut(), separator)?;
+            let (text, _) = self.decode_segment(
+                &samples[range],
+                lang,
+                runtime,
+                on_delta.as_deref_mut(),
+                separator,
+            )?;
             if !text.is_empty() {
                 texts.push(text);
             }
@@ -708,8 +735,44 @@ impl WhisperModel {
         lang: &str,
         runtime: ForwardRuntime<'_>,
     ) -> Result<(String, String)> {
+        self.decode_segment(samples, lang, runtime, None, false)
+    }
+
+    fn decode_segment(
+        &self,
+        samples: &[f32],
+        lang: &str,
+        runtime: ForwardRuntime<'_>,
+        on_delta: Option<&mut DeltaSink<'_>>,
+        separator: bool,
+    ) -> Result<(String, String)> {
+        // Features gardées sur le GPU jusqu'au KV cross (identiques au bit :
+        // seules des copies f32 disparaissent). `SARAGOSSA_STT_FEATURES_HOST=1`
+        // rétablit le readback ; les replis per-op le rétablissent aussi.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(metal) = runtime.metal_executor() {
+            if !crate::runtime_flags::stt_features_host()
+                && crate::runtime_flags::env_var_os("SARAGOSSA_STT_DECODER_PEROP").is_none()
+            {
+                if let Some(features) = self.encoder.encode_samples_resident(samples, metal)? {
+                    return self.decode_text(
+                        AudioFeatures::Resident(&features),
+                        lang,
+                        runtime,
+                        on_delta,
+                        separator,
+                    );
+                }
+            }
+        }
         let features = self.encode_segment(samples, runtime)?;
-        self.decode_text(&features, lang, runtime, None, false)
+        self.decode_text(
+            AudioFeatures::Host(&features),
+            lang,
+            runtime,
+            on_delta,
+            separator,
+        )
     }
 
     fn encode_segment(&self, samples: &[f32], runtime: ForwardRuntime<'_>) -> Result<Tensor> {
@@ -736,7 +799,13 @@ impl WhisperModel {
         lang: &str,
         runtime: ForwardRuntime<'_>,
     ) -> Result<(String, String)> {
-        self.decode_text(audio_features, lang, runtime, None, false)
+        self.decode_text(
+            AudioFeatures::Host(audio_features),
+            lang,
+            runtime,
+            None,
+            false,
+        )
     }
 
     fn prompt(&self, lang: &str, timestamps: bool) -> Vec<u32> {
@@ -767,7 +836,7 @@ impl WhisperModel {
     /// langue n'est jamais compté : il fait partie du préfixe, même en mode auto.
     fn is_silence(
         &self,
-        audio_features: &Tensor,
+        features: AudioFeatures<'_>,
         prompt: &[u32],
         runtime: ForwardRuntime<'_>,
     ) -> Result<bool> {
@@ -778,7 +847,7 @@ impl WhisperModel {
         let mut probe =
             TimestampRules::scoring(self.eot_token, self.no_speech_token, RulesMode::Probe);
         self.decoder.generate(
-            audio_features,
+            features,
             prompt,
             budget,
             runtime,
@@ -790,7 +859,7 @@ impl WhisperModel {
         }
         let mut plain = TimestampRules::scoring(self.eot_token, None, RulesMode::Plain);
         let generated = self.decoder.generate(
-            audio_features,
+            features,
             prompt,
             budget,
             runtime,
@@ -806,7 +875,7 @@ impl WhisperModel {
 
     fn decode_text(
         &self,
-        audio_features: &Tensor,
+        features: AudioFeatures<'_>,
         lang: &str,
         runtime: ForwardRuntime<'_>,
         on_delta: Option<&mut DeltaSink<'_>>,
@@ -815,24 +884,25 @@ impl WhisperModel {
         let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
         let prompt = self.prompt(lang, false);
         let effective_lang = if lang == "auto" { "auto" } else { lang }.to_string();
-        if self.is_silence(audio_features, &prompt, runtime)? {
+        if self.is_silence(features, &prompt, runtime)? {
             return Ok((String::new(), effective_lang));
         }
         let t_dec = std::time::Instant::now();
         let generated = match on_delta {
-            None => self.decoder.generate_greedy(
-                audio_features,
+            None => self.decoder.generate(
+                features,
                 &prompt,
-                self.token_budget(),
-                self.eot_token,
+                (self.token_budget(), self.eot_token),
                 runtime,
+                None,
+                &mut |_| Ok(()),
             )?,
             Some(on_delta) => {
                 // Redécoder le préfixe à chaque token (≤ 448) reste négligeable
                 // devant un pas GPU et suit exactement le décodage final.
                 let mut deltas = TextDeltas::new(separator);
                 let generated = self.decoder.generate(
-                    audio_features,
+                    features,
                     &prompt,
                     (self.token_budget(), self.eot_token),
                     runtime,
@@ -901,7 +971,7 @@ impl WhisperModel {
                 self.language_tokens.clone(),
             );
             let generated = self.decoder.generate(
-                &features,
+                AudioFeatures::Host(&features),
                 &prompt,
                 (self.token_budget(), self.eot_token),
                 runtime,
