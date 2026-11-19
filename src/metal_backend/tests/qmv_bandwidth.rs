@@ -198,3 +198,116 @@ fn qmv_u4_bandwidth_probe() -> Result<()> {
     );
     Ok(())
 }
+
+// NOTE: la sonde précédente garde une seule copie des poids (servie par le SLC
+// sous ~48 Mo) et mesure 8 dispatches par command buffer pour les grosses
+// formes (latence commit/wait non amortie). Ici, des copies tournantes
+// dépassent 1 Go et chaque command buffer dure ≥ 20 ms : débit DRAM du decode.
+#[test]
+#[ignore = "sonde bande passante qmv u4 en DRAM, GPU au repos"]
+fn qmv_u4_dram_bandwidth_probe() -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    for (n, k) in [
+        (5120, 17408),
+        (17408, 5120),
+        (10240, 5120),
+        (6144, 5120),
+        (5120, 6144),
+        (248_320, 5120),
+    ] {
+        let bytes = n * k * 9 / 16;
+        let copies = (1usize << 30).div_ceil(bytes).max(2);
+        let mut weights = Vec::new();
+        for _ in 0..copies {
+            weights.push([
+                metal.buffer_from_slice(&vec![0xa937_7ac5_u32; n * k / 8], "probe_packed")?,
+                metal.buffer_from_slice(&vec![0x3a80_u16; n * k / 64], "probe_scales")?,
+                metal.buffer_from_slice(&vec![0xbc80_u16; n * k / 64], "probe_biases")?,
+            ]);
+        }
+        let lhs = metal.upload_f32_buffer(&vec![0.125; k], "probe_lhs")?;
+        let out = metal.uncached_f32_buffer(n, "probe_out")?;
+        let dims = [n as u32, k as u32, (k / 8) as u32, (k / 64) as u32];
+        let reps = (10_000_000_000 / bytes).max(copies) / copies * copies;
+        let mut samples = Vec::new();
+        for trial in 0..9 {
+            let cb = metal.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&metal.affine_qmv_fast_aligned_u4_gs64_f32);
+            enc.set_buffer(0, Some(&lhs), 0);
+            enc.set_buffer(4, Some(&out), 0);
+            set_u32_bytes(enc, 5, &dims, "probe_dims")?;
+            for rep in 0..reps {
+                let [p, s, b] = &weights[rep % copies];
+                enc.set_buffer(1, Some(p), 0);
+                enc.set_buffer(2, Some(s), 0);
+                enc.set_buffer(3, Some(b), 0);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(1, (n / 8) as u64, 1),
+                    MTLSize::new(64, 1, 1),
+                );
+                post_dispatch_barrier_buffer(enc, &out);
+            }
+            enc.end_encoding();
+            let start = std::time::Instant::now();
+            commit_and_wait(cb)?;
+            if trial >= 2 {
+                samples.push(start.elapsed().as_secs_f64() / reps as f64);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        let t = samples[3];
+        eprintln!(
+            "dram qmv_u4 N={n} K={k} copies={copies} reps={reps} median={:.4}ms {:.0}GB/s",
+            t * 1e3,
+            bytes as f64 / t / 1e9
+        );
+    }
+    // gate+up+SwiGLU fusionné du 27B (17408×5120, deux matrices).
+    let (n, k) = (17408usize, 5120usize);
+    let bytes = 2 * n * k * 9 / 16;
+    let copies = (1usize << 30).div_ceil(bytes);
+    let mut weights = Vec::new();
+    for _ in 0..2 * copies {
+        weights.push([
+            metal.buffer_from_slice(&vec![0xa937_7ac5_u32; n * k / 8], "probe_packed")?,
+            metal.buffer_from_slice(&vec![0x3a80_u16; n * k / 64], "probe_scales")?,
+            metal.buffer_from_slice(&vec![0xbc80_u16; n * k / 64], "probe_biases")?,
+        ]);
+    }
+    let lhs = metal.upload_f32_buffer(&vec![0.125; k], "probe_lhs")?;
+    let out = metal.uncached_f32_buffer(n, "probe_out")?;
+    let dims = [n as u32, k as u32, (k / 8) as u32, (k / 64) as u32];
+    let reps = (10_000_000_000 / bytes).max(copies) / copies * copies;
+    let mut samples = Vec::new();
+    for trial in 0..9 {
+        let cb = metal.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&metal.affine_gate_up_swiglu_fast_u4_gs64_f32);
+        enc.set_buffer(0, Some(&lhs), 0);
+        enc.set_buffer(7, Some(&out), 0);
+        set_u32_bytes(enc, 8, &dims, "probe_dims")?;
+        for rep in 0..reps {
+            for (slot, w) in weights[2 * (rep % copies)..][..2].iter().enumerate() {
+                for (i, buf) in w.iter().enumerate() {
+                    enc.set_buffer(1 + 3 * slot as u64 + i as u64, Some(buf), 0);
+                }
+            }
+            enc.dispatch_thread_groups(MTLSize::new(1, (n / 8) as u64, 1), MTLSize::new(64, 1, 1));
+            post_dispatch_barrier_buffer(enc, &out);
+        }
+        enc.end_encoding();
+        let start = std::time::Instant::now();
+        commit_and_wait(cb)?;
+        if trial >= 2 {
+            samples.push(start.elapsed().as_secs_f64() / reps as f64);
+        }
+    }
+    samples.sort_by(f64::total_cmp);
+    eprintln!(
+        "dram gate_up_swiglu_u4 N={n} K={k} median={:.4}ms {:.0}GB/s",
+        samples[3] * 1e3,
+        bytes as f64 / samples[3] / 1e9
+    );
+    Ok(())
+}
