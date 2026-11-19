@@ -251,10 +251,14 @@ DIALECT = {
 
 def build_plan(model_order, cfgs, reps, lengths):
     """Entrées entrelacées : par modèle, round-robin des configurations, ordre
-    inversé à chaque répétition (A B C | C B A | A B C…), longueurs tournées."""
+    inversé à chaque répétition (A B C | C B A | A B C…), longueurs tournées.
+
+    Les concurrents passent d'abord ; saragossa ferme la campagne, compilé
+    depuis origin/main au début de son tour (décision du 19 nov.)."""
     entries = []
-    for model in model_order:
-        runnable = [c for c, spec in cfgs[model].items() if "unsupported" not in spec]
+    for model, last in [(m, False) for m in model_order] + [(m, True) for m in model_order]:
+        runnable = [c for c, spec in cfgs[model].items() if "unsupported" not in spec
+                    and (spec.get("engine") == "saragossa") == last]
         for rep in range(reps):
             order = runnable if rep % 2 == 0 else runnable[::-1]
             for config in order:
@@ -366,6 +370,8 @@ def engine_version(name, spec):
         return re.sub(r".*/llmd/v([^/]+)/.*", r"llmd \1", (binary.read_text()
                                                           if binary.exists() else "absent"),
                       flags=re.S)
+    if name == "saragossa":
+        return "commit noté à la compilation (tour de saragossa)"
     if not binary.exists():
         return "absent"
     lines = sh(binary, "--version").splitlines()
@@ -632,6 +638,9 @@ def run_entry(run_dir, entry_id):
     except Watchdog:
         status = "watchdog"
         return 1
+    except BaseException:
+        status = "interrupted"         # rejouée à la reprise
+        raise
     finally:
         signal.alarm(0)
         gone = server.stop() if server else True
@@ -683,7 +692,7 @@ def build_saragossa(src, lock_env, log):
     commit = sh("git", "-C", src, "rev-parse", "HEAD")
     log(f"compilation saragossa {commit[:10]} sous build.lock")
     subprocess.run([sys.executable, "-I", "-B", str(REPO / "tools/gpulock.py"), "run", "--owner",
-                    "campagne-build", "--prio", "6", "--", "taskpolicy", "-b", "cargo", "build",
+                    "campagne-build", "--prio", "2", "--", "taskpolicy", "-b", "cargo", "build",
                     "--release", "--bin", "saragossa", "--manifest-path", str(src / "Cargo.toml")],
                    check=True, env={**os.environ, "GPU_LOCK": lock_env,
                                     "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS", "4")})
@@ -725,16 +734,12 @@ def main_run(args):
     if freeze_path.exists() and not args.dry_run:
         freeze = json.loads(freeze_path.read_text())
         log(f"reprise : freeze.json existant, plan de {len(freeze['plan'])} entrées")
-        if sha256_file(freeze["engines"]["saragossa"]["bin"]) != freeze["engines"]["saragossa"]["sha256"]:
-            raise SystemExit("binaire saragossa modifié depuis le gel : refus de reprendre")
     else:
-        if args.dry_run or args.saragossa_bin:
-            sar_bin = pathlib.Path(args.saragossa_bin or args.saragossa_src) / (
-                "" if args.saragossa_bin else "target/release/saragossa")
-            commit = sh("git", "-C", sar_bin.parents[2] if not args.saragossa_bin else REPO,
-                        "rev-parse", "HEAD")
-        else:
-            sar_bin, commit = build_saragossa(args.saragossa_src, args.build_lock, log)
+        # Binaire compilé au tour de saragossa (fin de campagne), sauf --saragossa-bin.
+        sar_bin = pathlib.Path(args.saragossa_bin) if args.saragossa_bin else \
+            pathlib.Path(args.saragossa_src) / "target/release/saragossa"
+        commit = sh("git", "-C", REPO, "rev-parse", "HEAD") if args.saragossa_bin else \
+            "compilé depuis origin/main au tour de saragossa"
         eng = engines(ext, sar_bin)
         cfgs = {m: configs(m, inv[m], eng) for m in models}
         if args.configs:
@@ -745,8 +750,7 @@ def main_run(args):
                 if "unsupported" in spec:
                     continue
                 missing = [str(f) for f in spec["files"] if not pathlib.Path(f).exists()]
-                if not missing and spec["engine"] == "saragossa" and args.dry_run \
-                        and not args.saragossa_bin:
+                if not missing and spec["engine"] == "saragossa" and not args.saragossa_bin:
                     continue      # binaire compilé au lancement réel
                 if missing or not pathlib.Path(spec["argv"][0]).exists():
                     spec["unsupported"] = f"introuvable : {missing or spec['argv'][0]}"
@@ -809,23 +813,57 @@ def main_run(args):
 
     journal = Journal(run_dir)
     child = {"proc": None}
+    flag = pathlib.Path(args.busy_flag)
 
     def stop_all(signum, _):
-        if child["proc"] and child["proc"].poll() is None:
-            child["proc"].send_signal(signal.SIGTERM)     # gpulock le transmet au groupe
+        # Pas de wait() ici : un handler qui attend dans un Popen.wait interrompu
+        # se bloque (verrou de waitpid). On transmet, la boucle principale sort.
+        child["stop"] = signum
+        if child["proc"] is not None and child["proc"].returncode is None:
             try:
-                child["proc"].wait(timeout=120)
-            except subprocess.TimeoutExpired:
-                child["proc"].kill()
-        raise SystemExit(f"interrompu (signal {signum}) ; relancer la même commande reprend")
+                os.kill(child["proc"].pid, signal.SIGTERM)   # gpulock le transmet au groupe
+            except ProcessLookupError:
+                pass
+        if child["proc"] is None:
+            raise SystemExit(f"interrompu (signal {signum}) ; relancer la même commande reprend")
     signal.signal(signal.SIGTERM, stop_all)
     signal.signal(signal.SIGINT, stop_all)
     signal.signal(signal.SIGHUP, stop_all)
 
+    flag.write_text(f"{os.getpid()} {run_dir}\n")   # les autres agents ne compilent pas
+    try:
+        return loop(args, run_dir, freeze, journal, child, log)
+    finally:
+        if flag.exists():
+            flag.unlink()
+
+
+def ensure_saragossa(args, run_dir, freeze, journal, log):
+    """Compile origin/main au premier tour de saragossa ; commit et SHA dans freeze.json."""
+    sar = freeze["engines"]["saragossa"]
+    built = [r for r in journal.rows() if r["kind"] == "saragossa_build"]
+    if built:
+        if sha256_file(sar["bin"]) != built[-1]["sha256"]:
+            raise SystemExit("binaire saragossa modifié depuis sa compilation : refus de reprendre")
+        return
+    if args.saragossa_bin:
+        commit = sar["commit"]
+    else:
+        _, commit = build_saragossa(args.saragossa_src, args.build_lock, log)
+    sar.update({"commit": commit, "sha256": sha256_file(sar["bin"]),
+                "version": f"origin/main {commit}",
+                "built": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    (run_dir / "freeze.json").write_text(json.dumps(freeze, indent=1, default=str))
+    journal.write({"kind": "saragossa_build", "commit": commit, "sha256": sar["sha256"],
+                   "time": time.time()})
+
+
+def loop(args, run_dir, freeze, journal, child, log):
     previous = None
     for entry in freeze["plan"]:
         rows = journal.rows()
-        if any(r["kind"] == "entry_done" and r.get("entry") == entry["id"] for r in rows):
+        if any(r["kind"] == "entry_done" and r.get("status") != "interrupted"
+               and r.get("entry") == entry["id"] for r in rows):
             continue
         failed = [r for r in rows if r["kind"] == "entry_done" and r.get("model") == entry["model"]
                   and r.get("config") == entry["config"] and r["status"] == "load_failed"]
@@ -833,22 +871,28 @@ def main_run(args):
             journal.write({"kind": "entry_done", "entry": entry["id"], "model": entry["model"],
                            "config": entry["config"], "status": "skipped_after_load_failures"})
             continue
+        if freeze["configs"][entry["model"]][entry["config"]]["engine"] == "saragossa":
+            ensure_saragossa(args, run_dir, freeze, journal, log)
         if previous is not None:
             journal.write({"kind": "cooldown", "before": entry["id"], **cooldown()})
         log(f"entrée {entry['id']}")
         child["proc"] = subprocess.Popen(
             [sys.executable, "-I", "-B", str(REPO / "tools/gpulock.py"), "run", "--owner",
-             "campagne", "--prio", "6", "--", sys.executable, "-I", "-B", str(HERE / "campaign.py"),
+             "campagne", "--prio", str(args.prio), "--", sys.executable, "-I", "-B", str(HERE / "campaign.py"),
              "_entry", str(run_dir), entry["id"]], env={**os.environ, "GPU_LOCK": args.gpu_lock})
         child["proc"].wait()
+        child["proc"] = None
+        if child.get("stop"):
+            raise SystemExit(f"interrompu (signal {child['stop']}) ; relancer la même commande reprend")
         previous = entry["id"]
         if not any(r["kind"] == "entry_done" and r.get("entry") == entry["id"]
                    for r in journal.rows()):
             raise SystemExit(f"entrée {entry['id']} sans fin enregistrée (rc "
-                             f"{child['proc'].returncode}) ; relancer reprend")
+                             "?) ; relancer reprend")
 
     rows = journal.rows()
-    done = {r["entry"]: r for r in rows if r["kind"] == "entry_done"}
+    done = {r["entry"]: r for r in rows if r["kind"] == "entry_done"
+            and r.get("status") != "interrupted"}
     final_attempt = {e: r.get("attempt") for e, r in done.items()}
     measures = [r for r in rows if r["kind"] == "measure"
                 and final_attempt.get(r["entry"]) == r["attempt"]]
@@ -869,6 +913,10 @@ def _self_check():
     cfgs = {"m": {"a": {}, "b": {}, "c": {"unsupported": "x"}}}
     plan = build_plan(["m"], cfgs, 3, LENGTHS)
     assert [e["config"] for e in plan] == ["a", "b", "b", "a", "a", "b"]
+    cfgs = {"m": {"s": {"engine": "saragossa"}, "l": {"engine": "llama"}},
+            "n": {"s": {"engine": "saragossa"}, "l": {"engine": "llama"}}}
+    order = [(e["model"], e["config"]) for e in build_plan(["m", "n"], cfgs, 1, LENGTHS)]
+    assert order == [("m", "l"), ("n", "l"), ("m", "s"), ("n", "s")]
     assert plan[1]["lengths"] == [512, 4096, 16384] and plan[2]["lengths"] == [4096, 16384, 512]
     assert len(nonce("x")) == 16 and nonce("x") == nonce("x") != nonce("y")
     prompt = {"content": NONCE_LINE.format(nonce="0" * 16) + "body"}
@@ -924,5 +972,8 @@ if __name__ == "__main__":
     parser.add_argument("--prompt-source", default=str(REPO / "src"),
                         help="sources .rs découpées en prompts (figées dans RUN_DIR/prompts)")
     parser.add_argument("--gpu-lock", default=os.environ.get("GPU_LOCK", f"{scratch}/gpu.lock"))
+    parser.add_argument("--prio", type=int, default=2, help="priorité gpulock (0 = la plus haute)")
+    parser.add_argument("--busy-flag", default=f"{scratch}/bench-en-cours",
+                        help="présent pendant la campagne : les autres agents ne compilent pas")
     parser.add_argument("--build-lock", default=os.environ.get("BUILD_LOCK", f"{scratch}/build.lock"))
     sys.exit(main_run(parser.parse_args()))
