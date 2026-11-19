@@ -72,7 +72,8 @@ fn dense_bf16_qmv_matches_f32() -> Result<()> {
 #[test]
 #[ignore = "requiert Metal avec GEMM NA et SARAGOSSA_RUST_DENSE_BF16_GEMM actif (défaut) ; poids synthétiques"]
 fn dense_bf16_prefill_gemm_matches_f32() -> Result<()> {
-    dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_tiled_x2")
+    // Défaut : GEMM à un produit, activation arrondie une fois en bf16.
+    dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_bn128")
 }
 
 #[test]
@@ -139,30 +140,15 @@ fn run_flag_child(name: &str, child: &str, env: (&str, &str)) {
 
 #[test]
 #[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
-fn dense_bf16_prefill_n_first_matches_f32() -> Result<()> {
-    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_NFIRST_CHILD";
+fn dense_bf16_prefill_x1_kill_switch_selects_hi_lo() -> Result<()> {
+    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_X1_CHILD";
     if std::env::var_os(CHILD).is_some() {
         return dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_tiled_x2");
     }
     run_flag_child(
-        "dense_bf16_prefill_n_first_matches_f32",
+        "dense_bf16_prefill_x1_kill_switch_selects_hi_lo",
         CHILD,
-        ("SARAGOSSA_RUST_DENSE_BF16_GEMM_NFIRST", "1"),
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
-fn dense_bf16_prefill_x1_rounds_activation_once() -> Result<()> {
-    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_X1_CHILD";
-    if std::env::var_os(CHILD).is_some() {
-        return dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_bn128");
-    }
-    run_flag_child(
-        "dense_bf16_prefill_x1_rounds_activation_once",
-        CHILD,
-        ("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1", "1"),
+        ("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1", "0"),
     );
     Ok(())
 }
@@ -196,9 +182,9 @@ fn dense_bf16_prefill_matches_f32(expected_kernel: &str) -> Result<()> {
             .map(|i| ((i % 19) as f32 - 9.0) / 7.0 + (i % 5) as f32 * 1e-3)
             .collect(),
     )?;
-    let decision = expected_kernel == "gemm_nax_bf16_nt_bn128";
-    // Le GEMM de décision arrondit l'activation en bf16 (au plus proche, pair).
-    let reference = if decision {
+    let rounded_once = expected_kernel == "gemm_nax_bf16_nt_bn128";
+    // Le GEMM à un produit arrondit l'activation en bf16 (au plus proche, pair).
+    let reference = if rounded_once {
         let rounded = input.data().iter().map(|&v| {
             let bits = v.to_bits();
             f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
@@ -224,7 +210,7 @@ fn dense_bf16_prefill_matches_f32(expected_kernel: &str) -> Result<()> {
     encoded?;
     commit_and_wait(cb)?;
     let mut expected_trace = Vec::new();
-    if decision {
+    if rounded_once {
         expected_trace.push(format!("f32_to_bf16 M={} N=1 K=0", batch * in_dim));
     }
     expected_trace.push(format!(
@@ -235,7 +221,7 @@ fn dense_bf16_prefill_matches_f32(expected_kernel: &str) -> Result<()> {
         "le kernel attendu doit être réellement dispatché"
     );
     let actual = read_f32_buffer(&out, batch * out_dim)?;
-    // Tolérance f32 relative : le GEMM n'arrondit pas les activations en bf16.
+    // Tolérance f32 relative contre la référence à l'activation déjà arrondie.
     for (index, (a, e)) in actual.iter().zip(expected.data()).enumerate() {
         assert!(
             (a - e).abs() <= 1e-3 * e.abs().max(1.0),

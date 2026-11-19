@@ -1699,22 +1699,15 @@ pub(crate) fn dense_bf16_qmv_stage_enabled() -> bool {
 }
 
 /// GEMM matmul2d bf16 à un seul produit au prefill des poids bf16 denses :
-/// l'activation est arrondie en bf16 au lieu d'être scindée hi + lo, ce qui
-/// divise par deux les MMA. Change l'arithmétique, donc ni identité greedy ni
-/// goldens garantis. Opt-in : `SARAGOSSA_RUST_DENSE_BF16_GEMM_X1=1`.
+/// l'activation est arrondie une fois en bf16 au lieu d'être scindée hi + lo,
+/// deux fois moins de MMA (prefill 27B BF16 −36 à −44 %, KL moyen ≤ 3e-5,
+/// docs/perf/prefill-bf16.md). Change l'arithmétique du prefill (voir
+/// docs/perf/greedy-identity.md). Défaut ON ; kill-switch
+/// `SARAGOSSA_RUST_DENSE_BF16_GEMM_X1=0` (GEMM hi + lo).
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn dense_bf16_gemm_x1_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1", false))
-}
-
-/// Grille N d'abord pour `gemm_nax_bf16_nt_tiled_x2` : les tuiles voisines
-/// partagent la tuile A f32 au lieu de la tuile B. Même calcul par tuile,
-/// sortie égale au bit. Opt-in : `SARAGOSSA_RUST_DENSE_BF16_GEMM_NFIRST=1`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
-pub(crate) fn dense_bf16_gemm_n_first_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_GEMM_NFIRST", false))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1", true))
 }
 
 /// GEMM NA tuilé des poids bf16 denses au prefill (batch ≥ 64). Défaut ON ;
