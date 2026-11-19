@@ -104,9 +104,9 @@ kernel void gemm_nax_bf16_nt_gate_up_swiglu(device const bfloat* Ap [[buffer(0)]
   auto cH = op.get_destination_cooperative_tensor<decltype(mA), decltype(mG), bfloat>();
   op.run(mA, mG, cG);
   op.run(mA, mU, cU);
-  #pragma unroll full
+  _Pragma("clang loop unroll(full)")
   for (uint16_t i = 0; i < cG.get_capacity(); ++i) {
-    if (cG.get_mask(i)) {
+    if (cG.is_valid_element(i)) {
       float g = cG[i];
       cH[i] = bfloat((g / (1.0f + exp(-g))) * cU[i]);
     }
