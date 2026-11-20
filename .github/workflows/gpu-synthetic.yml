@@ -99,6 +99,7 @@ jobs:
             metal_backend::tests::dense_bf16::dense_bf16_qmv_matches_f32
             metal_backend::tests::dense_bf16::dense_bf16_embedding_matches_f32
             metal_backend::tests::dense_bf16::dense_bf16_qmv_stage_matches_row_qmv_bitwise
+            metal_backend::tests::dense_bf16::dense_bf16_qmv_stage_rows_matches_stage_bitwise
             metal_backend::tests::dequant_u56_bf16_transpose_matches_cpu
             metal_backend::tests::qmv_u56_strict_rows_are_bit_exact
             metal_backend::tests::affine_qmv_u5_runtime_flag_routes
