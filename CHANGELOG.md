@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.20](https://github.com/azerozero/saragossa/compare/v0.3.19...v0.3.20) - 2026-11-20
+
+### Other
+
+- Merge pull request #286 from azerozero/perf/suffix-decoding
+- *(decoder)* bilan opt-in des drafts lookup acceptés
+- *(decoder)* source de brouillon SuffixDecoding opt-in pour les lookups
+
 ## [0.3.19](https://github.com/azerozero/saragossa/compare/v0.3.18...v0.3.19) - 2026-11-20
 
 ### Fixed
