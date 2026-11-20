@@ -547,7 +547,8 @@ pub(super) const QMM_NA_U4_FLINT_MIN_DIM: usize = 512;
 /// Variante 4-bit gs64 du GEMM NA tuilé. Le chemin reste borné aux grandes
 /// projections denses (`min_dim` = [`QMM_NA_U4_DEFAULT_MIN_DIM`]) : les petites
 /// projections shared-expert de Qwen divergent en oracle greedy avec
-/// l'accumulation bf16 tensor-core et gardent le qmv f32. Le plancher est porté
+/// l'accumulation bf16 tensor-core ; elles gardent le qmv f32, sauf sur les
+/// Qwen MoE où le bf16×4 les sert (KL corpus dans le bruit). Le plancher est porté
 /// par l'executor parce que flint partage ces formes avec Qwen : seule
 /// l'identité du modèle, validée par ses propres oracles, peut l'abaisser.
 pub(super) fn can_use_qmm_na_fused_tiled_u4_buffers(

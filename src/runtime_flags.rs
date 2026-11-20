@@ -1553,6 +1553,41 @@ pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM", true))
 }
 
+/// Petites projections u4 sous le plancher (512 au lieu de 2048) servies par
+/// le GEMM NA tuilé à lhs f32 scindé, pour les Qwen et Gemma
+/// (`SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM`). Au prefill du 35B-A3B, l'expert
+/// partagé (2048→512→2048) et k/v (2048→512) quittent le qmv ligne à ligne.
+///
+/// Défaut bf16×4 sur les Qwen MoE seuls (`qwen_moe`), désactivé ailleurs.
+/// `=0` coupe, `=1` ou `=x4` force le bf16×4 (lo·lo compris), `=x3` le
+/// bf16×3. Mesures 35B-A3B (M5 Max, 2026-11-20, docs/perf/qwen-small-nax-gemm.md) :
+/// prefill 4096 1082 → 907 ms et 16384 5020 → 4223 ms (ABBA ×3), KL corpus
+/// 0,01037 → 0,01003, Δ apparié −3,3 % d'IC95 [−0,0020 ; +0,0013], dans le
+/// bruit des perturbations neutres (−6 % à +13 %).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn qwen_small_nax_gemm(qwen_moe: bool) -> Option<SmallNaxGemm> {
+    static VALUE: OnceLock<Option<String>> = OnceLock::new();
+    let value = VALUE.get_or_init(|| env_var("SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM"));
+    match value.as_deref().map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("x3") => Some(SmallNaxGemm::X3),
+        Some(v) if v.eq_ignore_ascii_case("x4") => Some(SmallNaxGemm::X4),
+        Some(v) => env_flag_value(v)
+            .unwrap_or(qwen_moe)
+            .then_some(SmallNaxGemm::X4),
+        None => qwen_moe.then_some(SmallNaxGemm::X4),
+    }
+}
+
+/// Variante du GEMM tuilé u4 à lhs f32 scindé hi + lo.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SmallNaxGemm {
+    /// hi·hi + hi·lo + lo·hi (lo·lo abandonné, ~2⁻¹⁶).
+    X3,
+    /// Les quatre produits.
+    X4,
+}
+
 /// GEMM NA u4 tuilé bf16×3, au lieu du qmv f32, pour les seules projections
 /// k/v des couches full-attention du modèle cible quand c'est un Qwen dense
 /// (sans experts ni sinks) à k/v 5120→1024 en u4 gs64, comme Qwen3.8 27B.

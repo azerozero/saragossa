@@ -911,6 +911,7 @@ impl MetalExecutor {
         let na_gemm_coop_qb_tiled_gs128 = compile_na("gemm_nax_coop_qb_tiled_gs128");
         let na_gemm_coop_qb_tiled_u4 = compile_na("gemm_nax_coop_qb_tiled_u4");
         let na_gemm_coop_qb_tiled_u4_x3 = compile_na("gemm_nax_coop_qb_tiled_u4_x3");
+        let na_gemm_coop_qb_tiled_u4_x4 = compile_na("gemm_nax_coop_qb_tiled_u4_x4");
         let na_gemm_bf16_nt_tiled_x2 = compile_na("gemm_nax_bf16_nt_tiled_x2");
         let na_gemm_bf16_nt_tiled_x2_maskn = compile_na("gemm_nax_bf16_nt_tiled_x2_maskn");
         let na_gemm_bf16_nt_bn128 = compile_na("gemm_nax_bf16_nt_bn128");
@@ -1099,6 +1100,7 @@ impl MetalExecutor {
             ),
             prefill_sink_steel: crate::runtime_flags::flint_prefill_steel_enabled(),
             qmm_na_u4_min_dim: QMM_NA_U4_DEFAULT_MIN_DIM,
+            qmm_na_u4_x4: false,
             qmm_na_u4_x3_weights: Vec::new(),
             prefill_window_kv: crate::runtime_flags::flint_window_kv_enabled(),
             causal_attention_prefill_nax_d128,
@@ -1145,6 +1147,7 @@ impl MetalExecutor {
             na_gemm_coop_qb_tiled_gs128,
             na_gemm_coop_qb_tiled_u4,
             na_gemm_coop_qb_tiled_u4_x3,
+            na_gemm_coop_qb_tiled_u4_x4,
             na_gemm_bf16_nt_tiled_x2,
             na_gemm_bf16_nt_tiled_x2_maskn,
             na_gemm_bf16_nt_bn128,

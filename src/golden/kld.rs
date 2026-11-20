@@ -437,6 +437,9 @@ fn compare_with_prefill(
     let model =
         crate::load_causal_decoder_for_metal(&assets, &executor)?.with_metal_executor(executor)?;
     let (mut kls, mut deltas, mut same) = (Vec::new(), Vec::new(), 0);
+    // NOTE: export opt-in par position (« kl top1 » par ligne) pour les
+    // comparaisons appariées entre variantes ; sans effet sur les seuils.
+    let mut tops = Vec::new();
     let mut rows = reference.rows.iter();
     for chunk in &meta.chunks {
         // Même découpe que kld.py : prefill du contexte, puis decode token par token.
@@ -459,10 +462,19 @@ fn compare_with_prefill(
                 );
             }
             same += usize::from(actual == ids[0]);
+            tops.push(actual == ids[0]);
             if position + 1 < chunk.len() {
                 logits = model.next_logits_cached(&mut cache, chunk[position])?;
             }
         }
+    }
+    if let Ok(dump) = std::env::var("SARAGOSSA_TEST_KLD_DUMP") {
+        let lines: String = kls
+            .iter()
+            .zip(&tops)
+            .map(|(kl, top)| format!("{kl:e} {}\n", u8::from(*top)))
+            .collect();
+        std::fs::write(dump, lines)?;
     }
     let engine = summarize(&kls, &mut deltas, same);
     let noise = meta.mlx_bf16_noise;

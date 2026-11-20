@@ -3309,6 +3309,82 @@ fn qmm_na_fused_tiled_u4_flint_shapes_x3_match_f32_reference() -> Result<()> {
     Ok(())
 }
 
+/// Noyaux bf16×3 et bf16×4 (lo·lo en plus) dispatchés directement sur les
+/// petites formes du 35B-A3B et de flint, contre la référence f32 pure (f64).
+/// Même budget empirique que le x3 ; le x4 doit s'y tenir aussi.
+#[test]
+fn qmm_na_fused_tiled_u4_x4_matches_f32_reference() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (Some(x3), Some(x4)) = (
+        executor.na_gemm_coop_qb_tiled_u4_x3.as_ref(),
+        executor.na_gemm_coop_qb_tiled_u4_x4.as_ref(),
+    ) else {
+        eprintln!("skip: GEMM NA u4 indisponible (macOS < 26 ?)");
+        return Ok(());
+    };
+    let batch = 65;
+    for (in_dim, out_dim) in [(2048_usize, 512_usize), (2048, 1024), (1024, 2048)] {
+        let weight = test_affine_varied(out_dim, in_dim)?;
+        let MetalLinearWeightBuffers::AffineQuantized {
+            packed,
+            packed_offset,
+            scales,
+            scales_offset,
+            biases,
+            biases_offset,
+            ..
+        } = executor.resolve_linear_weight_buffers(
+            &LinearWeight::AffineQuantized(weight.clone()),
+            "x4_weight",
+        )?
+        else {
+            panic!("poids affine attendu");
+        };
+        let mut lhs = Vec::with_capacity(batch * in_dim);
+        for row in 0..batch {
+            lhs.extend_from_slice(&varied_row(in_dim, 17 + row));
+        }
+        let lhs_buf = executor.upload_f32_buffer(&lhs, "x4_lhs")?;
+        let (exact, abs_dot) = qmm_u4_f64_reference(&weight, &lhs, batch);
+        for (name, pso) in [("x3", x3), ("x4", x4)] {
+            let out_buf = executor.uncached_f32_buffer(batch * out_dim, "x4_out")?;
+            let command_buffer = executor.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            executor.dispatch_affine_qmm_na_fused_tiled_u4(
+                encoder,
+                pso,
+                &lhs_buf,
+                &packed,
+                packed_offset,
+                &scales,
+                scales_offset,
+                &biases,
+                biases_offset,
+                &out_buf,
+                batch,
+                in_dim,
+                out_dim,
+                "x4_test",
+                "x4_test",
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(command_buffer)?;
+            let out = read_f32_buffer(&out_buf, batch * out_dim)?;
+            let mut worst = 0.0_f64;
+            for idx in 0..batch * out_dim {
+                assert!(out[idx].is_finite(), "{name} {in_dim}→{out_dim} [{idx}] non fini");
+                let rel = (f64::from(out[idx]) - exact[idx]).abs() / abs_dot[idx].max(1e-30);
+                worst = worst.max(rel);
+            }
+            eprintln!("{name} {in_dim}→{out_dim} : écart relatif max {worst:.3e}");
+            assert!(worst <= 1e-5, "{name} {in_dim}→{out_dim} : {worst:.3e} > 1e-5");
+        }
+    }
+    Ok(())
+}
+
 /// k/v d'un Qwen dense 5120→1024 ouverts par identité de poids : seul le
 /// poids enregistré passe au GEMM NA bf16×3 par le sélecteur owned (chemin du
 /// prefill cible), et sa sortie colle à la référence f32 pure (f64), finie
