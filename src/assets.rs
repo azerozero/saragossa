@@ -31,6 +31,9 @@ pub struct MtpWeightsInfo {
     pub has_fc_weight: bool,
     /// Indique si au moins un tenseur `mtp.*` existe.
     pub has_mtp_tensors: bool,
+    /// Tête lue dans un shard du trunk (pas de sidecar) : ses tenseurs sont
+    /// déjà comptés par le catalogue.
+    pub embedded: bool,
 }
 
 impl MtpWeightsInfo {
@@ -74,7 +77,7 @@ impl ModelAssets {
             });
         }
         let catalog = WeightCatalog::from_shards(&shards)?;
-        let mtp = detect_mtp_weights(model_dir, &raw_config_json, sidecar_override)?;
+        let mtp = detect_mtp_weights(model_dir, &raw_config_json, sidecar_override, &shards)?;
 
         Ok(Self {
             model_dir: model_dir.to_path_buf(),
@@ -214,6 +217,7 @@ fn detect_mtp_weights(
     model_dir: &Path,
     config: &serde_json::Value,
     sidecar_override: Option<PathBuf>,
+    shards: &[PathBuf],
 ) -> Result<MtpWeightsInfo> {
     // Tête posée hors du répertoire du modèle (dossier en lecture seule) :
     // l'override explicite remplace la détection et ne se replie jamais
@@ -238,7 +242,40 @@ fn detect_mtp_weights(
             return mtp_weights_info(path);
         }
     }
-    Ok(MtpWeightsInfo::default())
+    embedded_mtp_weights(shards)
+}
+
+/// Tête MTP embarquée dans les shards (checkpoint HF bf16 sans sidecar) : le
+/// shard qui porte toutes les clés `mtp.*` sert de sidecar, seuls ses tenseurs
+/// MTP sont lus à leur offset. Les clés nues (`layers.*`) ne comptent pas ici,
+/// elles désignent le trunk.
+fn embedded_mtp_weights(shards: &[PathBuf]) -> Result<MtpWeightsInfo> {
+    let mut found: Option<(PathBuf, Vec<String>)> = None;
+    for shard in shards {
+        let keys: Vec<String> = read_safetensors_keys(shard)?
+            .iter()
+            .filter(|key| key.starts_with("mtp.") || key.starts_with("language_model.mtp."))
+            .map(|key| normalize_mtp_sidecar_key(key))
+            .collect();
+        if keys.is_empty() {
+            continue;
+        }
+        if found.is_some() {
+            // ponytail: une tête répartie sur plusieurs shards reste non prise
+            // en charge (LazySidecar lit un seul fichier).
+            return Ok(MtpWeightsInfo::default());
+        }
+        found = Some((shard.clone(), keys));
+    }
+    Ok(
+        found.map_or_else(MtpWeightsInfo::default, |(path, keys)| MtpWeightsInfo {
+            path: Some(path),
+            tensor_count: keys.len(),
+            has_fc_weight: keys.iter().any(|key| key == "mtp.fc.weight"),
+            has_mtp_tensors: true,
+            embedded: true,
+        }),
+    )
 }
 
 fn mtp_weights_info(path: PathBuf) -> Result<MtpWeightsInfo> {
@@ -254,6 +291,7 @@ fn mtp_weights_info(path: PathBuf) -> Result<MtpWeightsInfo> {
         tensor_count: keys.len(),
         has_fc_weight,
         has_mtp_tensors,
+        embedded: false,
     })
 }
 
@@ -482,7 +520,7 @@ mod tests {
         write_safetensors(&explicit, "mtp.fc.weight");
         let config = serde_json::json!({});
 
-        let info = super::detect_mtp_weights(model.path(), &config, Some(explicit.clone()))
+        let info = super::detect_mtp_weights(model.path(), &config, Some(explicit.clone()), &[])
             .expect("invariant: sidecar explicite lisible");
         assert_eq!(info.path.as_deref(), Some(explicit.as_path()));
         assert!(info.is_available());
@@ -490,7 +528,7 @@ mod tests {
         let foreign = outside.path().join("autre.safetensors");
         write_safetensors(&foreign, "dummy.weight");
         assert!(matches!(
-            super::detect_mtp_weights(model.path(), &config, Some(foreign)),
+            super::detect_mtp_weights(model.path(), &config, Some(foreign), &[]),
             Err(InferError::MissingWeight(_))
         ));
 
@@ -498,15 +536,46 @@ mod tests {
         let without_fc = outside.path().join("sans-fc.safetensors");
         write_safetensors(&without_fc, "mtp.norm.weight");
         assert!(matches!(
-            super::detect_mtp_weights(model.path(), &config, Some(without_fc)),
+            super::detect_mtp_weights(model.path(), &config, Some(without_fc), &[]),
             Err(InferError::MissingWeight(_))
         ));
 
         let missing = outside.path().join("absent.safetensors");
         assert!(matches!(
-            super::detect_mtp_weights(model.path(), &config, Some(missing)),
+            super::detect_mtp_weights(model.path(), &config, Some(missing), &[]),
             Err(InferError::MissingArtifact { .. })
         ));
+    }
+
+    #[test]
+    fn embedded_mtp_head_in_trunk_shard_is_detected_without_sidecar() {
+        let tmp = tempfile::tempdir().expect("invariant: tempdir");
+        let trunk = tmp.path().join("model-00001-of-00002.safetensors");
+        let last = tmp.path().join("model-00002-of-00002.safetensors");
+        write_safetensors(&trunk, "model.layers.0.input_layernorm.weight");
+        write_safetensors_keys(
+            &last,
+            &["lm_head.weight", "mtp.fc.weight", "mtp.norm.weight"],
+        );
+        let config = serde_json::json!({});
+        let shards = vec![trunk.clone(), last.clone()];
+
+        let info = super::detect_mtp_weights(tmp.path(), &config, None, &shards)
+            .expect("invariant: shards lisibles");
+        assert_eq!(info.path.as_deref(), Some(last.as_path()));
+        assert!(info.embedded && info.is_available());
+        assert_eq!(info.tensor_count, 2);
+
+        // Ni sidecar ni clé `mtp.*` : tête absente, l'appelant avertit.
+        let info = super::detect_mtp_weights(tmp.path(), &config, None, &shards[..1])
+            .expect("invariant: shard lisible");
+        assert_eq!(info, MtpWeightsInfo::default());
+
+        // Un sidecar présent garde la priorité sur la tête embarquée.
+        write_safetensors(&tmp.path().join("mtp.safetensors"), "mtp.fc.weight");
+        let info = super::detect_mtp_weights(tmp.path(), &config, None, &shards)
+            .expect("invariant: sidecar lisible");
+        assert!(!info.embedded && info.is_available());
     }
 
     #[test]
@@ -544,18 +613,24 @@ mod tests {
     }
 
     fn write_safetensors(path: &Path, name: &'static str) {
+        write_safetensors_keys(path, &[name]);
+    }
+
+    fn write_safetensors_keys(path: &Path, names: &[&'static str]) {
         let data = [1.0_f32]
             .into_iter()
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
         let buffer = serialize(
-            [(
-                name,
-                F32View {
-                    shape: vec![1],
-                    data,
-                },
-            )],
+            names.iter().map(|name| {
+                (
+                    *name,
+                    F32View {
+                        shape: vec![1],
+                        data: data.clone(),
+                    },
+                )
+            }),
             None,
         )
         .expect("invariant: safetensors sérialisable");
