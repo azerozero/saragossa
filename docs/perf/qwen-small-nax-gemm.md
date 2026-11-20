@@ -46,6 +46,7 @@ chemin : leur KL est identique au défaut.
 
 Pour estimer le plancher, on a pris deux perturbations sans perte de
 précision :
+
 - la récurrence linéaire jeton par jeton, de même précision que le défaut ;
 - l'attention Steel f32, plus précise que le défaut.
 
