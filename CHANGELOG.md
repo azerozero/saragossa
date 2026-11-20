@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.23](https://github.com/azerozero/saragossa/compare/v0.3.22...v0.3.23) - 2026-11-20
+
+### Fixed
+
+- *(serve)* l'enfant du relais ferme les sockets héritées non déclarées
+
+### Other
+
+- Merge pull request #302 from azerozero/fix/relais-sans-refus
+- *(perf)* ligne vide avant la liste du plancher de bruit
+- Merge pull request #287 from azerozero/perf/prefill-quant
+- *(prefill)* portée du bf16×4 Qwen MoE, semis MTP compris, commentaires à jour
+- *(prefill)* bf16×4 par défaut sur les petites projections des Qwen MoE
+- *(prefill)* variante bf16×4 des petites projections u4 en opt-in
+- Merge remote-tracking branch 'origin/main' into perf/prefill-quant
+- *(prefill)* GEMM bf16×3 des petites projections Qwen en opt-in
+
 ## [0.3.22](https://github.com/azerozero/saragossa/compare/v0.3.21...v0.3.22) - 2026-11-20
 
 ### Fixed
