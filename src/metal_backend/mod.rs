@@ -417,6 +417,9 @@ pub struct MetalExecutor {
     /// Plancher de `in_dim`/`out_dim` du GEMM NA u4 gs64 : 2048 par défaut,
     /// abaissé pour flint seul par [`Self::enable_flint_small_nax_gemm`].
     qmm_na_u4_min_dim: usize,
+    /// Sous le plancher, bf16×4 au lieu du bf16×3 : Qwen MoE par défaut
+    /// ([`Self::set_small_nax_gemm_x4`]), jamais flint ni les k/v du 27B.
+    qmm_na_u4_x4: bool,
     /// `weight_id` des poids ouverts au GEMM NA u4 sous le plancher : les k/v
     /// des couches full du modèle cible
     /// ([`Self::allow_qmm_na_u4_x3_weight`]). Vide par défaut.

@@ -362,7 +362,7 @@ impl MetalExecutor {
                     "qmm na tiled u4 x3 attend out_dim%64=0, reçu out_dim={out_dim}"
                 )));
             }
-            let (pso, name) = if crate::runtime_flags::qwen_small_nax_gemm_x4() {
+            let (pso, name) = if self.qmm_na_u4_x4 {
                 (
                     self.na_gemm_coop_qb_tiled_u4_x4.as_ref(),
                     "gemm_nax_coop_qb_tiled_u4_x4",
@@ -373,8 +373,7 @@ impl MetalExecutor {
                     "gemm_nax_coop_qb_tiled_u4_x3",
                 )
             };
-            let pso = pso
-                .ok_or_else(|| InferError::Config(format!("{name}: NA indisponible")))?;
+            let pso = pso.ok_or_else(|| InferError::Config(format!("{name}: NA indisponible")))?;
             #[cfg(test)]
             super::flags::count_qmm_na_u4_x3_dispatch();
             return self.dispatch_affine_qmm_na_fused_tiled_u4(

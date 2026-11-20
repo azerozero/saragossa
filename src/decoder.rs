@@ -2583,10 +2583,15 @@ impl CausalDecoder {
         // du GEMM NA u4 ne touche aucun autre modèle. Sinks appris et expert
         // partagé sans gate signent flint ; Qwen et Gemma n'en ont aucun.
         let flint = self.config.attention_sinks && self.config.ungated_shared_expert;
-        if (flint && crate::runtime_flags::flint_small_nax_gemm_enabled())
-            || (!flint && crate::runtime_flags::qwen_small_nax_gemm_enabled())
-        {
+        if flint {
+            if crate::runtime_flags::flint_small_nax_gemm_enabled() {
+                executor.enable_flint_small_nax_gemm();
+            }
+        } else if let Some(variant) = crate::runtime_flags::qwen_small_nax_gemm(
+            self.config.is_qwen && self.config.num_experts.is_some(),
+        ) {
             executor.enable_flint_small_nax_gemm();
+            executor.set_small_nax_gemm_x4(variant == crate::runtime_flags::SmallNaxGemm::X4);
         }
         self.enable_single_copy_weights(&executor)?;
         if self.qwen_kv_nax_x3_shape().is_some() && crate::runtime_flags::qwen_kv_nax_x3_enabled() {

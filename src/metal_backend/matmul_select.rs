@@ -96,6 +96,12 @@ impl MetalExecutor {
         }
     }
 
+    /// Choisit le bf16×4 (lo·lo compris) pour les projections sous le
+    /// plancher ; sans pipeline x4, le bf16×3 reste.
+    pub(crate) fn set_small_nax_gemm_x4(&mut self, x4: bool) {
+        self.qmm_na_u4_x4 = x4 && self.na_gemm_coop_qb_tiled_u4_x4.is_some();
+    }
+
     /// Ouvre ce seul poids au GEMM NA u4 sous le plancher, servi par le
     /// bf16×3 : appelé pour les k/v des couches full du modèle cible (Qwen
     /// dense à k/v 5120→1024). L'autorisation suit l'identité du poids

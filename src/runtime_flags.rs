@@ -1553,29 +1553,39 @@ pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM", true))
 }
 
-/// Même plancher abaissé (512) pour les Qwen et Gemma
-/// (`SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM`, défaut 0). Au prefill du 35B-A3B,
-/// l'expert partagé (2048→512→2048), k/v (2048→512) passent du qmv ligne à
-/// ligne au bf16×3. Arithmétique différente du qmv f32 : opt-in tant que le
-/// protocole KL corpus n'a pas tranché.
+/// Petites projections u4 sous le plancher (512 au lieu de 2048) servies par
+/// le GEMM NA tuilé à lhs f32 scindé, pour les Qwen et Gemma
+/// (`SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM`). Au prefill du 35B-A3B, l'expert
+/// partagé (2048→512→2048) et k/v (2048→512) quittent le qmv ligne à ligne.
+///
+/// Défaut bf16×4 sur les Qwen MoE seuls (`qwen_moe`), désactivé ailleurs.
+/// `=0` coupe, `=1` ou `=x4` force le bf16×4 (lo·lo compris), `=x3` le
+/// bf16×3. Mesures 35B-A3B (M5 Max, 2026-11-20, docs/perf/qwen-small-nax-gemm.md) :
+/// prefill 4096 1082 → 907 ms et 16384 5020 → 4223 ms (ABBA ×3), KL corpus
+/// 0,01037 → 0,01003, Δ apparié −3,3 % d'IC95 [−0,0020 ; +0,0013], dans le
+/// bruit des perturbations neutres (−6 % à +13 %).
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub(crate) fn qwen_small_nax_gemm_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        qwen_small_nax_gemm_x4() || env_flag("SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM", false)
-    })
+pub(crate) fn qwen_small_nax_gemm(qwen_moe: bool) -> Option<SmallNaxGemm> {
+    static VALUE: OnceLock<Option<String>> = OnceLock::new();
+    let value = VALUE.get_or_init(|| env_var("SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM"));
+    match value.as_deref().map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("x3") => Some(SmallNaxGemm::X3),
+        Some(v) if v.eq_ignore_ascii_case("x4") => Some(SmallNaxGemm::X4),
+        Some(v) => env_flag_value(v)
+            .unwrap_or(qwen_moe)
+            .then_some(SmallNaxGemm::X4),
+        None => qwen_moe.then_some(SmallNaxGemm::X4),
+    }
 }
 
-/// `SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM=x4` : comme `=1`, et toute projection
-/// u4 sous le plancher par défaut (flint compris) prend le noyau bf16×4, qui
-/// ajoute le produit lo·lo abandonné par le bf16×3.
+/// Variante du GEMM tuilé u4 à lhs f32 scindé hi + lo.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub(crate) fn qwen_small_nax_gemm_x4() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        env_var("SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM")
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("x4"))
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SmallNaxGemm {
+    /// hi·hi + hi·lo + lo·hi (lo·lo abandonné, ~2⁻¹⁶).
+    X3,
+    /// Les quatre produits.
+    X4,
 }
 
 /// GEMM NA u4 tuilé bf16×3, au lieu du qmv f32, pour les seules projections
