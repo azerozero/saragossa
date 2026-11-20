@@ -112,6 +112,17 @@ fn take_config_args(
         match arg.as_str() {
             "--config" | "--profile" => path = Some(iter.next().ok_or_else(missing)?),
             "--set" => sets.push(iter.next().ok_or_else(missing)?),
+            // NOTE: une valeur en argv est visible par `ps` ; elle passe donc par
+            // l'environnement, que le relais SIGUSR2 transmet à l'enfant.
+            "--api-key" | "--bearer-token" => {
+                let key = iter.next().ok_or_else(missing)?;
+                eprintln!(
+                    "saragossa serve: --api-key est déprécié (visible dans `ps`), utiliser SARAGOSSA_API_KEY"
+                );
+                // NOTE: `set_var` n'est sûr que parce que ce code s'exécute au démarrage,
+                // avant tout thread ; la clé passe ensuite à tous les sous-processus.
+                std::env::set_var("SARAGOSSA_API_KEY", key);
+            }
             _ => rest.push(arg),
         }
     }

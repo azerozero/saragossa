@@ -104,7 +104,9 @@ pub(super) fn diff_models(
 
 /// Valide toute la liste ; une référence HF nue n'est jamais résolue à chaud :
 /// elle n'est acceptée que si son alias est déjà servi (chemin résolu gardé),
-/// les autres chemins doivent être des dossiers avec un `config.json` lisible. Toutes les erreurs
+/// les autres chemins doivent être des dossiers avec un `config.json` lisible.
+/// NOTE: ces chemins viennent du profil TOML de l'opérateur, qui est de confiance :
+/// aucun confinement n'est ajouté, le profil a les droits de l'utilisateur serveur. Toutes les erreurs
 /// sont listées.
 fn validate_models(
     mut wanted: Vec<ServeModelConfig>,

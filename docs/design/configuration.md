@@ -7,7 +7,7 @@ un profil ne peut jamais réactiver une modalité absente du binaire.
 
 ## Référence et périmètre
 
-Grob sépare les fonctions dans `src/features/`, les préréglages distribués dans
+Grob sépare ses fonctions par module, les préréglages distribués dans
 `presets/` (avec un index et des descriptions) et les compositions locales dans
 `profiles/`. Saragossa conserverait ses modules moteur actuels et reprendrait
 seulement ce format de configuration, sans routage de fournisseurs ni secrets.

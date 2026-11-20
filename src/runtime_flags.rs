@@ -110,6 +110,16 @@ pub fn denoise_threads() -> usize {
     })
 }
 
+/// Variante mathématique commune (`exp`/`tanh`/sigmoïde `exact_math`) pour le
+/// débruitage CPU (`SARAGOSSA_DENOISE_COMMON=1`, défaut 0 : libm). Sortie
+/// identique au bit entre CPU 1 thread, multi-cœur et GPU, pour environ 4 % de
+/// temps CPU en plus (mesuré).
+#[cfg(feature = "denoise")]
+pub fn denoise_common() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DENOISE_COMMON", false))
+}
+
 /// Réseau DFN3 en lot sur GPU Metal pour `saragossa enhance`
 /// (`SARAGOSSA_DENOISE_GPU`, défaut 0). Garde le fichier entier en mémoire ;
 /// sortie identique au bit au CPU en variante `exp`/`tanh` communes, à quelques
@@ -3124,50 +3134,48 @@ mod tests {
         Ok(())
     }
 
-    // Les tests d'env ci-dessous partagent le même processus : un mutex
-    // les sérialise, sans quoi les `set_var`/`remove_var` fuient d'un test à
-    // l'autre sous le harness multi-thread de Cargo.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Les tests d'env passent par `test_support::env_guard` : verrou unique,
+    // restauration à la sortie.
 
     #[test]
     fn env_var_exact_preserves_values_without_legacy_fallback() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut env = crate::test_support::env_guard();
         let name = "SARAGOSSA_TEST_EXACT";
         let legacy = "RETI_TEST_EXACT";
-        std::env::remove_var(name);
-        std::env::set_var(legacy, "herite");
+        env.remove(name);
+        env.set(legacy, "herite");
         assert_eq!(env_var_exact(name), None);
         for value in ["", "  canonique  "] {
-            std::env::set_var(name, value);
+            env.set(name, value);
             assert_eq!(env_var_exact(name).as_deref(), Some(value));
         }
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            std::env::set_var(name, std::ffi::OsStr::from_bytes(&[0xff]));
+            env.set(name, std::ffi::OsStr::from_bytes(&[0xff]));
             assert_eq!(env_var_exact(name), None);
         }
-        std::env::remove_var(name);
-        std::env::remove_var(legacy);
+        env.remove(name);
+        env.remove(legacy);
     }
 
     #[test]
     fn env_var_prefers_canonical_over_legacy() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-        std::env::set_var("SARAGOSSA_TEST_PRIORITE", "canonique");
-        std::env::set_var("RETI_TEST_PRIORITE", "herite");
+        let mut env = crate::test_support::env_guard();
+        env.set("SARAGOSSA_TEST_PRIORITE", "canonique");
+        env.set("RETI_TEST_PRIORITE", "herite");
         assert_eq!(
             env_var("SARAGOSSA_TEST_PRIORITE").as_deref(),
             Some("canonique")
         );
-        std::env::remove_var("SARAGOSSA_TEST_PRIORITE");
-        std::env::remove_var("RETI_TEST_PRIORITE");
+        env.remove("SARAGOSSA_TEST_PRIORITE");
+        env.remove("RETI_TEST_PRIORITE");
     }
 
     #[cfg(feature = "stt")]
     #[test]
     fn stt_kill_switches_honour_zero_and_one() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut env = crate::test_support::env_guard();
         for (name, read) in [
             ("SARAGOSSA_STT_MEL_SERIAL", stt_mel_serial as fn() -> bool),
             (
@@ -3175,33 +3183,33 @@ mod tests {
                 stt_dec_attn_bf16 as fn() -> bool,
             ),
         ] {
-            std::env::remove_var(name);
+            env.remove(name);
             assert!(!read(), "{name} absent");
-            std::env::set_var(name, "0");
+            env.set(name, "0");
             assert!(!read(), "{name}=0");
-            std::env::set_var(name, "1");
+            env.set(name, "1");
             assert!(read(), "{name}=1");
-            std::env::remove_var(name);
+            env.remove(name);
         }
     }
 
     #[test]
     fn env_var_falls_back_to_legacy_prefix() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-        std::env::remove_var("SARAGOSSA_TEST_REPLI");
-        std::env::set_var("RETI_TEST_REPLI", "herite");
+        let mut env = crate::test_support::env_guard();
+        env.remove("SARAGOSSA_TEST_REPLI");
+        env.set("RETI_TEST_REPLI", "herite");
         assert_eq!(env_var("SARAGOSSA_TEST_REPLI").as_deref(), Some("herite"));
         assert!(env_present("SARAGOSSA_TEST_REPLI"));
-        std::env::remove_var("RETI_TEST_REPLI");
+        env.remove("RETI_TEST_REPLI");
     }
 
     #[test]
     fn env_flag_honours_legacy_prefix() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-        std::env::remove_var("SARAGOSSA_TEST_DRAPEAU");
-        std::env::set_var("RETI_TEST_DRAPEAU", "1");
+        let mut env = crate::test_support::env_guard();
+        env.remove("SARAGOSSA_TEST_DRAPEAU");
+        env.set("RETI_TEST_DRAPEAU", "1");
         assert!(env_flag("SARAGOSSA_TEST_DRAPEAU", false));
-        std::env::remove_var("RETI_TEST_DRAPEAU");
+        env.remove("RETI_TEST_DRAPEAU");
         assert!(!env_flag("SARAGOSSA_TEST_DRAPEAU", false));
     }
 

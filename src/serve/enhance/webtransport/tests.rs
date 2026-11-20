@@ -165,6 +165,46 @@ async fn invalid_token_and_rate_are_rejected() {
     }
 }
 #[tokio::test]
+async fn token_by_header_or_subprotocol_and_foreign_origin() {
+    use web_transport_quinn::proto::ConnectRequest;
+    let mut fixture = setup().await;
+    fixture.url.set_query(Some("rate=48000&format=f32"));
+    let request = || ConnectRequest::new(fixture.url.clone());
+    let header = |name: &'static str, value: &str| {
+        request().with_header(
+            http::HeaderName::from_static(name),
+            http::HeaderValue::from_str(value).unwrap(),
+        )
+    };
+    fixture
+        .client
+        .connect(header("authorization", "bearer test-key"))
+        .await
+        .unwrap();
+    fixture
+        .client
+        .connect(request().with_protocol("bearer.test-key"))
+        .await
+        .unwrap();
+    for (rejected, status) in [
+        (request(), 401),
+        (header("authorization", "Bearer wrong"), 401),
+        (
+            header("authorization", "Bearer test-key").with_header(
+                http::HeaderName::from_static("origin"),
+                http::HeaderValue::from_static("https://evil.example"),
+            ),
+            403,
+        ),
+    ] {
+        let error = fixture.client.connect(rejected).await.unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("got: Some({status})")),
+            "{error}"
+        );
+    }
+}
+#[tokio::test]
 async fn oversized_frame_and_partial_sample_reset_the_session() {
     for bytes in [
         (MAX_FRAME as u32 + 1).to_le_bytes().to_vec(),

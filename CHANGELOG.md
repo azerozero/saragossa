@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.17](https://github.com/azerozero/saragossa/compare/v0.3.16...v0.3.17) - 2026-11-19
+
+### Fixed
+
+- *(metal)* bibliothèque NA compilée une fois, échec signalé
+
+## [0.3.16](https://github.com/azerozero/saragossa/compare/v0.3.15...v0.3.16) - 2026-11-19
+
+### Other
+
+- Merge pull request #281 from azerozero/perf/denoise-math-commune
+- Merge pull request #283 from azerozero/perf/decode-quant-largeur
+- Merge origin/main dans perf/denoise-math-commune
+- *(denoise)* variante commune opt-in (SARAGOSSA_DENOISE_COMMON), libm reste le défaut
+- *(decode)* sonde qmv u4 en DRAM, poids tournants et command buffers longs
+- *(denoise)* variante mathématique commune par défaut sur CPU, libm en kill-switch
+- *(decode)* sonde de bande passante des qmv u4 dense et MoE
+
 ## [0.3.15](https://github.com/azerozero/saragossa/compare/v0.3.14...v0.3.15) - 2026-11-18
 
 ### Added

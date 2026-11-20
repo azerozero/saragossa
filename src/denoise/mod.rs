@@ -178,6 +178,20 @@ impl DeepFilterNet3 {
         Ok(out)
     }
 
+    /// [`Self::enhance`] en variante `Math::Libm` (historique, défaut),
+    /// indépendamment de `SARAGOSSA_DENOISE_COMMON`.
+    ///
+    /// # Errors
+    /// Propage les erreurs du traitement des trames.
+    pub fn enhance_libm(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        let mut inner = self.stream();
+        inner.state.math = Math::Libm;
+        let mut stream = DenoiseStream::from_stream(inner);
+        let mut out = stream.push(audio)?;
+        out.extend(stream.finish()?);
+        Ok(out)
+    }
+
     /// Ouvre un flux temps réel.
     #[must_use]
     pub fn stream(&self) -> DfStream<'_> {

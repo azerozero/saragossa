@@ -30,7 +30,7 @@ de référence et de repli mesurable.
 | `src/whisper/` | STT Whisper |
 | `src/tts*.rs` | talker, codec, Mimi et voix Qwen3-TTS |
 | `src/text_embedder/` | embeddings texte CPU |
-| `src/serve/` | transport local et API compatible OpenAI |
+| `src/serve/` | transport local et API compatible OpenAI ; features `ws` (défaut), `h2` et `webtransport` (opt-in) pour le streaming `enhance` |
 | `src/runtime_flags.rs` | source unique des flags et diagnostics runtime |
 | `src/kernels.metal` | kernels Metal généraux |
 | `build.rs` | copie du préambule figé `assets/steel_attention.metal` dans `OUT_DIR` |

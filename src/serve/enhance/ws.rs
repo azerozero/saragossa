@@ -1,5 +1,5 @@
 //! RFC 6455 synchrone : messages bornés, masque client et contrôle de flux socket.
-use super::pcm::{invalid, Config, Pcm, MAX_FRAME};
+use super::pcm::{invalid, loopback_origin, Config, Pcm, MAX_FRAME};
 use super::*;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::io::Cursor;
@@ -63,29 +63,6 @@ impl EnhanceService {
         };
         session(&mut wire, &mut pcm, enhance_idle_timeout())
     }
-}
-/// Origin d'un navigateur sur la machine locale, quel que soit le port.
-fn loopback_origin(origin: &str) -> bool {
-    let Some(rest) = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-    else {
-        return false;
-    };
-    let (host, port) = if let Some(inner) = rest.strip_prefix('[') {
-        let Some((host, tail)) = inner.split_once(']') else {
-            return false;
-        };
-        (host, tail.strip_prefix(':').unwrap_or(tail))
-    } else {
-        rest.split_once(':').unwrap_or((rest, ""))
-    };
-    port.bytes().all(|b| b.is_ascii_digit())
-        && (host == "localhost"
-            || host == "::1"
-            || host
-                .parse::<std::net::Ipv4Addr>()
-                .is_ok_and(|ip| ip.is_loopback()))
 }
 /// Pings ou pongs tolérés entre deux messages de données.
 const MAX_CONTROL_RUN: usize = 32;
