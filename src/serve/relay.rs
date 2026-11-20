@@ -409,6 +409,21 @@ fn over_budget() -> bool {
         .is_some()
 }
 
+/// Retire `--api-key VALEUR` de la ligne de commande de l'enfant : le jeton lui
+/// parvient par `SARAGOSSA_API_KEY`, posé au démarrage, et reste hors de `ps`.
+fn without_api_key(args: impl Iterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut kept = Vec::new();
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        if arg == "--api-key" || arg == "--bearer-token" {
+            args.next();
+        } else {
+            kept.push(arg);
+        }
+    }
+    kept
+}
+
 /// Lance l'enfant et attend son octet « prêt » ; renvoie son pid.
 #[allow(unsafe_code)]
 fn hand_over(binary: &PathBuf, listener: RawFd, sequential: bool) -> ServeResult<u32> {
@@ -423,7 +438,7 @@ fn hand_over(binary: &PathBuf, listener: RawFd, sequential: bool) -> ServeResult
     }
     let mut command = Command::new(binary);
     command
-        .args(std::env::args_os().skip(1))
+        .args(without_api_key(std::env::args_os().skip(1)))
         .env(LISTEN_FDS_ENV, listen)
         .env(READY_FD_ENV, ready.to_string());
     if sequential {
@@ -467,6 +482,17 @@ fn hand_over(binary: &PathBuf, listener: RawFd, sequential: bool) -> ServeResult
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_argv_drops_the_api_key() {
+        let args =
+            ["--port", "1", "--api-key", "s3cret", "--model", "a"].map(std::ffi::OsString::from);
+        let kept = without_api_key(args.into_iter());
+        assert_eq!(
+            kept,
+            ["--port", "1", "--model", "a"].map(std::ffi::OsString::from)
+        );
+    }
 
     #[test]
     fn listen_fds_rejects_duplicates_and_unknown_names() {

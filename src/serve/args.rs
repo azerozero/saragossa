@@ -272,7 +272,7 @@ pub(super) fn help_text() -> String {
     }
     format!(
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
-         [--api-key TOKEN] [--model ID=DIR|DIR|ORG/REPO]... \\
+         [--api-key TOKEN (deprecated, use SARAGOSSA_API_KEY)] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
          {modality_options}[--backend cpu|metal] [--preload] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
          Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap and the [[models]] list (id, path) only. See `saragossa config print`.\n\
