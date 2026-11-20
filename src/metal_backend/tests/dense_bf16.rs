@@ -545,6 +545,151 @@ fn dense_bf16_qmv_stage_matches_row_qmv_bitwise() -> Result<()> {
     with_metal_fast_math_override(false, || dense_bf16_stage_vs_row(&shapes, false))
 }
 
+/// Le qmv bf16 en lignes rend au bit le qmv à blocs de chaque ligne : la
+/// vérification spéculative garde l'arithmétique du decode M=1.
+fn dense_bf16_rows_vs_stage(shapes: &[(usize, usize, usize)]) -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    for &(n, k, batch) in shapes {
+        let bits: Vec<u16> = (0..n * k)
+            .map(|i| {
+                let v = ((i.wrapping_mul(2_654_435_761) >> 7) % 4093) as f32 / 4093.0 - 0.5;
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let rhs = metal.buffer_from_slice(&bits, "rows_rhs")?;
+        let x: Vec<f32> = (0..batch * k)
+            .map(|i| ((i * 40_503 % 997) as f32 / 997.0 - 0.5) * 1.37)
+            .collect();
+        let lhs = metal.upload_f32_buffer(&x, "rows_lhs")?;
+        let dims = [batch as u32, n as u32, k as u32];
+        let stage_out = metal.uncached_f32_buffer(batch * n, "rows_stage_out")?;
+        let rows_out = metal.uncached_f32_buffer(batch * n, "rows_out")?;
+        stage_probe_run(&metal, true, [&lhs, &rhs, &stage_out], dims, 1)?;
+        let cb = metal.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        metal.encode_dense_qmv_rhs_bf16(enc, &lhs, &rhs, &rows_out, batch, n, k)?;
+        enc.end_encoding();
+        commit_and_wait(cb)?;
+        let bits_of = |buffer| -> Result<Vec<u32>> {
+            Ok(read_f32_buffer(buffer, batch * n)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        let expected = bits_of(&stage_out)?;
+        assert!(expected.iter().all(|&b| b != 0), "N={n} K={k}");
+        assert_eq!(bits_of(&rows_out)?, expected, "N={n} K={k} M={batch}");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
+fn dense_bf16_qmv_stage_rows_matches_stage_bitwise() -> Result<()> {
+    // 9 lignes = arbre DFlash B=8 ; 17 et 33 traversent plusieurs groupes de 16.
+    let shapes = [
+        (37, 512, 2),
+        (1024, 5120, 9),
+        (48, 5120, 17),
+        (6, 17408, 33),
+        (248_320, 5120, 4),
+    ];
+    dense_bf16_rows_vs_stage(&shapes)?;
+    with_metal_fast_math_override(false, || dense_bf16_rows_vs_stage(&shapes))
+}
+
+/// Temps moyen par dispatch du qmv bf16 de production (`rows` : noyau en
+/// lignes ; sinon qmv à blocs relu par ligne, comme sans le noyau en lignes).
+fn rows_probe_run(
+    metal: &MetalExecutor,
+    rows: bool,
+    buffers: [&metal::Buffer; 3],
+    dims: [u32; 3],
+    reps: usize,
+) -> Result<f64> {
+    if !rows {
+        return stage_probe_run(metal, true, buffers, dims, reps);
+    }
+    let [batch, n, k] = dims.map(|d| d as usize);
+    let cb = metal.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    for _ in 0..reps {
+        metal.encode_dense_qmv_rhs_bf16(enc, buffers[0], buffers[1], buffers[2], batch, n, k)?;
+    }
+    enc.end_encoding();
+    let start = std::time::Instant::now();
+    commit_and_wait(cb)?;
+    Ok(start.elapsed().as_secs_f64() / reps as f64)
+}
+
+#[test]
+#[ignore = "sonde qmv bf16 en lignes (vérification spéculative), GPU au repos"]
+fn dense_bf16_qmv_rows_probe() -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    let shapes = [
+        (17408_usize, 5120_usize, 9_usize),
+        (5120, 17408, 9),
+        (248_320, 5120, 9),
+        (17408, 5120, 3),
+        (17408, 5120, 4),
+    ];
+    for (n, k, batch) in shapes {
+        let bits: Vec<u16> = (0..n * k)
+            .map(|i| {
+                let v = ((i.wrapping_mul(2_654_435_761) >> 7) % 4093) as f32 / 4093.0 - 0.5;
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let rhs = metal.buffer_from_slice(&bits, "probe_rhs")?;
+        drop(bits);
+        let x: Vec<f32> = (0..batch * k)
+            .map(|i| ((i * 40_503 % 997) as f32 / 997.0 - 0.5) * 1.37)
+            .collect();
+        let lhs = metal.upload_f32_buffer(&x, "probe_lhs")?;
+        let dims = [batch as u32, n as u32, k as u32];
+        let outs = [
+            metal.uncached_f32_buffer(batch * n, "probe_stage")?,
+            metal.uncached_f32_buffer(batch * n, "probe_rows")?,
+        ];
+        let mut samples = [Vec::new(), Vec::new()];
+        for trial in 0..9 {
+            for rows in [trial % 2 == 1, trial % 2 == 0] {
+                let t = rows_probe_run(
+                    &metal,
+                    rows,
+                    [&lhs, &rhs, &outs[usize::from(rows)]],
+                    dims,
+                    4,
+                )?;
+                if trial >= 2 {
+                    samples[usize::from(rows)].push(t);
+                }
+            }
+        }
+        let bits_of = |buffer| -> Result<Vec<u32>> {
+            Ok(read_f32_buffer(buffer, batch * n)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        assert_eq!(
+            bits_of(&outs[1])?,
+            bits_of(&outs[0])?,
+            "N={n} K={k} M={batch}"
+        );
+        for (rows, values) in samples.iter_mut().enumerate() {
+            values.sort_by(f64::total_cmp);
+            eprintln!(
+                "N={n} K={k} M={batch} rows={} median={:.3}ms {:.0}GB/s",
+                rows == 1,
+                values[3] * 1e3,
+                (n * k * 2) as f64 / values[3] / 1e9
+            );
+        }
+    }
+    Ok(())
+}
+
 // Temps commit/wait amortis sur plusieurs dispatches, ordre alterné : contrôle
 // local, pas une distribution sur GPU au repos.
 #[test]

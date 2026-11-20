@@ -517,6 +517,9 @@ pub struct SpeculativeStats {
     pub dflash_switched_at: Option<usize>,
     /// Tokens du prompt repris du cache de préfixe au lieu d'être préremplis.
     pub reused_prefix_tokens: usize,
+    /// Tours de la boucle DFlash (un draft + une vérification) ; `None` quand
+    /// la tête MTP a servi seule.
+    pub dflash_tours: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

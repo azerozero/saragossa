@@ -181,6 +181,96 @@ kernel void dense_qmv_rhs_bf16_stage_f32(
     }
 }
 
+// Variante en lignes de `dense_qmv_rhs_bf16_stage_f32` pour la vérification
+// spéculative (2 à 63 lignes, sous le plancher du GEMM). Chaque simdgroup porte
+// NR lignes de poids et R lignes d'activation : le bloc de 256 poids est lu une
+// fois (au lieu d'une fois par ligne) et chaque activation chargée sert NR
+// sorties. R et NR sont des constantes de compilation : les accumulateurs
+// restent en registres (un indice dynamique les renvoyait en mémoire). Les lignes au-delà
+// de `batch` relisent la dernière ligne valide et ne sont pas écrites. Par
+// couple (ligne, sortie), l'ordre d'accumulation et l'expression sont ceux du
+// noyau à blocs : identité au bit avec le decode M=1, vérifiée par
+// `dense_bf16_qmv_stage_rows_matches_stage_bitwise`.
+// Grille : x = ceil(out_dim / (4 NR)), y = ceil(batch / R). Exige in_dim % 256 == 0.
+template <uint R, uint NR>
+kernel void dense_qmv_rhs_bf16_rows_f32(
+    device const float* lhs [[buffer(0)]],
+    device const bfloat* rhs [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint3& dims [[buffer(3)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    threadgroup uint4 stage[4][NR][32];
+    const uint batch = dims.x;
+    const uint out_dim = dims.y;
+    const uint in_dim = dims.z;
+    const uint b0 = tile.y * R;
+    const uint row0 = (tile.x * 4u + simd_gid) * NR;
+    if (b0 >= batch || row0 >= out_dim) {
+        return;
+    }
+    const device uint4* w[NR];
+    for (uint n = 0u; n < NR; ++n) {
+        w[n] = (const device uint4*)(rhs + min(row0 + n, out_dim - 1u) * in_dim);
+    }
+    const device float* x[R];
+    for (uint r = 0u; r < R; ++r) {
+        x[r] = lhs + min(b0 + r, batch - 1u) * in_dim + lane;
+    }
+    float acc[NR][R];
+    for (uint n = 0u; n < NR; ++n) {
+        for (uint r = 0u; r < R; ++r) {
+            acc[n][r] = 0.0f;
+        }
+    }
+    for (uint kb = 0u; kb < in_dim; kb += 256u) {
+        for (uint n = 0u; n < NR; ++n) {
+            stage[simd_gid][n][lane] = w[n][kb / 8u + lane];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float wv[NR][8];
+        for (uint n = 0u; n < NR; ++n) {
+            threadgroup const bfloat* mine = (threadgroup const bfloat*)stage[simd_gid][n];
+            for (uint i = 0u; i < 8u; ++i) {
+                wv[n][i] = float(mine[lane + 32u * i]);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0u; r < R; ++r) {
+            float xv[8];
+            for (uint i = 0u; i < 8u; ++i) {
+                xv[i] = x[r][kb + 32u * i];
+            }
+            for (uint n = 0u; n < NR; ++n) {
+                for (uint i = 0u; i < 8u; ++i) {
+                    acc[n][r] += xv[i] * wv[n][i];
+                }
+            }
+        }
+    }
+    for (uint n = 0u; n < NR; ++n) {
+        for (uint r = 0u; r < R; ++r) {
+            const float total = simd_sum(acc[n][r]);
+            if (lane == 0u && row0 + n < out_dim && b0 + r < batch) {
+                out[(b0 + r) * out_dim + row0 + n] = total;
+            }
+        }
+    }
+}
+
+#define DENSE_QMV_BF16_ROWS(R, NR) \
+    template [[host_name("dense_qmv_rhs_bf16_rows_f32_r" #R "_n" #NR)]] \
+    kernel void dense_qmv_rhs_bf16_rows_f32<R, NR>(device const float*, device const bfloat*, \
+    device float*, constant uint3&, uint, uint, uint2);
+DENSE_QMV_BF16_ROWS(2, 1) DENSE_QMV_BF16_ROWS(3, 1) DENSE_QMV_BF16_ROWS(4, 1)
+#define DENSE_QMV_BF16_ROWS_ALL(R) DENSE_QMV_BF16_ROWS(R, 4)
+DENSE_QMV_BF16_ROWS_ALL(5) DENSE_QMV_BF16_ROWS_ALL(6) DENSE_QMV_BF16_ROWS_ALL(7)
+DENSE_QMV_BF16_ROWS_ALL(8) DENSE_QMV_BF16_ROWS_ALL(9) DENSE_QMV_BF16_ROWS_ALL(10)
+DENSE_QMV_BF16_ROWS_ALL(11) DENSE_QMV_BF16_ROWS_ALL(12) DENSE_QMV_BF16_ROWS_ALL(13)
+DENSE_QMV_BF16_ROWS_ALL(14) DENSE_QMV_BF16_ROWS_ALL(15) DENSE_QMV_BF16_ROWS_ALL(16)
+
 // QMV dense f32 batch>=1, out_dim multiple de 8, in_dim multiple de 512.
 // Reutilise chaque bloc d'activation pour 8 lignes de poids (2 simdgroups x 4
 // lignes), utile pour les routeurs MoE denses [256, 2048]. L'ordre

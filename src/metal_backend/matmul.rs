@@ -535,14 +535,42 @@ impl MetalExecutor {
         ];
         // Le noyau à blocs de 256 garde l'ordre d'accumulation du qmv par ligne.
         let stage = in_dim % 256 == 0 && crate::runtime_flags::dense_bf16_qmv_stage_enabled();
-        let (pipeline, name, rows_per_group) = if stage {
-            (
+        // Plusieurs lignes (vérification MTP/DFlash) : le bloc de poids est lu une
+        // fois pour R ≤ 16 lignes au lieu d'une, même arithmétique par ligne.
+        let rows = (stage && batch > 1 && crate::runtime_flags::dense_bf16_qmv_rows_enabled())
+            .then(|| batch.min(16));
+        // Lignes de poids par simdgroup : 1 jusqu'à 4 lignes d'activation (MTP),
+        // 4 au-delà (DFlash) pour réutiliser chaque activation chargée. Sonde
+        // `dense_bf16_qmv_rows_probe` (27B, gate 17408×5120) : R = 3-4 0,36 ms
+        // en NR = 1 contre 0,41-0,44 en NR = 4 ; R = 9 0,77 ms en NR = 4 contre
+        // 0,94 en NR = 1 et 0,97 relu par ligne ; lm_head R = 9 6,6 contre 13,5 ms.
+        let per_simdgroup = if batch <= 4 { 1 } else { 4 };
+        let rows_pipeline = rows
+            .map(|r| {
+                self.qmvt_pipeline(&format!(
+                    "dense_qmv_rhs_bf16_rows_f32_r{r}_n{per_simdgroup}"
+                ))
+            })
+            .transpose()?;
+        let (pipeline, name, rows_per_group, batch_groups) = match (&rows_pipeline, rows) {
+            (Some(pipeline), Some(r)) => (
+                pipeline,
+                "dense_qmv_rhs_bf16_rows_f32",
+                4 * per_simdgroup,
+                batch.div_ceil(r),
+            ),
+            _ if stage => (
                 &self.dense_qmv_rhs_bf16_stage_f32,
                 "dense_qmv_rhs_bf16_stage_f32",
                 4,
-            )
-        } else {
-            (&self.dense_qmv_rhs_bf16_f32, "dense_qmv_rhs_bf16_f32", 1)
+                batch,
+            ),
+            _ => (
+                &self.dense_qmv_rhs_bf16_f32,
+                "dense_qmv_rhs_bf16_f32",
+                1,
+                batch,
+            ),
         };
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs), 0);
@@ -553,7 +581,11 @@ impl MetalExecutor {
             std::mem::size_of::<[u32; 3]>() as u64,
             dims.as_ptr().cast::<std::ffi::c_void>(),
         );
-        let threads_per_group = if stage {
+        // Noyau à blocs : un simdgroup par ligne de poids, 4 par threadgroup ;
+        // noyau en lignes : 4 simdgroups de 4 lignes de poids chacun.
+        let threads_per_group = if rows.is_some() {
+            128
+        } else if stage {
             32 * rows_per_group as NSUInteger
         } else {
             self.qmv_thread_group_size(pipeline)
@@ -563,7 +595,7 @@ impl MetalExecutor {
         encoder.dispatch_thread_groups(
             MTLSize::new(
                 checked_nsuint(out_dim.div_ceil(rows_per_group), "bf16 qmv out_dim")?,
-                checked_nsuint(batch, "bf16 qmv batch")?,
+                checked_nsuint(batch_groups, "bf16 qmv batch")?,
                 1,
             ),
             MTLSize::new(threads_per_group, 1, 1),

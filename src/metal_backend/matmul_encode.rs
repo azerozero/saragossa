@@ -55,7 +55,7 @@ impl MetalExecutor {
 
     /// Pipeline qmv-T `name`, créé à la première demande : seul le mode strict
     /// les utilise, le démarrage n'en paie aucun.
-    fn qmvt_pipeline(&self, name: &str) -> Result<ComputePipelineState> {
+    pub(super) fn qmvt_pipeline(&self, name: &str) -> Result<ComputePipelineState> {
         let mut cache = self
             .qmvt_pipelines
             .lock()
