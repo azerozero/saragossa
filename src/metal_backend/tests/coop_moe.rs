@@ -1501,7 +1501,7 @@ fn coop_qb_tiled_u4_bit_identical_to_u8_same_weights() -> Result<()> {
 }
 
 /// Prédicat du MLP fusionné : accepte seulement trois poids u4 gs64 sans offset
-/// aux bonnes dimensions ; un offset non nul (poids poolé, régression de
+/// aux bonnes dimensions ; un offset mal aligné (poids poolé, régression de
 /// 9f23853), un poids dense ou une forme inattendue renvoient au chemin séparé.
 #[test]
 fn fused_dense_mlp_supported_rejects_offsets_dense_and_shape() -> Result<()> {
@@ -1540,13 +1540,19 @@ fn fused_dense_mlp_supported_rejects_offsets_dense_and_shape() -> Result<()> {
         executor.fused_dense_mlp_supported(batch, in_dim, g, u, d, inter_dim)
     };
     assert!(supported(&gate, &up, &down), "trois poids u4 gs64 sans offset doivent être acceptés");
+    // Depuis f2331f6, les vues mmap décalées sont liées : un offset packed
+    // aligné sur 16 octets passe, un offset mal aligné renvoie au chemin séparé.
     assert!(
-        !supported(&u4(inter_dim, in_dim, 64), &up, &down),
-        "un offset non nul sur gate doit renvoyer au chemin séparé"
+        supported(&u4(inter_dim, in_dim, 64), &up, &down),
+        "un offset aligné sur gate doit être accepté"
     );
     assert!(
-        !supported(&gate, &up, &u4(in_dim, inter_dim, 64)),
-        "un offset non nul sur down doit renvoyer au chemin séparé"
+        !supported(&u4(inter_dim, in_dim, 4), &up, &down),
+        "un offset mal aligné sur gate doit renvoyer au chemin séparé"
+    );
+    assert!(
+        !supported(&gate, &up, &u4(in_dim, inter_dim, 4)),
+        "un offset mal aligné sur down doit renvoyer au chemin séparé"
     );
     assert!(
         !supported(&gate, &up, &u4(in_dim + 64, inter_dim, 0)),
