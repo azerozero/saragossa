@@ -548,7 +548,8 @@ fn rms_qmv_u8_bitwise_matches_fused_qkv_split() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
-    std::env::set_var("SARAGOSSA_RUST_FULL_QKV_SPLIT_RMS_U8", "1");
+    let mut env = crate::test_support::env_guard();
+    env.set("SARAGOSSA_RUST_FULL_QKV_SPLIT_RMS_U8", "1");
     let (q_heads, head_dim) = (16_usize, 256_usize);
     let q_gate_dim = q_heads * head_dim * 2;
     let (out_dim, in_dim) = (9216_usize, 2048_usize);
