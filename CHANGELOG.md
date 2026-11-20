@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.22](https://github.com/azerozero/saragossa/compare/v0.3.21...v0.3.22) - 2026-11-20
+
+### Fixed
+
+- *(mtp)* clés du tronc ignorées quand la tête est embarquée dans un shard
+- *(mtp)* tête MTP embarquée dans les shards et avertissement si inactive
+
+### Other
+
+- Merge pull request #300 from azerozero/test/mlp-fusionne-offsets
+- Merge pull request #299 from azerozero/fix/mtp-tete-embarquee
+- *(metal)* offsets alignés acceptés par le MLP fusionné depuis f2331f6
+
 ## [0.3.21](https://github.com/azerozero/saragossa/compare/v0.3.20...v0.3.21) - 2026-11-20
 
 ### Fixed
