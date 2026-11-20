@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.19](https://github.com/azerozero/saragossa/compare/v0.3.18...v0.3.19) - 2026-11-20
+
+### Fixed
+
+- *(prefill)* borne le tampon de timestamps GPU à 4096 échantillons
+
+### Other
+
+- Merge pull request #282 from azerozero/perf/prefill-bf16-27b
+- tests X1 exemptés de la CI GPU, GEMM NA absent du runner
+- *(gpu)* tests X1 du prefill bf16 dans la liste synthétique
+- Merge branch 'main' into perf/prefill-bf16-27b
+- *(perf)* périmètre, conditions K et N et mémoire du GEMM bf16 à un produit
+- *(prefill)* borne le GEMM bf16 à un produit au prefill Qwen dense bf16
+- Merge remote-tracking branch 'origin/main' into perf/prefill-bf16-27b
+- *(perf)* prefill BF16 à un produit, vitesse, KL et identité
+- *(prefill)* GEMM bf16 à un produit par défaut, retrait de NFIRST
+- *(prefill)* GEMM bf16 dense à un produit et grille N d'abord en opt-in
+
 ## [0.3.18](https://github.com/azerozero/saragossa/compare/v0.3.17...v0.3.18) - 2026-11-20
 
 ### Fixed
