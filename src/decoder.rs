@@ -2583,6 +2583,9 @@ impl CausalDecoder {
         // du GEMM NA u4 ne touche aucun autre modèle. Sinks appris et expert
         // partagé sans gate signent flint ; Qwen et Gemma n'en ont aucun.
         let flint = self.config.attention_sinks && self.config.ungated_shared_expert;
+        // NOTE: sur un Qwen MoE, le plancher abaissé vaut pour tout l'executor,
+        // semis de la tête MTP compris (batch ≥ 32) : sans effet sur la sortie,
+        // la vérification greedy reste exacte ; seule l'acceptation peut bouger.
         if flint {
             if crate::runtime_flags::flint_small_nax_gemm_enabled() {
                 executor.enable_flint_small_nax_gemm();

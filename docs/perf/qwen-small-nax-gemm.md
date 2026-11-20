@@ -64,3 +64,10 @@ défaut.
 | 16384 | 5020-5198 ms | 4058 ms (−21,9 %) | 4223 ms (−15,9 %) |
 
 Chaque variante a son propre bras A, d'où les deux valeurs du qmv f32.
+
+## Tête MTP
+
+Le plancher abaissé vaut pour tout l'executor du Qwen MoE, donc aussi pour le
+semis de la tête MTP (batch ≥ 32). La sortie ne change pas : la vérification
+greedy reste exacte. Seul le taux d'acceptation du brouillon peut bouger ; il
+n'a pas été mesuré séparément.

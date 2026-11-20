@@ -87,9 +87,9 @@ fn qmm_u6_selection_preserves_decode_and_fallback() {
 impl MetalExecutor {
     /// Abaisse le plancher du GEMM NA u4 aux petites projections de flint,
     /// servies par le bf16×3 (`gemm_nax_coop_qb_tiled_u4_x3`). Appelé à
-    /// l'installation de l'executor sur un décodeur flint seulement : Qwen et
-    /// Gemma gardent le plancher 2048 et restent bit-identiques. Sans le
-    /// pipeline x3, le plancher reste en place (repli qmv).
+    /// l'installation de l'executor sur un décodeur flint ou Qwen MoE (alors
+    /// en bf16×4) : Qwen denses et Gemma gardent le plancher 2048 et restent
+    /// bit-identiques. Sans le pipeline x3, le plancher reste en place (repli qmv).
     pub(crate) fn enable_flint_small_nax_gemm(&mut self) {
         if self.na_gemm_coop_qb_tiled_u4_x3.is_some() {
             self.qmm_na_u4_min_dim = QMM_NA_U4_FLINT_MIN_DIM;

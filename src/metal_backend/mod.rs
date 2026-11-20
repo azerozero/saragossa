@@ -415,7 +415,7 @@ pub struct MetalExecutor {
     /// Choix du Steel avec sinks (lu du flag, forcé en test).
     prefill_sink_steel: bool,
     /// Plancher de `in_dim`/`out_dim` du GEMM NA u4 gs64 : 2048 par défaut,
-    /// abaissé pour flint seul par [`Self::enable_flint_small_nax_gemm`].
+    /// abaissé pour flint et les Qwen MoE par [`Self::enable_flint_small_nax_gemm`].
     qmm_na_u4_min_dim: usize,
     /// Sous le plancher, bf16×4 au lieu du bf16×3 : Qwen MoE par défaut
     /// ([`Self::set_small_nax_gemm_x4`]), jamais flint ni les k/v du 27B.
@@ -485,9 +485,10 @@ pub struct MetalExecutor {
     na_gemm_coop_qb_tiled_gs128: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4: Option<ComputePipelineState>,
     /// GEMM tuilé u4 bf16×3 à lhs f32, réservé aux projections sous le
-    /// plancher par défaut (petites formes de flint).
+    /// plancher par défaut (petites formes de flint, `=x3` sur les Qwen MoE).
     na_gemm_coop_qb_tiled_u4_x3: Option<ComputePipelineState>,
-    /// Variante bf16×4 (lo·lo en plus), opt-in `SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM=x4`.
+    /// Variante bf16×4 (lo·lo en plus), défaut des Qwen MoE
+    /// (`SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM=0` la coupe).
     na_gemm_coop_qb_tiled_u4_x4: Option<ComputePipelineState>,
     /// GEMM tuilé à poids bf16 denses `[N,K]` et lhs f32 scindé hi + lo,
     /// pour le prefill des modèles BF16.

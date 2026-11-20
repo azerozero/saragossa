@@ -353,8 +353,8 @@ impl MetalExecutor {
         in_dim: usize,
         out_dim: usize,
     ) -> Result<()> {
-        // Sous le plancher par défaut (formes que seuls flint et les poids k/v
-        // d'un Qwen dense ouvrent), le bf16×3 lit le lhs f32 directement : pas
+        // Sous le plancher par défaut (formes que seuls flint, les Qwen MoE et
+        // les poids k/v d'un Qwen dense ouvrent), le bf16×3/×4 lit le lhs f32 directement : pas
         // de conversion bf16 préalable.
         if in_dim.min(out_dim) < QMM_NA_U4_DEFAULT_MIN_DIM {
             if out_dim % 64 != 0 {
