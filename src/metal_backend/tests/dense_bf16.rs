@@ -72,7 +72,16 @@ fn dense_bf16_qmv_matches_f32() -> Result<()> {
 #[test]
 #[ignore = "requiert Metal avec GEMM NA et SARAGOSSA_RUST_DENSE_BF16_GEMM actif (défaut) ; poids synthétiques"]
 fn dense_bf16_prefill_gemm_matches_f32() -> Result<()> {
-    // Défaut : GEMM à un produit, activation arrondie une fois en bf16.
+    // Hors portée `DenseBf16X1Scope` (tête MTP, drafter, Gemma, quantifiés) :
+    // GEMM hi + lo par défaut.
+    dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_tiled_x2")
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; poids synthétiques"]
+fn dense_bf16_prefill_x1_scope_rounds_activation_once() -> Result<()> {
+    // Couches du prefill résident Qwen dense bf16 : GEMM à un produit.
+    let _scope = crate::runtime_flags::DenseBf16X1Scope::enter(true);
     dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_bn128")
 }
 
@@ -143,6 +152,8 @@ fn run_flag_child(name: &str, child: &str, env: (&str, &str)) {
 fn dense_bf16_prefill_x1_kill_switch_selects_hi_lo() -> Result<()> {
     const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_X1_CHILD";
     if std::env::var_os(CHILD).is_some() {
+        // `=0` coupe le GEMM à un produit même dans la portée.
+        let _scope = crate::runtime_flags::DenseBf16X1Scope::enter(true);
         return dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_tiled_x2");
     }
     run_flag_child(
@@ -197,6 +208,8 @@ fn dense_bf16_fused_mlp_matches_x1() -> Result<()> {
         );
         return Ok(());
     }
+    // Le MLP fusionné ne sert que dans la portée X1 du prefill résident.
+    let _scope = crate::runtime_flags::DenseBf16X1Scope::enter(true);
     let executor = MetalExecutor::new()?;
     let (hidden, inter) = (256_usize, 384_usize);
     let mut resolved = Vec::new();
@@ -292,6 +305,22 @@ fn dense_bf16_pair_gemm_matches_f32() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
+fn dense_bf16_prefill_x1_forced_outside_scope() -> Result<()> {
+    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_X1_FORCED_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        // `=1` force le GEMM à un produit hors portée.
+        return dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_bn128");
+    }
+    run_flag_child(
+        "dense_bf16_prefill_x1_forced_outside_scope",
+        CHILD,
+        ("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1", "1"),
+    );
     Ok(())
 }
 

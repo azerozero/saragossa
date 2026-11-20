@@ -126,6 +126,17 @@ pub(crate) fn whisper_bf16_gemm_enabled() -> bool {
     })
 }
 
+/// Projections d'attention du decode Whisper (q, k, v, o, cross q et o) sur les
+/// poids bf16 du QMV decode. Opt-in `SARAGOSSA_STT_DEC_ATTN_BF16=1` : l'arrondi
+/// bf16 des poids change les logits ; défaut OFF (f32, inchangé).
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(crate) fn whisper_decode_attn_bf16_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        whisper_decode_bf16_qmv_enabled() && crate::runtime_flags::stt_dec_attn_bf16()
+    })
+}
+
 /// Active le QMV decode Whisper avec poids bf16 row-major pour les projections
 /// M=1 où le microbench montre un gain. `SARAGOSSA_STT_F32=1` force le chemin f32.
 pub(crate) fn whisper_decode_bf16_qmv_enabled() -> bool {
@@ -335,16 +346,20 @@ impl MetalExecutor {
             )));
         }
         // NOTE: GEMM bf16 à un produit (activation arrondie une fois en bf16)
-        // pour les modèles de décision et, par défaut, le prefill LLM : KL du
-        // 27B BF16 dans docs/perf/prefill-bf16.md. `SARAGOSSA_RUST_DENSE_BF16_GEMM_X1=0`
-        // rétablit la correction hi + lo hors décision.
+        // pour les modèles de décision et, par défaut, les couches du prefill
+        // résident d'un LLM Qwen dense bf16 (`DenseBf16X1Scope`) ; ailleurs
+        // (decode, vérification, tête MTP, drafter, Gemma, modèles quantifiés)
+        // hi + lo. KL du 27B BF16 dans docs/perf/prefill-bf16.md.
         if let Some(pso) = self
             .na_gemm_bf16_nt_bn128
             .as_ref()
             .filter(|_| uses_dense_bf16_gemm_x1(batch, in_dim, out_dim))
         {
-            let len = checked_len(batch, in_dim, "décision GEMM A bf16")?;
-            let lhs_bf16 = self.private_bf16_buffer(len, "decision_gemm_lhs_bf16")?;
+            // NOTE: scratch bf16 M×K mis en cache par longueur : un tampon par
+            // K distinct (5120, 6144, 17408 sur le 27B), soit 2·M·K octets,
+            // 142 Mo pour le down_proj à 4096 lignes et 285 Mo à 8192.
+            let len = checked_len(batch, in_dim, "GEMM bf16 un produit A bf16")?;
+            let lhs_bf16 = self.private_bf16_buffer(len, "dense_bf16_gemm_lhs_bf16")?;
             self.encode_f32_to_bf16(encoder, lhs, &lhs_bf16, len)?;
             self.dispatch_dense_bf16_gemm_x1(
                 encoder, pso, &lhs_bf16, rhs, out, batch, out_dim, in_dim,
@@ -497,6 +512,22 @@ impl MetalExecutor {
         out_dim: usize,
         in_dim: usize,
     ) -> Result<()> {
+        self.encode_dense_qmv_rhs_bf16_at(encoder, lhs, rhs_bf16, out, 0, batch, out_dim, in_dim)
+    }
+
+    /// [`Self::encode_dense_qmv_rhs_bf16`] avec un décalage d'écriture (append KV).
+    #[expect(clippy::too_many_arguments, reason = "qmv bas niveau (dims + buffers)")]
+    pub(crate) fn encode_dense_qmv_rhs_bf16_at(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs: &BufferRef,
+        rhs_bf16: &BufferRef,
+        out: &BufferRef,
+        out_offset_bytes: u64,
+        batch: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
         let dims = [
             checked_u32(batch, "bf16 qmv batch")?,
             checked_u32(out_dim, "bf16 qmv out_dim")?,
@@ -516,7 +547,7 @@ impl MetalExecutor {
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs), 0);
         encoder.set_buffer(1, Some(rhs_bf16), 0);
-        encoder.set_buffer(2, Some(out), 0);
+        encoder.set_buffer(2, Some(out), out_offset_bytes);
         encoder.set_bytes(
             3,
             std::mem::size_of::<[u32; 3]>() as u64,

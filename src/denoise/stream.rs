@@ -27,7 +27,12 @@ impl<'a> DenoiseStream<'a> {
     #[must_use]
     pub fn with_threads(model: &'a DeepFilterNet3, threads: usize) -> Self {
         let mut stream = model.stream();
-        stream.threads = threads.max(1);
+        // Variante faible latence : convolutions internes à état, pas multi-cœur non porté.
+        stream.threads = if model.net.is_std() {
+            threads.max(1)
+        } else {
+            1
+        };
         Self::from_stream(stream)
     }
 
@@ -63,6 +68,10 @@ const BLOCK_HOPS: usize = 256;
 trait Hops {
     fn hop(&mut self, input: &[f32], output: &mut [f32]) -> Result<()>;
     fn tail(&mut self) -> Vec<f32>;
+    /// Échantillons de retard à retirer en tête de sortie.
+    fn delay(&self) -> usize {
+        DfStream::DELAY_SAMPLES
+    }
     /// Nombre de hops entiers que [`Self::hops`] veut traiter d'un coup (1 : hop par hop).
     fn block(&self) -> usize {
         1
@@ -99,6 +108,9 @@ impl Hops for DfStream<'_> {
     fn tail(&mut self) -> Vec<f32> {
         self.finish()
     }
+    fn delay(&self) -> usize {
+        self.delay_samples()
+    }
 }
 
 struct Buffered<P> {
@@ -117,10 +129,10 @@ impl<P: Hops> Buffered<P> {
     fn new(processor: P) -> Self {
         Self {
             pending: vec![0.0; processor.block() * HOP_SIZE],
+            skip: processor.delay(),
             processor,
             hops: Vec::new(),
             used: 0,
-            skip: DfStream::DELAY_SAMPLES,
             owed: 0,
             finished: false,
         }

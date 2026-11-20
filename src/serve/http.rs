@@ -920,10 +920,17 @@ pub(in crate::serve) fn is_authorized(request: &HttpRequest, expected: &str) -> 
     let Some(header) = request.header("authorization") else {
         return false;
     };
-    let Some(token) = header.strip_prefix("Bearer ") else {
+    let Some(token) = bearer_token(header) else {
         return false;
     };
     constant_time_eq(token.as_bytes(), expected.as_bytes())
+}
+
+/// Jeton d'un en-tête `Authorization: Bearer <jeton>` ; schéma insensible à la
+/// casse (RFC 7235 §2.1).
+pub(in crate::serve) fn bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
 }
 
 pub(super) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

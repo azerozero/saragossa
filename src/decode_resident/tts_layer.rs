@@ -24,7 +24,8 @@ pub(crate) struct TtsCpLayerWeights<'a> {
     pub rope_frequencies: &'a BufferRef,
     pub input_norm: &'a BufferRef,
     /// Projection q, k, v concaténée (lignes dans cet ordre).
-    pub qkv_proj: &'a MetalLinearWeightBuffers,
+    /// Un poids concaténé q+k+v, ou trois poids q, k, v (vues du stockage, sans copie).
+    pub qkv_proj: &'a [MetalLinearWeightBuffers],
     pub q_norm: &'a BufferRef,
     pub k_norm: &'a BufferRef,
     pub o_proj: &'a MetalLinearWeightBuffers,
@@ -70,7 +71,15 @@ impl DecodeResidentState {
         let eligible = !dims.attn_output_gate
             && !kv.has_sinks()
             && kv.supports_fused_rope_append()
-            && executor.linear_weight_out_dim(weights.qkv_proj) == qkv_dim
+            && weights.qkv_proj.iter().all(|w| {
+                weights.qkv_proj.len() == 1 || MetalExecutor::is_aligned_u6_weight(w, hidden)
+            })
+            && weights
+                .qkv_proj
+                .iter()
+                .map(|w| executor.linear_weight_out_dim(w))
+                .sum::<usize>()
+                == qkv_dim
             && MetalExecutor::is_aligned_u6_weight(weights.gate_proj, hidden)
             && MetalExecutor::is_aligned_u6_weight(weights.up_proj, hidden)
             && executor.linear_weight_out_dim(weights.up_proj) == inter
@@ -100,15 +109,37 @@ impl DecodeResidentState {
             hidden,
             dims.eps,
         )?;
-        let projected = executor.encode_matmul_weight_buffers(
-            encoder,
-            normed.tensor().buffer(),
-            1,
-            hidden,
-            weights.qkv_proj,
-            qkv.tensor().buffer(),
-            false,
-        )?;
+        let projected = match weights.qkv_proj {
+            [qkv_proj] => executor.encode_matmul_weight_buffers(
+                encoder,
+                normed.tensor().buffer(),
+                1,
+                hidden,
+                qkv_proj,
+                qkv.tensor().buffer(),
+                false,
+            )?,
+            parts => {
+                let mut rows = 0;
+                for part in parts {
+                    if !executor.encode_qmv_u6_at(
+                        encoder,
+                        normed.tensor().buffer(),
+                        part,
+                        qkv.tensor().buffer(),
+                        byte_offset_f32(rows, "couche TTS qkv offset")?,
+                        hidden,
+                    )? {
+                        return Err(InferError::Config(
+                            "couche TTS fusionnée: qkv séparé refusé après vérification"
+                                .to_string(),
+                        ));
+                    }
+                    rows += executor.linear_weight_out_dim(part);
+                }
+                rows
+            }
+        };
         if projected != qkv_dim {
             return Err(InferError::Dimension(format!(
                 "couche TTS fusionnée: qkv sort {projected}, attendu {qkv_dim}"

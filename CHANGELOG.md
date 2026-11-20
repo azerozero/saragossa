@@ -7,6 +7,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.20](https://github.com/azerozero/saragossa/compare/v0.3.19...v0.3.20) - 2026-11-20
+
+### Other
+
+- Merge pull request #286 from azerozero/perf/suffix-decoding
+- *(decoder)* bilan opt-in des drafts lookup acceptés
+- *(decoder)* source de brouillon SuffixDecoding opt-in pour les lookups
+
+## [0.3.19](https://github.com/azerozero/saragossa/compare/v0.3.18...v0.3.19) - 2026-11-20
+
+### Fixed
+
+- *(prefill)* borne le tampon de timestamps GPU à 4096 échantillons
+
+### Other
+
+- Merge pull request #282 from azerozero/perf/prefill-bf16-27b
+- tests X1 exemptés de la CI GPU, GEMM NA absent du runner
+- *(gpu)* tests X1 du prefill bf16 dans la liste synthétique
+- Merge branch 'main' into perf/prefill-bf16-27b
+- *(perf)* périmètre, conditions K et N et mémoire du GEMM bf16 à un produit
+- *(prefill)* borne le GEMM bf16 à un produit au prefill Qwen dense bf16
+- Merge remote-tracking branch 'origin/main' into perf/prefill-bf16-27b
+- *(perf)* prefill BF16 à un produit, vitesse, KL et identité
+- *(prefill)* GEMM bf16 à un produit par défaut, retrait de NFIRST
+- *(prefill)* GEMM bf16 dense à un produit et grille N d'abord en opt-in
+
+## [0.3.18](https://github.com/azerozero/saragossa/compare/v0.3.17...v0.3.18) - 2026-11-20
+
+### Fixed
+
+- *(serve)* pas de second 500 après réponse commencée, invalidation audio et embeddings
+- *(serve)* le parent n'accepte plus après l'annonce du vidage
+- *(serve)* panique moteur contenue, jeton hors argv, WebTransport durci
+
+### Other
+
+- Merge pull request #294 from azerozero/fix/na-compile-garde
+- *(metal)* garde NA, noyaux générés par macro exclus de l'analyse
+- Merge pull request #293 from azerozero/test/audit-suite
+- Merge pull request #291 from azerozero/fix/audit-secu-docs
+- liste GPU synthétique complétée, garde d'environnement unique, mélange nocturne
+- *(serve)* relais séquentiel déterministe, sockets transmises par le test
+
+## [0.3.17](https://github.com/azerozero/saragossa/compare/v0.3.16...v0.3.17) - 2026-11-19
+
+### Fixed
+
+- *(metal)* bibliothèque NA compilée une fois, échec signalé
+
+## [0.3.16](https://github.com/azerozero/saragossa/compare/v0.3.15...v0.3.16) - 2026-11-19
+
+### Other
+
+- Merge pull request #281 from azerozero/perf/denoise-math-commune
+- Merge pull request #283 from azerozero/perf/decode-quant-largeur
+- Merge origin/main dans perf/denoise-math-commune
+- *(denoise)* variante commune opt-in (SARAGOSSA_DENOISE_COMMON), libm reste le défaut
+- *(decode)* sonde qmv u4 en DRAM, poids tournants et command buffers longs
+- *(denoise)* variante mathématique commune par défaut sur CPU, libm en kill-switch
+- *(decode)* sonde de bande passante des qmv u4 dense et MoE
+
+## [0.3.15](https://github.com/azerozero/saragossa/compare/v0.3.14...v0.3.15) - 2026-11-18
+
+### Added
+
+- *(denoise)* variante faible latence DeepFilterNet3_ll, choisie par le modèle
+
+### Fixed
+
+- *(whisper)* is_silence prend AudioFeatures après fusion de main
+- *(serve)* sérialiser les tests qui écrivent les atomiques de rechargement
+- *(decode)* tampon de transposition qmv bf16 déclaré en uint4
+- *(denoise)* fusion de main, multi-cœur exact avec Math et chemin GPU
+- *(poids)* offsets des vues mmap liés partout, bf16 dense toujours copié
+- *(denoise)* invariants, gardes de forme et cache des noyaux du chemin GPU DFN3
+- *(stt)* déclarer les kill-switches dans runtime_flags et prouver l'identité résidente
+
+### Other
+
+- Merge pull request #279 from azerozero/feat/dfn3-faible-latence
+- Merge pull request #280 from azerozero/perf/bf16-stage-defaut
+- Merge pull request #252 from azerozero/perf/stt-tts-suite
+- *(decode)* noyau qmv bf16 à blocs de 256 activé par défaut
+- Merge remote-tracking branch 'origin/main' into perf/stt-tts-suite
+- Merge pull request #275 from azerozero/perf/denoise-mc-exact
+- Merge pull request #276 from azerozero/perf/decode-bf16-gemv
+- *(decode)* identité au bit du qmv bf16 aussi sans fast-math
+- Merge remote-tracking branch 'origin/main' into perf/denoise-mc-exact
+- Merge pull request #273 from azerozero/perf/poids-partages
+- *(decode)* qmv bf16 à lectures vectorisées, identique au bit, en opt-in
+- *(denoise)* multi-cœur exact au bit près, GRU séquentiels
+- Merge pull request #272 from azerozero/perf/denoise-gpu-exact
+- *(poids)* poids quantifiés partagés entre processus par mmap opt-in
+- *(denoise)* réseau DFN3 en lot sur GPU Metal pour les fichiers longs, identique au bit au CPU commun
+- *(tts)* lire le QKV du talker sans copie quand les poids sont adossés au stockage
+- *(tts)* prouver que les couches du talker fusionnées sont encodées
+- intégrer main et préserver les optimisations audio
+- fusionner les derniers correctifs audio de main
+- *(tts)* comparer les couches du talker fusionnées au bit près
+- intégrer les dernières évolutions de main
+- fusionner main dans la suite STT et TTS
+- *(stt)* garder les features sur le GPU, attention decode bf16 en opt-in
+- *(tts)* encoder les couches du talker en 8 dispatches
+- *(stt)* calculer le log-mel par trames en parallèle
+
 ## [0.3.14](https://github.com/azerozero/saragossa/compare/v0.3.13...v0.3.14) - 2026-11-18
 
 ### Added

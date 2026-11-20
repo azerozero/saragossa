@@ -86,6 +86,21 @@ fn golden_log_mel_matches_fixture() -> Result<()> {
     Ok(())
 }
 
+/// Le log-mel parallèle par trames reste identique au bit au calcul séquentiel.
+#[test]
+fn log_mel_parallel_matches_serial_bitwise() -> Result<()> {
+    let samples: Vec<f32> = (0..N_SAMPLES / 3)
+        .map(|i| ((i as f32) * 0.013).sin() * 0.5 + ((i * 7919) % 101) as f32 * 1.0e-3)
+        .collect();
+    for bins in [80, 128] {
+        let serial = log_mel_impl(&samples, bins, false)?;
+        let parallel = log_mel_impl(&samples, bins, true)?;
+        let bits = |t: &Tensor| t.data().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&serial), bits(&parallel), "bins={bins}");
+    }
+    Ok(())
+}
+
 /// Encodeur Whisper metal-rs ≡ golden mlx-rs figé (sans mlx-rs ; charge le snapshot
 /// whisper-tiny local pour l'inférence metal-rs). Mêmes tolérances que `live_encoder_*`.
 #[test]
@@ -124,6 +139,41 @@ fn golden_encoder_matches_fixture() -> Result<()> {
     }
     assert!(mean_abs < 1.0e-2, "drift moyen trop élevé: {mean_abs:.6e}");
     assert!(max_abs < 2.0e-1, "drift max trop élevé: {max_abs:.6e}");
+    Ok(())
+}
+
+/// Features résidentes (sans readback intermédiaire) contre le chemin hôte
+/// `SARAGOSSA_STT_FEATURES_HOST=1` : identiques au bit sur whisper-tiny.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "inférence: whisper-tiny local et verrou GPU requis"]
+fn resident_features_match_host_path_bitwise() -> Result<()> {
+    let Some(model_dir) = local_whisper_tiny_dir() else {
+        return Err(crate::InferError::Config(
+            "snapshot whisper-tiny requis".into(),
+        ));
+    };
+    let encoder = WhisperEncoder::from_model_dir(model_dir)?;
+    let metal = crate::MetalExecutor::new()?;
+    // Signal déterministe de 5 s à 16 kHz : somme de deux sinus.
+    let samples: Vec<f32> = (0..80_000)
+        .map(|i| {
+            let t = i as f32 / 16_000.0;
+            0.3 * (440.0 * std::f32::consts::TAU * t).sin()
+                + 0.1 * (1_234.0 * std::f32::consts::TAU * t).sin()
+        })
+        .collect();
+    let host = encoder.encode_samples(&samples, ForwardRuntime::metal(&metal))?;
+    let resident = encoder
+        .encode_samples_resident(&samples, &metal)?
+        .ok_or_else(|| crate::InferError::Config("chemin résident indisponible".into()))?;
+    let (rows, cols) = host.as_matrix()?;
+    assert_eq!((resident.rows, resident.cols), (rows, cols));
+    let got = crate::metal_backend::read_f32_buffer(&resident.buffer, rows * cols)?;
+    assert!(!got.is_empty() && got.iter().all(|v| v.is_finite()));
+    for (index, (a, b)) in got.iter().zip(host.data()).enumerate() {
+        assert_eq!(a.to_bits(), b.to_bits(), "feature {index}");
+    }
     Ok(())
 }
 

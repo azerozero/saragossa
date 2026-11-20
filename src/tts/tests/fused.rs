@@ -1,4 +1,4 @@
-//! Oracle de la trame fusionnée du code predictor (`SARAGOSSA_TTS_CP_FUSED`).
+//! Oracles des chemins fusionnés du code predictor et du talker TTS.
 //!
 //! Seuils fixés avant la première mesure, jamais élargis :
 //! - logits fusionnés contre pas à pas (projection CPU, mêmes codes imposés) :
@@ -14,11 +14,160 @@
 
 use super::*;
 use crate::decode_resident::TtsCodebookSample;
+use crate::runtime_flags::TTS_FUSED_LAYER_ENCODES;
 use crate::sampling::token_distribution_top_k_top_p;
+use std::cell::Cell;
 
 const LOGITS_MAX_ABS: f32 = 1e-3;
 const PROBS_MAX_ABS: f32 = 1e-6;
 const NEAR_TIE: f32 = 1e-5;
+
+/// Couches talker fusionnées contre le kill-switch : état final et logits
+/// identiques au bit sur 3 graines × 16 trames, avec deux caches indépendants.
+#[test]
+#[ignore = "inférence: snapshots TTS locaux et verrou GPU requis"]
+fn tts_talker_fused_kernels_match_general_layers() -> Result<()> {
+    use crate::runtime_flags::with_tts_talker_fused_kernels_override;
+
+    for (env, repo) in [
+        (
+            "SARAGOSSA_QWEN3_TTS_CUSTOMVOICE_DIR",
+            "models--mlx-community--Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit",
+        ),
+        (
+            "SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR",
+            "models--mlx-community--Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit",
+        ),
+    ] {
+        let path = local_tts_snapshot(env, repo)
+            .ok_or_else(|| InferError::Config(format!("snapshot requis: {repo}")))?;
+        let model = TtsModel::load_local(path)?;
+        let config = model
+            .generation_config
+            .as_ref()
+            .expect("invariant: snapshot avec sampling");
+        let weights = model
+            .code_predictor
+            .resolve_tts_codebook_weights(
+                &model.code_predictor_projection,
+                &model.code_predictor_heads,
+                &model.code_predictor_embeddings,
+            )?
+            .expect("invariant: trame fusionnée disponible");
+        let prepared = model.prepare_inputs("Bonjour, comment allez-vous ?")?;
+        let mut frames = 0;
+        for seed in [0, 17, 42] {
+            let sub = config.subtalker_params(seed);
+            let sample = TtsCodebookSample {
+                temperature: sub.temperature,
+                top_k: sub.top_k,
+                top_p: sub.top_p,
+            };
+            let mut rng = DeterministicSampler::new(seed);
+            let (mut fused_cache, mut state) = model.prefill_talker(&prepared.input)?;
+            let (mut general_cache, _) = model.prefill_talker(&prepared.input)?;
+            for cache in [&mut fused_cache, &mut general_cache] {
+                assert!(model.talker.setup_resident_decode_from_prefill(cache, 16)?);
+            }
+            assert!(
+                with_tts_talker_fused_kernels_override(true, || {
+                    model.enable_talker_fused_layers(&mut fused_cache)
+                })?,
+                "couches talker fusionnées inactives sur {repo}"
+            );
+            assert!(
+                !with_tts_talker_fused_kernels_override(false, || {
+                    model.enable_talker_fused_layers(&mut general_cache)
+                })?,
+                "kill-switch talker inactif sur {repo}"
+            );
+            let mut cp = model
+                .code_predictor
+                .new_resident_decode_cache(17)?
+                .expect("invariant: code predictor résident");
+            let mut trailing = 0;
+            for frame in 0..16 {
+                let tok = (seed as i32 + frame) % 2048;
+                let e0 = model.codec_embed(&[tok])?;
+                let (codes, _) = model
+                    .code_predictor
+                    .decode_tts_codebooks_resident(
+                        &mut cp,
+                        &weights,
+                        state.data(),
+                        e0.data(),
+                        sample,
+                        rng.state(),
+                        false,
+                    )?
+                    .expect("invariant: arène résidente");
+                for _ in 0..codes.len() {
+                    rng.advance();
+                }
+                let mut frame_codes = vec![tok];
+                frame_codes.extend(codes.iter().map(|&code| code as i32));
+                // Les mêmes codes alimentent les deux historiques KV sur toute la séquence.
+                let next = model.next_talker_input(&prepared, &mut trailing, &frame_codes)?;
+                let encoded_before = TTS_FUSED_LAYER_ENCODES.with(Cell::get);
+                let (fused_state, fused_logits) =
+                    with_tts_talker_fused_kernels_override(true, || {
+                        model
+                            .talker
+                            .decode_state_logits_resident_from_embedding(&mut fused_cache, &next)
+                    })?
+                    .expect("invariant: talker fusionné résident");
+                let encoded_fused = TTS_FUSED_LAYER_ENCODES.with(Cell::get) - encoded_before;
+                assert_eq!(
+                    encoded_fused,
+                    model.assets.model_config.talker_config.num_hidden_layers as usize,
+                    "toutes les couches du talker doivent passer par la voie fusionnée ({repo})"
+                );
+                let (general_state, general_logits) =
+                    with_tts_talker_fused_kernels_override(false, || {
+                        model
+                            .talker
+                            .decode_state_logits_resident_from_embedding(&mut general_cache, &next)
+                    })?
+                    .expect("invariant: talker général résident");
+                assert_eq!(
+                    TTS_FUSED_LAYER_ENCODES.with(Cell::get) - encoded_before,
+                    encoded_fused,
+                    "le chemin général ne doit encoder aucune couche fusionnée ({repo})"
+                );
+                for (name, fused, general) in [
+                    ("état", &fused_state, &general_state),
+                    ("logits", &fused_logits, &general_logits),
+                ] {
+                    assert!(!fused.data().is_empty(), "{name} vide sur {repo}");
+                    assert_eq!(
+                        fused.shape(),
+                        general.shape(),
+                        "{name} {repo} seed={seed} frame={frame}"
+                    );
+                    assert_eq!(fused.data().len(), general.data().len());
+                    for (index, (a, b)) in fused.data().iter().zip(general.data()).enumerate() {
+                        assert!(
+                            a.is_finite() && b.is_finite(),
+                            "{name} non fini {repo} seed={seed} frame={frame} index={index}"
+                        );
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{name} {repo} seed={seed} frame={frame} index={index}"
+                        );
+                    }
+                }
+                state = fused_state;
+                frames += 1;
+            }
+        }
+        assert_eq!(frames, 48);
+        eprintln!(
+            "couches talker fusionnées {repo}: {frames} trames, état et logits identiques au bit"
+        );
+    }
+    Ok(())
+}
 
 #[test]
 #[ignore = "inférence: snapshots TTS locaux et verrou GPU requis"]

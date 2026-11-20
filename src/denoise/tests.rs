@@ -119,13 +119,15 @@ fn dfn3_matches_pytorch_reference() {
 }
 
 /// Latence CPU par hop de 10 ms (p50/p99/max) sur le clip doré, un seul thread.
+/// `SARAGOSSA_DFN3_MODEL` choisit le fichier de poids du dossier (variante faible latence).
 #[test]
 #[ignore = "mesure ; requiert SARAGOSSA_DFN3_DIR"]
 fn dfn3_hop_latency() {
     let dir = std::path::PathBuf::from(
         std::env::var("SARAGOSSA_DFN3_DIR").expect("invariant: test ignoré sans la variable"),
     );
-    let model = DeepFilterNet3::load(dir.join("dfn3.safetensors")).unwrap();
+    let name = std::env::var("SARAGOSSA_DFN3_MODEL").unwrap_or_else(|_| "dfn3.safetensors".into());
+    let model = DeepFilterNet3::load(dir.join(name)).unwrap();
     let golden = crate::safetensor::load_f32_tensors(dir.join("golden.safetensors")).unwrap();
     let audio = golden["audio"].data();
     let mut times = Vec::new();
@@ -151,6 +153,111 @@ fn dfn3_hop_latency() {
 }
 
 mod synthetic;
+
+fn ll_metadata() -> std::collections::HashMap<String, String> {
+    [
+        ("sr", "48000"),
+        ("fft_size", "960"),
+        ("hop_size", "480"),
+        ("nb_erb", "32"),
+        ("nb_df", "96"),
+        ("df_order", "5"),
+        ("df_lookahead", "0"),
+        ("conv_lookahead", "0"),
+        ("conv_ch", "64"),
+        ("conv_kernel", "2,3"),
+        ("conv_kernel_inp", "3,3"),
+        ("emb_hidden_dim", "512"),
+        ("emb_num_layers", "3"),
+        ("enc_linear_groups", "16"),
+        ("linear_groups", "16"),
+        ("df_hidden_dim", "512"),
+        ("df_num_layers", "3"),
+        ("df_pathway_kernel_size_t", "5"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+#[test]
+fn config_reads_low_latency_metadata_and_defaults_to_std() {
+    assert_eq!(
+        Config::from_metadata(&Default::default()).unwrap(),
+        Config::STD
+    );
+    let ll = Config::from_metadata(&ll_metadata()).unwrap();
+    assert_eq!(
+        ll,
+        Config {
+            hidden: 512,
+            erb_layers: 2,
+            df_layers: 3,
+            conv_kt: 2,
+            enc_groups: 16,
+            lookahead: 0,
+        }
+    );
+    for (key, bad) in [
+        ("df_lookahead", "2"),
+        ("df_hidden_dim", "256"),
+        ("nb_erb", "24"),
+        ("conv_kernel", "2"),
+        ("df_order", "x"),
+    ] {
+        let mut meta = ll_metadata();
+        meta.insert(key.into(), bad.into());
+        assert!(Config::from_metadata(&meta).is_err(), "{key} = {bad}");
+    }
+}
+
+/// Oracle onnxruntime de DeepFilterNet3_ll (`tools/voice/dfn3_onnx_ref.py`).
+///
+/// Tolérances figées avant la première comparaison, celles de l'oracle
+/// PyTorch standard : masque et coefficients ≤ 1e-3, LSNR ≤ 1e-2 dB. Les
+/// features du golden sont rejouées telles quelles : sans anticipation, le
+/// pas τ lit la trame τ.
+#[test]
+#[ignore = "requiert SARAGOSSA_DFN3_LL_DIR (dfn3_ll.safetensors + golden_ll.safetensors)"]
+fn dfn3_ll_matches_onnxruntime() {
+    let dir = std::path::PathBuf::from(
+        std::env::var("SARAGOSSA_DFN3_LL_DIR").expect("invariant: test ignoré sans la variable"),
+    );
+    let model = DeepFilterNet3::load(dir.join("dfn3_ll.safetensors")).unwrap();
+    assert_eq!(model.net.config.lookahead, 0);
+    assert_eq!(model.stream().delay_samples(), FFT_SIZE - HOP_SIZE);
+    let golden = crate::safetensor::load_f32_tensors(dir.join("golden_ll.safetensors")).unwrap();
+    let (erb, spec) = (golden["erb_feat"].data(), golden["spec_feat"].data());
+    let (mask, coefs, lsnr) = (
+        golden["mask"].data(),
+        golden["coefs"].data(),
+        golden["lsnr"].data(),
+    );
+    let width = NB_DF * 2 * ORDER;
+    let mut state = model.net.new_state();
+    let (mut mask_err, mut coef_err, mut lsnr_err) = (0.0_f32, 0.0_f32, 0.0_f32);
+    for t in 0..lsnr.len() {
+        let mut cplx = [0.0_f32; 2 * NB_DF];
+        for f in 0..NB_DF {
+            cplx[f] = spec[(t * NB_DF + f) * 2];
+            cplx[NB_DF + f] = spec[(t * NB_DF + f) * 2 + 1];
+        }
+        let step = model
+            .net
+            .step(&mut state, &erb[t * NB_ERB..(t + 1) * NB_ERB], &cplx);
+        for (g, w) in step.mask.iter().zip(&mask[t * NB_ERB..]) {
+            mask_err = mask_err.max((g - w).abs());
+        }
+        for (g, w) in step.coefs.iter().zip(&coefs[t * width..]) {
+            coef_err = coef_err.max((g - w).abs());
+        }
+        lsnr_err = lsnr_err.max((step.lsnr - lsnr[t]).abs());
+    }
+    eprintln!("dfn3_ll oracle ORT: masque {mask_err:.2e} coefs {coef_err:.2e} lsnr {lsnr_err:.2e}");
+    assert!(mask_err <= 1e-3, "masque {mask_err}");
+    assert!(coef_err <= 1e-3, "coefficients {coef_err}");
+    assert!(lsnr_err <= 1e-2, "lsnr {lsnr_err}");
+}
 
 #[test]
 fn enhance_preserves_partial_hops_and_matches_streaming() {
@@ -335,7 +442,7 @@ fn dfn3_gpu_long_file_bit_exact_and_speed() {
     };
     let (gpu, t_gpu) = time(&|| model.enhance_gpu(&audio).unwrap());
     let (common, t_common) = time(&|| model.enhance_common(&audio).unwrap());
-    let (libm, t_libm) = time(&|| model.enhance(&audio).unwrap());
+    let (libm, t_libm) = time(&|| model.enhance_libm(&audio).unwrap());
     let same = gpu
         .iter()
         .zip(&common)

@@ -169,6 +169,8 @@ pub(crate) use self::linear_attention::{linear_tree_refusal, LinearTreeShape};
 pub(crate) use self::matmul::take_concat_profile;
 #[cfg(any(feature = "stt", feature = "diar"))]
 pub(crate) use self::matmul::whisper_bf16_gemm_enabled;
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(crate) use self::matmul::whisper_decode_attn_bf16_enabled;
 pub(crate) use self::matmul::whisper_decode_bf16_qmv_enabled;
 use self::na_gemm::NA_GEMM_SRC;
 #[cfg(test)]
@@ -195,7 +197,7 @@ pub(crate) fn qmvt_dispatches_for_test() -> usize {
 #[cfg(feature = "stt")]
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
-    WhisperStepEmit, WhisperStepOutput,
+    WhisperResidentMatrix, WhisperStepEmit, WhisperStepOutput,
 };
 #[cfg(any(feature = "stt", feature = "diar"))]
 pub(crate) use self::whisper_encode::{

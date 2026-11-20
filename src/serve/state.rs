@@ -238,6 +238,27 @@ impl ServeState {
         }
     }
 
+    /// NOTE: `catch_unwind` ne couvre pas une panique entre la création d'un
+    /// encodeur Metal et son `endEncoding`, ni un `Drop` qui panique pendant
+    /// l'unwind (abandon du processus) : l'invalidation reste au mieux.
+    ///
+    /// Abandonne tous les poids chargés après une panique du moteur ; les
+    /// slots se rechargent à la prochaine requête.
+    pub(super) fn invalidate_models(&mut self) {
+        for slot in &mut self.models {
+            slot.loaded = None;
+        }
+        #[cfg(any(
+            feature = "stt",
+            feature = "tts",
+            feature = "diar",
+            feature = "denoise"
+        ))]
+        self.audio.invalidate();
+        #[cfg(feature = "embed")]
+        self.embeddings.invalidate();
+    }
+
     /// Garde de l'invariant thread moteur (voir [`ServeState`]).
     fn assert_engine_thread(&self) {
         debug_assert_eq!(

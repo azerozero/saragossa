@@ -13,6 +13,10 @@ quasi-égalité top-1/top-2 :
 
 ## Limites actuelles
 
+Le noyau qmv bf16 à blocs de 256 (`dense_qmv_rhs_bf16_stage_f32`, decode dense
+BF16) est actif par défaut et identique au bit au qmv par ligne ;
+`SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE=0` rend l'ancien noyau.
+
 Deux kernels actifs par défaut ne sont pas bit-identiques au pas mono-ligne.
 
 | Kernel | Quand | Pourquoi |
@@ -33,14 +37,16 @@ Coût mesuré le 3 nov. 2026 (27B, ABBA, M5 Max) :
 - skinny coupé : DFlash −49 à −52 % ;
 - NAX greedy coupé : DFlash −25 % à 32k et −36 % à 64k, MTP −6 à −9 %.
 
-Le prefill des poids bf16 denses (64 lignes et plus) arrondit désormais
-l'activation en bf16 avant un GEMM à un produit, au lieu du hi + lo
-(19 nov. 2026, [prefill-bf16.md](prefill-bf16.md)). Les bits du prefill
-changent, pas le contrat AR/vérification : le decode reste sur le qmv f32.
+Les couches du prefill résident d'un LLM Qwen dense bf16 (64 lignes et plus)
+arrondissent désormais l'activation en bf16 avant un GEMM à un produit, au
+lieu du hi + lo (19 nov. 2026, [prefill-bf16.md](prefill-bf16.md)). Les bits
+du prefill changent. Le contrat AR/vérification ne change pas : le decode, la
+vérification, la tête MTP et le drafter restent en dehors de cette portée.
 Contre l'ancien GEMM sur le 27B BF16 : KL moyen de 7e-6 à 3e-5 (max
 5,8e-4), top-1 identique à 98,8-100 %, greedy de 64 tokens identique sur
 8/8 morceaux courts, 3/4 fenêtres de 2048 tokens (une diverge au 10e
-token) et 4/4 de 8192. `SARAGOSSA_RUST_DENSE_BF16_GEMM_X1=0` rétablit le hi + lo.
+token) et 4/4 de 8192. `SARAGOSSA_RUST_DENSE_BF16_GEMM_X1=0` rétablit le hi + lo ; `=1` force le GEMM à
+un produit partout, decode et vérification compris si le plancher M descend sous 64.
 
 ### Mode strict (`SARAGOSSA_RUST_VERIFY_STRICT=1`, opt-in)
 

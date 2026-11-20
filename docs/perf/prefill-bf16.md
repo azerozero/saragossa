@@ -25,12 +25,33 @@ Herbert tenait 50 TFLOP/s effectifs, saragossa 21.
 
 ## Changement
 
-Par défaut, le prefill LLM des poids bf16 denses (M ≥ 64, N multiple de
-128) reprend le chemin des modèles de décision. L'activation est arrondie
-une fois en bf16 (`f32_to_bf16`), puis multipliée par
-`gemm_nax_bf16_nt_bn128` (matmul2d, tuiles 64×128, grille N d'abord).
-L'accumulation reste en f32. `SARAGOSSA_RUST_DENSE_BF16_GEMM_X1=0` rétablit
-le GEMM hi + lo.
+Le GEMM à un produit arrondit l'activation une fois en bf16
+(`f32_to_bf16`), puis la multiplie par `gemm_nax_bf16_nt_bn128` (matmul2d,
+tuiles 64×128, grille N d'abord). L'accumulation reste en f32. Sur le 27B,
+le prefill est 36 à 44 % plus court.
+
+Il s'active par défaut quand toutes ces conditions sont réunies :
+
+- c'est une projection d'une couche du prefill résident d'un LLM Qwen dont
+  toutes les queues MLP sont denses en bf16 (portée `DenseBf16X1Scope`) ;
+- M ≥ 64 lignes ;
+- K et N sont multiples de 64, et N l'est aussi de 128.
+
+Partout ailleurs, le GEMM hi + lo reste en place :
+
+- la tête MTP ;
+- le drafter DFlash ;
+- Gemma ;
+- les tenseurs restés en bf16 dans les modèles quantifiés ;
+- le decode et la vérification, même avec un plancher
+  `SARAGOSSA_RUST_DENSE_BF16_GEMM_MIN_BATCH` sous 64.
+
+`SARAGOSSA_RUST_DENSE_BF16_GEMM_X1=1` force le GEMM à un produit partout, ces
+chemins compris. `=0` le coupe partout.
+
+Le tampon bf16 de A (M×K) est gardé en cache, un par K distinct (5120, 6144
+et 17408 sur le 27B). Il occupe 2·M·K octets : 142 Mo pour le down_proj à
+4096 lignes, 285 Mo à 8192.
 
 Écartés :
 

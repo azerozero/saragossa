@@ -98,3 +98,26 @@ impl<'a> Pcm<'a> {
         }
     }
 }
+/// Origin d'un navigateur sur la machine locale, quel que soit le port.
+pub(super) fn loopback_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let (host, port) = if let Some(inner) = rest.strip_prefix('[') {
+        let Some((host, tail)) = inner.split_once(']') else {
+            return false;
+        };
+        (host, tail.strip_prefix(':').unwrap_or(tail))
+    } else {
+        rest.split_once(':').unwrap_or((rest, ""))
+    };
+    port.bytes().all(|b| b.is_ascii_digit())
+        && (host == "localhost"
+            || host == "::1"
+            || host
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| ip.is_loopback()))
+}

@@ -56,6 +56,8 @@ mod generation;
 mod lightbatch;
 mod loading;
 mod lookup;
+mod suffix;
+pub(crate) use suffix::SuffixParams;
 mod mtp;
 mod mtp_adaptive;
 mod mtp_history;
@@ -595,6 +597,10 @@ struct ResidentArena {
     final_norm: metal::Buffer,
     lm_head: MetalLinearWeightBuffers,
     mtp: Option<ResidentMtpArena>,
+    /// QKV concaténé par couche quand le pas embedding encode la couche TTS
+    /// fusionnée ([`CausalDecoder::enable_tts_fused_layers`]) ; `None` sinon.
+    #[cfg(feature = "tts")]
+    tts_fused_qkv: Option<Vec<Vec<MetalLinearWeightBuffers>>>,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]

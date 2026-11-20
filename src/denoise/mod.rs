@@ -7,6 +7,9 @@
 //! Le flux est causal avec une anticipation de deux trames : chaque hop de
 //! 480 échantillons fourni à [`DfStream::process_hop`] restitue le hop retardé
 //! de [`DfStream::DELAY_SAMPLES`] échantillons (30 ms, plus le tamponnage d'un hop).
+//! La variante faible latence `DeepFilterNet3_ll` (sans anticipation, 10 ms de
+//! retard) est choisie par les métadonnées du modèle chargé, voir
+//! `tools/voice/convert_dfn3_onnx.py` et [`DfStream::delay_samples`].
 
 mod dsp;
 mod exact_math;
@@ -33,14 +36,13 @@ pub use crate::audio_resample::resample;
 use dsp::{Analysis, FeatureState, Synthesis, FREQ_BINS, NB_DF, NB_ERB};
 pub use dsp::{FFT_SIZE, HOP_SIZE, SAMPLE_RATE};
 use layers::Math;
-use network::{NetState, Network, ORDER};
+use network::{Config, NetState, Network, ORDER};
 
 use crate::{InferError, Result};
 
-/// Anticipation des convolutions d'entrée (`conv_lookahead`), en trames.
-const CONV_LOOKAHEAD: usize = 2;
-/// Anticipation du filtre profond (`df_lookahead`), en trames.
-const DF_LOOKAHEAD: usize = 2;
+/// Anticipation (`conv_lookahead` = `df_lookahead`) de DFN3 standard, en trames.
+#[cfg(test)]
+const CONV_LOOKAHEAD: usize = Config::STD.lookahead;
 
 /// Décode un WAV complet ; préférer [`wav::WavStream`] pour les fichiers longs.
 ///
@@ -71,15 +73,19 @@ pub struct DeepFilterNet3 {
 }
 
 impl DeepFilterNet3 {
-    /// Charge `dfn3.safetensors` (state dict officiel converti par `tools/voice/convert_dfn3.py`).
+    /// Charge `dfn3.safetensors` (state dict officiel converti par `tools/voice/convert_dfn3.py`),
+    /// ou une variante exportée en ONNX convertie par `tools/voice/convert_dfn3_onnx.py`
+    /// (DeepFilterNet3_ll), reconnue à ses métadonnées.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si un poids manque, a une forme inattendue, ou si la
     /// banque ERB du checkpoint ne correspond pas à celle de libDF.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let config = Config::from_metadata(&crate::safetensor::load_metadata(path)?)?;
         let weights = crate::safetensor::load_f32_tensors(path)?;
-        let net = Network::load(weights, FREQ_BINS)?;
+        let net = Network::load(weights, FREQ_BINS, config)?;
         let widths = dsp::erb_widths();
         let mut start = 0;
         for (band, &width) in widths.iter().enumerate() {
@@ -129,6 +135,11 @@ impl DeepFilterNet3 {
     /// Erreurs Metal (pas de GPU, compilation, exécution).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub fn enhance_gpu(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        if !self.net.is_std() {
+            return Err(InferError::Config(
+                "chemin GPU DFN3 réservé au modèle standard (variante faible latence : CPU)".into(),
+            ));
+        }
         // Passe 1 : features de chaque pas, sans réseau ; mêmes trames que le flux.
         let mut record = self.stream();
         record.steps = Steps::Record(Vec::new(), Vec::new());
@@ -167,6 +178,20 @@ impl DeepFilterNet3 {
         Ok(out)
     }
 
+    /// [`Self::enhance`] en variante `Math::Libm` (historique, défaut),
+    /// indépendamment de `SARAGOSSA_DENOISE_COMMON`.
+    ///
+    /// # Errors
+    /// Propage les erreurs du traitement des trames.
+    pub fn enhance_libm(&self, audio: &[f32]) -> Result<Vec<f32>> {
+        let mut inner = self.stream();
+        inner.state.math = Math::Libm;
+        let mut stream = DenoiseStream::from_stream(inner);
+        let mut out = stream.push(audio)?;
+        out.extend(stream.finish()?);
+        Ok(out)
+    }
+
     /// Ouvre un flux temps réel.
     #[must_use]
     pub fn stream(&self) -> DfStream<'_> {
@@ -177,7 +202,8 @@ impl DeepFilterNet3 {
             synthesis: Synthesis::new(&mut planner, &self.window),
             features: FeatureState::new(self.widths.clone()),
             state: self.net.new_state(),
-            spec_ring: vec![vec![Complex32::default(); FREQ_BINS]; 2 * DF_LOOKAHEAD + 1],
+            spec_ring: vec![vec![Complex32::default(); FREQ_BINS]; ORDER],
+            lookahead: self.net.config.lookahead,
             frames: 0,
             last_lsnr: 0.0,
             steps: Steps::Live,
@@ -211,8 +237,10 @@ pub struct DfStream<'a> {
     synthesis: Synthesis,
     features: FeatureState,
     state: NetState,
-    /// Spectres `t - 4 ..= t`, soit `τ - 2 ..= τ + 2` pour la trame de sortie τ = t − 2.
+    /// Spectres `t - 4 ..= t`, soit `τ − 4 + la ..= τ + la` pour la trame de sortie τ = t − la.
     spec_ring: Vec<Vec<Complex32>>,
+    /// Anticipation `la` du modèle, en trames (2 en standard, 0 en faible latence).
+    lookahead: usize,
     frames: usize,
     last_lsnr: f32,
     steps: Steps,
@@ -221,8 +249,15 @@ pub struct DfStream<'a> {
 }
 
 impl DfStream<'_> {
-    /// Retard entrée → sortie : `N − H` (STFT) + deux trames d'anticipation.
-    pub const DELAY_SAMPLES: usize = FFT_SIZE - HOP_SIZE + CONV_LOOKAHEAD * HOP_SIZE;
+    /// Retard entrée → sortie de DFN3 standard : `N − H` (STFT) + deux trames d'anticipation.
+    pub const DELAY_SAMPLES: usize = FFT_SIZE - HOP_SIZE + 2 * HOP_SIZE;
+
+    /// Retard entrée → sortie du modèle chargé : `N − H` + `la` trames d'anticipation
+    /// (30 ms en standard, 10 ms en faible latence), plus le hop en remplissage.
+    #[must_use]
+    pub fn delay_samples(&self) -> usize {
+        FFT_SIZE - HOP_SIZE + self.lookahead * HOP_SIZE
+    }
 
     /// SNR local estimé (dB) de la dernière trame produite ; 0 sur le chemin
     /// GPU (`DeepFilterNet3::enhance_gpu`), qui ne calcule pas le LSNR.
@@ -250,9 +285,9 @@ impl DfStream<'_> {
             self.analysis.process(input, slot);
             self.features.process(slot, &mut erb, &mut cplx);
         }
-        self.frames = (self.frames + 1).min(CONV_LOOKAHEAD + 1);
-        // `pad_feat` ignore les deux premières trames de features.
-        if self.frames <= CONV_LOOKAHEAD {
+        self.frames = (self.frames + 1).min(self.lookahead + 1);
+        // `pad_feat` ignore les `la` premières trames de features.
+        if self.frames <= self.lookahead {
             output.fill(0.0);
             return Ok(());
         }
@@ -263,7 +298,7 @@ impl DfStream<'_> {
     /// Vide l'anticipation en fin de signal (features et spectres nuls, comme le padding PyTorch).
     #[must_use]
     pub fn finish(&mut self) -> Vec<f32> {
-        let mut out = vec![0.0; CONV_LOOKAHEAD * HOP_SIZE];
+        let mut out = vec![0.0; self.lookahead * HOP_SIZE];
         let zeros = ([0.0_f32; NB_ERB], [0.0_f32; 2 * NB_DF]);
         for hop in out.chunks_exact_mut(HOP_SIZE) {
             self.spec_ring.rotate_left(1);
@@ -329,8 +364,8 @@ impl DfStream<'_> {
                 self.analysis.process(hop, slot);
                 self.features.process(slot, &mut erb, &mut cplx);
             }
-            self.frames = (self.frames + 1).min(CONV_LOOKAHEAD + 1);
-            let emit = self.frames > CONV_LOOKAHEAD;
+            self.frames = (self.frames + 1).min(self.lookahead + 1);
+            let emit = self.frames > self.lookahead;
             if emit {
                 erbs.extend(erb);
                 cplxs.extend(cplx);
@@ -369,7 +404,7 @@ fn render(
     (mask, coefs): (&[f32], &[f32]),
     output: &mut [f32],
 ) {
-    let center = &ring[DF_LOOKAHEAD];
+    let center = &ring[ORDER - 1 - net.config.lookahead];
     let inv = &net.erb_inv;
     let mut spec = vec![Complex32::default(); FREQ_BINS];
     for f in NB_DF..FREQ_BINS {
