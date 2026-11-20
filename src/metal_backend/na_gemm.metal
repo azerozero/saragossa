@@ -594,21 +594,22 @@ kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
 // ici l'erreur relative descend vers 2⁻¹⁶ pour 3× les MMA. Deux tuiles B
 // (hi, lo) : 18 Ko de threadgroup, ce qui exclut une variante gate+up fusionnée
 // (quatre tuiles, au-delà des 32 Ko).
-kernel void gemm_nax_coop_qb_tiled_u4_x3(device const float* A [[buffer(0)]],
-                                         device const uint* Bp   [[buffer(1)]],
-                                         device const bfloat* Bs [[buffer(2)]],
-                                         device const bfloat* Bb [[buffer(3)]],
-                                         device float* C         [[buffer(4)]],
-                                         constant uint3& mnk     [[buffer(5)]],
-                                         uint2 tgid [[threadgroup_position_in_grid]],
-                                         uint lid [[thread_index_in_threadgroup]],
-                                         uint sgid [[simdgroup_index_in_threadgroup]]) {
+// X4 ajoute lo·lo (SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM=x4) : l'erreur ne tient
+// plus qu'au résidu de la scission hi + lo, pour 4× les MMA au lieu de 3×.
+template <bool X4>
+static void qb_tiled_u4_split(const device float* A,
+                              const device uint* Bp,
+                              const device bfloat* Bs,
+                              const device bfloat* Bb,
+                              device float* C,
+                              uint3 mnk,
+                              threadgroup bfloat* Wh,
+                              threadgroup bfloat* Wl,
+                              uint2 tgid,
+                              uint lid,
+                              uint sgid) {
   uint M = mnk.x, N = mnk.y, K = mnk.z;
   constexpr uint BN = 64, BK = 64, BKP = BK + 8, WN = 2;
-  threadgroup metal::vec<bfloat,8> Wh8[BN * BKP / 8];
-  threadgroup metal::vec<bfloat,8> Wl8[BN * BKP / 8];
-  threadgroup bfloat* Wh = (threadgroup bfloat*)Wh8;
-  threadgroup bfloat* Wl = (threadgroup bfloat*)Wl8;
   uint sg_m = sgid / WN;
   uint sg_n = sgid - sg_m * WN;
   uint m0 = tgid.x * 64u + sg_m * 32u;
@@ -632,6 +633,10 @@ kernel void gemm_nax_coop_qb_tiled_u4_x3(device const float* A [[buffer(0)]],
       NaxFrag::mma(c1a, c1b, a1h, b0h, b1h);
       NaxFrag::mma(c1a, c1b, a1h, b0l, b1l);
       NaxFrag::mma(c1a, c1b, a1l, b0h, b1h);
+      if (X4) {
+        NaxFrag::mma(c0a, c0b, a0l, b0l, b1l);
+        NaxFrag::mma(c1a, c1b, a1l, b0l, b1l);
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -640,6 +645,23 @@ kernel void gemm_nax_coop_qb_tiled_u4_x3(device const float* A [[buffer(0)]],
   NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
   NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
 }
+#define QB_TILED_U4_SPLIT_KERNEL(NAME, X4)                                        \
+kernel void NAME(device const float* A [[buffer(0)]],                            \
+                 device const uint* Bp   [[buffer(1)]],                          \
+                 device const bfloat* Bs [[buffer(2)]],                          \
+                 device const bfloat* Bb [[buffer(3)]],                          \
+                 device float* C         [[buffer(4)]],                          \
+                 constant uint3& mnk     [[buffer(5)]],                          \
+                 uint2 tgid [[threadgroup_position_in_grid]],                    \
+                 uint lid [[thread_index_in_threadgroup]],                       \
+                 uint sgid [[simdgroup_index_in_threadgroup]]) {                 \
+  threadgroup metal::vec<bfloat,8> Wh8[64u * 72u / 8u];                         \
+  threadgroup metal::vec<bfloat,8> Wl8[64u * 72u / 8u];                         \
+  qb_tiled_u4_split<X4>(A, Bp, Bs, Bb, C, mnk, (threadgroup bfloat*)Wh8,        \
+                        (threadgroup bfloat*)Wl8, tgid, lid, sgid);              \
+}
+QB_TILED_U4_SPLIT_KERNEL(gemm_nax_coop_qb_tiled_u4_x3, false)
+QB_TILED_U4_SPLIT_KERNEL(gemm_nax_coop_qb_tiled_u4_x4, true)
 // GEMM NA à poids bf16 denses B[N,K] (modèles BF16 non quantifiés), même
 // tuilage 64×64×64 que `gemm_nax_coop_qb_tiled_u4_x3`. A f32 est scindé en
 // hi + lo bf16 et chaque pas fait hi·B + lo·B : le poids est exact en bf16,

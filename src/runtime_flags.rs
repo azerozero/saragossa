@@ -1561,7 +1561,21 @@ pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) fn qwen_small_nax_gemm_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM", false))
+    *ENABLED.get_or_init(|| {
+        qwen_small_nax_gemm_x4() || env_flag("SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM", false)
+    })
+}
+
+/// `SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM=x4` : comme `=1`, et toute projection
+/// u4 sous le plancher par défaut (flint compris) prend le noyau bf16×4, qui
+/// ajoute le produit lo·lo abandonné par le bf16×3.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn qwen_small_nax_gemm_x4() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("x4"))
+    })
 }
 
 /// GEMM NA u4 tuilé bf16×3, au lieu du qmv f32, pour les seules projections

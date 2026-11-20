@@ -362,9 +362,19 @@ impl MetalExecutor {
                     "qmm na tiled u4 x3 attend out_dim%64=0, reçu out_dim={out_dim}"
                 )));
             }
-            let pso = self.na_gemm_coop_qb_tiled_u4_x3.as_ref().ok_or_else(|| {
-                InferError::Config("gemm_nax_coop_qb_tiled_u4_x3: NA indisponible".into())
-            })?;
+            let (pso, name) = if crate::runtime_flags::qwen_small_nax_gemm_x4() {
+                (
+                    self.na_gemm_coop_qb_tiled_u4_x4.as_ref(),
+                    "gemm_nax_coop_qb_tiled_u4_x4",
+                )
+            } else {
+                (
+                    self.na_gemm_coop_qb_tiled_u4_x3.as_ref(),
+                    "gemm_nax_coop_qb_tiled_u4_x3",
+                )
+            };
+            let pso = pso
+                .ok_or_else(|| InferError::Config(format!("{name}: NA indisponible")))?;
             #[cfg(test)]
             super::flags::count_qmm_na_u4_x3_dispatch();
             return self.dispatch_affine_qmm_na_fused_tiled_u4(
@@ -719,7 +729,7 @@ impl MetalExecutor {
     }
 
     /// Dispatch du GEMM tuilé u4 : lhs bf16, ou f32 pour la variante x3.
-    fn dispatch_affine_qmm_na_fused_tiled_u4(
+    pub(super) fn dispatch_affine_qmm_na_fused_tiled_u4(
         &self,
         encoder: &ComputeCommandEncoderRef,
         pso: &ComputePipelineState,
