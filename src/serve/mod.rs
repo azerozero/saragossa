@@ -119,6 +119,8 @@ fn take_config_args(
                 eprintln!(
                     "saragossa serve: --api-key est déprécié (visible dans `ps`), utiliser SARAGOSSA_API_KEY"
                 );
+                // NOTE: `set_var` n'est sûr que parce que ce code s'exécute au démarrage,
+                // avant tout thread ; la clé passe ensuite à tous les sous-processus.
                 std::env::set_var("SARAGOSSA_API_KEY", key);
             }
             _ => rest.push(arg),

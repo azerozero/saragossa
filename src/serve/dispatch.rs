@@ -365,14 +365,54 @@ fn run_batch<S: ServeStream>(batch: Vec<Queued<S>>, state: &mut ServeState) {
             (stream, request, _bytes)
         })
         .collect();
-    let mut sockets: Vec<(&mut S, &HttpRequest)> = jobs
+    let mut tracked: Vec<(Sent<'_, S>, &HttpRequest)> = jobs
         .iter_mut()
-        .map(|(stream, request, _)| (stream, &*request))
+        .map(|(stream, request, _)| (Sent::new(stream), &*request))
         .collect();
-    if !guarded(state, |state| handle_batch(state, &mut sockets)) {
-        for (stream, _) in sockets {
-            let _ = send_error(stream, 500, PANIC_MESSAGE);
+    let mut wrapped: Vec<(&mut Sent<'_, S>, &HttpRequest)> = tracked
+        .iter_mut()
+        .map(|(sent, request)| (sent, *request))
+        .collect();
+    if !guarded(state, |state| handle_batch(state, &mut wrapped)) {
+        drop(wrapped);
+        for (sent, _) in &mut tracked {
+            sent.reply_500();
         }
+    }
+}
+
+/// Socket qui note si des octets de réponse sont déjà partis : après une
+/// panique, un 500 ne peut plus s'ajouter à une réponse commencée (SSE comprise).
+struct Sent<'a, S> {
+    inner: &'a mut S,
+    started: bool,
+}
+
+impl<'a, S: Write> Sent<'a, S> {
+    fn new(inner: &'a mut S) -> Self {
+        Self {
+            inner,
+            started: false,
+        }
+    }
+
+    /// Répond 500 si rien n'est parti ; sinon laisse la connexion se fermer au
+    /// drop de la socket, le client voyant un flux interrompu.
+    fn reply_500(&mut self) {
+        if !self.started {
+            let _ = send_error(self.inner, 500, PANIC_MESSAGE);
+        }
+    }
+}
+
+impl<S: Write> Write for Sent<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.started |= !buf.is_empty();
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -409,13 +449,14 @@ fn run_job<S: ServeStream>(job: Job<S>, state: &mut ServeState) {
         waiting,
     } = job;
     drop(waiting);
+    let mut sent = Sent::new(&mut stream);
     let ok = guarded(state, |state| {
-        if let Err(error) = handle_job(&mut stream, state, &request) {
+        if let Err(error) = handle_job(&mut sent, state, &request) {
             eprintln!("saragossa serve request error: {error}");
         }
     });
     if !ok {
-        let _ = send_error(&mut stream, 500, PANIC_MESSAGE);
+        sent.reply_500();
     }
 }
 
@@ -642,6 +683,20 @@ mod tests {
         let mut state = ServeState::new(&args);
         assert!(!guarded(&mut state, |_| panic!("panique injectée")));
         assert!(guarded(&mut state, |_| {}));
+    }
+
+    #[test]
+    fn no_second_response_after_a_started_one() {
+        let mut out = Vec::new();
+        let mut sent = Sent::new(&mut out);
+        sent.reply_500();
+        assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 500"));
+        let mut out = Vec::new();
+        let mut sent = Sent::new(&mut out);
+        sent.write_all(b"HTTP/1.1 200 OK\r\n")
+            .expect("invariant: Vec");
+        sent.reply_500();
+        assert_eq!(out, b"HTTP/1.1 200 OK\r\n");
     }
 
     #[test]

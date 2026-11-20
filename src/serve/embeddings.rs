@@ -30,6 +30,11 @@ pub(super) struct EmbeddingsState {
 }
 
 impl EmbeddingsState {
+    /// Abandonne le modèle chargé (après une panique du moteur).
+    pub(super) fn invalidate(&mut self) {
+        self.model = None;
+    }
+
     /// Construit l'état embeddings depuis le chemin CLI, sans charger les poids.
     pub(super) fn new(args: &ServeArgs) -> Self {
         Self {
