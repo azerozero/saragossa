@@ -238,6 +238,14 @@ impl ServeState {
         }
     }
 
+    /// Abandonne tous les poids chargés après une panique du moteur ; les
+    /// slots se rechargent à la prochaine requête.
+    pub(super) fn invalidate_models(&mut self) {
+        for slot in &mut self.models {
+            slot.loaded = None;
+        }
+    }
+
     /// Garde de l'invariant thread moteur (voir [`ServeState`]).
     fn assert_engine_thread(&self) {
         debug_assert_eq!(

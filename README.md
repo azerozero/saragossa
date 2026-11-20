@@ -26,7 +26,7 @@ cargo test --lib --no-default-features --features devtools
 ```
 
 On Windows, use TCP explicitly; Unix sockets are unavailable. Start the server
-with `saragossa serve --backend cpu --port 8090 --api-key TOKEN --model ID=DIR`,
+with `SARAGOSSA_API_KEY=TOKEN saragossa serve --backend cpu --port 8090 --model ID=DIR`,
 where `DIR` is the local weights directory. For `bench-serve`, use
 `--url 127.0.0.1:8090 --api-key TOKEN`. TCP requires bearer authentication;
 there is no automatic unauthenticated fallback from a Unix socket.
@@ -243,6 +243,10 @@ Face page first, then export `HF_TOKEN`.
 saragossa \
   --model-dir models/Qwen3.6-35B-A3B-oQ8 --backend metal \
   --prompt "Hello" --max-tokens 64 --temperature 0 --metrics
+
+# Offline audio tools (features `denoise` and `diar`, on by default):
+saragossa enhance --model dfn3.safetensors --input noisy.wav --output clean.wav
+saragossa diarize --model-dir DIR [--format rttm|json] [--cpu] audio.wav
 ```
 
 ## Library usage
@@ -256,7 +260,7 @@ Add the crate and drive the engine directly. The main entry points are
 A **single-threaded**, multi-model local HTTP server. The default behavior is
 single-user: the warm state is global to a model until a session key is supplied.
 The transport is a Unix socket by default (`/tmp/saragossa-serve.sock`, mode
-0600); TCP loopback requires a bearer (`--api-key` or `SARAGOSSA_API_KEY`). A
+0600); TCP loopback requires a bearer (`SARAGOSSA_API_KEY`; `--api-key` is deprecated because `ps` shows it). A
 per-connection read deadline (30 s) and a hard `max_tokens` ceiling (4096) shed
 runaway requests.
 

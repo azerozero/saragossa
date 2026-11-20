@@ -369,7 +369,29 @@ fn run_batch<S: ServeStream>(batch: Vec<Queued<S>>, state: &mut ServeState) {
         .iter_mut()
         .map(|(stream, request, _)| (stream, &*request))
         .collect();
-    handle_batch(state, &mut sockets);
+    if !guarded(state, |state| handle_batch(state, &mut sockets)) {
+        for (stream, _) in sockets {
+            let _ = send_error(stream, 500, PANIC_MESSAGE);
+        }
+    }
+}
+
+const PANIC_MESSAGE: &str = "erreur interne du moteur, modèles rechargés à la prochaine requête";
+
+/// Exécute `work` sur le thread moteur en contenant une panique : `false` si
+/// elle a eu lieu. Les poids chargés sont alors abandonnés (rechargement
+/// paresseux) car l'état GPU et décodeur est incertain ; le serveur reste vivant.
+fn guarded(state: &mut ServeState, work: impl FnOnce(&mut ServeState)) -> bool {
+    // NOTE: AssertUnwindSafe est sûr ici car l'état possiblement
+    // incohérent est invalidé avant toute réutilisation.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut *state)));
+    if outcome.is_ok() {
+        return true;
+    }
+    eprintln!("saragossa serve panique du moteur contenue, modèles invalidés");
+    // Un Drop qui paniquerait à son tour ne doit pas tuer le moteur.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.invalidate_models()));
+    false
 }
 
 /// Exécute un job sur le thread moteur.
@@ -387,8 +409,13 @@ fn run_job<S: ServeStream>(job: Job<S>, state: &mut ServeState) {
         waiting,
     } = job;
     drop(waiting);
-    if let Err(error) = handle_job(&mut stream, state, &request) {
-        eprintln!("saragossa serve request error: {error}");
+    let ok = guarded(state, |state| {
+        if let Err(error) = handle_job(&mut stream, state, &request) {
+            eprintln!("saragossa serve request error: {error}");
+        }
+    });
+    if !ok {
+        let _ = send_error(&mut stream, 500, PANIC_MESSAGE);
     }
 }
 
@@ -606,6 +633,15 @@ mod tests {
             .read_to_string(&mut response)
             .expect("invariant: réponse lisible avant le timeout");
         response
+    }
+
+    #[test]
+    fn engine_panic_is_contained_and_engine_stays_usable() {
+        let args = ServeArgs::parse(["--model", "a=/x/a", "--backend", "cpu"].map(String::from))
+            .expect("invariant: arguments valides");
+        let mut state = ServeState::new(&args);
+        assert!(!guarded(&mut state, |_| panic!("panique injectée")));
+        assert!(guarded(&mut state, |_| {}));
     }
 
     #[test]
