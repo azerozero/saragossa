@@ -127,12 +127,14 @@ fn wait_line(rx: &mpsc::Receiver<String>, needle: &str) -> String {
 }
 
 fn child_pid(rx: &mpsc::Receiver<String>) -> u32 {
-    wait_line(rx, "prêt, vidage")
-        .split("enfant pid ")
+    parse_child_pid(&wait_line(rx, "prêt, vidage")).expect("pid de l'enfant")
+}
+
+fn parse_child_pid(line: &str) -> Option<u32> {
+    line.split("enfant pid ")
         .nth(1)
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|pid| pid.parse().ok())
-        .expect("pid de l'enfant")
 }
 
 fn wait_exit(child: &mut Child, within: Duration) {
@@ -238,7 +240,20 @@ fn sequential_relay_queues_until_parent_exits() {
     let (clients, _ok, failed) = health_clients(port, &stop);
     signal("-USR2", old.id());
     wait_line(&rx, "relais séquentiel: l'enfant attendra");
-    let new_pid = child_pid(&rx);
+    // Après « accept arrêté » le parent n'accepte plus : la requête suivante
+    // est forcément chez l'enfant (sinon le parent la servirait lui-même).
+    // Les deux lignes viennent de deux threads, dans un ordre quelconque.
+    let (mut new_pid, mut stopped) = (None, false);
+    while new_pid.is_none() || !stopped {
+        let line = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("relais ou arrêt de l'accept absent");
+        stopped |= line.contains("relais: accept arrêté");
+        if line.contains("prêt, vidage") {
+            new_pid = parse_child_pid(&line);
+        }
+    }
+    let new_pid = new_pid.expect("pid de l'enfant");
     let mut chat = TcpStream::connect(("127.0.0.1", port)).expect("connexion chat");
     let body = r#"{"model":"t","messages":[{"role":"user","content":"x"}]}"#;
     write!(

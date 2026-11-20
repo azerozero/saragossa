@@ -337,6 +337,7 @@ pub(super) fn incoming<S>(
 ) -> impl Iterator<Item = io::Result<S>> {
     std::iter::from_fn(move || loop {
         if DRAINING.load(Ordering::Relaxed) {
+            eprintln!("saragossa serve relais: accept arrêté");
             return None;
         }
         let mut poll = libc::pollfd {
@@ -347,7 +348,9 @@ pub(super) fn incoming<S>(
         #[allow(unsafe_code)]
         // SAFETY: un seul `pollfd` valide, vivant pendant l'appel.
         let ready = unsafe { libc::poll(&mut poll, 1, 250) };
-        if ready > 0 {
+        // NOTE: relu après `poll` : une connexion arrivée pendant l'attente
+        // revient au successeur.
+        if ready > 0 && !DRAINING.load(Ordering::Relaxed) {
             match accept() {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 accepted => return Some(accepted),
@@ -382,11 +385,13 @@ pub(super) fn watch(listener: RawFd) {
         }
         match hand_over(&config.binary, listener, sequential) {
             Ok(pid) => {
+                // NOTE: avant le journal, qui annonce que ce processus
+                // n'accepte plus de nouvelle connexion.
+                DRAINING.store(true, Ordering::Relaxed);
                 eprintln!(
                     "saragossa serve relais: enfant pid {pid} prêt, vidage (max {}s)",
                     config.drain.as_secs()
                 );
-                DRAINING.store(true, Ordering::Relaxed);
                 std::thread::sleep(config.drain);
                 eprintln!("saragossa serve relais: délai de vidage atteint, sortie");
                 std::process::exit(0);
