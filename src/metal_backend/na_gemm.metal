@@ -58,8 +58,10 @@ kernel void gemm_nax_bf16_bn128(device const bfloat* Ap [[buffer(0)]],
   op.run(mA, mB, mC);
 }
 // C[M,N] = A[M,K]·B[N,K]^T, A et B bf16 (poids dense non transposé), accum f32.
-// matmul2d MPP tuiles 64×128 sur 8 simdgroups ; exige N%128=0. Réservé aux
-// modèles de décision, dont l'oracle couvre l'arrondi bf16 de l'activation.
+// matmul2d MPP tuiles 64×128 sur 8 simdgroups ; exige N%128=0. Sert aux
+// modèles de décision et au prefill des LLM Qwen dense bf16 (portée
+// `DenseBf16X1Scope`) : l'activation y est arrondie en bf16, écart mesuré par
+// KL dans docs/perf/prefill-bf16.md.
 // Grille N en x : les groupes voisins partagent la même tuile A (64×K) ; à
 // M=2048, N=12288, K=4096, 64 TFLOP/s contre 26 avec M en x, à l'identique.
 kernel void gemm_nax_bf16_nt_bn128(device const bfloat* Ap [[buffer(0)]],

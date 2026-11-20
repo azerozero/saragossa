@@ -471,7 +471,11 @@ impl Network {
             h_erb: zeros(self.config.erb_layers, self.config.hidden),
             h_df: zeros(self.config.df_layers, self.config.hidden),
             conv_hist: ConvHist::default(),
-            math: Math::Libm,
+            math: if crate::runtime_flags::denoise_common() {
+                Math::Common
+            } else {
+                Math::Libm
+            },
         }
     }
 

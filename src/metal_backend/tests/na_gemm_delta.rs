@@ -327,11 +327,39 @@ fn na_gemm_src_compiles() -> Result<()> {
         eprintln!("metal_tensor indisponible sur ce SDK — test NA sauté");
         return Ok(());
     }
-    if let Err(e) = executor
-        .device
-        .new_library_with_source(NA_GEMM_SRC, &options)
-    {
-        panic!("NA_GEMM_SRC ne compile pas (casse tous les pipelines NA) : {e}");
+    // Les deux préambules du runtime (déroulement actif ou kill-switch).
+    for prelude in ["", "#define NAX_KK_UNROLL\n"] {
+        let library = executor
+            .device
+            .new_library_with_source(&format!("{prelude}{NA_GEMM_SRC}"), &options)
+            .unwrap_or_else(|e| {
+                panic!("NA_GEMM_SRC ne compile pas (casse tous les pipelines NA) : {e}")
+            });
+        // Chaque noyau littéral doit donner un pipeline : un `None` du runtime
+        // ferait retomber son chemin en f32 sans erreur.
+        let names: Vec<&str> = NA_GEMM_SRC
+            .split("kernel void ")
+            .skip(1)
+            .filter_map(|rest| rest.split('(').next())
+            .map(str::trim)
+            // Les noyaux générés par macro (`NAME`, `##BM`) n'ont pas de nom littéral.
+            .filter(|name| {
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .collect();
+        assert!(names.contains(&"gemm_nax"), "analyse des noyaux NA vide");
+        for name in names {
+            let function = library
+                .get_function(name, None)
+                .unwrap_or_else(|e| panic!("noyau NA {name} absent : {e}"));
+            if let Err(e) = executor
+                .device
+                .new_compute_pipeline_state_with_function(&function)
+            {
+                panic!("pipeline NA {name} non créé : {e}");
+            }
+        }
     }
     Ok(())
 }

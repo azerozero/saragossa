@@ -160,6 +160,32 @@ impl AudioState {
         }
     }
 
+    /// Abandonne les modèles et sessions chargés (après une panique du moteur) ;
+    /// ils se rechargent à la prochaine requête.
+    pub(super) fn invalidate(&mut self) {
+        #[cfg(feature = "stt")]
+        {
+            self.stt.model = None;
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            {
+                self.stt.metal = None;
+            }
+            self.stt_sessions = super::stt::SttSessions::default();
+        }
+        #[cfg(feature = "diar")]
+        {
+            self.diar.model = None;
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            {
+                self.diar.metal = None;
+            }
+        }
+        #[cfg(feature = "tts")]
+        {
+            self.tts.model = None;
+        }
+    }
+
     #[cfg(feature = "denoise")]
     pub(super) fn enhance_path(&self) -> Option<PathBuf> {
         self.enhance_path.clone()

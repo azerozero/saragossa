@@ -56,6 +56,8 @@ mod generation;
 mod lightbatch;
 mod loading;
 mod lookup;
+mod suffix;
+pub(crate) use suffix::SuffixParams;
 mod mtp;
 mod mtp_adaptive;
 mod mtp_history;

@@ -110,6 +110,16 @@ pub fn denoise_threads() -> usize {
     })
 }
 
+/// Variante mathématique commune (`exp`/`tanh`/sigmoïde `exact_math`) pour le
+/// débruitage CPU (`SARAGOSSA_DENOISE_COMMON=1`, défaut 0 : libm). Sortie
+/// identique au bit entre CPU 1 thread, multi-cœur et GPU, pour environ 4 % de
+/// temps CPU en plus (mesuré).
+#[cfg(feature = "denoise")]
+pub fn denoise_common() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DENOISE_COMMON", false))
+}
+
 /// Réseau DFN3 en lot sur GPU Metal pour `saragossa enhance`
 /// (`SARAGOSSA_DENOISE_GPU`, défaut 0). Garde le fichier entier en mémoire ;
 /// sortie identique au bit au CPU en variante `exp`/`tanh` communes, à quelques
@@ -1184,6 +1194,36 @@ pub(crate) fn lookup_greedy_draft_tokens() -> usize {
     })
 }
 
+/// Source suffixe (SuffixDecoding, `decoder::suffix`) à la place des n-grammes
+/// pour les deux lookups (boucle greedy `SARAGOSSA_RUST_LOOKUP_GREEDY` et drafts
+/// lookup du MTP `SARAGOSSA_RUST_MTP_LOOKUP_DRAFT`), opt-in :
+/// `SARAGOSSA_RUST_SUFFIX_DRAFT=1` (correspondance 4, probabilité 0,1 du papier)
+/// ou `=m:p` (correspondance `m`, probabilité cumulée minimale `p` ; `p = 1`
+/// coupe le brouillon où les occurrences divergent). Défaut : n-grammes.
+pub(crate) fn suffix_draft() -> Option<crate::decoder::SuffixParams> {
+    static PARAMS: OnceLock<Option<crate::decoder::SuffixParams>> = OnceLock::new();
+    *PARAMS
+        .get_or_init(|| env_var("SARAGOSSA_RUST_SUFFIX_DRAFT").and_then(|v| parse_suffix_draft(&v)))
+}
+
+fn parse_suffix_draft(value: &str) -> Option<crate::decoder::SuffixParams> {
+    let default = crate::decoder::SuffixParams {
+        min_match: 4,
+        min_prob: 0.1,
+    };
+    match value.trim().split_once(':') {
+        Some((min_match, min_prob)) => Some(crate::decoder::SuffixParams {
+            min_match: min_match.trim().parse().ok()?,
+            min_prob: min_prob
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|p| (0.0..=1.0).contains(p))?,
+        }),
+        None => env_flag_value(value)?.then_some(default),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static LOOKUP_GREEDY_OVERRIDE: std::cell::Cell<Option<usize>> =
@@ -1728,6 +1768,50 @@ pub(crate) fn prefill_kv_shared_enabled() -> bool {
 pub(crate) fn dense_bf16_qmv_stage_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE", true))
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+thread_local! {
+    static DENSE_BF16_X1_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// GEMM matmul2d bf16 à un seul produit sur les poids bf16 denses :
+/// l'activation est arrondie une fois en bf16 au lieu d'être scindée hi + lo,
+/// deux fois moins de MMA (prefill 27B BF16 −36 à −44 %, KL moyen ≤ 3e-5,
+/// docs/perf/prefill-bf16.md). Change l'arithmétique (voir
+/// docs/perf/greedy-identity.md). Par défaut, seulement dans la portée
+/// [`DenseBf16X1Scope`] : couches du prefill résident d'un LLM Qwen
+/// dense entièrement bf16. `SARAGOSSA_RUST_DENSE_BF16_GEMM_X1=1` le force
+/// partout (tête MTP, drafter, Gemma, tenseurs bf16 des modèles quantifiés,
+/// decode et vérification si le plancher M descend sous 64) ; `=0` le coupe
+/// partout (GEMM hi + lo).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn dense_bf16_gemm_x1_enabled() -> bool {
+    static FORCED: OnceLock<Option<bool>> = OnceLock::new();
+    FORCED
+        .get_or_init(|| {
+            env_var("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1").and_then(|v| env_flag_value(&v))
+        })
+        .unwrap_or_else(|| DENSE_BF16_X1_SCOPE.with(std::cell::Cell::get))
+}
+
+/// Portée par défaut du GEMM bf16 à un produit, refermée au `drop`.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) struct DenseBf16X1Scope(bool);
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl DenseBf16X1Scope {
+    /// Ouvre (ou ferme, avec `false`) la portée sur ce thread.
+    pub(crate) fn enter(enabled: bool) -> Self {
+        Self(DENSE_BF16_X1_SCOPE.with(|value| value.replace(enabled)))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+impl Drop for DenseBf16X1Scope {
+    fn drop(&mut self) {
+        DENSE_BF16_X1_SCOPE.with(|value| value.set(self.0));
+    }
 }
 
 /// GEMM NA tuilé des poids bf16 denses au prefill (batch ≥ 64). Défaut ON ;
@@ -3091,50 +3175,48 @@ mod tests {
         Ok(())
     }
 
-    // Les tests d'env ci-dessous partagent le même processus : un mutex
-    // les sérialise, sans quoi les `set_var`/`remove_var` fuient d'un test à
-    // l'autre sous le harness multi-thread de Cargo.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Les tests d'env passent par `test_support::env_guard` : verrou unique,
+    // restauration à la sortie.
 
     #[test]
     fn env_var_exact_preserves_values_without_legacy_fallback() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut env = crate::test_support::env_guard();
         let name = "SARAGOSSA_TEST_EXACT";
         let legacy = "RETI_TEST_EXACT";
-        std::env::remove_var(name);
-        std::env::set_var(legacy, "herite");
+        env.remove(name);
+        env.set(legacy, "herite");
         assert_eq!(env_var_exact(name), None);
         for value in ["", "  canonique  "] {
-            std::env::set_var(name, value);
+            env.set(name, value);
             assert_eq!(env_var_exact(name).as_deref(), Some(value));
         }
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            std::env::set_var(name, std::ffi::OsStr::from_bytes(&[0xff]));
+            env.set(name, std::ffi::OsStr::from_bytes(&[0xff]));
             assert_eq!(env_var_exact(name), None);
         }
-        std::env::remove_var(name);
-        std::env::remove_var(legacy);
+        env.remove(name);
+        env.remove(legacy);
     }
 
     #[test]
     fn env_var_prefers_canonical_over_legacy() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-        std::env::set_var("SARAGOSSA_TEST_PRIORITE", "canonique");
-        std::env::set_var("RETI_TEST_PRIORITE", "herite");
+        let mut env = crate::test_support::env_guard();
+        env.set("SARAGOSSA_TEST_PRIORITE", "canonique");
+        env.set("RETI_TEST_PRIORITE", "herite");
         assert_eq!(
             env_var("SARAGOSSA_TEST_PRIORITE").as_deref(),
             Some("canonique")
         );
-        std::env::remove_var("SARAGOSSA_TEST_PRIORITE");
-        std::env::remove_var("RETI_TEST_PRIORITE");
+        env.remove("SARAGOSSA_TEST_PRIORITE");
+        env.remove("RETI_TEST_PRIORITE");
     }
 
     #[cfg(feature = "stt")]
     #[test]
     fn stt_kill_switches_honour_zero_and_one() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut env = crate::test_support::env_guard();
         for (name, read) in [
             ("SARAGOSSA_STT_MEL_SERIAL", stt_mel_serial as fn() -> bool),
             (
@@ -3142,33 +3224,55 @@ mod tests {
                 stt_dec_attn_bf16 as fn() -> bool,
             ),
         ] {
-            std::env::remove_var(name);
+            env.remove(name);
             assert!(!read(), "{name} absent");
-            std::env::set_var(name, "0");
+            env.set(name, "0");
             assert!(!read(), "{name}=0");
-            std::env::set_var(name, "1");
+            env.set(name, "1");
             assert!(read(), "{name}=1");
-            std::env::remove_var(name);
+            env.remove(name);
         }
     }
 
     #[test]
     fn env_var_falls_back_to_legacy_prefix() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-        std::env::remove_var("SARAGOSSA_TEST_REPLI");
-        std::env::set_var("RETI_TEST_REPLI", "herite");
+        let mut env = crate::test_support::env_guard();
+        env.remove("SARAGOSSA_TEST_REPLI");
+        env.set("RETI_TEST_REPLI", "herite");
         assert_eq!(env_var("SARAGOSSA_TEST_REPLI").as_deref(), Some("herite"));
         assert!(env_present("SARAGOSSA_TEST_REPLI"));
-        std::env::remove_var("RETI_TEST_REPLI");
+        env.remove("RETI_TEST_REPLI");
+    }
+
+    #[test]
+    fn suffix_draft_parses_flag_and_params() {
+        use crate::decoder::SuffixParams;
+        assert_eq!(super::parse_suffix_draft("0"), None);
+        assert_eq!(
+            super::parse_suffix_draft("1"),
+            Some(SuffixParams {
+                min_match: 4,
+                min_prob: 0.1
+            })
+        );
+        assert_eq!(
+            super::parse_suffix_draft("6:1"),
+            Some(SuffixParams {
+                min_match: 6,
+                min_prob: 1.0
+            })
+        );
+        assert_eq!(super::parse_suffix_draft("6:1.5"), None);
+        assert_eq!(super::parse_suffix_draft("x:0.1"), None);
     }
 
     #[test]
     fn env_flag_honours_legacy_prefix() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
-        std::env::remove_var("SARAGOSSA_TEST_DRAPEAU");
-        std::env::set_var("RETI_TEST_DRAPEAU", "1");
+        let mut env = crate::test_support::env_guard();
+        env.remove("SARAGOSSA_TEST_DRAPEAU");
+        env.set("RETI_TEST_DRAPEAU", "1");
         assert!(env_flag("SARAGOSSA_TEST_DRAPEAU", false));
-        std::env::remove_var("RETI_TEST_DRAPEAU");
+        env.remove("RETI_TEST_DRAPEAU");
         assert!(!env_flag("SARAGOSSA_TEST_DRAPEAU", false));
     }
 

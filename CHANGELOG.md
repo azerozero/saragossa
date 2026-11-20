@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.20](https://github.com/azerozero/saragossa/compare/v0.3.19...v0.3.20) - 2026-11-20
+
+### Other
+
+- Merge pull request #286 from azerozero/perf/suffix-decoding
+- *(decoder)* bilan opt-in des drafts lookup acceptés
+- *(decoder)* source de brouillon SuffixDecoding opt-in pour les lookups
+
+## [0.3.19](https://github.com/azerozero/saragossa/compare/v0.3.18...v0.3.19) - 2026-11-20
+
+### Fixed
+
+- *(prefill)* borne le tampon de timestamps GPU à 4096 échantillons
+
+### Other
+
+- Merge pull request #282 from azerozero/perf/prefill-bf16-27b
+- tests X1 exemptés de la CI GPU, GEMM NA absent du runner
+- *(gpu)* tests X1 du prefill bf16 dans la liste synthétique
+- Merge branch 'main' into perf/prefill-bf16-27b
+- *(perf)* périmètre, conditions K et N et mémoire du GEMM bf16 à un produit
+- *(prefill)* borne le GEMM bf16 à un produit au prefill Qwen dense bf16
+- Merge remote-tracking branch 'origin/main' into perf/prefill-bf16-27b
+- *(perf)* prefill BF16 à un produit, vitesse, KL et identité
+- *(prefill)* GEMM bf16 à un produit par défaut, retrait de NFIRST
+- *(prefill)* GEMM bf16 dense à un produit et grille N d'abord en opt-in
+
+## [0.3.18](https://github.com/azerozero/saragossa/compare/v0.3.17...v0.3.18) - 2026-11-20
+
+### Fixed
+
+- *(serve)* pas de second 500 après réponse commencée, invalidation audio et embeddings
+- *(serve)* le parent n'accepte plus après l'annonce du vidage
+- *(serve)* panique moteur contenue, jeton hors argv, WebTransport durci
+
+### Other
+
+- Merge pull request #294 from azerozero/fix/na-compile-garde
+- *(metal)* garde NA, noyaux générés par macro exclus de l'analyse
+- Merge pull request #293 from azerozero/test/audit-suite
+- Merge pull request #291 from azerozero/fix/audit-secu-docs
+- liste GPU synthétique complétée, garde d'environnement unique, mélange nocturne
+- *(serve)* relais séquentiel déterministe, sockets transmises par le test
+
+## [0.3.17](https://github.com/azerozero/saragossa/compare/v0.3.16...v0.3.17) - 2026-11-19
+
+### Fixed
+
+- *(metal)* bibliothèque NA compilée une fois, échec signalé
+
+## [0.3.16](https://github.com/azerozero/saragossa/compare/v0.3.15...v0.3.16) - 2026-11-19
+
+### Other
+
+- Merge pull request #281 from azerozero/perf/denoise-math-commune
+- Merge pull request #283 from azerozero/perf/decode-quant-largeur
+- Merge origin/main dans perf/denoise-math-commune
+- *(denoise)* variante commune opt-in (SARAGOSSA_DENOISE_COMMON), libm reste le défaut
+- *(decode)* sonde qmv u4 en DRAM, poids tournants et command buffers longs
+- *(denoise)* variante mathématique commune par défaut sur CPU, libm en kill-switch
+- *(decode)* sonde de bande passante des qmv u4 dense et MoE
+
 ## [0.3.15](https://github.com/azerozero/saragossa/compare/v0.3.14...v0.3.15) - 2026-11-18
 
 ### Added

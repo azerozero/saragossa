@@ -123,7 +123,7 @@ async fn request_stream(
             .headers()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
+            .and_then(super::super::http::bearer_token)
             .is_some_and(|v| super::super::http::constant_time_eq(v.as_bytes(), key.as_bytes()))
     }) {
         return reject(&mut response, 401).await;

@@ -159,17 +159,41 @@ pub(super) async fn session(conn: quinn::Connection, front: Arc<Front>) -> Serve
     if request.url.path() != "/v1/audio/enhance/wt" {
         return reject(request, http::StatusCode::NOT_FOUND).await;
     }
-    let mut token = None;
+    // Origin comme WS : une page tierce ne doit pas piloter l'endpoint local.
+    if request
+        .headers
+        .get("origin")
+        .is_some_and(|o| !o.to_str().is_ok_and(super::pcm::loopback_origin))
+    {
+        return reject(request, http::StatusCode::FORBIDDEN).await;
+    }
+    // Jeton : en-tête Authorization, sinon sous-protocole `bearer.<jeton>`, sinon
+    // `?token=` (les navigateurs ne posent aucun en-tête sur WebTransport ; le
+    // sous-protocole y est préférable). Jamais journalisé : l'URL n'est pas loguée.
     let mut query = Vec::new();
+    let mut query_token = None;
     for (key, value) in request.url.query_pairs() {
-        if key == "token" && token.is_none() {
-            token = Some(value.into_owned());
+        if key == "token" && query_token.is_none() {
+            query_token = Some(value.into_owned());
         } else {
             query.push(format!("{key}={value}"));
         }
     }
+    let header_token = request
+        .headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(super::super::http::bearer_token);
+    let protocol = request
+        .protocols
+        .iter()
+        .find(|p| p.starts_with("bearer."))
+        .cloned();
+    let token = header_token
+        .or(protocol.as_deref().and_then(|p| p.strip_prefix("bearer.")))
+        .or(query_token.as_deref());
     if !front.api_key.as_deref().is_some_and(|expected| {
-        token.as_deref().is_some_and(|token| {
+        token.is_some_and(|token| {
             super::super::http::constant_time_eq(token.as_bytes(), expected.as_bytes())
         })
     }) {
@@ -192,7 +216,11 @@ pub(super) async fn session(conn: quinn::Connection, front: Arc<Front>) -> Serve
         }
     };
     let mut worker = Worker::new(model, config, slot);
-    let session = deadline(request.ok()).await?;
+    let response = match protocol {
+        Some(p) => web_transport_quinn::proto::ConnectResponse::OK.with_protocol(p),
+        None => web_transport_quinn::proto::ConnectResponse::OK,
+    };
+    let session = deadline(request.respond(response)).await?;
     let result = async {
         let (mut send, mut recv) = deadline(session.accept_bi()).await?;
         let result = pump(&mut send, &mut recv, &mut worker).await;
