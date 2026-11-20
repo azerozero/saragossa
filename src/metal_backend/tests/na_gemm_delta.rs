@@ -342,7 +342,11 @@ fn na_gemm_src_compiles() -> Result<()> {
             .skip(1)
             .filter_map(|rest| rest.split('(').next())
             .map(str::trim)
-            .filter(|name| !name.contains('#'))
+            // Les noyaux générés par macro (`NAME`, `##BM`) n'ont pas de nom littéral.
+            .filter(|name| {
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
             .collect();
         assert!(names.contains(&"gemm_nax"), "analyse des noyaux NA vide");
         for name in names {
