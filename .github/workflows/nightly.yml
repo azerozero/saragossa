@@ -40,6 +40,12 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Tests
         run: cargo test --lib --bins --all-features
+      # NOTE: libtest ne mélange qu'en nightly (`--shuffle`, instable) et le leg
+      # nightly tolère déjà l'échec ; aucun outil externe. La graine est
+      # affichée : rejouer avec `-- -Zunstable-options --shuffle-seed <graine>`.
+      - name: Tests lib en ordre mélangé
+        if: matrix.toolchain == 'nightly'
+        run: cargo test --lib --all-features -- -Zunstable-options --shuffle
       - name: Documentation tests
         run: cargo test --doc --all-features
 
