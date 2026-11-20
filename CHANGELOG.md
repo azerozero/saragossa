@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.18](https://github.com/azerozero/saragossa/compare/v0.3.17...v0.3.18) - 2026-11-20
+
+### Fixed
+
+- *(serve)* pas de second 500 après réponse commencée, invalidation audio et embeddings
+- *(serve)* le parent n'accepte plus après l'annonce du vidage
+- *(serve)* panique moteur contenue, jeton hors argv, WebTransport durci
+
+### Other
+
+- Merge pull request #294 from azerozero/fix/na-compile-garde
+- *(metal)* garde NA, noyaux générés par macro exclus de l'analyse
+- Merge pull request #293 from azerozero/test/audit-suite
+- Merge pull request #291 from azerozero/fix/audit-secu-docs
+- liste GPU synthétique complétée, garde d'environnement unique, mélange nocturne
+- *(serve)* relais séquentiel déterministe, sockets transmises par le test
+
 ## [0.3.17](https://github.com/azerozero/saragossa/compare/v0.3.16...v0.3.17) - 2026-11-19
 
 ### Fixed
