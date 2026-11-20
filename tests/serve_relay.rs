@@ -14,15 +14,20 @@ use std::time::{Duration, Instant};
 
 /// Lance `serve` en TCP ; renvoie le processus, le port et ses lignes stderr.
 fn serve(extra: &[&str]) -> (Child, u16, mpsc::Receiver<String>) {
-    let (child, port, _, rx) = spawn_serve(extra, false);
+    let (child, port, _, rx) = spawn_serve(extra, false, Vec::new());
     (child, port, rx)
 }
 
 /// Lance `serve` sur des sockets liées par le test et transmises comme par un
 /// relais (`SARAGOSSA_LISTEN_FDS`) : aucun port libéré puis repris entre-temps.
 /// Avec `enhance`, ajoute le listener h2 (et la socket WebTransport si
-/// compilée) ; renvoie aussi le port h2.
-fn spawn_serve(extra: &[&str], enhance: bool) -> (Child, u16, Option<u16>, mpsc::Receiver<String>) {
+/// compilée) ; renvoie aussi le port h2. `stray` passe en plus des fd hérités
+/// sans les déclarer, comme une connexion acceptée pendant le `fork`.
+fn spawn_serve(
+    extra: &[&str],
+    enhance: bool,
+    stray: Vec<std::os::fd::OwnedFd>,
+) -> (Child, u16, Option<u16>, mpsc::Receiver<String>) {
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
     let bind = || std::net::TcpListener::bind("127.0.0.1:0").expect("écoute");
@@ -48,6 +53,7 @@ fn spawn_serve(extra: &[&str], enhance: bool) -> (Child, u16, Option<u16>, mpsc:
             owned.push(wt.into());
         }
     }
+    owned.extend(stray);
     let fds: Vec<i32> = owned.iter().map(AsRawFd::as_raw_fd).collect();
     command
         .args(["serve", "--port", &port.to_string(), "--api-key", "k"])
@@ -206,6 +212,26 @@ fn relay_hands_over_without_refusing_connections() {
     assert_ne!(new_pid, old.id());
 }
 
+/// Une connexion acceptée par le parent pendant le `fork` du relais arrive
+/// chez l'enfant sans FD_CLOEXEC (accept non atomique hors Linux) : l'enfant
+/// la ferme, sinon le client du parent n'aurait jamais sa fin de réponse.
+#[test]
+fn undeclared_inherited_socket_is_closed() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("écoute");
+    let mut client =
+        TcpStream::connect(listener.local_addr().expect("adresse")).expect("connexion");
+    let (accepted, _) = listener.accept().expect("accept");
+    let (mut server, _, _, rx) = spawn_serve(&[], false, vec![accepted.into()]);
+    wait_line(&rx, "non déclarée");
+    client
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("délai");
+    let read = client.read(&mut [0u8; 1]);
+    let _ = server.kill();
+    let _ = server.wait();
+    assert_eq!(read.expect("fin de flux attendue"), 0);
+}
+
 #[test]
 fn failed_child_keeps_parent_serving() {
     let (mut server, port, rx) = serve(&["--upgrade-binary", "/usr/bin/false"]);
@@ -298,7 +324,7 @@ fn sequential_relay_queues_until_parent_exits() {
 #[cfg(feature = "h2")]
 #[test]
 fn relay_with_h2_refuses_nothing() {
-    let (mut old, port, h2_port, rx) = spawn_serve(&[], true);
+    let (mut old, port, h2_port, rx) = spawn_serve(&[], true, Vec::new());
     let h2_port = h2_port.expect("port h2");
     // Connexion h2 tenue par le parent, pilotée sur son propre thread pour
     // répondre au PING du GOAWAY en deux temps.

@@ -105,6 +105,9 @@ pub(super) fn configure(args: &mut Vec<String>, serve: &ServeSection) -> ServeRe
     };
     let relayed =
         std::env::var_os(LISTEN_FDS_ENV).is_some() || std::env::var_os(READY_FD_ENV).is_some();
+    if relayed {
+        close_undeclared_sockets();
+    }
     if let Ok(pid) = std::env::var(SEQUENTIAL_ENV) {
         std::env::remove_var(SEQUENTIAL_ENV);
         // NOTE: hors relais, une variable égarée bloquerait le moteur.
@@ -123,6 +126,50 @@ pub(super) fn configure(args: &mut Vec<String>, serve: &ServeSection) -> ServeRe
         sequential,
     });
     Ok(())
+}
+
+/// Ferme les sockets héritées sans FD_CLOEXEC que le parent n'a pas
+/// déclarées (`SARAGOSSA_LISTEN_FDS`, fd « prêt »).
+///
+/// NOTE: hors Linux, `accept` puis `FD_CLOEXEC` ne sont pas atomiques dans
+/// std ni dans mio : une connexion acceptée par le parent pendant le `fork`
+/// du relais passe à l'enfant. Le parent y répond et la ferme, mais la copie
+/// de l'enfant retient le FIN et le client attend la fin de la réponse
+/// jusqu'à son délai. Les fd ouverts par ce processus ont tous FD_CLOEXEC ;
+/// seules les sockets héritées sans ce drapeau et non déclarées sont fermées.
+#[allow(unsafe_code)]
+fn close_undeclared_sockets() {
+    let ready = std::env::var(READY_FD_ENV).ok().and_then(|v| parse_fd(&v));
+    let mut declared: Vec<RawFd> = ready.into_iter().collect();
+    if let Ok(value) = std::env::var(LISTEN_FDS_ENV) {
+        // NOTE: une liste invalide est refusée plus loin par `inherited` ;
+        // sans liste fiable, rien n'est fermé.
+        let Some((main, named)) = parse_listen(&value, ready) else {
+            return;
+        };
+        declared.push(main);
+        declared.extend(named.iter().map(|(_, fd, _)| *fd));
+    }
+    let Ok(entries) = std::fs::read_dir("/dev/fd") else {
+        return;
+    };
+    let fds: Vec<RawFd> = entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    for fd in fds {
+        if fd <= 2 || declared.contains(&fd) || option(fd, libc::SO_TYPE).is_none() {
+            continue;
+        }
+        // SAFETY: lecture des drapeaux d'un fd ; un fd fermé fait échouer l'appel.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || flags & libc::FD_CLOEXEC != 0 {
+            continue;
+        }
+        eprintln!("saragossa serve relais: socket héritée non déclarée (fd {fd}), fermée");
+        // SAFETY: socket héritée sans FD_CLOEXEC ni déclaration : aucun code
+        // de ce processus ne la possède, elle n'est fermée qu'une fois.
+        unsafe { libc::close(fd) };
+    }
 }
 
 /// Vrai si le préchargement attend la sortie du parent (relais séquentiel).
