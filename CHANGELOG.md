@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.21](https://github.com/azerozero/saragossa/compare/v0.3.20...v0.3.21) - 2026-11-20
+
+### Fixed
+
+- *(prefill)* API des tenseurs coopératifs du MLP bf16 fusionné
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into perf/prefill-bf16-fusions
+- *(perf)* KL des fusions MLP et b/a du prefill BF16
+- *(prefill)* poids bf16 synthétiques tronqués après l'échelle
+- *(prefill)* MLP bf16 fusionné et GEMM b/a de la linear attention, opt-in
+
 ## [0.3.20](https://github.com/azerozero/saragossa/compare/v0.3.19...v0.3.20) - 2026-11-20
 
 ### Other
