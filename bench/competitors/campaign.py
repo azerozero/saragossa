@@ -51,6 +51,8 @@ LENGTHS = (512, 4096, 16384)
 LOAD_TIMEOUT_S = 2400            # ISQ mistral.rs et BF16 compris
 REQUEST_DEADLINE_S = 1800
 LOAD_MAX, CPU_MAX = 2.0, 50.0
+# Statuts d'entrée rejoués à la reprise : interruption, port encore tenu.
+RETRY = {"interrupted", "port_busy"}
 COOLDOWN_MIN_S, COOLDOWN_MAX_S, COOLDOWN_GPU_C = 45, 300, 50
 NONCE_LINE = "Request id: {nonce}\n\n"   # 16 chiffres = 16 tokens (prompts.py)
 INSTRUCTION = ("\n\nAbove is Rust source code. Write a detailed technical review of it: "
@@ -611,8 +613,9 @@ def run_entry(run_dir, entry_id):
             return 1
         headers = DIALECT[spec["engine"]].get("headers")
         signal.alarm(REQUEST_DEADLINE_S + 60)
+        shortest = prompts[str(min(map(int, prompts)))]
         warm = client.chat_stream("127.0.0.1", PORT, request_body(
-            spec, model_name, content_with_nonce(prompts["512"], nonce("warmup", entry_id, attempt)),
+            spec, model_name, content_with_nonce(shortest, nonce("warmup", entry_id, attempt)),
             WARMUP_TOKENS), headers=headers, deadline_s=REQUEST_DEADLINE_S)
         signal.alarm(0)
         journal.write({"kind": "warmup", **meta, "status": warm.get("status"),
@@ -877,7 +880,7 @@ def loop(args, run_dir, freeze, journal, child, log):
     previous = None
     for entry in freeze["plan"]:
         rows = journal.rows()
-        if any(r["kind"] == "entry_done" and r.get("status") != "interrupted"
+        if any(r["kind"] == "entry_done" and r.get("status") not in RETRY
                and r.get("entry") == entry["id"] for r in rows):
             continue
         failed = [r for r in rows if r["kind"] == "entry_done" and r.get("model") == entry["model"]
@@ -906,7 +909,8 @@ def loop(args, run_dir, freeze, journal, child, log):
 
     rows = journal.rows()
     done = {r["entry"]: r for r in rows if r["kind"] == "entry_done"
-            and r.get("status") != "interrupted"}
+            and r.get("status") not in RETRY}
+    missing = [e["id"] for e in freeze["plan"] if e["id"] not in done]
     final_attempt = {e: r.get("attempt") for e, r in done.items()}
     measures = [r for r in rows if r["kind"] == "measure"
                 and final_attempt.get(r["entry"]) == r["attempt"]]
@@ -916,8 +920,12 @@ def loop(args, run_dir, freeze, journal, child, log):
                "measures_planned": len(freeze["plan"]) * len(freeze["protocol"]["lengths"]),
                "measures_ok": sum(1 for r in measures if r["integrity"]["ok"]),
                "measures_failed": sum(1 for r in measures if not r["integrity"]["ok"]),
+               "missing": missing,
                "finished": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=1))
+    if missing:
+        log(f"incomplet, relancer reprend : {missing}")
+        return 1
     (run_dir / "DONE").write_text(summary["finished"] + "\n")
     log(f"terminé : {summary}")
     return 0
