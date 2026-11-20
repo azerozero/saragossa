@@ -1194,6 +1194,36 @@ pub(crate) fn lookup_greedy_draft_tokens() -> usize {
     })
 }
 
+/// Source suffixe (SuffixDecoding, `decoder::suffix`) à la place des n-grammes
+/// pour les deux lookups (boucle greedy `SARAGOSSA_RUST_LOOKUP_GREEDY` et drafts
+/// lookup du MTP `SARAGOSSA_RUST_MTP_LOOKUP_DRAFT`), opt-in :
+/// `SARAGOSSA_RUST_SUFFIX_DRAFT=1` (correspondance 4, probabilité 0,1 du papier)
+/// ou `=m:p` (correspondance `m`, probabilité cumulée minimale `p` ; `p = 1`
+/// coupe le brouillon où les occurrences divergent). Défaut : n-grammes.
+pub(crate) fn suffix_draft() -> Option<crate::decoder::SuffixParams> {
+    static PARAMS: OnceLock<Option<crate::decoder::SuffixParams>> = OnceLock::new();
+    *PARAMS
+        .get_or_init(|| env_var("SARAGOSSA_RUST_SUFFIX_DRAFT").and_then(|v| parse_suffix_draft(&v)))
+}
+
+fn parse_suffix_draft(value: &str) -> Option<crate::decoder::SuffixParams> {
+    let default = crate::decoder::SuffixParams {
+        min_match: 4,
+        min_prob: 0.1,
+    };
+    match value.trim().split_once(':') {
+        Some((min_match, min_prob)) => Some(crate::decoder::SuffixParams {
+            min_match: min_match.trim().parse().ok()?,
+            min_prob: min_prob
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|p| (0.0..=1.0).contains(p))?,
+        }),
+        None => env_flag_value(value)?.then_some(default),
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static LOOKUP_GREEDY_OVERRIDE: std::cell::Cell<Option<usize>> =
@@ -3201,6 +3231,28 @@ mod tests {
         assert_eq!(env_var("SARAGOSSA_TEST_REPLI").as_deref(), Some("herite"));
         assert!(env_present("SARAGOSSA_TEST_REPLI"));
         env.remove("RETI_TEST_REPLI");
+    }
+
+    #[test]
+    fn suffix_draft_parses_flag_and_params() {
+        use crate::decoder::SuffixParams;
+        assert_eq!(super::parse_suffix_draft("0"), None);
+        assert_eq!(
+            super::parse_suffix_draft("1"),
+            Some(SuffixParams {
+                min_match: 4,
+                min_prob: 0.1
+            })
+        );
+        assert_eq!(
+            super::parse_suffix_draft("6:1"),
+            Some(SuffixParams {
+                min_match: 6,
+                min_prob: 1.0
+            })
+        );
+        assert_eq!(super::parse_suffix_draft("6:1.5"), None);
+        assert_eq!(super::parse_suffix_draft("x:0.1"), None);
     }
 
     #[test]
