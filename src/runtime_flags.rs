@@ -1794,6 +1794,17 @@ pub(crate) fn dense_bf16_qmv_stage_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE", true))
 }
 
+/// qmv bf16 en lignes : sous le plancher du GEMM (vérification MTP/DFlash),
+/// chaque bloc de poids chargé sert 16 lignes d'activation au lieu d'être relu
+/// par ligne. Même arithmétique par ligne que le qmv à blocs (égalité au bit,
+/// test `dense_bf16_qmv_stage_rows_matches_stage_bitwise`). Actif par défaut ;
+/// `SARAGOSSA_RUST_DENSE_BF16_QMV_ROWS=0` rend une relecture par ligne.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn dense_bf16_qmv_rows_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_QMV_ROWS", true))
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 thread_local! {
     static DENSE_BF16_X1_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

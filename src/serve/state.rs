@@ -754,6 +754,31 @@ struct CompletionPath {
     prefix_cache: &'static str,
     decode_path: &'static str,
     streaming: bool,
+    /// Compteurs spéculatifs (MTP ou DFlash) ; `None` en AR.
+    speculative: Option<saragossa::SpeculativeStats>,
+}
+
+/// `dflash` quand le drafter DFlash a servi la requête, sinon `mtp` ou `ar`.
+fn speculative_decode_path(stats: Option<&saragossa::SpeculativeStats>) -> &'static str {
+    match stats {
+        Some(stats) if stats.dflash_tours.is_some() => "dflash",
+        Some(_) => "mtp",
+        None => "ar",
+    }
+}
+
+/// Suffixe ` spec_proposed=… spec_accepted=…` du journal, plus ` spec_tours=…`
+/// (un draft + une vérification) en DFlash ; vide en AR.
+fn speculative_log(stats: Option<&saragossa::SpeculativeStats>) -> String {
+    stats.map_or_else(String::new, |stats| {
+        let tours = stats
+            .dflash_tours
+            .map_or_else(String::new, |tours| format!(" spec_tours={tours}"));
+        format!(
+            " spec_proposed={} spec_accepted={}{tours}",
+            stats.proposed, stats.accepted
+        )
+    })
 }
 
 impl LoadedModel {
@@ -783,7 +808,7 @@ impl LoadedModel {
         let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
         let use_mtp = self.routes_mtp(&request, &prepared);
-        let (output, reused_prefix_tokens, prefix_cache) = if use_mtp {
+        let (output, reused_prefix_tokens, prefix_cache, speculative) = if use_mtp {
             // NOTE: v1 MTP assume son propre prefill via le prefix-cache du
             // décodeur (longest-prefix + extension). Il by-passe donc les
             // snapshots par blocs de serve pour ces seules requêtes greedy
@@ -799,10 +824,12 @@ impl LoadedModel {
             )?;
             text_stop.finish()?;
             let reused = output.stats.reused_prefix_tokens;
+            let stats = output.stats.clone();
             (
                 mtp::into_generation_output(output, started.elapsed()),
                 reused,
                 "decoder-longest-prefix",
+                Some(stats),
             )
         } else {
             let (prompt_state, reused_prefix_tokens, prefill) = self
@@ -836,7 +863,7 @@ impl LoadedModel {
                 text_stop.finish()?;
                 output
             };
-            (output, reused_prefix_tokens, "block-snapshots")
+            (output, reused_prefix_tokens, "block-snapshots", None)
         };
         ensure_guided_finished(token_constraint.as_deref())?;
         self.finish_completion(
@@ -846,8 +873,9 @@ impl LoadedModel {
             started.elapsed(),
             CompletionPath {
                 prefix_cache,
-                decode_path: if use_mtp { "mtp" } else { "ar" },
+                decode_path: speculative_decode_path(speculative.as_ref()),
                 streaming: false,
+                speculative,
             },
         )
     }
@@ -896,6 +924,7 @@ impl LoadedModel {
         let mut detokenizer = StreamingTextDetokenizer::new(&self.assets, stop_texts, max_tokens);
         let mut stream_error = None;
         let mut stream_started = !use_mtp;
+        let mut speculative = None;
         let output = if use_mtp {
             // NOTE: comme le non-stream, MTP préremplit via le cache longest-prefix
             // du décodeur et by-passe les snapshots serve v1. Le callback observe
@@ -940,6 +969,7 @@ impl LoadedModel {
                 },
             )?;
             reused_prefix_tokens = output.stats.reused_prefix_tokens;
+            speculative = Some(output.stats.clone());
             mtp::into_generation_output(output, started.elapsed())
         } else {
             self.decoder
@@ -993,8 +1023,9 @@ impl LoadedModel {
                 } else {
                     "block-snapshots"
                 },
-                decode_path: if use_mtp { "mtp" } else { "ar" },
+                decode_path: speculative_decode_path(speculative.as_ref()),
                 streaming: true,
+                speculative,
             },
         )?;
         detokenizer.finish(&completion.content, on_event)?;
@@ -1057,7 +1088,7 @@ impl LoadedModel {
         };
         let content = strip_text_stops(decoded, &prepared.stop_texts);
         eprintln!(
-            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}{} footprint_bytes={} prefix_cache_bytes={}{}",
+            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}{}{} footprint_bytes={} prefix_cache_bytes={}{}",
             self.id,
             prompt_tokens,
             output.tokens.len(),
@@ -1067,6 +1098,7 @@ impl LoadedModel {
             reused_prefix_tokens,
             path.prefix_cache,
             path.decode_path,
+            speculative_log(path.speculative.as_ref()),
             if path.streaming { " streaming=true" } else { "" },
             process_footprint_bytes().unwrap_or(0),
             self.prefix_cache_bytes(),
@@ -1276,6 +1308,7 @@ impl LoadedModel {
                 prefix_cache: "decoder-longest-prefix",
                 decode_path: "batch",
                 streaming: true,
+                speculative: None,
             },
         );
         let completion = match completion {
@@ -1907,6 +1940,26 @@ fn render_chat_prompt(
 mod tests {
     use super::*;
     use saragossa::ChatTemplateMessage;
+
+    #[test]
+    fn speculative_log_distinguishes_dflash_from_mtp() {
+        assert_eq!(speculative_decode_path(None), "ar");
+        assert_eq!(speculative_log(None), "");
+        let mut stats = saragossa::SpeculativeStats {
+            proposed: 12,
+            accepted: 7,
+            verifications: 5,
+            ..Default::default()
+        };
+        assert_eq!(speculative_decode_path(Some(&stats)), "mtp");
+        assert_eq!(
+            speculative_log(Some(&stats)),
+            " spec_proposed=12 spec_accepted=7"
+        );
+        stats.dflash_tours = Some(3);
+        assert_eq!(speculative_decode_path(Some(&stats)), "dflash");
+        assert!(speculative_log(Some(&stats)).ends_with("spec_tours=3"));
+    }
 
     fn cfg(id: &str, path: &str) -> ServeModelConfig {
         ServeModelConfig {

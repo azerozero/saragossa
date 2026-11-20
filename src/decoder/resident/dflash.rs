@@ -708,6 +708,7 @@ impl CausalDecoder {
             );
         }
 
+        stats.dflash_tours = Some(tours);
         Ok(SpeculativeOutput {
             tokens: generated,
             stats,
