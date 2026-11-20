@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.24](https://github.com/azerozero/saragossa/compare/v0.3.23...v0.3.24) - 2026-11-20
+
+### Other
+
+- *(gpu)* liste le test d'identité du qmv bf16 en lignes
+- *(metal)* qmv bf16 en lignes pour la vérification spéculative et compteurs DFlash dans serve
+
 ## [0.3.23](https://github.com/azerozero/saragossa/compare/v0.3.22...v0.3.23) - 2026-11-20
 
 ### Fixed
