@@ -104,7 +104,16 @@ impl MtpHead {
         let sidecar = LazySidecar::open(path.as_ref())?;
         // Résout les clés normalisées (sans préfixe `language_model.`) → clé réelle.
         let mut resolve: HashMap<String, String> = HashMap::new();
+        // Shard du tronc à tête embarquée : seules ses clés `mtp.*` comptent,
+        // ses clés nues (`layers.*` du tronc) ne sont pas une tête MTP.
+        let prefixed =
+            |name: &str| name.starts_with("mtp.") || name.starts_with("language_model.mtp.");
+        let embedded = sidecar.header.tensors.keys().any(|name| prefixed(name))
+            && sidecar.header.tensors.keys().any(|name| !prefixed(name));
         for name in sidecar.header.tensors.keys() {
+            if embedded && !prefixed(name) {
+                continue;
+            }
             let normalized = normalize_mtp_sidecar_key(name);
             if let Some(previous) = resolve.insert(normalized.clone(), name.to_string()) {
                 // Deux clés réelles pour une même clé normalisée : laquelle
@@ -2391,6 +2400,15 @@ mod tests {
                 load(&collision, MtpMoeQuant::Dense),
                 Err(InferError::Config(_))
             ));
+
+            // Shard du tronc à tête embarquée : ses clés nues ne sont pas
+            // normalisées en `mtp.*` et n'entrent pas en collision.
+            let mut embedded = moe_tensors();
+            embedded.push((
+                "layers.0.self_attn.o_proj.weight".into(),
+                tensor(&[H, H], |_| 0.0),
+            ));
+            assert!(load(&embedded, MtpMoeQuant::Dense).is_ok());
 
             // Norme finale trop courte : refusée avant tout encodage GPU, dont
             // les kernels liraient `hidden` coefficients hors du buffer.
