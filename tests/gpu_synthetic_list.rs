@@ -12,6 +12,8 @@ const EXEMPT: &[(&str, &str)] = &[
     ("dense_bf16_prefill_gemm_matches_f32", "na"),
     ("decision_dense_bf16_gemm_rounds_activation_once", "na"),
     ("dense_bf16_prefill_kill_switch_selects_qmv", "na"),
+    ("dense_bf16_pair_gemm_matches_f32", "na"),
+    ("dense_bf16_fused_mlp_matches_x1", "na"),
     ("dense_bf16_prefill_x1_scope_rounds_activation_once", "na"),
     ("dense_bf16_prefill_x1_kill_switch_selects_hi_lo", "na"),
     ("dense_bf16_prefill_x1_forced_outside_scope", "na"),

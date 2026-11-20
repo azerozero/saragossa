@@ -110,3 +110,20 @@ puis retiré de la PR. Δp max : 0,012 à 2048 et à 8192.
 
 L'arrondi bf16 de l'activation touche le prefill seulement. Le decode M = 1
 reste sur le qmv f32. Voir [greedy-identity.md](greedy-identity.md).
+
+## Fusions opt-in (MLP, b/a)
+
+`SARAGOSSA_RUST_DENSE_BF16_FUSED_MLP=1` calcule gate et up dans un seul
+dispatch matmul2d, avec le SwiGLU en épilogue et H écrit en bf16. Le résultat
+est égal au bit au chemin X1 (`dense_bf16_fused_mlp_matches_x1`).
+
+`SARAGOSSA_RUST_DENSE_BF16_LA_BA_GEMM=1` remplace les deux qmv des
+projections b/a par un GEMM hi + lo sur `[b; a]`. Les deux flags actifs sont
+comparés au défaut, dans le même protocole qu'au-dessus :
+
+| Corpus | Positions | KL moyen | KL max | Top-1 | Greedy 64 tokens |
+|---|---:|---:|---:|---:|---|
+| corpus kld, 8 × 512 | 2048 | 1,1e-5 | 1,7e-3 | 100 % | 7/8 identiques, 1 diverge au 64e token |
+| pg1661, 4 fenêtres de 8192 + 64 | 256 | 2,3e-5 | 3,8e-4 | 98,4 % (252/256) | 3/4 identiques, 1 diverge au 43e token |
+
+Le gain en temps n'est pas encore mesuré.

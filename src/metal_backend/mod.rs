@@ -487,8 +487,13 @@ pub struct MetalExecutor {
     /// GEMM tuilé à poids bf16 denses `[N,K]` et lhs f32 scindé hi + lo,
     /// pour le prefill des modèles BF16.
     na_gemm_bf16_nt_tiled_x2: Option<ComputePipelineState>,
+    /// Même GEMM hi + lo, N quelconque (projections b/a, opt-in).
+    na_gemm_bf16_nt_tiled_x2_maskn: Option<ComputePipelineState>,
     /// matmul2d MPP A et B bf16, B `[N,K]` : réservé aux décisions THX-02.
     na_gemm_bf16_nt_bn128: Option<ComputePipelineState>,
+    /// Même matmul2d que `na_gemm_bf16_nt_bn128` sur gate et up, SwiGLU en
+    /// épilogue et H bf16 (MLP dense bf16 fusionné du prefill, opt-in).
+    na_gemm_bf16_nt_gate_up_swiglu: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_align64: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_gate_up_swiglu: Option<ComputePipelineState>,
     #[cfg(test)]

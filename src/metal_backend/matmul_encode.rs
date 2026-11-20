@@ -460,6 +460,34 @@ impl MetalExecutor {
         {
             return Self::fused_micro_mlp_supported(batch, in_dim, inter_dim, [g, u, d]);
         }
+        if let (
+            MetalLinearWeightBuffers::DenseBf16 {
+                out_dim: gate_out,
+                in_dim: gate_in,
+                ..
+            },
+            MetalLinearWeightBuffers::DenseBf16 {
+                out_dim: up_out,
+                in_dim: up_in,
+                ..
+            },
+            MetalLinearWeightBuffers::DenseBf16 {
+                out_dim: down_out,
+                in_dim: down_in,
+                ..
+            },
+        ) = (gate, up, down)
+        {
+            // Mêmes GEMM X1 que les passes séparées : l'égalité au bit en dépend.
+            return crate::runtime_flags::dense_bf16_fused_mlp_enabled()
+                && self.na_gemm_bf16_nt_gate_up_swiglu.is_some()
+                && self.na_gemm_bf16_nt_bn128.is_some()
+                && (*gate_out, *gate_in) == (inter_dim, in_dim)
+                && (*up_out, *up_in) == (inter_dim, in_dim)
+                && (*down_out, *down_in) == (in_dim, inter_dim)
+                && super::matmul::uses_dense_bf16_gemm_x1(batch, in_dim, inter_dim)
+                && super::matmul::uses_dense_bf16_gemm_x1(batch, inter_dim, in_dim);
+        }
         // Les vues décalées (poids mmap, sous-vues) passent si leurs offsets
         // respectent l'alignement des kernels tuilés ; les trois dispatches
         // lient chacun leurs offsets.
@@ -585,6 +613,23 @@ impl MetalExecutor {
             self.encode_micro_gemm_bf16(encoder, &hidden_bf16, output_buffer, batch, inter_dim, d)?;
             return Ok(());
         }
+        if let (
+            MetalLinearWeightBuffers::DenseBf16 { rhs: g, .. },
+            MetalLinearWeightBuffers::DenseBf16 { rhs: u, .. },
+            MetalLinearWeightBuffers::DenseBf16 { rhs: d, .. },
+        ) = (gate, up, down)
+        {
+            return self.encode_fused_dense_bf16_mlp(
+                encoder,
+                lhs_buffer,
+                batch,
+                in_dim,
+                [gate, up, down],
+                [g, u, d],
+                inter_dim,
+                output_buffer,
+            );
+        }
         let (gp, gpo, gs, gso, gb, gbo) = quant(gate, "gate_proj")?;
         let (up_p, upo, us, uso, ub, ubo) = quant(up, "up_proj")?;
         let (dp, dpo, ds, dso, db, dbo) = quant(down, "down_proj")?;
@@ -668,6 +713,73 @@ impl MetalExecutor {
             in_dim,
             "gemm_nax_coop_qb_tiled_u4",
             "qmm_na_fused_tiled_u4_gs64",
+        )
+    }
+
+    /// MLP bf16 dense fusionné : x arrondi une fois en bf16, gate+up+SwiGLU en
+    /// un dispatch vers H bf16, puis le down X1 sur H. Mêmes arrondis que les
+    /// passes X1 séparées, à `f32_to_bf16(swiglu_f32(g, u))` près, égal au bit.
+    fn encode_fused_dense_bf16_mlp(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        [gate, up, down]: [&MetalLinearWeightBuffers; 3],
+        [g, u, d]: [&Buffer; 3],
+        inter_dim: usize,
+        output_buffer: &BufferRef,
+    ) -> Result<()> {
+        if !self.fused_dense_mlp_supported(batch, in_dim, gate, up, down, inter_dim) {
+            return Err(InferError::Config(
+                "MLP bf16 fusionné : poids ou dimensions hors prédicat".into(),
+            ));
+        }
+        let (Some(pso), Some(down_pso)) = (
+            self.na_gemm_bf16_nt_gate_up_swiglu.as_ref(),
+            self.na_gemm_bf16_nt_bn128.as_ref(),
+        ) else {
+            return Err(InferError::Config(
+                "MLP bf16 fusionné : kernel NA indisponible".into(),
+            ));
+        };
+        let lhs_len = checked_len(batch, in_dim, "MLP bf16 fusionné lhs")?;
+        let hidden_len = checked_len(batch, inter_dim, "MLP bf16 fusionné hidden")?;
+        let lhs_bf16 = self.private_bf16_buffer(lhs_len, "fused_mlp_lhs_bf16")?;
+        let hidden_bf16 = self.private_bf16_buffer(hidden_len, "fused_mlp_hidden_bf16")?;
+        self.encode_f32_to_bf16(encoder, lhs_buffer, &lhs_bf16, lhs_len)?;
+        let mnk = [
+            checked_u32(batch, "MLP bf16 fusionné batch")?,
+            checked_u32(inter_dim, "MLP bf16 fusionné inter_dim")?,
+            checked_u32(in_dim, "MLP bf16 fusionné in_dim")?,
+            0,
+        ];
+        encoder.set_compute_pipeline_state(pso);
+        encoder.set_buffer(0, Some(&lhs_bf16), 0);
+        encoder.set_buffer(1, Some(g), 0);
+        encoder.set_buffer(2, Some(u), 0);
+        encoder.set_buffer(3, Some(&hidden_bf16), 0);
+        encoder.set_bytes(4, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
+        trace_dispatch_path("gemm_nax_bf16_nt_gate_up_swiglu", batch, inter_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(inter_dim / 128, "MLP bf16 fusionné inter tiles")?,
+                checked_nsuint(batch.div_ceil(64), "MLP bf16 fusionné batch tiles")?,
+                1,
+            ),
+            MTLSize::new(pso.thread_execution_width().max(1) * 8, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, &hidden_bf16);
+        self.dispatch_dense_bf16_gemm_x1(
+            encoder,
+            down_pso,
+            &hidden_bf16,
+            d,
+            output_buffer,
+            batch,
+            in_dim,
+            inter_dim,
         )
     }
 

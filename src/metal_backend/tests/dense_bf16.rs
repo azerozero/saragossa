@@ -164,6 +164,150 @@ fn dense_bf16_prefill_x1_kill_switch_selects_hi_lo() -> Result<()> {
     Ok(())
 }
 
+/// Poids bf16 synthétiques `[out_dim, in_dim]` non dyadiques, graine `seed`.
+fn synthetic_bf16(
+    executor: &MetalExecutor,
+    out_dim: usize,
+    in_dim: usize,
+    seed: usize,
+) -> Result<(LinearWeight, Vec<f32>)> {
+    let values: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| {
+            let v = ((i * 40_503 + seed * 7919) % 997) as f32 / 997.0 - 0.5;
+            // Tronqué après l'échelle : la référence CPU lit exactement le poids bf16.
+            f32::from_bits((v * 0.4).to_bits() & 0xffff_0000)
+        })
+        .collect();
+    let bits: Vec<u8> = values
+        .iter()
+        .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+        .collect();
+    let weight = crate::DenseBf16Tensor::new(
+        &[out_dim, in_dim],
+        executor.weight_buffer_from_bf16_bytes(&bits)?,
+    )?;
+    Ok((LinearWeight::DenseBf16(weight), values))
+}
+
+fn bits_of(buffer: &Buffer, len: usize) -> Result<Vec<u32>> {
+    Ok(read_f32_buffer(buffer, len)?
+        .iter()
+        .map(|v| v.to_bits())
+        .collect())
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
+fn dense_bf16_fused_mlp_matches_x1() -> Result<()> {
+    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_FUSED_MLP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        run_flag_child(
+            "dense_bf16_fused_mlp_matches_x1",
+            CHILD,
+            ("SARAGOSSA_RUST_DENSE_BF16_FUSED_MLP", "1"),
+        );
+        return Ok(());
+    }
+    // Le MLP fusionné ne sert que dans la portée X1 du prefill résident.
+    let _scope = crate::runtime_flags::DenseBf16X1Scope::enter(true);
+    let executor = MetalExecutor::new()?;
+    let (hidden, inter) = (256_usize, 384_usize);
+    let mut resolved = Vec::new();
+    for (seed, (out_dim, in_dim)) in [(inter, hidden), (inter, hidden), (hidden, inter)]
+        .into_iter()
+        .enumerate()
+    {
+        let (weight, _) = synthetic_bf16(&executor, out_dim, in_dim, seed)?;
+        resolved.push(executor.resolve_linear_weight_buffers(&weight, "test_fused_bf16")?);
+    }
+    let [gate, up, down] = [&resolved[0], &resolved[1], &resolved[2]];
+    assert!(!executor.fused_dense_mlp_supported(63, hidden, gate, up, down, inter));
+    // Une tuile M pleine, une tuile masquée, plusieurs tuiles N.
+    for m in [64_usize, 70, 130] {
+        assert!(executor.fused_dense_mlp_supported(m, hidden, gate, up, down, inter));
+        let x: Vec<f32> = (0..m * hidden)
+            .map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * 2.3)
+            .collect();
+        let lhs = executor.upload_f32_buffer(&x, "fused_bf16_lhs")?;
+        let fused = executor.uncached_f32_buffer(m * hidden, "fused_bf16_out")?;
+        let g = executor.uncached_f32_buffer(m * inter, "fused_bf16_gate")?;
+        let u = executor.uncached_f32_buffer(m * inter, "fused_bf16_up")?;
+        let h = executor.uncached_f32_buffer(m * inter, "fused_bf16_h")?;
+        let split = executor.uncached_f32_buffer(m * hidden, "fused_bf16_split")?;
+        let cb = executor.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        executor.encode_fused_dense_mlp(enc, &lhs, m, hidden, gate, up, down, inter, &fused)?;
+        executor.encode_matmul_weight_buffers(enc, &lhs, m, hidden, gate, &g, false)?;
+        executor.encode_matmul_weight_buffers(enc, &lhs, m, hidden, up, &u, false)?;
+        executor.encode_swiglu(enc, &mut Vec::new(), &g, &u, &h, m * inter)?;
+        executor.encode_matmul_weight_buffers(enc, &h, m, inter, down, &split, false)?;
+        enc.end_encoding();
+        commit_and_wait(cb)?;
+        let expected = bits_of(&split, m * hidden)?;
+        assert!(expected.iter().any(|&b| b != 0), "M={m}");
+        assert_eq!(bits_of(&fused, m * hidden)?, expected, "M={m}");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
+fn dense_bf16_pair_gemm_matches_f32() -> Result<()> {
+    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_LA_BA_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        run_flag_child(
+            "dense_bf16_pair_gemm_matches_f32",
+            CHILD,
+            ("SARAGOSSA_RUST_DENSE_BF16_LA_BA_GEMM", "1"),
+        );
+        return Ok(());
+    }
+    let executor = MetalExecutor::new()?;
+    // N = 2·48 comme b/a du 27B : une tuile N pleine et une tuile masquée.
+    let (heads, in_dim) = (48_usize, 320_usize);
+    let (b, b_values) = synthetic_bf16(&executor, heads, in_dim, 1)?;
+    let (a, a_values) = synthetic_bf16(&executor, heads, in_dim, 2)?;
+    for rows in [63_usize, 64, 70] {
+        let x: Vec<f32> = (0..rows * in_dim)
+            .map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * 2.3)
+            .collect();
+        let lhs = executor.upload_f32_buffer(&x, "pair_bf16_lhs")?;
+        let cb = executor.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        let out =
+            executor.encode_dense_bf16_pair_gemm(enc, &lhs, rows, in_dim, [&b, &a], "pair_test")?;
+        enc.end_encoding();
+        commit_and_wait(cb)?;
+        let Some(out) = out else {
+            assert!(rows < 64, "GEMM b/a attendu à M={rows}");
+            continue;
+        };
+        assert!(rows >= 64);
+        let actual = read_f32_buffer(&out, rows * 2 * heads)?;
+        for row in 0..rows {
+            for (col, w) in b_values
+                .chunks(in_dim)
+                .chain(a_values.chunks(in_dim))
+                .enumerate()
+            {
+                let xr = &x[row * in_dim..(row + 1) * in_dim];
+                let e: f64 = xr
+                    .iter()
+                    .zip(w)
+                    .map(|(&x, &w)| f64::from(x) * f64::from(w))
+                    .sum();
+                let got = f64::from(actual[row * 2 * heads + col]);
+                // hi + lo : erreur relative d'activation vers 2⁻¹⁶.
+                assert!(
+                    (got - e).abs() <= 1e-4 * e.abs().max(1.0),
+                    "{row},{col}: {got} != {e}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 #[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
 fn dense_bf16_prefill_x1_forced_outside_scope() -> Result<()> {

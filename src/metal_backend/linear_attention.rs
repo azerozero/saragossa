@@ -1203,24 +1203,44 @@ impl MetalExecutor {
             weights.in_proj_z.weight(),
             &z_buffer,
         )?;
-        self.encode_matmul_weight(
-            encoder,
-            owned_buffers,
-            input_buffer,
-            rows,
-            in_dim,
-            weights.in_proj_b.weight(),
-            &beta_input_buffer,
-        )?;
-        self.encode_matmul_weight(
-            encoder,
-            owned_buffers,
-            input_buffer,
-            rows,
-            in_dim,
-            weights.in_proj_a.weight(),
-            &gate_input_buffer,
-        )?;
+        let k4_dk128 = use_seq_delta_batch
+            && spec.conv_kernel_dim == 4
+            && spec.value_head_dim == 128
+            && spec.key_head_dim == 128;
+        // b/a bf16 en un GEMM `[rows, 2·heads]`, lu par le seul noyau k4 dk128
+        // via `LinearAttnBatchLayout` (beta à 0, gate à `heads`).
+        let beta_gate = if k4_dk128 {
+            self.encode_dense_bf16_pair_gemm(
+                encoder,
+                input_buffer,
+                rows,
+                in_dim,
+                [weights.in_proj_b.weight(), weights.in_proj_a.weight()],
+                "linear_attn_batch_resident_beta_gate",
+            )?
+        } else {
+            None
+        };
+        if beta_gate.is_none() {
+            self.encode_matmul_weight(
+                encoder,
+                owned_buffers,
+                input_buffer,
+                rows,
+                in_dim,
+                weights.in_proj_b.weight(),
+                &beta_input_buffer,
+            )?;
+            self.encode_matmul_weight(
+                encoder,
+                owned_buffers,
+                input_buffer,
+                rows,
+                in_dim,
+                weights.in_proj_a.weight(),
+                &gate_input_buffer,
+            )?;
+        }
         if use_seq_delta_batch {
             let conv_out_buffer = self.private_f32_buffer(
                 checked_len(rows, conv_dim, "linear-attn batch conv_out")?,
@@ -1246,12 +1266,32 @@ impl MetalExecutor {
                 checked_len(rows, value_dim, "linear-attn batch y")?,
                 super::prefill::PHASE_GATE,
             )?;
-            if spec.conv_kernel_dim == 4 && spec.value_head_dim == 128 && spec.key_head_dim == 128 {
+            if k4_dk128 {
+                let (beta_input, gate_input, layout) = match &beta_gate {
+                    Some(fused) => (
+                        fused,
+                        fused,
+                        LinearAttnBatchLayout {
+                            beta_offset: 0,
+                            gate_offset: byte_offset_f32(
+                                spec.num_value_heads,
+                                "linear-attn beta_gate offset",
+                            )?,
+                            gate_stride: 2 * spec.num_value_heads,
+                            ..LinearAttnBatchLayout::contiguous(spec)
+                        },
+                    ),
+                    None => (
+                        &beta_input_buffer,
+                        &gate_input_buffer,
+                        LinearAttnBatchLayout::contiguous(spec),
+                    ),
+                };
                 self.encode_linear_attn_conv_norm_gates_k4_dk128_batch(
                     encoder,
                     &qkv_buffer,
-                    &beta_input_buffer,
-                    &gate_input_buffer,
+                    beta_input,
+                    gate_input,
                     &conv_weight_buffer,
                     &state.conv,
                     &a_log_buffer,
@@ -1263,7 +1303,7 @@ impl MetalExecutor {
                     &decay_buffer,
                     rows,
                     spec,
-                    LinearAttnBatchLayout::contiguous(spec),
+                    layout,
                     true,
                     None,
                 )?;

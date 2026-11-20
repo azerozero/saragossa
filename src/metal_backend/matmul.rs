@@ -350,41 +350,20 @@ impl MetalExecutor {
         // résident d'un LLM Qwen dense bf16 (`DenseBf16X1Scope`) ; ailleurs
         // (decode, vérification, tête MTP, drafter, Gemma, modèles quantifiés)
         // hi + lo. KL du 27B BF16 dans docs/perf/prefill-bf16.md.
-        if let Some(pso) = self.na_gemm_bf16_nt_bn128.as_ref().filter(|_| {
-            (crate::runtime_flags::decision_gemm_bf16_enabled()
-                || crate::runtime_flags::dense_bf16_gemm_x1_enabled())
-                && out_dim % 128 == 0
-                && can_use_dense_bf16_gemm(batch, in_dim, out_dim)
-        }) {
+        if let Some(pso) = self
+            .na_gemm_bf16_nt_bn128
+            .as_ref()
+            .filter(|_| uses_dense_bf16_gemm_x1(batch, in_dim, out_dim))
+        {
             // NOTE: scratch bf16 M×K mis en cache par longueur : un tampon par
             // K distinct (5120, 6144, 17408 sur le 27B), soit 2·M·K octets,
             // 142 Mo pour le down_proj à 4096 lignes et 285 Mo à 8192.
             let len = checked_len(batch, in_dim, "GEMM bf16 un produit A bf16")?;
             let lhs_bf16 = self.private_bf16_buffer(len, "dense_bf16_gemm_lhs_bf16")?;
             self.encode_f32_to_bf16(encoder, lhs, &lhs_bf16, len)?;
-            let mnk = [
-                checked_u32(batch, "bf16 gemm batch")?,
-                checked_u32(out_dim, "bf16 gemm out_dim")?,
-                checked_u32(in_dim, "bf16 gemm in_dim")?,
-                0,
-            ];
-            encoder.set_compute_pipeline_state(pso);
-            encoder.set_buffer(0, Some(&lhs_bf16), 0);
-            encoder.set_buffer(1, Some(rhs), 0);
-            encoder.set_buffer(2, Some(out), 0);
-            encoder.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
-            trace_dispatch_path("gemm_nax_bf16_nt_bn128", batch, out_dim, in_dim);
-            profile_dispatch();
-            encoder.dispatch_thread_groups(
-                MTLSize::new(
-                    checked_nsuint(out_dim / 128, "bf16 gemm out tiles")?,
-                    checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?,
-                    1,
-                ),
-                MTLSize::new(pso.thread_execution_width().max(1) * 8, 1, 1),
-            );
-            // Barrière complète : le scratch A est réécrit par le GEMM suivant.
-            post_dispatch_barrier(encoder);
+            self.dispatch_dense_bf16_gemm_x1(
+                encoder, pso, &lhs_bf16, rhs, out, batch, out_dim, in_dim,
+            )?;
             return Ok(out_dim);
         }
         if let Some(pso) = self
@@ -397,6 +376,88 @@ impl MetalExecutor {
             self.encode_dense_qmv_rhs_bf16(encoder, lhs, rhs, out, batch, out_dim, in_dim)?;
         }
         Ok(out_dim)
+    }
+
+    /// matmul2d bf16 `C[M,N] = A[M,K]·B[N,K]^T`, A déjà en bf16, N%128=0.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "dispatch Metal: pipeline, buffers et dimensions restent explicites"
+    )]
+    pub(super) fn dispatch_dense_bf16_gemm_x1(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pso: &ComputePipelineState,
+        lhs_bf16: &BufferRef,
+        rhs: &BufferRef,
+        out: &BufferRef,
+        batch: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
+        let mnk = [
+            checked_u32(batch, "bf16 gemm batch")?,
+            checked_u32(out_dim, "bf16 gemm out_dim")?,
+            checked_u32(in_dim, "bf16 gemm in_dim")?,
+            0,
+        ];
+        encoder.set_compute_pipeline_state(pso);
+        encoder.set_buffer(0, Some(lhs_bf16), 0);
+        encoder.set_buffer(1, Some(rhs), 0);
+        encoder.set_buffer(2, Some(out), 0);
+        encoder.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
+        trace_dispatch_path("gemm_nax_bf16_nt_bn128", batch, out_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(out_dim / 128, "bf16 gemm out tiles")?,
+                checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?,
+                1,
+            ),
+            MTLSize::new(pso.thread_execution_width().max(1) * 8, 1, 1),
+        );
+        // Barrière complète : le scratch A est réécrit par le GEMM suivant.
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Projections b/a bf16 denses de la linear attention au prefill : un GEMM
+    /// hi + lo (`gemm_nax_bf16_nt_tiled_x2_maskn`) sur la concaténation
+    /// `[first; second]`, sortie `[rows, 2·heads]`. `None` hors flag ou hors
+    /// forme : l'appelant garde ses deux qmv.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la concaténation ou une dimension échoue.
+    pub(crate) fn encode_dense_bf16_pair_gemm(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input: &BufferRef,
+        rows: usize,
+        in_dim: usize,
+        [first, second]: [&LinearWeight; 2],
+        label: &'static str,
+    ) -> Result<Option<Buffer>> {
+        let (LinearWeight::DenseBf16(_), LinearWeight::DenseBf16(_)) = (first, second) else {
+            return Ok(None);
+        };
+        let Some(pso) = self.na_gemm_bf16_nt_tiled_x2_maskn.as_ref().filter(|_| {
+            crate::runtime_flags::dense_bf16_la_ba_gemm_enabled()
+                && crate::runtime_flags::dense_bf16_gemm_enabled()
+                && rows >= dense_bf16_gemm_min_batch()
+                && in_dim % 64 == 0
+        }) else {
+            return Ok(None);
+        };
+        let MetalLinearWeightBuffers::DenseBf16 { rhs, out_dim, .. } =
+            self.resolve_concat_linear_weight_buffers(&[first, second], label)?
+        else {
+            return Err(InferError::Dimension(format!(
+                "{label}: concat bf16 attendue"
+            )));
+        };
+        let out = self.private_f32_buffer(checked_len(rows, out_dim, label)?, label)?;
+        self.encode_dense_bf16_gemm(encoder, pso, input, &rhs, &out, rows, out_dim, in_dim)?;
+        Ok(Some(out))
     }
 
     /// GEMM NA tuilé `C[M,N] = A[M,K]·B[N,K]^T`, A f32 scindé hi + lo, B bf16.
@@ -427,7 +488,7 @@ impl MetalExecutor {
         encoder.dispatch_thread_groups(
             MTLSize::new(
                 checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?,
-                checked_nsuint(out_dim / 64, "bf16 gemm out tiles")?,
+                checked_nsuint(out_dim.div_ceil(64), "bf16 gemm out tiles")?,
                 1,
             ),
             MTLSize::new(128, 1, 1),
@@ -1563,6 +1624,15 @@ fn dense_bf16_gemm_min_batch() -> usize {
             .filter(|min| (1..=DENSE_BF16_GEMM_MIN_BATCH).contains(min))
             .unwrap_or(DENSE_BF16_GEMM_MIN_BATCH)
     })
+}
+
+/// Prédicat du GEMM bf16 à un produit (`gemm_nax_bf16_nt_bn128`), hors
+/// disponibilité du pipeline ; partagé avec le MLP bf16 fusionné.
+pub(super) fn uses_dense_bf16_gemm_x1(batch: usize, in_dim: usize, out_dim: usize) -> bool {
+    (crate::runtime_flags::decision_gemm_bf16_enabled()
+        || crate::runtime_flags::dense_bf16_gemm_x1_enabled())
+        && out_dim % 128 == 0
+        && can_use_dense_bf16_gemm(batch, in_dim, out_dim)
 }
 
 fn can_use_dense_bf16_gemm(batch: usize, in_dim: usize, out_dim: usize) -> bool {
