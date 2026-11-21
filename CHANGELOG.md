@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.27](https://github.com/azerozero/saragossa/compare/v0.3.26...v0.3.27) - 2026-11-21
+
+### Fixed
+
+- *(test)* saute proprement les tests sur poids locaux absents, corrige le code mort h2
+
 ## [0.3.26](https://github.com/azerozero/saragossa/compare/v0.3.25...v0.3.26) - 2026-11-21
 
 ### Fixed
