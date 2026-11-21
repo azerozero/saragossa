@@ -413,7 +413,10 @@ fn load_from_shards_with_context(
     let prefixes = QwenPrefixes::detect(catalog);
     let tensors = load_decoder_tensors_with_context(config, shards, catalog, &prefixes, context)?;
     validate_decoder_shapes(config, &tensors)?;
-    Ok(CausalDecoder::from_decoder_tensors(tensors, config.into())?.with_snapshot_sources(sources))
+    let hf_raw = qwen35_hf_raw(config, &tensors);
+    Ok(CausalDecoder::from_decoder_tensors(tensors, config.into())?
+        .with_snapshot_sources(sources)
+        .with_trunk_hf_raw_norms(hf_raw))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -970,23 +973,25 @@ fn validate_lora_targets(
     Ok(())
 }
 
+/// Checkpoint Qwen3.5 transformers brut (conv1d `[canaux, 1, noyau]`), dont
+/// les normes reçoivent `1 + weight` ; la conv1d n'est pas modifiée par l'offset.
+fn qwen35_hf_raw(config: &ModelConfig, tensors: &HashMap<String, DecoderTensor>) -> bool {
+    matches!(
+        config.model_type.as_str(),
+        "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text"
+    ) && tensors.iter().any(|(key, tensor)| {
+        key.ends_with(".linear_attn.conv1d.weight")
+            && matches!(tensor.shape(), [_, 1, kernel] if *kernel > 1)
+    })
+}
+
 /// Les checkpoints HF Qwen3.5 stockent les RMSNorm comme `1 + weight`.
 /// MLX intègre déjà cet offset dans `sanitize()` et transpose les convolutions
 /// de `[canaux, 1, noyau]` vers `[canaux, noyau, 1]`. Comme MLX, utiliser ce
 /// layout pour distinguer les poids bruts des exports déjà convertis, quel que
 /// soit leur préfixe ou dtype. Nos kernels acceptent les deux layouts conv1d.
 fn bake_qwen35_norm_offset(config: &ModelConfig, tensors: &mut HashMap<String, DecoderTensor>) {
-    if !matches!(
-        config.model_type.as_str(),
-        "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text"
-    ) {
-        return;
-    }
-    let has_hf_conv = tensors.iter().any(|(key, tensor)| {
-        key.ends_with(".linear_attn.conv1d.weight")
-            && matches!(tensor.shape(), [_, 1, kernel] if *kernel > 1)
-    });
-    if !has_hf_conv {
+    if !qwen35_hf_raw(config, tensors) {
         return;
     }
     for (key, tensor) in tensors.iter_mut() {

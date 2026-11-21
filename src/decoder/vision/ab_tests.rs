@@ -248,7 +248,7 @@ fn vision_decode_ab_real_sidecars() -> std::result::Result<(), Box<dyn std::erro
     let executor = crate::MetalExecutor::new()?;
     let model = crate::load_causal_decoder_for_metal(&assets, &executor)?
         .with_metal_executor(executor)?
-        .with_mtp_sidecar(assets.mtp.path.as_ref().ok_or("sidecar MTP absent")?)?
+        .with_mtp_weights(&assets.mtp)?
         .with_dflash_draft_from_env(&assets.config)?;
     let draft = model.dflash_draft().ok_or("sidecar DFlash absent")?;
     let root =

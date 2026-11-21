@@ -2857,7 +2857,7 @@ fn mtp_committed_two_row_verifier_edges_match_ar() -> Result<()> {
         "MTP verifier integration requires an MTP sidecar in {}",
         model_dir.display()
     );
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         return Err(InferError::MissingArtifact {
             path: model_dir,
             what: "MTP sidecar",
@@ -2865,7 +2865,7 @@ fn mtp_committed_two_row_verifier_edges_match_ar() -> Result<()> {
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     assert!(
         model.mtp.is_some(),
         "MTP verifier integration must load the MTP head"
@@ -3097,7 +3097,7 @@ fn d1_strict_model() -> Result<(crate::ModelAssets, CausalDecoder)> {
         InferError::Config("test D1 strict : SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL".to_string())
     })?;
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let mtp_path = assets
+    let _mtp_path = assets
         .mtp
         .path
         .clone()
@@ -3107,7 +3107,7 @@ fn d1_strict_model() -> Result<(crate::ModelAssets, CausalDecoder)> {
         })?;
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(&mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     if model.mtp.is_none() || !model.supports_resident_full_decode() {
         return Err(InferError::Config(
             "test D1 strict : MTP résident non supporté".to_string(),
@@ -3429,13 +3429,13 @@ fn mtp_sampled_matches_ar_at_low_temperature_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip MTP échantillonné : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let prompt = mtp_verifier_prompt_ids(
         &assets,
         "Write a Rust function that parses a semantic version string and returns its three components.",
@@ -3498,13 +3498,13 @@ fn mtp_stop_sequences_match_ar_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip stop sequences MTP : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let prompt = mtp_verifier_prompt_ids(
         &assets,
         "Write a Rust function that parses a semantic version string and returns its three components.",
@@ -3699,13 +3699,13 @@ fn mtp_early_first_token_streams_once_and_stops_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip premier token MTP : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let prompt = mtp_verifier_prompt_ids(
         &assets,
         "Explain in two sentences why the borrow checker rejects aliasing mutable references.",
@@ -3920,6 +3920,61 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
     Ok(())
 }
 
+/// Défaut greedy sur cible dense BF16 : l'entrée publique (sans
+/// `SARAGOSSA_RUST_DFLASH_TREE`) vérifie un arbre B = 4 et sort exactement les
+/// tokens de l'AR. Requiert une cible BF16 (`SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`)
+/// et `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`.
+#[test]
+#[ignore = "modèle réel BF16 + draft DFlash requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_default_tree_b4_bf16_matches_ar_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none()
+        || crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_TREE").is_some()
+    {
+        eprintln!("skip DFlash B=4 : drafter absent ou SARAGOSSA_RUST_DFLASH_TREE posée");
+        return Ok(());
+    }
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    // Chargement de `serve` : poids créés directement en Metal (MLP bf16 gardés).
+    let executor = crate::MetalExecutor::new_with_kernel_profile(
+        crate::KernelProfile::for_model_dir(&assets.model_dir),
+    )?;
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)?
+        .with_metal_executor(executor)?
+        .with_dflash_draft_from_env(&assets.config)?;
+    let draft = model
+        .dflash_draft()
+        .ok_or_else(|| InferError::Config("drafter DFlash non chargé".to_string()))?
+        .clone();
+    assert!(model.dense_bf16_mlp(), "le test exige une cible dense BF16");
+    assert_eq!(
+        crate::runtime_flags::dflash_tree_default_budget(true, true),
+        4,
+        "défaut greedy BF16 : B = 4 (hors mode strict)"
+    );
+    let options = mtp_verifier_options(Vec::new());
+    for text in [
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+        "Raconte en quelques phrases l'histoire d'un phare isolé sur une côte bretonne.",
+    ] {
+        let prompt = mtp_verifier_prompt_ids(&assets, text)?;
+        let ar = model.generate_greedy_cached_with_options(&prompt, 64, &options)?;
+        let spec = model.generate_greedy_dflash_resident_with_options(
+            &prompt,
+            64,
+            &options,
+            &draft,
+            draft.info.block_size,
+        )?;
+        assert!(spec.stats.verifications > 0 && spec.stats.accepted > 0);
+        assert_eq!(spec.tokens, ar, "DFlash arbre B=4 diverge de l'AR");
+    }
+    Ok(())
+}
+
 // --- DFlash : boucle résidente contre boucle CPU (GPU + modèle réel + draft) ---
 
 /// Oracle de la boucle DFlash résidente : mêmes tokens que la boucle CPU et que
@@ -3951,8 +4006,8 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         .with_metal_runtime()?
         .with_dflash_draft_from_env(&assets.config)?;
     // Sidecar MTP pour le repli après bascule (section ignorée sans sidecar).
-    if let Some(mtp_path) = assets.mtp.path.as_ref() {
-        model = model.with_mtp_sidecar(mtp_path)?;
+    if assets.mtp.path.is_some() {
+        model = model.with_mtp_weights(&assets.mtp)?;
     }
     let draft = model
         .dflash_draft()
@@ -4324,13 +4379,13 @@ fn mtp_seed_metal_matches_cpu_oracle_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip semis MTP : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let head = model
         .mtp
         .as_ref()
@@ -5898,8 +5953,8 @@ fn greedy_identity_states_real_model() -> Result<()> {
     let mut model =
         crate::load_causal_decoder_for_metal(&assets, &executor)?.with_metal_executor(executor)?;
     let has_mtp = match assets.mtp.path.as_ref() {
-        Some(path) => {
-            model = model.with_mtp_sidecar(path)?;
+        Some(_) => {
+            model = model.with_mtp_weights(&assets.mtp)?;
             true
         }
         None => false,
@@ -6174,7 +6229,7 @@ fn greedy_identity_states_real_model() -> Result<()> {
     }
     eprintln!("identité : largeur d'arbre max {tree_widths:?}, vérifications Skip ≥ 5 lignes {skip_coverage:?}");
     // `dflash-défaut` : la largeur observée est celle du budget par défaut
-    // (B = 3 en greedy strict, B = 8 sinon), pas une autre.
+    // (B = 4 sur cible bf16 dense, B = 3 sinon en greedy), pas une autre.
     for mode in &selected {
         if !coverage.contains_key(mode) {
             failures.push(format!(
@@ -6184,8 +6239,16 @@ fn greedy_identity_states_real_model() -> Result<()> {
     }
     if selected.contains("dflash-défaut") {
         let width = tree_widths.get("dflash-défaut").copied().unwrap_or(0);
-        let expected =
-            crate::runtime_flags::dflash_tree_default_budget(true, model.dense_bf16_mlp()) + 1;
+        // Lignes littérales (budget + ancre) : ne pas recalculer par la fonction
+        // de production, sinon un changement de défaut passerait inaperçu.
+        let expected = match (
+            crate::runtime_flags::verify_strict_enabled(),
+            model.dense_bf16_mlp(),
+        ) {
+            (true, _) => 4,
+            (false, true) => 5,
+            (false, false) => 4,
+        };
         if width != expected {
             failures.push(format!(
                 "dflash-défaut : arbre de {width} lignes au plus, {expected} attendu"
@@ -6257,8 +6320,8 @@ fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
     let assets = crate::ModelAssets::load_local(&model_dir)?;
     let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
     let has_mtp = match assets.mtp.path.as_ref() {
-        Some(path) => {
-            model = model.with_mtp_sidecar(path)?;
+        Some(_) => {
+            model = model.with_mtp_weights(&assets.mtp)?;
             true
         }
         None => false,
@@ -6582,6 +6645,60 @@ fn mtp_fixed_depths_match_ar_synthetic() -> Result<()> {
     })
 }
 
+/// Profondeur fixe 2 avec tête de draft u4 tirée du lm_head bf16 du tronc
+/// (`quantize_draft_lm_head_u4`, défaut des cibles bf16) : la vérification reste
+/// faite par le lm_head bf16, la sortie greedy est donc celle de l'AR.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_d2_u4_draft_head_matches_ar_synthetic() -> Result<()> {
+    assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
+    let (mut model, prompt) = mtp_sign_synthetic_model()?;
+    let device = metal::Device::system_default()
+        .ok_or_else(|| InferError::Config("device Metal absent".into()))?;
+    // Tête bf16 du tronc : même motif de signes que la fixture, plus un bruit
+    // hors des colonnes vues par la norme, pour que la quantification u4 arrondisse.
+    let (hidden, vocab) = (model.final_norm.len(), 97);
+    let mut head = vec![0.0_f32; vocab * hidden];
+    for (i, value) in head.iter_mut().enumerate().skip(3 * hidden) {
+        *value = ((i * 7919) % 1009) as f32 / 1009.0 - 0.5;
+    }
+    head[0] = 1.0;
+    head[hidden] = -1.0;
+    head[2 * hidden + 1] = -1.0;
+    let bits: Vec<u16> = head.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+    let buffer = device.new_buffer_with_data(
+        bits.as_ptr().cast(),
+        (bits.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    model.lm_head = Linear::from_weight(
+        crate::LinearWeight::DenseBf16(crate::DenseBf16Tensor::new(&[vocab, hidden], buffer)?),
+        None,
+    )?;
+    model.mtp_draft_lm_head = Some(
+        mtp::quantize_draft_lm_head_u4(&model.lm_head)?
+            .ok_or_else(|| InferError::Config("tête u4 refusée".into()))?,
+    );
+    let options = GenerationOptions::default();
+    crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || -> Result<()> {
+        model.clear_prefix_cache();
+        let ar = model.generate_greedy_cached_with_options(&prompt, 48, &options)?;
+        assert_eq!(ar.len(), 48);
+        model.clear_prefix_cache();
+        let output = crate::runtime_flags::with_mtp_fixed_depth_override(|| {
+            model.generate_greedy_mtp_batched_with_options(&prompt, 48, &options, 2)
+        })?;
+        eprintln!(
+            "D2 u4 : proposés={:?} acceptés={:?}",
+            output.stats.proposed_by_position, output.stats.accepted_by_position
+        );
+        assert_eq!(output.tokens, ar, "D2 + tête u4 diverge de l'AR");
+        assert!(output.stats.accepted > 0, "aucun draft accepté");
+        Ok(())
+    })
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
     mtp_synthetic_model_with(|_| Ok(()))
@@ -6679,7 +6796,11 @@ fn mtp_bf16_history_generation_adoption_and_f32_fallback() -> Result<()> {
     assert!(decode_resident_full_enabled());
     assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
     assert!(prefix_cache_enabled());
-    let (model, prompt) = mtp_seed_synthetic_model()?;
+    // POURQUOI : depuis bbe5b4f, un prompt à froid est calculé en deux temps
+    // (ancre alignée puis queue), donc l'historique MTP compte deux segments.
+    // Ce test vérifie le semis d'un seul tenant : reprises à la longueur exacte.
+    let (model, prompt) =
+        crate::runtime_flags::with_prefix_align_for_test(None, mtp_seed_synthetic_model)?;
     let capacity = prompt.len() + 16;
     crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || -> Result<()> {
         with_kv_format_override(KvFormat::Bf16, || -> Result<()> {
@@ -7176,14 +7297,14 @@ fn mtp_bf16_real_greedy_ids_and_memory() -> Result<()> {
     let dir = mtp_verifier_model_dir()
         .ok_or_else(|| InferError::Config("modèle local MTP requis".into()))?;
     let assets = crate::ModelAssets::load_local(&dir)?;
-    let sidecar = assets
+    let _sidecar = assets
         .mtp
         .path
         .as_ref()
         .ok_or_else(|| InferError::Config("sidecar MTP local requis".into()))?;
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(sidecar)?;
+        .with_mtp_weights(&assets.mtp)?;
     let number = |name: &str, default| -> Result<usize> {
         std::env::var(name).ok().map_or(Ok(default), |s| {
             s.parse()
@@ -7405,14 +7526,14 @@ fn spec_route_alternation_reuses_prefix_real_model() -> Result<()> {
         return Ok(());
     }
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let mtp_path = assets
+    let _mtp_path = assets
         .mtp
         .path
         .clone()
         .ok_or_else(|| InferError::Config("sidecar MTP requis".to_string()))?;
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(&mtp_path)?
+        .with_mtp_weights(&assets.mtp)?
         .with_dflash_draft_from_env(&assets.config)?;
     let draft = model
         .dflash_draft()

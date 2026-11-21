@@ -80,12 +80,12 @@ fn prefix_extension_matches_cold_prefill_real_model() -> Result<()> {
     let mut model =
         crate::load_causal_decoder_for_metal(&assets, &executor)?.with_metal_executor(executor)?;
     if modes.contains("mtp") || modes.contains("dflash") {
-        let path = assets
+        let _path = assets
             .mtp
             .path
             .clone()
             .ok_or_else(|| InferError::Config("tête MTP absente".into()))?;
-        model = model.with_mtp_sidecar(path)?;
+        model = model.with_mtp_weights(&assets.mtp)?;
     }
     let draft = if modes.contains("dflash") {
         model = model.with_dflash_draft_from_env(&assets.config)?;

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-r"""Quantification mixte par sensibilité, sans calibration, au format MLX affine.
+r"""Quantification mixte par sensibilité au format MLX affine.
+
+--target-bpw et --imatrix activent l'allocation 3/4/5/6/8 calibrée (sensitivity.py),
+échelles/biais et modules épinglés inclus dans le budget. Sans ces options,
+la recette historique ci-dessous reste indépendante d'un corpus.
 
 Alloue deux largeurs de bits par couche selon l'erreur de quantification
 mesurée en espace des poids, puis écrit un modèle MLX chargeable par `mlx-lm`
@@ -62,10 +66,6 @@ import shutil
 import sys
 from pathlib import Path
 
-import mlx.core as mx
-from mlx_lm import load
-from mlx_lm.utils import quantize_model, save_config, save_model
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tokenizer_sidecar import check_tokenizer  # noqa: E402
 
@@ -94,6 +94,7 @@ def relative_quant_error(weight, bits: int, group_size: int) -> float:
     Le epsilon au dénominateur évite la division par zéro sur une couche de
     poids nuls, cas dégénéré mais possible sur un modèle élagué.
     """
+    import mlx.core as mx
     quantized, scales, biases = mx.quantize(weight, group_size=group_size, bits=bits)
     restored = mx.dequantize(
         quantized, scales, biases, group_size=group_size, bits=bits
@@ -109,6 +110,7 @@ def scan_layers(model, force_high: re.Pattern | None, bits: int, group_size: int
     Les poids 3D sont les stacks d'experts MoE (`SwitchLinear`) ; ils comptent
     comme candidats au même titre que les 2D.
     """
+    import mlx.core as mx
     forced: dict[str, int] = {}
     candidates: dict[str, tuple[float, int]] = {}
 
@@ -194,8 +196,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output", required=True, type=Path, help="répertoire du modèle quantifié"
     )
-    parser.add_argument("--low-bits", type=int, default=3, help="largeur basse")
-    parser.add_argument("--high-bits", type=int, default=4, help="largeur haute")
+    parser.add_argument("--low-bits", type=int, default=None, help="largeur basse (défaut 3 ; --base-bits avec --target-bpw)")
+    parser.add_argument("--base-bits", type=int, choices=(3, 4, 5, 6, 8), default=4,
+                        help="largeur de départ avec --target-bpw (défaut 4)")
+    parser.add_argument("--high-bits", type=int, default=None, help="largeur haute (défaut 4 ; 6 avec --target-bpw)")
+    parser.add_argument("--target-bpw", type=float, help="budget langage réel, allocation 3/4/5/6/8 gs64")
+    parser.add_argument("--imatrix", type=Path,
+                        help="E[x²] par colonne ; sans elle, --target-bpw classe en espace des poids")
+    parser.add_argument("--imatrix-blend", action="store_true",
+                        help="pondérer E[x²] par sqrt(moyenne_ligne(W²) + W_ij²) pendant le fit")
     parser.add_argument(
         "--high-fraction",
         type=float,
@@ -213,12 +222,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--force-high",
         default=None,
-        help="regex des modules épinglés en largeur haute, hors budget. "
+        help="regex des modules épinglés en largeur haute, hors budget high-fraction "
+        "mais inclus dans target-bpw. "
         "Par défaut: minimal en dense (embed|lm_head), structurel avec --moe "
         "(récurrence, routeur, experts partagés, attention). "
         "Chaîne vide pour désactiver.",
     )
     args = parser.parse_args(argv)
+    if args.low_bits is None:
+        args.low_bits = args.base_bits if args.target_bpw is not None else 3
+    if args.high_bits is None:
+        args.high_bits = 6 if args.target_bpw is not None else 4
     if args.force_high is None:
         # Le bon épinglage dépend de l'architecture : appliquer la recette MoE
         # à un dense épinglerait toute l'attention et ferait grimper le bpw en
@@ -233,11 +247,28 @@ def validate(args: argparse.Namespace) -> None:
         raise SystemExit(f"modèle source introuvable: {args.input}")
     if not (args.input / "config.json").is_file():
         raise SystemExit(f"config.json absent de {args.input}")
+    if args.output.exists() or args.output.is_symlink():
+        raise SystemExit(f"destination existante refusée : {args.output}")
+    if args.target_bpw is not None:
+        import math
+        if (not math.isfinite(args.target_bpw) or args.target_bpw <= 0
+                or args.low_bits != args.base_bits or args.high_bits not in (5, 6, 8)
+                or args.base_bits > args.high_bits or args.group_size != 64):
+            raise SystemExit("--target-bpw positif et fini, --low-bits égal à --base-bits, "
+                             "--base-bits <= --high-bits 5/6/8 et --group-size 64 requis")
+        if args.imatrix is not None and not args.imatrix.is_file():
+            raise SystemExit(f"imatrix introuvable : {args.imatrix}")
+        if args.imatrix_blend and args.imatrix is None:
+            raise SystemExit("--imatrix-blend exige --imatrix")
+    elif args.imatrix is not None or args.imatrix_blend:
+        raise SystemExit("--imatrix et --imatrix-blend exigent --target-bpw")
+    elif args.base_bits != 4:
+        raise SystemExit("--base-bits exige --target-bpw")
     if not (args.input / "tokenizer.json").is_file():
         raise SystemExit(f"tokenizer.json absent de {args.input}")
     if not 0.0 <= args.high_fraction <= 1.0:
         raise SystemExit(f"--high-fraction hors de [0, 1]: {args.high_fraction}")
-    if args.low_bits >= args.high_bits:
+    if args.target_bpw is None and args.low_bits >= args.high_bits:
         raise SystemExit(
             f"--low-bits ({args.low_bits}) doit être inférieur à "
             f"--high-bits ({args.high_bits})"
@@ -247,12 +278,21 @@ def validate(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if not (sys.argv[1:] if argv is None else argv):
+        from test_allocation import main as test_main
+        from sensitivity import _self_check
+        _self_check()
+        return test_main()
     args = parse_args(argv)
     validate(args)
+    from mlx_lm import load
+    from mlx_lm.utils import quantize_model, save_config, save_model
 
     force_high = re.compile(args.force_high) if args.force_high else None
 
     print(f"chargement de {args.input}...", flush=True)
+    if args.target_bpw is not None:
+        return target_template(args)
     model, _ = load(str(args.input))
     config = json.loads((args.input / "config.json").read_text())
 
@@ -299,6 +339,46 @@ def main(argv: list[str] | None = None) -> int:
     check_tokenizer(args.input, args.output)
 
     print(f"modèle écrit dans {args.output}", flush=True)
+    return 0
+
+
+def target_template(args):
+    """Écrit un vrai checkpoint min-max utilisable comme template par convert_ls."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from mlx_lm.utils import quantize_model, save_config, save_model
+    from imatrix import load_bf16
+    from sensitivity import scan
+
+    # Sans imatrix : score en espace des poids, sans corpus (sensitivity.weight_space_score).
+    matrix = mx.load(str(args.imatrix)) if args.imatrix is not None else None
+    model, _ = load_bf16(args.input)
+    config = json.loads((args.input / "config.json").read_text())
+    assignment, report = scan(model, matrix, args.force_high, args.target_bpw, args.high_bits,
+                              imatrix_blend=args.imatrix_blend, base_bits=args.base_bits)
+
+    def predicate(path, module):
+        bits = assignment.get(path)
+        return {"group_size": 64, "bits": bits, "mode": "affine"} if bits else False
+
+    model, config = quantize_model(model, config, 64, args.base_bits, quant_predicate=predicate)
+    actual = config["quantization"]
+    for name, bits in assignment.items():
+        if actual.get(name, {}).get("bits") != bits:
+            raise ValueError(f"allocation non appliquée par mlx-lm : {name}")
+    stored = sum(v.nbytes * 8 for name, v in tree_flatten(model.parameters())
+                 if name.startswith("language_model."))
+    actual_bpw = stored / report["total_parameters"]
+    if abs(actual_bpw - report["actual_bpw"]) > 1e-9 or actual_bpw > args.target_bpw:
+        raise ValueError(f"budget réalisé différent du plan : {actual_bpw} bpw")
+    args.output.mkdir(parents=True, exist_ok=False)
+    save_model(str(args.output), model)
+    save_config(config, str(args.output / "config.json"))
+    copy_sidecars(args.input, args.output)
+    check_tokenizer(args.input, args.output)
+    (args.output / "allocation.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(f"template écrit : {report['actual_bpw']:.6f} bpw langage, "
+          f"cible {args.target_bpw} ; remplir avec convert_ls.py --imatrix", flush=True)
     return 0
 
 

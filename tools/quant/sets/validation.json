@@ -1,0 +1,102 @@
+{
+ "name": "validation",
+ "provenance": "HuggingFaceH4/no_robots (test) + CohereLabs/aya_dataset (test), datasets-server, 21 nov. 2026 ; ouverte une seule fois sur les finalistes (E4)",
+ "prompts": [
+  {
+   "id": "val-nr-1",
+   "category": "prose",
+   "source": "HuggingFaceH4/no_robots test row 1 (Brainstorm)",
+   "prompt": "What are 5 things I can do when it's raining in London? I am visiting for the first time and only for a week with my husband. We love to walk, eat good food, and explore."
+  },
+  {
+   "id": "val-nr-2",
+   "category": "prose",
+   "source": "HuggingFaceH4/no_robots test row 2 (Generation)",
+   "prompt": "Write several rhyming sentences from the perspective of Jay the RA, a resident assistant at The University of Glee. He's introducing himself and the college."
+  },
+  {
+   "id": "val-nr-3",
+   "category": "prose",
+   "source": "HuggingFaceH4/no_robots test row 3 (Brainstorm)",
+   "prompt": "What other strange and obscure music genres can I check out?"
+  },
+  {
+   "id": "val-nr-4",
+   "category": "prose",
+   "source": "HuggingFaceH4/no_robots test row 4 (Generation)",
+   "prompt": "Write one paragraph about the Tlachihualtepetl pyramid. Keep it at or below 15 sentences. Include its size and when it was built. Also, include any aspects of worship it had. Include aspects of its more recent history, too. Name at least one specific year. "
+  },
+  {
+   "id": "val-nr-20",
+   "category": "code",
+   "source": "HuggingFaceH4/no_robots test row 20 (Coding)",
+   "prompt": "This Java function below is not working as I expected, it's supposed to go through an array of numbers and if it finds a number in the array that is divisible by 2 with a remainder of 0, then it adds it to a new array and returns the new array at the end. Can you help debug the function and explain how why it's not working as expected?\n\npublic static List checkForEvens(int [] nums) {\n    ArrayList anwer = new ArrayList<Integer>();\n    for(int i = 0; i < nums.length; i++) {\n    if(nums[i] / 2 == 0) {\n    answer.add(nums[i]\n     }  \n   }\n}"
+  },
+  {
+   "id": "val-nr-72",
+   "category": "code",
+   "source": "HuggingFaceH4/no_robots test row 72 (Coding)",
+   "prompt": "I want to make a video game in Python! Can you show me how to make a game window with a player character in python?"
+  },
+  {
+   "id": "val-nr-119",
+   "category": "prose",
+   "source": "HuggingFaceH4/no_robots test row 119 (Open QA)",
+   "prompt": "What does boredom mean and what use does it have?"
+  },
+  {
+   "id": "val-nr-156",
+   "category": "prose",
+   "source": "HuggingFaceH4/no_robots test row 156 (Open QA)",
+   "prompt": "What is the International Atomic Time (TAI), and how does it differ from Coordinated Universal Time?"
+  },
+  {
+   "id": "val-nr-216",
+   "category": "code",
+   "source": "HuggingFaceH4/no_robots test row 216 (Coding)",
+   "prompt": "May you write me a simple application in Vue 3 where there is a number and two buttons that increment and decrement that number?"
+  },
+  {
+   "id": "val-nr-281",
+   "category": "code",
+   "source": "HuggingFaceH4/no_robots test row 281 (Coding)",
+   "prompt": "Could you please write a program that will give me a place to enter a string then show me the unicode of it? I use Python."
+  },
+  {
+   "id": "val-nr-293",
+   "category": "code",
+   "source": "HuggingFaceH4/no_robots test row 293 (Coding)",
+   "prompt": "I want my Python code not to error out if it runs into an error and to follow a different line of code. How do I make it do that?"
+  },
+  {
+   "id": "val-aya-1",
+   "category": "multilingue",
+   "source": "CohereLabs/aya_dataset test row 1 (Standard Arabic)",
+   "prompt": "قم بإنشاء قصيدة عتاب من بحر الطويل."
+  },
+  {
+   "id": "val-aya-53",
+   "category": "multilingue",
+   "source": "CohereLabs/aya_dataset test row 53 (Telugu)",
+   "prompt": "ఒక వ్యాపార సంస్థకు అవసరమైన వివిధ రకాల మూలధనాన్ని పేర్కొనండి."
+  },
+  {
+   "id": "val-aya-127",
+   "category": "multilingue",
+   "source": "CohereLabs/aya_dataset test row 127 (Portuguese)",
+   "prompt": "Qual é a diferença entre um vírus e uma bactéria? "
+  },
+  {
+   "id": "val-aya-228",
+   "category": "multilingue",
+   "source": "CohereLabs/aya_dataset test row 228 (Turkish)",
+   "prompt": "LinkedIn kullanmak için ipuçları"
+  },
+  {
+   "id": "val-aya-1518",
+   "category": "multilingue",
+   "source": "CohereLabs/aya_dataset test row 1518 (Simplified Chinese)",
+   "prompt": "为以下的原文给译文：\n\n君子曰：学不可以已。青，取之于蓝，而青于蓝;冰，水为之，而寒于水。木直中绳，輮以为轮，其曲中规。虽有槁暴，不复挺者，輮使之然也。故木受绳则直，金就砺则利，君子博学而日参省乎己，则知明而行无过矣。\n\n吾尝终日而思矣，不如须臾之所学也。吾尝跂而望矣，不如登高之博见也。登高而招，臂非加长也，而见者远;顺风而呼，声非加疾也，而闻者彰。假舆马者，非利足也，而致千里;假舟楫者，非能水也，而绝江河。君子生非异也，善假于物也。\n\n积土成山，风雨兴焉;积水成渊，蛟龙生焉;积善成德，而神明自得，圣心备焉。故不积跬步，无以至千里;不积小流，无以成江海。骐骥一跃，不能十步;驽马十驾，功在不舍。锲而舍之，朽木不折;锲而不舍，金石可镂。蚓无爪牙之利，筋骨之强，上食埃土，下饮黄泉，用心一也。蟹六跪而二螯，非蛇鳝之穴无可寄托者，用心躁也。"
+  }
+ ]
+}

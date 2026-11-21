@@ -138,6 +138,26 @@ fn qwen_kv_nax_x3_shape(
         .then_some(QWEN_27B_KV_SHAPE)
 }
 
+/// Provenance d'une tête MTP, qui fixe la convention de ses normes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MtpHeadSource {
+    /// Fichier sidecar séparé : normes telles que stockées (heuristique).
+    Sidecar,
+    /// Shard du modèle : même convention de normes que le tronc.
+    Embedded,
+}
+
+impl MtpHeadSource {
+    /// Provenance détectée par `ModelAssets` (shard du modèle ou sidecar).
+    fn of(weights: &crate::MtpWeightsInfo) -> Self {
+        if weights.embedded {
+            Self::Embedded
+        } else {
+            Self::Sidecar
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 /// Décrit les dimensions et options d'un décodeur causal.
 pub struct CausalDecoderConfig {
@@ -1366,6 +1386,9 @@ pub struct CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     dflash: Option<crate::DFlashDraft>,
     snapshot_sources: SnapshotSources,
+    /// Le loader du tronc a appliqué l'offset `1 + weight` des normes d'un
+    /// checkpoint transformers brut (`qwen_loader::bake_qwen35_norm_offset`).
+    trunk_hf_raw_norms: bool,
     prefix_cache: Arc<Mutex<PrefixCache>>,
     /// Alignement et queue des reprises du cache de préfixe, choisis au
     /// chargement (`runtime_flags::prefix_align_for_model`).
@@ -2035,6 +2058,7 @@ impl CausalDecoder {
             #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
             dflash: None,
             snapshot_sources: SnapshotSources::default(),
+            trunk_hf_raw_norms: false,
             prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
             prefix_align,
             memory_guard: None,
@@ -2803,12 +2827,53 @@ impl CausalDecoder {
         }
     }
 
-    /// Charge une tête MTP depuis un sidecar safetensors.
+    /// Charge une tête MTP depuis un fichier sidecar séparé, normes telles que
+    /// stockées. Pour la tête détectée par `ModelAssets` (sidecar ou shard du
+    /// modèle), utiliser [`Self::with_mtp_weights`].
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si le sidecar est incomplet ou incompatible.
-    pub fn with_mtp_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
+    pub fn with_mtp_sidecar(self, path: impl AsRef<Path>) -> Result<Self> {
+        self.with_mtp_head(path, MtpHeadSource::Sidecar)
+    }
+
+    /// Charge la tête MTP détectée par `ModelAssets` : chemin et provenance
+    /// (sidecar ou shard du modèle) voyagent ensemble, la convention des
+    /// normes suit donc la vraie source.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur sans tête détectée, ou si elle est incomplète ou
+    /// incompatible.
+    pub fn with_mtp_weights(self, weights: &crate::MtpWeightsInfo) -> Result<Self> {
+        let path = weights.path.as_ref().ok_or_else(|| {
+            InferError::MissingWeight("tête MTP (aucun sidecar ni shard mtp.*)".to_string())
+        })?;
+        self.with_mtp_head(path, MtpHeadSource::of(weights))
+    }
+
+    pub(crate) fn with_trunk_hf_raw_norms(mut self, hf_raw: bool) -> Self {
+        self.trunk_hf_raw_norms = hf_raw;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trunk_hf_raw_norms(&self) -> bool {
+        self.trunk_hf_raw_norms
+    }
+
+    /// Charge une tête MTP depuis `path`, fichier sidecar ou shard du modèle. Embarquée dans un tronc transformers brut,
+    /// la tête dense reçoit le même offset de normes `1 + weight` que lui
+    /// (kill-switch `SARAGOSSA_RUST_MTP_HF_NORM_OFFSET=0`).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la tête est incomplète ou incompatible.
+    fn with_mtp_head(mut self, path: impl AsRef<Path>, source: MtpHeadSource) -> Result<Self> {
+        let hf_norm_offset = source == MtpHeadSource::Embedded
+            && self.trunk_hf_raw_norms
+            && crate::runtime_flags::mtp_hf_norm_offset_enabled();
         self.ensure_metal_supported()?;
         let sources = SnapshotSources::capture([path.as_ref()]);
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2823,8 +2888,13 @@ impl CausalDecoder {
             not(all(target_os = "macos", feature = "metal")),
             expect(unused_mut, reason = "single-copy Metal seulement")
         )]
-        let mut head =
-            MtpHead::from_sidecar(&path, &self.config, self.final_norm.data().len(), &context)?;
+        let mut head = MtpHead::from_sidecar(
+            &path,
+            &self.config,
+            self.final_norm.data().len(),
+            &context,
+            hf_norm_offset,
+        )?;
         // La tête arrive après `enable_single_copy_weights` du tronc : sans ce
         // passage, ses linéaires quantifiées à la charge (fc, attention, expert
         // partagé, routeur) gardaient une copie CPU à scales f32 en plus de la
@@ -2859,18 +2929,89 @@ impl CausalDecoder {
 
     /// Charge le drafter DFlash 2 désigné par `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`
     /// (quantification `SARAGOSSA_RUST_DFLASH_QUANT_BITS`, u4 gs64 si absente :
-    /// la configuration mesurée en phase 7). Sans la variable, le décodeur est
-    /// rendu inchangé : c'est le kill-switch.
+    /// la configuration mesurée en phase 7). Sans la variable, ou à `0`, le
+    /// décodeur est rendu inchangé : c'est le kill-switch.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si le runtime Metal est absent, si le checkpoint est
     /// incompatible avec `target` ou si la quantification demandée est invalide.
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-    pub fn with_dflash_draft_from_env(mut self, target: &crate::ModelConfig) -> Result<Self> {
-        let Some(dir) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR") else {
-            return Ok(self);
-        };
+    pub fn with_dflash_draft_from_env(self, target: &crate::ModelConfig) -> Result<Self> {
+        match crate::runtime_flags::env_var_os(crate::devtools::DFLASH_DRAFT_DIR_ENV) {
+            Some(dir) if !dir.is_empty() && dir != "0" => {
+                self.with_dflash_draft_dir(target, std::path::PathBuf::from(dir))
+            }
+            _ => Ok(self),
+        }
+    }
+
+    /// Comme [`Self::with_dflash_draft_from_env`], mais le drafter est aussi
+    /// découvert : variable, sous-dossier `dflash/` du modèle, puis cache HF
+    /// (cf. [`crate::devtools::resolve_dflash_draft`]). Journalise le choix.
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que [`Self::with_dflash_draft_from_env`].
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    pub fn with_dflash_draft_auto(mut self, assets: &crate::ModelAssets) -> Result<Self> {
+        let env = crate::runtime_flags::env_var_os(crate::devtools::DFLASH_DRAFT_DIR_ENV);
+        let hf_cache = crate::hf_resolve::hf_cache_dir_from_env();
+        let found = crate::devtools::resolve_dflash_draft(
+            &assets.model_dir,
+            &assets.config,
+            env.as_deref(),
+            hf_cache.as_deref(),
+        );
+        let dense_bf16 = self.dense_bf16_mlp();
+        match found.dir.clone() {
+            Some(_) if !crate::devtools::dflash_beats_mtp(found.forced, dense_bf16) => {
+                eprintln!("saragossa {}", crate::devtools::DFLASH_SKIPPED_NOTE);
+                Ok(self)
+            }
+            Some(dir) => {
+                eprintln!("saragossa {}", found.note);
+                if found.forced {
+                    return self.with_dflash_draft_dir(&assets.config, dir);
+                }
+                // Un drafter découvert ne doit jamais bloquer le modèle : essai du
+                // candidat suivant, puis repli MTP.
+                let config = &assets.config;
+                let loaded = crate::devtools::first_loadable(found.candidates(), |dir| {
+                    self.load_dflash_draft_dir(config, dir.to_path_buf())
+                });
+                match loaded {
+                    Some((dir, ())) if Some(dir) != found.dir.as_deref() => {
+                        eprintln!("saragossa DFlash : drafter {} (repli)", dir.display());
+                    }
+                    Some(_) => {}
+                    None => eprintln!("saragossa DFlash : aucun drafter utilisable, repli MTP"),
+                }
+                Ok(self)
+            }
+            None => {
+                eprintln!("saragossa {}", found.note);
+                Ok(self)
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    fn with_dflash_draft_dir(
+        mut self,
+        target: &crate::ModelConfig,
+        dir: std::path::PathBuf,
+    ) -> Result<Self> {
+        self.load_dflash_draft_dir(target, dir)?;
+        Ok(self)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    fn load_dflash_draft_dir(
+        &mut self,
+        target: &crate::ModelConfig,
+        dir: std::path::PathBuf,
+    ) -> Result<()> {
         self.ensure_metal_supported()?;
         let metal = self.runtime.metal.as_deref().ok_or_else(|| {
             InferError::Config("drafter DFlash : runtime Metal requis".to_string())
@@ -2886,7 +3027,7 @@ impl CausalDecoder {
         self.dflash = Some(
             crate::devtools::dflash::load_dflash_draft_weights_with_runtime(
                 target,
-                std::path::PathBuf::from(dir),
+                dir,
                 quant,
                 ForwardRuntime::metal(metal),
             )?,
@@ -2898,7 +3039,7 @@ impl CausalDecoder {
                 self.snapshot_sources.append(draft.snapshot_sources.clone());
             }
         }
-        Ok(self)
+        Ok(())
     }
 
     /// Drafter DFlash chargé par `with_dflash_draft_from_env`, s'il y en a un.

@@ -59,6 +59,16 @@ fn drafter_layout(
     Ok((skip, capacity))
 }
 
+/// Vrai si les trois projections (gate, up, down) du MLP gardent leurs poids en
+/// bf16 dense : la vérification relit alors tous les poids bf16 et son coût
+/// suit le qmv bf16 en lignes (budget d'arbre `DFLASH_TREE_BF16_DEFAULT_BUDGET`).
+fn gated_mlp_dense_bf16(mlp: &crate::GatedMlp) -> bool {
+    let (gate, up, down) = mlp.projections();
+    [gate, up, down]
+        .iter()
+        .all(|projection| matches!(projection.weight(), crate::LinearWeight::DenseBf16(_)))
+}
+
 /// Forme des drafts vérifiés à chaque tour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::decoder) enum DFlashTreeMode {
@@ -264,8 +274,7 @@ impl CausalDecoder {
     /// par défaut, cf. `dflash_tree_default_budget`).
     pub(in crate::decoder) fn dense_bf16_mlp(&self) -> bool {
         self.layers.iter().any(|layer| {
-            matches!(&layer.mlp, Some(crate::FeedForward::Dense(mlp))
-                if matches!(mlp.projections().0.weight(), crate::LinearWeight::DenseBf16(_)))
+            matches!(&layer.mlp, Some(crate::FeedForward::Dense(mlp)) if gated_mlp_dense_bf16(mlp))
         })
     }
 
@@ -1424,6 +1433,81 @@ mod tests {
     /// Variable absente = arbre du budget par défaut, non explicite ; 0, B et
     /// valeur invalide sont explicites et l'emportent sur le défaut ; un refus
     /// replie seulement le défaut. Indépendant de l'environnement.
+    fn quantized_linear() -> crate::Linear {
+        let scales = Tensor::from_vec(vec![1, 1], vec![0.5])
+            .expect("invariant: échelles quantifiées valides");
+        let biases =
+            Tensor::from_vec(vec![1, 1], vec![0.0]).expect("invariant: biais quantifiés valides");
+        let weight =
+            crate::AffineQuantizedTensor::new(&[1, 1], vec![0x7654_3210], scales, biases, 8, 4)
+                .expect("invariant: poids quantifié valide");
+        crate::Linear::new_quantized(weight, None).expect("invariant: projection quantifiée valide")
+    }
+
+    fn bf16_linear(device: &metal::DeviceRef) -> crate::Linear {
+        let buffer = device.new_buffer(2 * 8, metal::MTLResourceOptions::StorageModeShared);
+        let weight = crate::DenseBf16Tensor::new(&[1, 8], buffer)
+            .expect("invariant: poids bf16 dense valide");
+        crate::Linear::from_weight(crate::LinearWeight::DenseBf16(weight), None)
+            .expect("invariant: projection bf16 valide")
+    }
+
+    /// Sélection automatique sans `SARAGOSSA_RUST_DFLASH_TREE` (hors strict) :
+    /// MLP quantifié ou f32 → B = 3, valeurs littérales.
+    #[test]
+    fn tree_default_budget_follows_quantized_mlp() {
+        let dense = || {
+            crate::Linear::new(
+                Tensor::from_vec(vec![1, 8], vec![0.25; 8]).expect("invariant"),
+                None,
+            )
+            .expect("invariant: projection f32 valide")
+        };
+        for mlp in [
+            crate::GatedMlp::new(quantized_linear(), quantized_linear(), quantized_linear()),
+            crate::GatedMlp::new(dense(), dense(), dense()),
+        ] {
+            assert!(!gated_mlp_dense_bf16(&mlp));
+            let budget =
+                crate::runtime_flags::select_dflash_tree_default_budget(true, false, false);
+            assert_eq!(budget, 3);
+            assert_eq!(
+                DFlashTreeMode::from_flag(None, budget).ok(),
+                Some((DFlashTreeMode::BestFirst(3), false))
+            );
+            assert_eq!(
+                DFlashTreeMode::from_flag(Some(Ok(8)), budget).ok(),
+                Some((DFlashTreeMode::BestFirst(8), true))
+            );
+        }
+    }
+
+    /// MLP bf16 dense sur ses trois projections → B = 4 ; une projection
+    /// quantifiée suffit à rester à B = 3. Poids synthétiques.
+    #[test]
+    #[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
+    fn tree_default_budget_follows_bf16_mlp_synthetic() {
+        let device = metal::Device::system_default().expect("invariant: device Metal requis");
+        let bf16 = crate::GatedMlp::new(
+            bf16_linear(&device),
+            bf16_linear(&device),
+            bf16_linear(&device),
+        );
+        assert!(gated_mlp_dense_bf16(&bf16));
+        let budget = crate::runtime_flags::select_dflash_tree_default_budget(true, false, true);
+        assert_eq!(budget, 4);
+        assert_eq!(
+            DFlashTreeMode::from_flag(None, budget).ok(),
+            Some((DFlashTreeMode::BestFirst(4), false))
+        );
+        let mixed = crate::GatedMlp::new(
+            bf16_linear(&device),
+            quantized_linear(),
+            bf16_linear(&device),
+        );
+        assert!(!gated_mlp_dense_bf16(&mixed));
+    }
+
     #[test]
     fn tree_default_falls_back_and_explicit_refuses() {
         assert_eq!(

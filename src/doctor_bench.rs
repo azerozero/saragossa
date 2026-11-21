@@ -77,6 +77,7 @@ struct ModelSummary {
     shard_count: usize,
     mtp_present: bool,
     mtp_tensors: usize,
+    advice: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -338,6 +339,17 @@ fn load_model_summary(path: &Path) -> CliResult<ModelSummary> {
         .as_ref()
         .is_some_and(|assets| assets.mtp.is_available());
     let mtp_tensors = assets.as_ref().map_or(0, |assets| assets.mtp.tensor_count);
+    let mut advice = Vec::new();
+    if let Some(command) = quantize_advice(path, &role, config.as_ref(), weight_bytes) {
+        advice.push(command);
+    }
+    #[cfg(feature = "devtools")]
+    // Même critère que l'activation automatique : dense BF16 seulement.
+    if let Some(config) = config.as_ref().filter(|config| {
+        mtp_present && config.quantization.is_none() && !config.is_moe() && raw_is_bf16(&raw)
+    }) {
+        advice.extend(drafter_advice(path, &name, config));
+    }
     let context = config_context(&raw);
     let (layers, full_layers, linear_layers, head_dim, kv_heads, arch, kv_bytes_at_context) =
         match &config {
@@ -381,7 +393,50 @@ fn load_model_summary(path: &Path) -> CliResult<ModelSummary> {
         shard_count,
         mtp_present,
         mtp_tensors,
+        advice,
     })
+}
+
+/// Un LLM dense (non quantifié) de plus de 4 Go gagne en débit à passer en
+/// 4 bits : renvoie la commande de conversion exacte.
+fn quantize_advice(
+    path: &Path,
+    role: &str,
+    config: Option<&ModelConfig>,
+    weight_bytes: u64,
+) -> Option<String> {
+    let dense = config.is_some_and(|config| config.quantization.is_none());
+    if !dense || !role.starts_with("LLM") || weight_bytes < 4 * 1024 * 1024 * 1024 {
+        return None;
+    }
+    // NOTE: ce conseil `mlx_lm convert` sera remplacé par `saragossa convert`
+    // (chantier feat/convert-natif).
+    Some(format!(
+        "modèle non quantifié ({}) : un 4 bits décode plus vite et tient en mémoire : \
+         python3 -m mlx_lm convert --hf-path {} --mlx-path {}-4bit -q --q-bits 4 --q-group-size 64",
+        format_bytes(weight_bytes),
+        path.display(),
+        path.display()
+    ))
+}
+
+/// Drafter DFlash introuvable pour un modèle qui a une tête MTP.
+#[cfg(feature = "devtools")]
+fn drafter_advice(path: &Path, name: &str, config: &ModelConfig) -> Option<String> {
+    let env = saragossa::runtime_flags::env_var_os(saragossa::devtools::DFLASH_DRAFT_DIR_ENV);
+    let cache = crate::hf_resolve::hf_cache_dir_from_env().ok();
+    let found =
+        saragossa::devtools::resolve_dflash_draft(path, config, env.as_deref(), cache.as_deref());
+    if found.dir.is_some() || env.is_some() {
+        return None;
+    }
+    Some(format!(
+        "aucun drafter DFlash : le décodage spéculatif peut gagner 30 à 90 % sur le code : \
+         poser un drafter DFlash 2 de {name} dans {}/{} (hidden_size, num_target_layers et \
+         vocab_size identiques au modèle)",
+        path.display(),
+        saragossa::devtools::DFLASH_SIBLING_DIR
+    ))
 }
 
 fn read_json(path: &Path) -> CliResult<Value> {
@@ -540,6 +595,16 @@ fn config_context(raw: &Value) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(feature = "devtools")]
+/// Poids déclarés en bfloat16 (`torch_dtype` ou `dtype`, racine ou `text_config`) :
+/// F16 et F32 ne sont pas le cas `dense_bf16_mlp` qui active DFlash seul.
+fn raw_is_bf16(raw: &Value) -> bool {
+    ["torch_dtype", "dtype"].into_iter().any(|key| {
+        json_string(raw, &[key]).or_else(|| json_string(raw, &["text_config", key]))
+            == Some("bfloat16".to_string())
+    })
 }
 
 fn json_string(raw: &Value, path: &[&str]) -> Option<String> {
@@ -756,6 +821,18 @@ fn print_doctor_markdown(models: &[ModelSummary], memory: Option<u64>) {
         );
     }
     println!();
+    println!("## CONSEILS");
+    let mut any = false;
+    for model in models {
+        for line in &model.advice {
+            any = true;
+            println!("- **{}** - {line}", model.name);
+        }
+    }
+    if !any {
+        println!("- aucun : quantification et drafters déjà en place");
+    }
+    println!();
     println!("## SANTE");
     for (status, name, detail) in health_checks() {
         println!("- {status} **{name}** - {detail}");
@@ -818,7 +895,8 @@ fn model_json(model: &ModelSummary) -> Value {
         "tensor_count": model.tensor_count,
         "shard_count": model.shard_count,
         "mtp_present": model.mtp_present,
-        "mtp_tensors": model.mtp_tensors
+        "mtp_tensors": model.mtp_tensors,
+        "advice": model.advice
     })
 }
 
@@ -1143,6 +1221,16 @@ fn print_bench_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "devtools")]
+    #[test]
+    fn bf16_detection_rejects_f16_and_f32() {
+        assert!(raw_is_bf16(&json!({"torch_dtype": "bfloat16"})));
+        assert!(raw_is_bf16(&json!({"text_config": {"dtype": "bfloat16"}})));
+        assert!(!raw_is_bf16(&json!({"torch_dtype": "float16"})));
+        assert!(!raw_is_bf16(&json!({"dtype": "float32"})));
+        assert!(!raw_is_bf16(&json!({})));
+    }
 
     #[test]
     fn doctor_args_accept_repeated_model_dirs() {

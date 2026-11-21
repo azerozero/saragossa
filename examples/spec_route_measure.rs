@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         MetalExecutor::new_with_kernel_profile(KernelProfile::for_model_dir(Path::new(&model)))?;
     let decoder = load_causal_decoder_for_metal(&assets, &executor)?
         .with_metal_executor(executor)?
-        .with_mtp_sidecar(assets.mtp.path.as_ref().ok_or("sidecar MTP requis")?)?
+        .with_mtp_weights(&assets.mtp)?
         .with_dflash_draft_from_env(&assets.config)?;
     if decoder.dflash_draft().is_none() {
         return Err("SARAGOSSA_RUST_DFLASH_DRAFT_DIR requis".into());

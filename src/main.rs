@@ -209,11 +209,12 @@ fn run() -> CliResult<()> {
     #[cfg(not(feature = "devtools"))]
     let load_mtp = mtp_active;
     if load_mtp {
-        let path =
-            assets.mtp.path.as_ref().ok_or_else(|| {
-                cli_error("decode/oracle MTP demandé mais aucun sidecar MTP détecté")
-            })?;
-        decoder = decoder.with_mtp_sidecar(path)?;
+        assets
+            .mtp
+            .path
+            .as_ref()
+            .ok_or_else(|| cli_error("decode/oracle MTP demandé mais aucun sidecar MTP détecté"))?;
+        decoder = decoder.with_mtp_weights(&assets.mtp)?;
         if let Some(path) = saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_MTP_DRAFT_LM_HEAD")
         {
             decoder = decoder.with_mtp_draft_lm_head_sidecar(PathBuf::from(path))?;
@@ -226,7 +227,7 @@ fn run() -> CliResult<()> {
         && !saragossa::devtools::mtp_acceptance_enabled()
         && !saragossa::devtools::dflash_acceptance_enabled()
     {
-        decoder = decoder.with_dflash_draft_from_env(&assets.config)?;
+        decoder = decoder.with_dflash_draft_auto(&assets)?;
     }
     let load_elapsed = load_started.elapsed();
     if args.load_only {

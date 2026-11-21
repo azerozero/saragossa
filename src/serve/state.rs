@@ -647,7 +647,7 @@ impl ModelSlot {
                         self.id
                     ))
                 })?;
-                decoder = decoder.with_mtp_sidecar(path)?;
+                decoder = decoder.with_mtp_weights(&assets.mtp)?;
                 eprintln!(
                     "saragossa serve MTP actif model={} sidecar={} max_draft={}",
                     self.id,
@@ -658,7 +658,7 @@ impl ModelSlot {
             // Le drafter n'est joignable que par le chemin MTP : inutile sans lui.
             #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
             if mtp_active {
-                decoder = decoder.with_dflash_draft_from_env(&assets.config)?;
+                decoder = decoder.with_dflash_draft_auto(&assets)?;
                 if let Some(draft) = decoder.dflash_draft() {
                     eprintln!(
                         "saragossa serve drafter DFlash actif model={} block_size={} quant_bits={:?}",

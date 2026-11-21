@@ -195,6 +195,21 @@ fn external_logits_comparison_keeps_strict_gates_and_bounds_bf16() {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn compare(name: &str, env: &str, comparison: Comparison) -> TestResult {
+    // POURQUOI : le GEMM groupé coop du prefill MoE est un chemin bf16 tensor-core
+    // (classe near-tie, cf. `moe_routed_coop_prefill_enabled`) ; face à la référence
+    // float32, seul le qmv par ligne est exact. Mesuré le 21 nov. : coop 1/96 écart
+    // greedy et KL21 0,0267, qmv 0/96 et 0,0078. Même résultat à efc72e6 : ce
+    // contrôle n'avait jamais été validé sur GPU (tools/goldens/README.md).
+    if matches!(comparison, Comparison::Float32) && name == "qwen36_moe" {
+        return crate::metal_backend::with_moe_coop_override(false, || {
+            compare_inner(name, env, comparison)
+        });
+    }
+    compare_inner(name, env, comparison)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn compare_inner(name: &str, env: &str, comparison: Comparison) -> TestResult {
     let Some(path) = local(env)? else {
         return Ok(());
     };

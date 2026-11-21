@@ -8,8 +8,13 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 mod codebook;
+mod discover;
 mod weights;
 pub use codebook::DFlashCodebook;
+pub use discover::{
+    dflash_beats_mtp, first_loadable, resolve_dflash_draft, DraftResolution, DFLASH_DRAFT_DIR_ENV,
+    DFLASH_SIBLING_DIR, DFLASH_SKIPPED_NOTE,
+};
 use weights::DraftWeights;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -908,6 +913,57 @@ pub fn load_dflash_draft_for_target(
     })
 }
 
+/// Tenseurs que [`load_dflash_draft_weights_with_runtime`] lit pour `info` :
+/// la découverte s'en sert pour écarter un checkpoint incomplet. Un test
+/// compare cette liste aux clés d'un checkpoint que le loader accepte.
+pub(crate) fn dflash_required_keys(info: &DFlashDraftInfo) -> Vec<String> {
+    required_keys(
+        info.num_hidden_layers,
+        info.conv_kernel_size > 0,
+        info.selector_rank > 0,
+    )
+}
+
+fn required_keys(layers: usize, conv: bool, selector: bool) -> Vec<String> {
+    let mut keys: Vec<String> = ["hidden_norm.weight", "fc.weight", "norm.weight"]
+        .map(String::from)
+        .into();
+    for layer in 0..layers {
+        let p = format!("layers.{layer}");
+        for key in [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ] {
+            keys.push(format!("{p}.{key}"));
+        }
+        if conv {
+            for conv in ["attention_conv", "mlp_conv"] {
+                keys.push(format!("{p}.{conv}.base_kernel"));
+                keys.push(format!("{p}.{conv}.kernel_projection.weight"));
+            }
+        }
+    }
+    if selector {
+        for key in [
+            "candidate_selector.hidden_projection.weight",
+            "candidate_selector.predecessor_codebook",
+            "candidate_selector.successor_codebook",
+        ] {
+            keys.push(key.to_string());
+        }
+    }
+    keys
+}
+
 /// Charge les poids d'un draft DFlash deja valide par rapport au trunk cible.
 ///
 /// # Errors
@@ -1342,6 +1398,217 @@ mod tests {
         assert_eq!(info.tensor_count, 1);
     }
 
+    fn write_draft(dir: &Path, target_layers: usize, vocab: Option<usize>) {
+        std::fs::create_dir_all(dir).expect("invariant: mkdir");
+        let vocab = vocab.map_or(String::new(), |v| format!("\"vocab_size\":{v},"));
+        let config = format!(
+            r#"{{"architectures":["DFlashDraftModel"],{vocab}"hidden_size":2048,
+            "num_hidden_layers":6,"num_target_layers":{target_layers},"intermediate_size":6144,
+            "num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,
+            "rms_norm_eps":0.000001,"rope_parameters":{{"rope_theta":10000000.0}},
+            "dflash_config":{{"block_size":16,"mask_token_id":1,"target_layer_ids":[1,6]}}}}"#
+        );
+        std::fs::write(dir.join("config.json"), config).expect("invariant: write config");
+        let mut tensors = HashMap::new();
+        for key in required_keys(6, false, false) {
+            insert_f32(&mut tensors, &key, &[1, 4]);
+        }
+        std::fs::write(
+            dir.join("model.safetensors"),
+            serialize(tensors, None).expect("invariant: serialize"),
+        )
+        .expect("invariant: write safetensors");
+    }
+
+    #[test]
+    fn discovery_rejects_incomplete_checkpoint_and_derived_variants() {
+        let root = tempfile::tempdir().expect("invariant: tempdir");
+        let target = target_config();
+        // Checkpoint réduit à fc.weight : écarté.
+        let model = root.path().join("m");
+        let sibling = model.join("dflash");
+        write_draft(&sibling, 40, None);
+        let mut tensors = HashMap::new();
+        insert_f32(&mut tensors, "fc.weight", &[1, 4]);
+        std::fs::write(
+            sibling.join("model.safetensors"),
+            serialize(tensors, None).expect("invariant: serialize"),
+        )
+        .expect("invariant: write");
+        let r = resolve_dflash_draft(&model, &target, None, None);
+        assert_eq!(r.dir, None);
+        assert!(r.note.contains("hidden_norm.weight"), "{}", r.note);
+
+        // Cache HF : base Qwen3.8-27B ne couvre pas -Instruct.
+        let cache = root.path().join("hub");
+        let snap = cache.join("models--x--d/snapshots/a");
+        write_draft(&snap, 40, None);
+        std::fs::write(
+            snap.join("README.md"),
+            "base_model:\n  - Qwen/Qwen3.8-27B\n",
+        )
+        .expect("invariant: readme");
+        for name in [
+            "Qwen3.8-27B-Instruct",
+            "Qwen3.8-27B-4bit-distill",
+            "Qwen3.8-27B-A3B",
+        ] {
+            let other = root.path().join(name);
+            assert_eq!(
+                resolve_dflash_draft(&other, &target, None, Some(&cache)).dir,
+                None,
+                "{name}"
+            );
+        }
+        // Un candidat invalide trié avant ne masque pas le suivant.
+        let bad = cache.join("models--a--bad/snapshots/a");
+        write_draft(&bad, 40, None);
+        std::fs::write(bad.join("README.md"), "base_model:\n  - Qwen/Qwen3.8-27B\n")
+            .expect("invariant: readme");
+        std::fs::remove_file(bad.join("model.safetensors")).expect("invariant: rm");
+        let first = root.path().join("Qwen3.8-27B");
+        assert_eq!(
+            resolve_dflash_draft(&first, &target, None, Some(&cache)).dir,
+            Some(snap.clone())
+        );
+        for name in ["Qwen3.8-27B", "Qwen3.8-27B-BF16", "Qwen3.8-27B-mlx-4bit"] {
+            let ok = root.path().join(name);
+            assert!(
+                resolve_dflash_draft(&ok, &target, None, Some(&cache))
+                    .dir
+                    .is_some(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_shape_candidate_falls_through_to_next() {
+        let root = tempfile::tempdir().expect("invariant: tempdir");
+        let tiny = tiny_target_config();
+        // Deux drafters minimaux : le premier (trié avant) a un hidden_norm de forme [1].
+        let mk = |name: &str, norm_dim: usize| {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).expect("invariant: mkdir");
+            std::fs::write(
+                dir.join("config.json"),
+                r#"{"architectures":["DFlashDraftModel"],"hidden_size":4,"num_hidden_layers":1,
+                "num_target_layers":4,"intermediate_size":8,"num_attention_heads":2,
+                "num_key_value_heads":1,"head_dim":2,"rms_norm_eps":0.000001,"rope_theta":10000.0,
+                "sliding_window":8,"layer_types":["sliding_attention"],
+                "dflash_config":{"block_size":4,"mask_token_id":15,"target_layer_ids":[0,2]}}"#,
+            )
+            .expect("invariant: config");
+            let mut t = HashMap::new();
+            insert_f32(&mut t, "hidden_norm.weight", &[norm_dim]);
+            insert_f32(&mut t, "fc.weight", &[4, 8]);
+            insert_f32(&mut t, "layers.0.input_layernorm.weight", &[4]);
+            insert_f32(&mut t, "layers.0.post_attention_layernorm.weight", &[4]);
+            insert_f32(&mut t, "layers.0.self_attn.q_proj.weight", &[4, 4]);
+            insert_f32(&mut t, "layers.0.self_attn.k_proj.weight", &[2, 4]);
+            insert_f32(&mut t, "layers.0.self_attn.v_proj.weight", &[2, 4]);
+            insert_f32(&mut t, "layers.0.self_attn.o_proj.weight", &[4, 4]);
+            insert_f32(&mut t, "layers.0.self_attn.q_norm.weight", &[2]);
+            insert_f32(&mut t, "layers.0.self_attn.k_norm.weight", &[2]);
+            insert_f32(&mut t, "layers.0.mlp.gate_proj.weight", &[8, 4]);
+            insert_f32(&mut t, "layers.0.mlp.up_proj.weight", &[8, 4]);
+            insert_f32(&mut t, "layers.0.mlp.down_proj.weight", &[4, 8]);
+            insert_f32(&mut t, "norm.weight", &[4]);
+            std::fs::write(
+                dir.join("model.safetensors"),
+                serialize(t, None).expect("invariant: serialize"),
+            )
+            .expect("invariant: safetensors");
+            dir
+        };
+        let (bad, good) = (mk("a-bad", 1), mk("b-good", 4));
+        let resolution = DraftResolution {
+            dir: Some(bad.clone()),
+            note: String::new(),
+            forced: false,
+            fallbacks: vec![good.clone()],
+        };
+        let (picked, _) = first_loadable(resolution.candidates(), |dir| {
+            load_dflash_draft_weights_for_target(&tiny, dir)
+        })
+        .expect("invariant: le valide est pris");
+        assert_eq!(picked, good.as_path());
+    }
+
+    #[test]
+    fn discovered_drafter_only_wins_on_dense_bf16() {
+        assert!(dflash_beats_mtp(true, false), "variable : forcé");
+        assert!(dflash_beats_mtp(false, true), "BF16 dense : DFlash");
+        assert!(!dflash_beats_mtp(false, false), "4 bits ou MoE : MTP");
+    }
+
+    #[test]
+    fn discovery_env_has_priority_and_zero_disables() {
+        let model = tempfile::tempdir().expect("invariant: tempdir");
+        write_draft(&model.path().join("dflash"), 40, None);
+        let target = target_config();
+        let forced = resolve_dflash_draft(model.path(), &target, Some("/x/draft".as_ref()), None);
+        assert_eq!(forced.dir, Some(PathBuf::from("/x/draft")));
+        for off in ["", "0"] {
+            let r = resolve_dflash_draft(model.path(), &target, Some(off.as_ref()), None);
+            assert_eq!(r.dir, None, "{off:?} désactive");
+        }
+    }
+
+    #[test]
+    fn discovery_finds_sibling_and_rejects_incompatible() {
+        let model = tempfile::tempdir().expect("invariant: tempdir");
+        let target = target_config();
+        let none = resolve_dflash_draft(model.path(), &target, None, None);
+        assert_eq!(none.dir, None);
+        assert!(none.note.contains("aucun drafter DFlash"));
+
+        let sibling = model.path().join("dflash");
+        write_draft(&sibling, 40, None);
+        let found = resolve_dflash_draft(model.path(), &target, None, None);
+        assert_eq!(found.dir, Some(sibling.clone()));
+
+        write_draft(&sibling, 41, None);
+        let bad_layers = resolve_dflash_draft(model.path(), &target, None, None);
+        assert_eq!(bad_layers.dir, None);
+        assert!(bad_layers.note.contains("ignoré"), "{}", bad_layers.note);
+
+        write_draft(&sibling, 40, Some(1234));
+        let bad_vocab = resolve_dflash_draft(model.path(), &target, None, None);
+        assert_eq!(bad_vocab.dir, None);
+        assert!(
+            bad_vocab.note.contains("vocab_size=1234"),
+            "{}",
+            bad_vocab.note
+        );
+    }
+
+    #[test]
+    fn discovery_hf_cache_matches_base_model_name() {
+        let root = tempfile::tempdir().expect("invariant: tempdir");
+        let cache = root.path().join("hub");
+        let snap = cache.join("models--incoai--Qwen3.8-27B-DFlash2/snapshots/abc");
+        write_draft(&snap, 40, None);
+        std::fs::write(
+            snap.join("README.md"),
+            "---\nbase_model:\n  - Qwen/Qwen3.8-27B\n---\n",
+        )
+        .expect("invariant: readme");
+        let target = target_config();
+        let model = root.path().join("Qwen3.8-27B-4bit");
+        let hit = resolve_dflash_draft(&model, &target, None, Some(&cache));
+        assert_eq!(hit.dir, Some(snap));
+        let other = root.path().join("Qwen3.6-35B-A3B-4bit");
+        assert_eq!(
+            resolve_dflash_draft(&other, &target, None, Some(&cache)).dir,
+            None
+        );
+        let hf_model = cache.join("models--Qwen--Qwen3.8-27B-8bit/snapshots/r1");
+        assert!(resolve_dflash_draft(&hf_model, &target, None, Some(&cache))
+            .dir
+            .is_some());
+    }
+
     #[test]
     fn loads_typed_dflash_draft_weights() {
         let temp = tempfile::tempdir().expect("invariant: tempdir");
@@ -1390,6 +1657,11 @@ mod tests {
 
         let draft = load_dflash_draft_weights_for_target(&tiny_target_config(), temp.path())
             .expect("invariant: poids draft dflash valides");
+        let mut present = read_safetensors_keys(&draft.info.weight_path).expect("invariant: clés");
+        let mut required = dflash_required_keys(&draft.info);
+        present.sort();
+        required.sort();
+        assert_eq!(present, required, "liste requise = clés lues par le loader");
 
         assert_eq!(draft.info.hidden_size, 4);
         assert_eq!(draft.info.target_layer_ids, vec![0, 2]);
