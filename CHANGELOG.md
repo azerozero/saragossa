@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.30](https://github.com/azerozero/saragossa/compare/v0.3.29...v0.3.30) - 2026-11-21
+
+### Fixed
+
+- *(test)* épingle l'historique MTP à l'alignement exact et le contrôle f32 Qwen MoE au qmv
+
+### Other
+
+- Merge pull request #315 from azerozero/test/identite-speculative
+- Merge pull request #316 from azerozero/perf/dflash-budget
+- *(decoder)* DFlash B=4 charge le décodeur comme serve
+- *(dflash)* verrouille les budgets d'arbre par défaut en valeurs littérales
+- Merge pull request #318 from azerozero/release-plz-2026-11-21T16-39-56Z
+- Merge pull request #317 from azerozero/fix/tests-rouges-gpu
+- *(dflash)* arbre B = 3 par défaut en greedy sur cible quantifiée
+- *(decoder)* identité spéculative et tête de draft u4
+
 ## [0.3.29](https://github.com/azerozero/saragossa/compare/v0.3.28...v0.3.29) - 2026-11-21
 
 ### Fixed
