@@ -6174,7 +6174,7 @@ fn greedy_identity_states_real_model() -> Result<()> {
     }
     eprintln!("identité : largeur d'arbre max {tree_widths:?}, vérifications Skip ≥ 5 lignes {skip_coverage:?}");
     // `dflash-défaut` : la largeur observée est celle du budget par défaut
-    // (B = 3 en greedy strict, B = 8 sinon), pas une autre.
+    // (B = 4 sur cible bf16 dense, B = 3 sinon en greedy), pas une autre.
     for mode in &selected {
         if !coverage.contains_key(mode) {
             failures.push(format!(

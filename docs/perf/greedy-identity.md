@@ -114,6 +114,35 @@ tok/s à 512, 15,2 → 24,5 à 4096 ; 12,6 → 21,9 à 16384 (un passage). Sorti
 identiques en md5 à l'AR aux trois longueurs, MTP compris.
 `SARAGOSSA_RUST_DFLASH_TREE=8` rétablit l'ancien budget.
 
+### Arbre DFlash sur cible quantifiée (21 nov. 2026)
+
+Sur une cible quantifiée (27B 4 bits, 35B-A3B MoE), le greedy sans
+`SARAGOSSA_RUST_DFLASH_TREE` prend B = 3 (4 lignes vérifiées) au lieu de 8.
+À 4 lignes la vérification passe par le qmv-T exact ; à partir de 5, par le
+skinny, qui coûte ~15 ms de plus par tour sur le 27B 4 bits (vérif. 40-45 ms à
+4 lignes, 56-66 ms de 5 à 9 lignes), et les nœuds ajoutés (2,6 → 3,3-3,7
+tokens par tour) ne le rachètent pas.
+
+ABBA (serve, 256 tokens, 2 passages par bras, médianes en tok/s, B = 8 → B = 3) :
+
+| Prompt | 27B 4 bits | 35B-A3B |
+|---|---|---|
+| 512 | 49,1 → 52,6 | 138,6 → 145,8 |
+| 4096 | 51,3 → 50,7 | 136,1 → 151,2 |
+| 16384 | 40,5 → 46,1 | 104,0 → 135,2 |
+
+Sorties identiques en md5 entre les bras et à l'AR. `SARAGOSSA_RUST_DFLASH_TREE=8`
+rétablit l'ancien budget.
+
+Écartés, mesurés sur des traces des chemins acceptés à B = 15 (27B BF16 et
+4 bits, 35B) : un budget adaptatif selon l'acceptation récente (fenêtre de 2 à
+8 tours, pas ±1) perd 2 à 6 % face au meilleur budget fixe, l'acceptation d'un
+tour n'étant pas corrélée à la précédente (autocorrélation −0,12 à 0,11, sauf
+0,31 en 4 bits 16k) ; un budget selon la confiance du sélecteur gagne au plus
+1,5 % en échantillon (bf16). Le qmv-T au-delà de 4 lignes
+(`SARAGOSSA_RUST_QMM_SKINNY_MIN_BATCH=17`) gagne à 5 lignes mais s'effondre à
+partir de 11.
+
 Le scan gated-delta inverse
 (`SARAGOSSA_RUST_LINEAR_INV_DELTA`, opt-in) reste hors périmètre : la
 vérification en lignes n'a pas de variante inverse.
