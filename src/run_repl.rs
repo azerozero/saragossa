@@ -183,14 +183,12 @@ impl ReplModel {
         let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
         let mtp_active = args.temperature.abs() <= f32::EPSILON
             && crate::serve::mtp::active_for(&assets, args.backend);
+        if mtp_active && assets.mtp.path.is_some() {
+            decoder = decoder.with_mtp_weights(&assets.mtp)?;
+        }
+        #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
         if mtp_active {
-            if let Some(path) = assets.mtp.path.as_ref() {
-                decoder = decoder.with_mtp_sidecar(path)?;
-            }
-            #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-            {
-                decoder = decoder.with_dflash_draft_auto(&assets)?;
-            }
+            decoder = decoder.with_dflash_draft_auto(&assets)?;
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if args.backend == RuntimeKind::Metal {

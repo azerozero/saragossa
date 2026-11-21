@@ -146,6 +146,10 @@ pub(super) fn validate_linear_chunked_flag() -> Result<()> {
 /// quantifié groupé, ~7,6× le qmv). Tri+pad par expert (16-aligné, CPU, readback des
 /// indices), UN dispatch par projection lisant le poids empilé packed. Opt-in.
 pub(crate) fn moe_coop_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = MOE_COOP_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_COOP", true))
 }
@@ -261,6 +265,26 @@ pub(crate) fn with_flint_moe_coop_tiled_override<R>(enabled: bool, run: impl FnO
     }
     let _restore =
         Restore(FLINT_MOE_COOP_TILED_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
+    run()
+}
+
+#[cfg(test)]
+thread_local! {
+    static MOE_COOP_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force le MoE coop du prefill sur ce thread le temps de `run` (`false` :
+/// qmv par ligne, seul chemin exact face à une référence float32).
+#[cfg(test)]
+pub(crate) fn with_moe_coop_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MOE_COOP_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(MOE_COOP_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
     run()
 }
 

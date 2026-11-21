@@ -241,11 +241,14 @@ fn assert_ab(
 #[ignore = "A/B réel : poids Qwen3.6, sidecars MTP/DFlash, fixtures et verrou GPU"]
 fn vision_decode_ab_real_sidecars() -> std::result::Result<(), Box<dyn std::error::Error>> {
     use std::path::Path;
-    let assets = crate::ModelAssets::load_local(std::env::var("SARAGOSSA_QWEN36_MOE_DIR")?)?;
+    let Some(model_dir) = crate::test_support::local_dir("SARAGOSSA_QWEN36_MOE_DIR") else {
+        return Ok(());
+    };
+    let assets = crate::ModelAssets::load_local(model_dir)?;
     let executor = crate::MetalExecutor::new()?;
     let model = crate::load_causal_decoder_for_metal(&assets, &executor)?
         .with_metal_executor(executor)?
-        .with_mtp_sidecar(assets.mtp.path.as_ref().ok_or("sidecar MTP absent")?)?
+        .with_mtp_weights(&assets.mtp)?
         .with_dflash_draft_from_env(&assets.config)?;
     let draft = model.dflash_draft().ok_or("sidecar DFlash absent")?;
     let root =

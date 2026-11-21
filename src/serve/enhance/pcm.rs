@@ -98,6 +98,7 @@ impl<'a> Pcm<'a> {
         }
     }
 }
+#[cfg(any(feature = "ws", feature = "webtransport"))]
 /// Origin d'un navigateur sur la machine locale, quel que soit le port.
 pub(super) fn loopback_origin(origin: &str) -> bool {
     let Some(rest) = origin

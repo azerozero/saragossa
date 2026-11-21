@@ -22,6 +22,7 @@ pub(super) fn draining() -> bool {
     #[cfg(not(unix))]
     false
 }
+#[cfg(feature = "webtransport")]
 /// Vrai une fois ce processus annoncé prêt au parent (toujours hors Unix).
 pub(super) fn announced() -> bool {
     #[cfg(unix)]

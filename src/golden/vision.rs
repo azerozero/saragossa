@@ -211,13 +211,15 @@ fn calibration_is_frozen() -> TestResult {
 #[test]
 #[ignore = "poids locaux, calibration préalable et verrou GPU requis"]
 fn vision_llm_logits_against_frozen_transformers() -> TestResult {
+    let Some(model_path) = crate::test_support::local_dir("SARAGOSSA_QWEN38_BF16_DIR") else {
+        return Ok(());
+    };
     calibration_is_frozen()?;
     let calibration: Calibration =
         serde_json::from_slice(&std::fs::read(root().join("llm-calibration.json"))?)?;
     let inputs: Inputs = serde_json::from_slice(&std::fs::read(root().join("mrope-inputs.json"))?)?;
     assert_eq!(inputs.cases.len(), 6);
     assert_eq!(calibration.cases.len(), 6);
-    let model_path = PathBuf::from(std::env::var("SARAGOSSA_QWEN38_BF16_DIR")?);
     assert_eq!(
         crate::hex(Sha256::digest(std::fs::read(
             model_path.join("config.json")

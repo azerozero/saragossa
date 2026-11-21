@@ -43,8 +43,8 @@ impl MtpLoadContext<'_> {
 /// Convention de stockage des normes de la tête.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MtpNormConvention {
-    /// Sidecars 27B (mlx-community, OptiQ) : décalage détecté par la moyenne,
-    /// chemin historique conservé tel quel.
+    /// Sidecars 27B à clés nues (mlx-community, OptiQ) : décalage détecté par
+    /// la moyenne, chemin historique conservé tel quel.
     MeanHeuristic,
     /// Checkpoint transformers officiel Qwen3.5/3.6 : chaque `RMSNorm` applique
     /// `1 + weight`, quelle que soit la moyenne stockée (une norme finale
@@ -87,19 +87,42 @@ impl MtpHead {
         config: &CausalDecoderConfig,
         hidden: usize,
         context: &MtpLoadContext<'_>,
+        hf_norm_offset: bool,
     ) -> Result<Self> {
-        Self::from_sidecar_with(path, config, hidden, context, MtpMoeQuant::Affine)
+        Self::from_sidecar_with_norms(
+            path,
+            config,
+            hidden,
+            context,
+            MtpMoeQuant::Affine,
+            hf_norm_offset,
+        )
     }
 
     /// `hidden` est la largeur du tronc (norme finale) : toutes les formes de la
     /// tête sont validées contre elle et la config avant tout encodage GPU,
     /// dont les kernels lisent `hidden` coefficients sans borner le buffer.
+    #[cfg(test)]
     pub(super) fn from_sidecar_with(
         path: impl AsRef<Path>,
         config: &CausalDecoderConfig,
         hidden: usize,
         context: &MtpLoadContext<'_>,
         moe_quant: MtpMoeQuant,
+    ) -> Result<Self> {
+        Self::from_sidecar_with_norms(path, config, hidden, context, moe_quant, false)
+    }
+
+    /// `hf_norm_offset` : la tête dense vient des shards d'un tronc dont le
+    /// loader a appliqué l'offset transformers (`1 + weight`), décidé par
+    /// l'appelant (`CausalDecoder::with_mtp_head`) ; sinon heuristique de moyenne.
+    pub(super) fn from_sidecar_with_norms(
+        path: impl AsRef<Path>,
+        config: &CausalDecoderConfig,
+        hidden: usize,
+        context: &MtpLoadContext<'_>,
+        moe_quant: MtpMoeQuant,
+        hf_norm_offset: bool,
     ) -> Result<Self> {
         let sidecar = LazySidecar::open(path.as_ref())?;
         // Résout les clés normalisées (sans préfixe `language_model.`) → clé réelle.
@@ -133,7 +156,14 @@ impl MtpHead {
             resolve.contains_key(MTP_DENSE_MARKER),
             resolve.contains_key(MTP_MOE_MARKER),
         ) {
-            (true, false) => Self::dense_from_tensors(&sidecar, &resolve, config, &dims, context),
+            (true, false) => {
+                let convention = if hf_norm_offset {
+                    MtpNormConvention::UnitOffset
+                } else {
+                    MtpNormConvention::MeanHeuristic
+                };
+                Self::dense_from_tensors(&sidecar, &resolve, config, &dims, context, convention)
+            }
             (false, true) => {
                 Self::moe_from_tensors(&sidecar, &resolve, config, &dims, context, moe_quant)
             }
@@ -154,8 +184,9 @@ impl MtpHead {
         config: &CausalDecoderConfig,
         dims: &MtpDims,
         context: &MtpLoadContext<'_>,
+        convention: MtpNormConvention,
     ) -> Result<Self> {
-        let norms = MtpNorms::load(st, resolve, MtpNormConvention::MeanHeuristic)?;
+        let norms = MtpNorms::load(st, resolve, convention)?;
         let fc = load_mtp_linear(st, resolve, "mtp.fc", context)?;
         let attention = mtp_attention(
             [
@@ -1395,6 +1426,116 @@ fn infer_mtp_affine_layout(
     Ok((bits, cols / groups))
 }
 
+/// Fixtures de `quantize_draft_lm_head_u4` : lm_head bf16 partagé Metal (le seul
+/// usage du Metal est le stockage ; la quantification est calculée sur CPU).
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+mod draft_head_u4_tests {
+    use super::quantize_draft_lm_head_u4;
+    use crate::{DenseBf16Tensor, Linear, LinearWeight, Tensor};
+
+    fn bf16_head(rows: usize, cols: usize, bias: bool) -> Option<(Linear, Vec<f32>)> {
+        let device = metal::Device::system_default()?;
+        let bits: Vec<u16> = (0..rows * cols)
+            .map(|i| {
+                let x = i as f32;
+                let v = ((x * 0.37).sin() * 3.0 + (x * 0.011).cos())
+                    * if i % 7 == 0 { 0.01 } else { 1.0 };
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let buffer = device.new_buffer_with_data(
+            bits.as_ptr().cast(),
+            (bits.len() * 2) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let weight = DenseBf16Tensor::new(&[rows, cols], buffer).expect("invariant: forme valide");
+        let bias =
+            bias.then(|| Tensor::from_vec(vec![rows], vec![0.0; rows]).expect("invariant: biais"));
+        let values = bits
+            .iter()
+            .map(|&b| f32::from_bits(u32::from(b) << 16))
+            .collect();
+        Some((
+            Linear::from_weight(LinearWeight::DenseBf16(weight), bias).expect("invariant: linear"),
+            values,
+        ))
+    }
+
+    /// 300 lignes : deux blocs de 256 lignes, dont un partiel ; le résultat doit
+    /// être celui d'une quantification en une passe, bit à bit.
+    #[test]
+    fn draft_head_u4_matches_reference_quantizer() {
+        let (rows, cols) = (300, 128);
+        let Some((head, values)) = bf16_head(rows, cols, false) else {
+            return;
+        };
+        let draft = quantize_draft_lm_head_u4(&head)
+            .expect("invariant: quantification valide")
+            .expect("invariant: tête quantifiable");
+        let LinearWeight::AffineQuantized(got) = draft.weight() else {
+            panic!("tête u4 affine attendue");
+        };
+        let groups = cols / 64;
+        let mut packed = vec![0_u32; rows * cols * 4 / 32];
+        let mut scales = vec![0_u16; rows * groups];
+        let mut biases = vec![0_u16; rows * groups];
+        crate::quantization::quantize_affine_bitstream_bf16(
+            &values,
+            cols,
+            64,
+            4,
+            &mut packed,
+            &mut scales,
+            &mut biases,
+        )
+        .expect("invariant: référence valide");
+        let bf16 = |bits: &[u16]| {
+            bits.iter()
+                .map(|&b| f32::from_bits(u32::from(b) << 16))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(got.packed_data(), packed.as_slice());
+        assert_eq!(got.scales_f32().as_ref(), bf16(&scales).as_slice());
+        assert_eq!(got.biases_f32().as_ref(), bf16(&biases).as_slice());
+        // Aller-retour : erreur bornée par le demi-pas de la scale bf16.
+        let restored = got
+            .dequantize()
+            .expect("invariant: déquantification valide");
+        for (idx, (&w, &r)) in values.iter().zip(restored.data()).enumerate() {
+            let scale = f32::from_bits(u32::from(scales[idx / 64]) << 16);
+            assert!(
+                (w - r).abs() <= scale * 0.5 + scale * 1.0e-2 + 1.0e-6,
+                "idx={idx} w={w} r={r}"
+            );
+        }
+    }
+
+    /// Hors contrat (cols non multiple de 64, biais, poids non bf16) : la tête
+    /// du tronc reste utilisée, sans erreur.
+    #[test]
+    fn draft_head_u4_declines_outside_contract() {
+        // 96 colonnes : 96 * 4 % 32 == 0 mais 96 % 64 != 0.
+        if let Some((head, _)) = bf16_head(4, 96, false) {
+            assert!(quantize_draft_lm_head_u4(&head)
+                .expect("invariant: pas d'erreur")
+                .is_none());
+        }
+        if let Some((head, _)) = bf16_head(4, 128, true) {
+            assert!(quantize_draft_lm_head_u4(&head)
+                .expect("invariant: pas d'erreur")
+                .is_none());
+        }
+        let dense = Linear::new(
+            Tensor::from_vec(vec![2, 64], vec![0.5; 128]).expect("invariant: poids"),
+            None,
+        )
+        .expect("invariant: linear");
+        assert!(quantize_draft_lm_head_u4(&dense)
+            .expect("invariant: pas d'erreur")
+            .is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{concat_rows, infer_mtp_affine_layout, normalize_mtp_sidecar_key};
@@ -1640,6 +1781,119 @@ mod tests {
             assert_eq!(head.norm.data()[0], 2.875);
             let q_norm = head.layer.attention.q_norm.as_ref().map(|n| n.data()[0]);
             assert_eq!(q_norm, Some(1.625));
+        }
+
+        /// Tête dense : la tête MoE sans ses experts, MLP dense à la place.
+        fn dense_tensors(prefix: &str) -> Vec<(String, Raw)> {
+            let mut out: Vec<(String, Raw)> = moe_tensors()
+                .into_iter()
+                .filter(|(name, _)| !name.contains(".mlp."))
+                .collect();
+            for name in ["gate_proj", "up_proj"] {
+                out.push((
+                    format!("mtp.layers.0.mlp.{name}.weight"),
+                    tensor(&[I, H], ramp),
+                ));
+            }
+            out.push((
+                "mtp.layers.0.mlp.down_proj.weight".into(),
+                tensor(&[H, I], ramp),
+            ));
+            out.into_iter()
+                .map(|(name, raw)| (name.replacen("mtp.", prefix, 1), raw))
+                .collect()
+        }
+
+        fn dense_config() -> CausalDecoderConfig {
+            CausalDecoderConfig {
+                num_experts: None,
+                ..moe_config(Some(16), E)
+            }
+        }
+
+        fn load_dense_at(path: &std::path::Path, hf_norm_offset: bool) -> crate::Result<MtpHead> {
+            MtpHead::from_sidecar_with_norms(
+                path,
+                &dense_config(),
+                H,
+                &MtpLoadContext::cpu(),
+                MtpMoeQuant::Dense,
+                hf_norm_offset,
+            )
+        }
+
+        /// Les 7 normes : embedding, hidden, entrée, post-attention, q, k, finale.
+        fn norms(head: &MtpHead) -> [f32; 7] {
+            let first = |t: Option<&Tensor>| t.map_or(f32::NAN, |t| t.data()[0]);
+            [
+                head.pre_fc_norm_embedding.data()[0],
+                head.pre_fc_norm_hidden.data()[0],
+                head.layer.input_norm.data()[0],
+                head.layer.post_attention_norm.data()[0],
+                first(head.layer.attention.q_norm.as_ref()),
+                first(head.layer.attention.k_norm.as_ref()),
+                head.norm.data()[0],
+            ]
+        }
+
+        /// Fixture stockée centrée sur zéro, avec `1 + weight` puis par la moyenne.
+        const UNIT_OFFSET: [f32; 7] = [1.25, 1.5, 1.0, 1.75, 1.625, 1.625, 2.875];
+        const MEAN_HEURISTIC: [f32; 7] = [1.25, 0.5, 1.0, 0.75, 0.625, 0.625, 1.875];
+
+        #[test]
+        fn sidecars_keep_mean_heuristic_whatever_the_prefix() {
+            // OptiQ : clés `mtp.*`, normes déjà décalées à 1,0 → restent à 1,0.
+            for prefix in ["mtp.", "language_model.mtp.", ""] {
+                let tensors: Vec<_> = dense_tensors(prefix)
+                    .into_iter()
+                    .map(|(name, raw)| {
+                        let shape = raw.0.clone();
+                        if name.contains("norm") {
+                            (name, tensor(&shape, |_| 1.0))
+                        } else {
+                            (name, raw)
+                        }
+                    })
+                    .collect();
+                let tmp = write_sidecar(&f32_typed(&tensors));
+                let head = load_dense_at(tmp.path(), false).expect("invariant: tête dense");
+                assert_eq!(norms(&head), [1.0; 7], "préfixe `{prefix}`");
+                let tmp = write_sidecar(&f32_typed(&dense_tensors(prefix)));
+                let head = load_dense_at(tmp.path(), false).expect("invariant: tête dense");
+                assert_eq!(norms(&head), MEAN_HEURISTIC, "préfixe `{prefix}`");
+            }
+        }
+
+        #[test]
+        fn sidecar_with_lm_head_beside_raw_index_keeps_mean_heuristic() {
+            // Clés MTP + `lm_head.weight` à côté d'un index transformers brut :
+            // seul l'appelant décide, le fichier voisin n'est plus lu.
+            let dir = tempfile::tempdir().expect("invariant: répertoire temporaire");
+            let mut tensors = dense_tensors("mtp.");
+            tensors.push(("lm_head.weight".into(), tensor(&[4, H], ramp)));
+            let path = dir.path().join("mtp.safetensors");
+            let tmp = write_sidecar(&f32_typed(&tensors));
+            std::fs::copy(tmp.path(), &path).expect("invariant: copie");
+            let conv = "model.language_model.layers.0.linear_attn.conv1d.weight";
+            std::fs::write(
+                dir.path().join("model.safetensors.index.json"),
+                serde_json::json!({ "weight_map": { conv: "model-00001-of-00002.safetensors" } })
+                    .to_string(),
+            )
+            .expect("invariant: index");
+            assert_eq!(
+                norms(&load_dense_at(&path, false).expect("tête")),
+                MEAN_HEURISTIC
+            );
+        }
+
+        #[test]
+        fn embedded_head_of_raw_trunk_gets_unit_offset_on_all_norms() {
+            let tmp = write_sidecar(&f32_typed(&dense_tensors("mtp.")));
+            assert_eq!(
+                norms(&load_dense_at(tmp.path(), true).expect("tête")),
+                UNIT_OFFSET
+            );
         }
 
         #[test]

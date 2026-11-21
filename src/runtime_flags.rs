@@ -701,6 +701,14 @@ pub(crate) fn mtp_draft_lm_head_u4_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_DRAFT_LM_HEAD_U4", true))
 }
 
+/// Normes `1 + weight` pour une tête MTP dense à clés `mtp.*` (disposition
+/// transformers, dont la tête embarquée du 27B BF16). Défaut ON ;
+/// `SARAGOSSA_RUST_MTP_HF_NORM_OFFSET=0` rend l'heuristique de moyenne.
+pub(crate) fn mtp_hf_norm_offset_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_HF_NORM_OFFSET", true))
+}
+
 /// Lissage EMA (`alpha`) de la deep-acceptance MTP adaptative. Défaut 0,3, borné
 /// dans `]0,1]` par le contrôleur. Lu depuis `SARAGOSSA_RUST_MTP_ADAPTIVE_ALPHA`.
 pub(super) fn mtp_adaptive_alpha() -> f32 {
@@ -2383,9 +2391,9 @@ pub(crate) fn dflash_tree_budget() -> Option<Result<usize, String>> {
     Some(parse_dflash_tree_budget(&value).ok_or(value))
 }
 
-/// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE` : B = 8 garde les
-/// 9 lignes de la chaîne (même coût de vérification) et gagne +12 à +35 % de
-/// decode en pairwise (`docs/perf/mtp-pairwise.md`).
+/// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE` en échantillonné :
+/// B = 8 garde les 9 lignes de la chaîne (même coût de vérification) et gagnait
+/// +12 à +35 % de decode en pairwise (`docs/perf/mtp-pairwise.md`).
 #[cfg(feature = "devtools")]
 pub(crate) const DFLASH_TREE_DEFAULT_BUDGET: usize = 8;
 
@@ -2397,6 +2405,17 @@ pub(crate) const DFLASH_TREE_DEFAULT_BUDGET: usize = 8;
 #[cfg(feature = "devtools")]
 pub(crate) const DFLASH_TREE_STRICT_DEFAULT_BUDGET: usize = 3;
 
+/// Budget de l'arbre DFlash 2 par défaut en greedy sur une cible quantifiée
+/// (MLP dense ou MoE hors bf16) : B = 3. La vérification de 4 lignes reste au
+/// qmv-T exact ; à 5 lignes et plus, le skinny coûte ~15 ms de plus par tour sur
+/// le 27B 4 bits, que les nœuds supplémentaires ne rachètent pas. ABBA du
+/// 21 nov. 2026 (M5 Max, serve, 256 tokens, tok/s B = 8 → B = 3, prompts
+/// 512 / 4096 / 16384) : 27B 4 bits 49,1 → 52,6, 51,3 → 50,7, 40,5 → 46,1 ;
+/// 35B-A3B 138,6 → 145,8, 136,1 → 151,2, 104,0 → 135,2. Sorties identiques en
+/// md5. `SARAGOSSA_RUST_DFLASH_TREE=8` rétablit l'ancien défaut.
+#[cfg(feature = "devtools")]
+pub(crate) const DFLASH_TREE_QUANT_DEFAULT_BUDGET: usize = 3;
+
 /// Budget de l'arbre DFlash 2 par défaut en greedy quand le MLP de la cible est
 /// en bf16 dense : B = 4. La vérification lit les poids bf16 (~54 Go sur le
 /// 27B) au débit mémoire jusqu'à 5-6 lignes, puis le coût croît vite (27B BF16,
@@ -2407,17 +2426,31 @@ pub(crate) const DFLASH_TREE_BF16_DEFAULT_BUDGET: usize = 4;
 
 /// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE`, pour une requête
 /// greedy (`greedy`, température nulle) : B = 3 en mode strict, B = 4 sur une
-/// cible bf16 dense (`dense_bf16`) ; B = 8 sinon (échantillonné compris).
+/// cible bf16 dense (`dense_bf16`), B = 3 sur une cible quantifiée ; B = 8 en
+/// échantillonné.
 #[cfg(feature = "devtools")]
 pub(crate) fn dflash_tree_default_budget(greedy: bool, dense_bf16: bool) -> usize {
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    if greedy && verify_strict_enabled() {
-        return DFLASH_TREE_STRICT_DEFAULT_BUDGET;
+    let strict = verify_strict_enabled();
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let strict = false;
+    select_dflash_tree_default_budget(greedy, strict, dense_bf16)
+}
+
+/// Règle de [`dflash_tree_default_budget`] sans lecture de l'environnement
+/// (`strict` : `SARAGOSSA_RUST_VERIFY_STRICT=1`).
+#[cfg(feature = "devtools")]
+pub(crate) fn select_dflash_tree_default_budget(
+    greedy: bool,
+    strict: bool,
+    dense_bf16: bool,
+) -> usize {
+    match (greedy, strict, dense_bf16) {
+        (false, _, _) => DFLASH_TREE_DEFAULT_BUDGET,
+        (true, true, _) => DFLASH_TREE_STRICT_DEFAULT_BUDGET,
+        (true, false, true) => DFLASH_TREE_BF16_DEFAULT_BUDGET,
+        (true, false, false) => DFLASH_TREE_QUANT_DEFAULT_BUDGET,
     }
-    if greedy && dense_bf16 {
-        return DFLASH_TREE_BF16_DEFAULT_BUDGET;
-    }
-    DFLASH_TREE_DEFAULT_BUDGET
 }
 
 /// Parse `SARAGOSSA_RUST_DFLASH_TREE` (entier, espaces ignorés) ; `None` si
@@ -2974,6 +3007,23 @@ fn hash_environment(
 
 #[cfg(test)]
 mod tests {
+    /// Valeurs littérales du budget d'arbre DFlash par défaut : une régression
+    /// de constante (par exemple 8 au lieu de 3) doit échouer ici.
+    #[test]
+    #[cfg(feature = "devtools")]
+    fn dflash_tree_default_budget_literals() {
+        use super::select_dflash_tree_default_budget as select;
+        assert_eq!(select(true, false, false), 3, "greedy, cible quantifiée");
+        assert_eq!(select(true, false, true), 4, "greedy, cible bf16 dense");
+        assert_eq!(select(false, false, false), 8, "échantillonné, quantifiée");
+        assert_eq!(select(false, false, true), 8, "échantillonné, bf16");
+        assert_eq!(select(false, true, true), 8, "échantillonné, strict");
+        assert_eq!(select(true, true, false), 3, "greedy strict, quantifiée");
+        assert_eq!(select(true, true, true), 3, "greedy strict, bf16");
+        assert_eq!(super::parse_dflash_tree_budget(" 8 "), Some(8));
+        assert_eq!(super::parse_dflash_tree_budget("huit"), None);
+    }
+
     #[test]
     fn vision_kill_switch_is_fail_closed_and_fingerprinted() {
         assert_eq!(super::vision_flag_value(None).ok(), Some(false));

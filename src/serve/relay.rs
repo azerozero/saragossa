@@ -266,6 +266,7 @@ fn parse_listen(value: &str, ready: Option<RawFd>) -> Option<(RawFd, Vec<Named>)
 
 /// Vrai une fois ce processus annoncé prêt : il peut lire les sockets
 /// partagées sans voler les datagrammes du parent.
+#[cfg(feature = "webtransport")]
 pub(super) fn announced() -> bool {
     ANNOUNCED.load(Ordering::Relaxed)
 }

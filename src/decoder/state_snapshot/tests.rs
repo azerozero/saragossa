@@ -205,12 +205,12 @@ fn identity_with_weights(mtp: bool) -> Result<()> {
     let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
     HITS.set(0);
     let tokens = if mtp {
-        let path = assets
+        let _path = assets
             .mtp
             .path
             .as_ref()
             .ok_or_else(|| invalid("tête MTP absente"))?;
-        model = model.with_mtp_sidecar(path)?;
+        model = model.with_mtp_weights(&assets.mtp)?;
         model
             .generate_greedy_mtp_core(&prompt, 24, &GenerationOptions::default(), 2, |_| true)?
             .tokens

@@ -197,6 +197,7 @@ fn qwen35_hf_bf16_matches_sanitized_mlx_tensors_and_cpu_logits() -> Result<()> {
                 .keys()
                 .any(|key| key.contains("mtp") || key.contains("visual")));
             let decoder = load_causal_decoder_from_shards(&config, &shards, &catalog)?;
+            assert_eq!(decoder.trunk_hf_raw_norms(), hf, "{prefix}");
             let logits = decoder.next_logits(&[0, 1])?.data().to_vec();
             assert!(logits.iter().any(|value| value.abs() > 0.1));
             if let Some((expected, expected_logits)) = &reference {
@@ -209,6 +210,45 @@ fn qwen35_hf_bf16_matches_sanitized_mlx_tensors_and_cpu_logits() -> Result<()> {
                 reference = Some((tensors, logits));
             }
         }
+    }
+    Ok(())
+}
+
+/// Tronc multishard sans `model.safetensors.index.json`, tête MTP dans un
+/// second shard : la convention du tronc se lit sur ses tenseurs, pas sur l'index.
+#[test]
+fn qwen35_raw_trunk_convention_is_known_without_index() -> Result<()> {
+    let mut config = test_config();
+    config.model_type = "qwen3_5".to_string();
+    config.num_hidden_layers = 2;
+    config.full_attention_interval = Some(2);
+    config.attn_output_gate = Some(true);
+    config.linear_num_key_heads = Some(1);
+    config.linear_num_value_heads = Some(1);
+    config.linear_key_head_dim = Some(2);
+    config.linear_value_head_dim = Some(2);
+    config.linear_conv_kernel_dim = Some(2);
+    for hf in [false, true] {
+        let dir = tempfile::tempdir().expect("invariant: répertoire temporaire");
+        let trunk = dir.path().join("model-00001-of-00002.safetensors");
+        let head = dir.path().join("model-00002-of-00002.safetensors");
+        write_checkpoint(
+            &trunk,
+            "model.language_model.",
+            "lm_head.",
+            hf,
+            false,
+            false,
+        );
+        let payload = vec![0u8; 4];
+        let view = TensorView::new(Dtype::BF16, vec![2], &payload)
+            .expect("invariant: payload BF16 valide");
+        let bytes = serialize([("mtp.fc.weight", view)], None).expect("invariant: sérialisation");
+        std::fs::write(&head, bytes).expect("invariant: écriture shard");
+        let shards = [trunk, head];
+        let catalog = WeightCatalog::from_shards(&shards)?;
+        let decoder = load_causal_decoder_from_shards(&config, &shards, &catalog)?;
+        assert_eq!(decoder.trunk_hf_raw_norms(), hf);
     }
     Ok(())
 }
