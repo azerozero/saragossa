@@ -226,7 +226,7 @@ def mlx_checks():
                 raise AssertionError("mode différent du rapport accepté")
             except ValueError as error:
                 assert "mode du template" in str(error) and not destination.exists()
-            convert_ls.convert(source, template, destination, matrix_file, blend)
+            convert_ls.convert(source, template, destination, matrix_file, blend, min_free_gib=0)
             result = mx.load(str(destination / "model.safetensors"))
             bpw = sum(v.nbytes * 8 for v in result.values()) / sum(v.size for v in original.values())
             assert abs(bpw - report["actual_bpw"]) < 1e-9 and bpw <= target

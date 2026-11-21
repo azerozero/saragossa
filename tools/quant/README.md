@@ -210,6 +210,29 @@ biais, tenseurs fixes et modules épinglés sont inclus. Le rapport conserve
 aussi `base_bits`. Les codes 3 bits sont emballés en flux little-endian
 contigu, 32 codes dans 3 mots u32, validés contre MLX sur CPU.
 
+`convert_ls.py` lit seulement les en-têtes des checkpoints, puis les poids
+source par mmap et blocs de 256 lignes (`--block-rows`). Les groupes de 64
+et les lignes du mélange restent entiers. Le calcul de `opt_quant.fit` est
+inchangé ; les payloads quantifiés sont écrits directement aux offsets des
+shards du template, y compris pour un module réparti entre plusieurs shards.
+Les tenseurs non quantifiés sont copiés octet pour octet. Seul l'ordre de
+cumul du diagnostic RMSE global change.
+
+La conversion refuse une destination existante et s'arrête sous 30 Gio libres
+(`--min-free-gib`). Une interruption laisse des shards `.partial` à supprimer
+avant de recommencer ; ils ne constituent pas un checkpoint utilisable. Aucun
+chargement du modèle entier ni accumulation des sorties n'est nécessaire.
+`--workers N` permet d'ajuster jusqu'à N blocs indépendants du même tenseur
+en parallèle sur CPU. La file est bornée à N blocs ; la mémoire augmente
+proportionnellement à N. Chaque processus écrit une plage distincte et le
+diagnostic est cumulé dans l'ordre des lignes. Le défaut reste un processus.
+Tests du flux, des experts fusionnés et des payloads SHA-256 sur CPU :
+
+```bash
+python3 -I -B tools/quant/test_tensor_stream.py
+python3 -I -B tools/quant/test_tensor_stream.py --mlx-cpu
+```
+
 L'objectif qualité est **KL < 0,031 (u4ls)** ; il n'est pas encore mesuré
 pour cette recette. L'erreur pondérée utilisée par l'allocation ne garantit
 pas la KL. Comparer le candidat avec `chat_kl.py eval` sur la même référence

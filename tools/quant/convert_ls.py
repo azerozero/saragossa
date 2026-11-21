@@ -14,13 +14,16 @@ Sans argument : auto-test stdlib des chemins et du mappage, sans MLX.
 """
 
 import argparse
+import gc
 import json
+import math
 import pathlib
 import shutil
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import opt_quant  # noqa: E402
+import tensor_stream  # noqa: E402
 from imatrix import importance_for  # noqa: E402
 
 
@@ -90,10 +93,15 @@ def validate_shapes(shard, base, shape, bits):
             raise ValueError(f"forme du template incompatible : {base}{suffix}")
 
 
-def convert(src, template, dst, imatrix=None, imatrix_blend=False):
+def convert(src, template, dst, imatrix=None, imatrix_blend=False,
+            block_rows=256, min_free_gib=30, workers=1):
     sources, shards = validate(src, template, dst)
     if imatrix_blend and imatrix is None:
         raise ValueError("--imatrix-blend exige --imatrix")
+    if workers <= 0:
+        raise ValueError("nombre de processus positif requis")
+    if block_rows <= 0 or not math.isfinite(min_free_gib) or min_free_gib < 0:
+        raise ValueError("bloc positif et réserve disque finie positive ou nulle requis")
     config = json.loads((template / "config.json").read_text())
     allocation = template / "allocation.json"
     if allocation.is_file():
@@ -107,85 +115,73 @@ def convert(src, template, dst, imatrix=None, imatrix_blend=False):
 
     mx.set_default_device(mx.cpu)
     matrix = mx.load(str(imatrix)) if imatrix is not None else None
-    weights = {}
-    for path in sources:
-        weights.update(mx.load(str(path)))
-    # mlx-lm peut ranger poids, échelles et biais d'un même module dans des
-    # shards différents (lm_head) : la validation porte sur l'ensemble.
-    owner, merged = {}, {}
-    for path in shards:
-        shard = mx.load(str(path))
-        merged.update(shard)
-        owner.update((key, path) for key in shard)
-    # Ordre des shards conservé : l'erreur signalée est celle du premier shard fautif.
-    bases = sorted(quantized_names(merged), key=lambda base: (shards.index(owner[base + '.scales']), base))
-    # Tous les modules sont contrôlés avant toute création ou conversion.
+    weights = tensor_stream.catalog(sources)
+    merged = tensor_stream.catalog(shards)
+    owner = {key: tensor.path for key, tensor in merged.items()}
+    # Valider tous les modules depuis les en-têtes, avant de créer la sortie.
+    bases = sorted(quantized_names(merged),
+                   key=lambda base: (shards.index(owner[base + ".scales"]), base))
     for base in bases:
         try:
-            x = bf16_tensor(mx, weights, base)
+            x = bf16_tensor(tensor_stream, weights, base)
             bits = quantization_spec(config, base)
             validate_shapes(merged, base, x.shape, bits)
+            if x.dtype not in ("BF16", "F16", "F32"):
+                raise ValueError(f"type source incompatible : {base}")
+            for suffix, dtype in ((".weight", "U32"), (".scales", "BF16"), (".biases", "BF16")):
+                if merged[base + suffix].dtype != dtype:
+                    raise ValueError(f"type du template incompatible : {base}{suffix}")
             importance_for(matrix, base, x.shape[-1])
         except ValueError as error:
             raise ValueError(f"{error} ({owner[base + '.scales'].name})") from None
-    del merged
-    suffixes = (".weight", ".scales", ".biases")
-    fitted = {}
+    tensor_stream.check_space(dst.parent, min_free_gib)
     dst.mkdir(parents=True, exist_ok=False)
-    count, err0, err1, total = 0, 0.0, 0.0, 0
+    # Les payloads non quantifiés sont copiés tels quels. Les sorties restent
+    # incomplètes (.partial) jusqu'à la réussite de tous les ajustements.
+    outputs = {path: dst / (path.name + ".partial") for path in shards}
     for path in shards:
-        shard = mx.load(str(path))
-        names = sorted({base for base in bases
-                        if any(owner[base + suffix] == path for suffix in suffixes)})
-        for base in names:
-            if base in fitted:
-                # Ajusté pour un shard précédent : seuls les tenseurs restants sont écrits.
-                remaining = []
-                for key, new in fitted.pop(base):
-                    if owner[key] != path:
-                        remaining.append((key, new))
-                        continue
-                    if new.shape != shard[key].shape or new.dtype != shard[key].dtype:
-                        raise ValueError(f"format incompatible : {key}")
-                    shard[key] = new
-                if remaining:
-                    fitted[base] = remaining
-                continue
-            x = bf16_tensor(mx, weights, base)
+        tensor_stream.copy_shard(path, outputs[path], min_free_gib)
+    count, err0, err1 = 0, 0.0, 0.0
+    total = sum(tensor.nbytes for tensor in merged.values())
+    with tensor_stream.cpu_pool(workers) as pool:
+        for base in bases:
+            source = bf16_tensor(tensor_stream, weights, base)
             bits = quantization_spec(config, base)
-            weight = importance_for(matrix, base, x.shape[-1])
+            weight = importance_for(matrix, base, source.shape[-1])
             blend = imatrix_blend and weight is not None
-            packed, scale, bias, rmse0, rmse1 = opt_quant.fit(
-                x, bits=bits, weight=weight, imatrix_blend=blend)
-            mx.eval(packed, scale, bias, rmse0, rmse1)
-            later = []
-            for suffix, new in zip(suffixes, (packed, scale, bias)):
-                key = base + suffix
-                if owner[key] != path:
-                    later.append((key, new))
-                    continue
-                old = shard[key]
-                if new.shape != old.shape or new.dtype != old.dtype:
-                    raise ValueError(f"format incompatible : {key}")
-                shard[key] = new
-            if later:
-                fitted[base] = later
+            if weight is not None:
+                weight = weight.tolist()
+            rows = math.prod(source.shape[:-1])
+            targets = [(merged[base + suffix], outputs[owner[base + suffix]])
+                       for suffix in (".weight", ".scales", ".biases")]
+            # Aucun groupe ni aucune ligne du blend n'est coupé. La file ne
+            # contient que workers blocs du tenseur courant, jamais le modèle.
+            jobs = ((source, start, min(start + block_rows, rows), bits,
+                     weight, blend, targets, min_free_gib)
+                    for start in range(0, rows, block_rows))
+            print("ajustement", count + 1, "/", len(bases), base, bits, "bits", flush=True)
+            for block, (error0, error1) in enumerate(
+                    tensor_stream.fit_blocks(pool, jobs, workers), 1):
+                if matrix is not None and weight is None and base.endswith(".embed_tokens"):
+                    error0 /= rows
+                    error1 /= rows
+                err0 += error0
+                err1 += error1
+                if block % 128 == 0:
+                    print("  lignes", min(block * block_rows, rows), "/", rows, flush=True)
+            gc.collect()
             count += 1
-            mass = opt_quant.error_mass(x, weight, blend)
-            if matrix is not None and weight is None and base.endswith(".embed_tokens"):
-                mass /= x.shape[0]
-            err0 += rmse0.item() ** 2 * mass
-            err1 += rmse1.item() ** 2 * mass
-        out = dst / path.name
-        mx.save_safetensors(str(out), shard, metadata={"format": "mlx"})
-        total += sum(v.nbytes for v in shard.values())
-        ratio = err1 / err0 if err0 else 0
-        print("écrit", out.name, count, f"MSE ls/minmax {ratio:.4f}", flush=True)
-    if fitted:
-        raise ValueError(f"tenseurs ajustés jamais écrits : {sorted(fitted)}")
+            print("ajusté", count, "/", len(bases), base, bits, "bits",
+                  f"MSE ls/minmax {err1 / err0 if err0 else 0:.4f}", flush=True)
+    for path in shards:
+        tensor_stream.check_space(dst, min_free_gib)
+        outputs[path].rename(dst / path.name)
+        print("écrit", path.name, flush=True)
     for path in template.iterdir():
         if path.is_file() and path not in shards and path.name != "README.md":
+            tensor_stream.check_space(dst, min_free_gib + path.stat().st_size / 2**30)
             shutil.copy2(path, dst / path.name)
+    tensor_stream.check_space(dst, min_free_gib + 4096 / 2**30)
     (dst / "README.md").write_text(
         "Checkpoint MLX affine gs64 : échelles et biais ajustés aux moindres carrés "
         "depuis les tenseurs BF16, format du template conservé. "
@@ -234,18 +230,25 @@ def _self_check():
         mx = ModuleType("mlx.core")
         mx.cpu = "cpu"
         mx.set_default_device = Mock()
-        mx.load = Mock(side_effect=lambda path: {
-            str(src / "model-1.safetensors"): {bf16_key(base): Mock(shape=(64, 64))},
+        headers = {
+            str(src / "model-1.safetensors"): {bf16_key(base): Mock(shape=(64, 64), dtype="BF16")},
             str(template / "model-1.safetensors"): {
-                base + ".weight": Mock(shape=(64, 8)),
-                base + ".scales": Mock(shape=(64, 1)),
-                base + ".biases": Mock(shape=(64, 1))},
-            str(second): {"language_model.lm_head.scales": object()},
+                base + ".weight": Mock(shape=(64, 8), dtype="U32"),
+                base + ".scales": Mock(shape=(64, 1), dtype="BF16"),
+                base + ".biases": Mock(shape=(64, 1), dtype="BF16")},
+            str(second): {"language_model.lm_head.scales": Mock()},
             str(root / "imatrix.safetensors"): {},
-        }[path])
+        }
+        for path, entries in headers.items():
+            for tensor in entries.values():
+                tensor.path = pathlib.Path(path)
+        mx.load = Mock(return_value={})
         mlx = ModuleType("mlx")
         mlx.core = mx
         with (patch.dict(sys.modules, {"mlx": mlx, "mlx.core": mx}),
+              patch.object(tensor_stream, "catalog",
+                           side_effect=lambda paths: {key: value for path in paths
+                                                      for key, value in headers[str(path)].items()}),
               patch.object(opt_quant, "fit") as fit):
             try:
                 convert(src, template, dst)
@@ -313,12 +316,16 @@ def main():
     parser.add_argument("--template", type=pathlib.Path, required=True, help="checkpoint MLX affine gs64 (3/4/5/6/8 bits)")
     parser.add_argument("--dst", type=pathlib.Path, required=True, help="destination inexistante")
     parser.add_argument("--imatrix", type=pathlib.Path, help="importance E[x²] par colonne ; linéaires manquants refusés")
+    parser.add_argument("--workers", type=int, default=1, help="processus CPU ; mémoire proportionnelle (défaut : 1)")
+    parser.add_argument("--block-rows", type=int, default=256, help="lignes par bloc CPU (défaut : 256)")
+    parser.add_argument("--min-free-gib", type=float, default=30, help="réserve disque minimale en Gio")
     parser.add_argument("--imatrix-blend", action="store_true",
                         help="pondérer E[x²] par sqrt(moyenne_ligne(W²) + W_ij²)")
     args = parser.parse_args()
     if args.imatrix_blend and args.imatrix is None:
         parser.error("--imatrix-blend exige --imatrix")
-    convert(args.src, args.template, args.dst, args.imatrix, args.imatrix_blend)
+    convert(args.src, args.template, args.dst, args.imatrix, args.imatrix_blend,
+            args.block_rows, args.min_free_gib, args.workers)
 
 
 if __name__ == "__main__":
