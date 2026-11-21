@@ -6679,7 +6679,11 @@ fn mtp_bf16_history_generation_adoption_and_f32_fallback() -> Result<()> {
     assert!(decode_resident_full_enabled());
     assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
     assert!(prefix_cache_enabled());
-    let (model, prompt) = mtp_seed_synthetic_model()?;
+    // POURQUOI : depuis bbe5b4f, un prompt à froid est calculé en deux temps
+    // (ancre alignée puis queue), donc l'historique MTP compte deux segments.
+    // Ce test vérifie le semis d'un seul tenant : reprises à la longueur exacte.
+    let (model, prompt) =
+        crate::runtime_flags::with_prefix_align_for_test(None, mtp_seed_synthetic_model)?;
     let capacity = prompt.len() + 16;
     crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || -> Result<()> {
         with_kv_format_override(KvFormat::Bf16, || -> Result<()> {
