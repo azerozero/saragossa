@@ -586,10 +586,14 @@ fn dense_bf16_rows_vs_stage(shapes: &[(usize, usize, usize)]) -> Result<()> {
 #[test]
 #[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
 fn dense_bf16_qmv_stage_rows_matches_stage_bitwise() -> Result<()> {
-    // 9 lignes = arbre DFlash B=8 ; 17 et 33 traversent plusieurs groupes de 16.
+    // 5 lignes = arbre DFlash B=4, 9 = B=8 ; 5-8 couvrent NR=1, 17 et 33
+    // traversent plusieurs groupes de 16.
     let shapes = [
         (37, 512, 2),
+        (1024, 5120, 5),
         (1024, 5120, 6),
+        (1024, 5120, 7),
+        (1024, 5120, 8),
         (1024, 5120, 9),
         (48, 5120, 17),
         (6, 17408, 33),
