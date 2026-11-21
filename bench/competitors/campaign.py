@@ -541,7 +541,7 @@ class Server:
                     pass
         self.log.close()
         time.sleep(1)
-        return all(identity(pid) != ident for pid, ident in tree.items())
+        return all(not ident or identity(pid) != ident for pid, ident in tree.items())
 
 
 def prepare_ollama(spec, port, log):
