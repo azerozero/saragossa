@@ -140,7 +140,7 @@ fn qwen_kv_nax_x3_shape(
 
 /// Provenance d'une tête MTP, qui fixe la convention de ses normes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MtpHeadSource {
+pub(crate) enum MtpHeadSource {
     /// Fichier sidecar séparé : normes telles que stockées (heuristique).
     Sidecar,
     /// Shard du modèle : même convention de normes que le tronc.
@@ -149,8 +149,7 @@ pub enum MtpHeadSource {
 
 impl MtpHeadSource {
     /// Provenance détectée par `ModelAssets` (shard du modèle ou sidecar).
-    #[must_use]
-    pub fn of(weights: &crate::MtpWeightsInfo) -> Self {
+    fn of(weights: &crate::MtpWeightsInfo) -> Self {
         if weights.embedded {
             Self::Embedded
         } else {
@@ -2828,13 +2827,30 @@ impl CausalDecoder {
         }
     }
 
-    /// Charge une tête MTP depuis un sidecar safetensors.
+    /// Charge une tête MTP depuis un fichier sidecar séparé, normes telles que
+    /// stockées. Pour la tête détectée par `ModelAssets` (sidecar ou shard du
+    /// modèle), utiliser [`Self::with_mtp_weights`].
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si le sidecar est incomplet ou incompatible.
     pub fn with_mtp_sidecar(self, path: impl AsRef<Path>) -> Result<Self> {
         self.with_mtp_head(path, MtpHeadSource::Sidecar)
+    }
+
+    /// Charge la tête MTP détectée par `ModelAssets` : chemin et provenance
+    /// (sidecar ou shard du modèle) voyagent ensemble, la convention des
+    /// normes suit donc la vraie source.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur sans tête détectée, ou si elle est incomplète ou
+    /// incompatible.
+    pub fn with_mtp_weights(self, weights: &crate::MtpWeightsInfo) -> Result<Self> {
+        let path = weights.path.as_ref().ok_or_else(|| {
+            InferError::MissingWeight("tête MTP (aucun sidecar ni shard mtp.*)".to_string())
+        })?;
+        self.with_mtp_head(path, MtpHeadSource::of(weights))
     }
 
     pub(crate) fn with_trunk_hf_raw_norms(mut self, hf_raw: bool) -> Self {
@@ -2847,15 +2863,14 @@ impl CausalDecoder {
         self.trunk_hf_raw_norms
     }
 
-    /// Charge une tête MTP depuis `path`, fichier sidecar ou shard du modèle
-    /// (`MtpWeightsInfo::embedded`). Embarquée dans un tronc transformers brut,
+    /// Charge une tête MTP depuis `path`, fichier sidecar ou shard du modèle. Embarquée dans un tronc transformers brut,
     /// la tête dense reçoit le même offset de normes `1 + weight` que lui
     /// (kill-switch `SARAGOSSA_RUST_MTP_HF_NORM_OFFSET=0`).
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si la tête est incomplète ou incompatible.
-    pub fn with_mtp_head(mut self, path: impl AsRef<Path>, source: MtpHeadSource) -> Result<Self> {
+    fn with_mtp_head(mut self, path: impl AsRef<Path>, source: MtpHeadSource) -> Result<Self> {
         let hf_norm_offset = source == MtpHeadSource::Embedded
             && self.trunk_hf_raw_norms
             && crate::runtime_flags::mtp_hf_norm_offset_enabled();

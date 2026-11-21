@@ -2857,7 +2857,7 @@ fn mtp_committed_two_row_verifier_edges_match_ar() -> Result<()> {
         "MTP verifier integration requires an MTP sidecar in {}",
         model_dir.display()
     );
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         return Err(InferError::MissingArtifact {
             path: model_dir,
             what: "MTP sidecar",
@@ -2865,7 +2865,7 @@ fn mtp_committed_two_row_verifier_edges_match_ar() -> Result<()> {
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     assert!(
         model.mtp.is_some(),
         "MTP verifier integration must load the MTP head"
@@ -3097,7 +3097,7 @@ fn d1_strict_model() -> Result<(crate::ModelAssets, CausalDecoder)> {
         InferError::Config("test D1 strict : SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL".to_string())
     })?;
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let mtp_path = assets
+    let _mtp_path = assets
         .mtp
         .path
         .clone()
@@ -3107,7 +3107,7 @@ fn d1_strict_model() -> Result<(crate::ModelAssets, CausalDecoder)> {
         })?;
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(&mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     if model.mtp.is_none() || !model.supports_resident_full_decode() {
         return Err(InferError::Config(
             "test D1 strict : MTP résident non supporté".to_string(),
@@ -3429,13 +3429,13 @@ fn mtp_sampled_matches_ar_at_low_temperature_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip MTP échantillonné : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let prompt = mtp_verifier_prompt_ids(
         &assets,
         "Write a Rust function that parses a semantic version string and returns its three components.",
@@ -3498,13 +3498,13 @@ fn mtp_stop_sequences_match_ar_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip stop sequences MTP : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let prompt = mtp_verifier_prompt_ids(
         &assets,
         "Write a Rust function that parses a semantic version string and returns its three components.",
@@ -3699,13 +3699,13 @@ fn mtp_early_first_token_streams_once_and_stops_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip premier token MTP : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let prompt = mtp_verifier_prompt_ids(
         &assets,
         "Explain in two sentences why the borrow checker rejects aliasing mutable references.",
@@ -3951,8 +3951,8 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         .with_metal_runtime()?
         .with_dflash_draft_from_env(&assets.config)?;
     // Sidecar MTP pour le repli après bascule (section ignorée sans sidecar).
-    if let Some(mtp_path) = assets.mtp.path.as_ref() {
-        model = model.with_mtp_sidecar(mtp_path)?;
+    if assets.mtp.path.is_some() {
+        model = model.with_mtp_weights(&assets.mtp)?;
     }
     let draft = model
         .dflash_draft()
@@ -4324,13 +4324,13 @@ fn mtp_seed_metal_matches_cpu_oracle_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip semis MTP : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let head = model
         .mtp
         .as_ref()
@@ -5898,8 +5898,8 @@ fn greedy_identity_states_real_model() -> Result<()> {
     let mut model =
         crate::load_causal_decoder_for_metal(&assets, &executor)?.with_metal_executor(executor)?;
     let has_mtp = match assets.mtp.path.as_ref() {
-        Some(path) => {
-            model = model.with_mtp_sidecar(path)?;
+        Some(_) => {
+            model = model.with_mtp_weights(&assets.mtp)?;
             true
         }
         None => false,
@@ -6257,8 +6257,8 @@ fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
     let assets = crate::ModelAssets::load_local(&model_dir)?;
     let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
     let has_mtp = match assets.mtp.path.as_ref() {
-        Some(path) => {
-            model = model.with_mtp_sidecar(path)?;
+        Some(_) => {
+            model = model.with_mtp_weights(&assets.mtp)?;
             true
         }
         None => false,
@@ -7176,14 +7176,14 @@ fn mtp_bf16_real_greedy_ids_and_memory() -> Result<()> {
     let dir = mtp_verifier_model_dir()
         .ok_or_else(|| InferError::Config("modèle local MTP requis".into()))?;
     let assets = crate::ModelAssets::load_local(&dir)?;
-    let sidecar = assets
+    let _sidecar = assets
         .mtp
         .path
         .as_ref()
         .ok_or_else(|| InferError::Config("sidecar MTP local requis".into()))?;
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(sidecar)?;
+        .with_mtp_weights(&assets.mtp)?;
     let number = |name: &str, default| -> Result<usize> {
         std::env::var(name).ok().map_or(Ok(default), |s| {
             s.parse()
@@ -7405,14 +7405,14 @@ fn spec_route_alternation_reuses_prefix_real_model() -> Result<()> {
         return Ok(());
     }
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let mtp_path = assets
+    let _mtp_path = assets
         .mtp
         .path
         .clone()
         .ok_or_else(|| InferError::Config("sidecar MTP requis".to_string()))?;
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(&mtp_path)?
+        .with_mtp_weights(&assets.mtp)?
         .with_dflash_draft_from_env(&assets.config)?;
     let draft = model
         .dflash_draft()

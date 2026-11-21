@@ -647,7 +647,7 @@ impl ModelSlot {
                         self.id
                     ))
                 })?;
-                decoder = decoder.with_mtp_head(path, saragossa::MtpHeadSource::of(&assets.mtp))?;
+                decoder = decoder.with_mtp_weights(&assets.mtp)?;
                 eprintln!(
                     "saragossa serve MTP actif model={} sidecar={} max_draft={}",
                     self.id,

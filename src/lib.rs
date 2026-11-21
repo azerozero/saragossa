@@ -105,8 +105,7 @@ pub use config::{ModelConfig, QuantConfig, RawModelConfig, RopeScalingConfig};
 pub use decoder::{
     force_resident_full_linear_decode, CausalDecoder, CausalDecoderCache, CausalDecoderConfig,
     CausalDecoderPromptMetalSnapshot, CausalDecoderPromptState, GenerationOptions,
-    GenerationOutput, GenerationTimings, MtpHeadSource, RopeStyle, SpeculativeOutput,
-    SpeculativeStats,
+    GenerationOutput, GenerationTimings, RopeStyle, SpeculativeOutput, SpeculativeStats,
 };
 #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 pub use decoder::{ResidentLinearXrayLayerDiff, ResidentLinearXrayReport};

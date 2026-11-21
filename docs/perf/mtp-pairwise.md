@@ -52,8 +52,8 @@ correctif, l'heuristique de moyenne y ratait q_norm, k_norm et la norme finale
 (moyennes 0,78 à 1,25) : l'acceptation BF16 restait à 0,97 draft par tour contre
 1,37 en 4 bits. Une tête embarquée dans les shards d'un tronc dont le loader a
 appliqué l'offset transformers (conv1d `[canaux, 1, noyau]`) reçoit désormais
-le même `1 + weight`, comme dans `sanitize` de mlx-vlm. La provenance est
-transmise par l'appelant (`MtpHeadSource`) ; un sidecar séparé (4 bits, OptiQ,
+le même `1 + weight`, comme dans `sanitize` de mlx-vlm. Chemin et provenance
+voyagent ensemble (`CausalDecoder::with_mtp_weights(&assets.mtp)`) ; un sidecar séparé (4 bits, OptiQ,
 montage mixte) garde l'heuristique, quel que soit son préfixe. ABBA 2×2, serve, D2 fixe, tête
 u4, charge < 2 ; tous les md5 sont identiques à l'AR :
 
