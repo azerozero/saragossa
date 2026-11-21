@@ -117,12 +117,7 @@ fn check_compatible(target: &ModelConfig, dir: &Path) -> Result<(), String> {
     // Le loader exige ces tenseurs : sans eux le chargement échouerait après coup.
     let keys =
         crate::catalog::read_safetensors_keys(&info.weight_path).map_err(|err| err.to_string())?;
-    let layers = (0..info.num_hidden_layers).map(|i| format!("layers.{i}.input_layernorm.weight"));
-    let required = ["fc.weight", "hidden_norm.weight", "norm.weight"]
-        .map(String::from)
-        .into_iter()
-        .chain(layers);
-    for key in required {
+    for key in super::dflash_required_keys(&info) {
         if !keys.contains(&key) {
             return Err(format!("tenseur {key} absent du checkpoint"));
         }

@@ -913,6 +913,57 @@ pub fn load_dflash_draft_for_target(
     })
 }
 
+/// Tenseurs que [`load_dflash_draft_weights_with_runtime`] lit pour `info` :
+/// la découverte s'en sert pour écarter un checkpoint incomplet. Un test
+/// compare cette liste aux clés d'un checkpoint que le loader accepte.
+pub(crate) fn dflash_required_keys(info: &DFlashDraftInfo) -> Vec<String> {
+    required_keys(
+        info.num_hidden_layers,
+        info.conv_kernel_size > 0,
+        info.selector_rank > 0,
+    )
+}
+
+fn required_keys(layers: usize, conv: bool, selector: bool) -> Vec<String> {
+    let mut keys: Vec<String> = ["hidden_norm.weight", "fc.weight", "norm.weight"]
+        .map(String::from)
+        .into();
+    for layer in 0..layers {
+        let p = format!("layers.{layer}");
+        for key in [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ] {
+            keys.push(format!("{p}.{key}"));
+        }
+        if conv {
+            for conv in ["attention_conv", "mlp_conv"] {
+                keys.push(format!("{p}.{conv}.base_kernel"));
+                keys.push(format!("{p}.{conv}.kernel_projection.weight"));
+            }
+        }
+    }
+    if selector {
+        for key in [
+            "candidate_selector.hidden_projection.weight",
+            "candidate_selector.predecessor_codebook",
+            "candidate_selector.successor_codebook",
+        ] {
+            keys.push(key.to_string());
+        }
+    }
+    keys
+}
+
 /// Charge les poids d'un draft DFlash deja valide par rapport au trunk cible.
 ///
 /// # Errors
@@ -1359,18 +1410,8 @@ mod tests {
         );
         std::fs::write(dir.join("config.json"), config).expect("invariant: write config");
         let mut tensors = HashMap::new();
-        for key in [
-            "fc.weight",
-            "hidden_norm.weight",
-            "norm.weight",
-            "layers.0.input_layernorm.weight",
-            "layers.1.input_layernorm.weight",
-            "layers.2.input_layernorm.weight",
-            "layers.3.input_layernorm.weight",
-            "layers.4.input_layernorm.weight",
-            "layers.5.input_layernorm.weight",
-        ] {
-            insert_f32(&mut tensors, key, &[1, 4]);
+        for key in required_keys(6, false, false) {
+            insert_f32(&mut tensors, &key, &[1, 4]);
         }
         std::fs::write(
             dir.join("model.safetensors"),
@@ -1419,6 +1460,17 @@ mod tests {
                 "{name}"
             );
         }
+        // Un candidat invalide trié avant ne masque pas le suivant.
+        let bad = cache.join("models--a--bad/snapshots/a");
+        write_draft(&bad, 40, None);
+        std::fs::write(bad.join("README.md"), "base_model:\n  - Qwen/Qwen3.8-27B\n")
+            .expect("invariant: readme");
+        std::fs::remove_file(bad.join("model.safetensors")).expect("invariant: rm");
+        let first = root.path().join("Qwen3.8-27B");
+        assert_eq!(
+            resolve_dflash_draft(&first, &target, None, Some(&cache)).dir,
+            Some(snap.clone())
+        );
         for name in ["Qwen3.8-27B", "Qwen3.8-27B-BF16", "Qwen3.8-27B-mlx-4bit"] {
             let ok = root.path().join(name);
             assert!(
@@ -1552,6 +1604,11 @@ mod tests {
 
         let draft = load_dflash_draft_weights_for_target(&tiny_target_config(), temp.path())
             .expect("invariant: poids draft dflash valides");
+        let mut present = read_safetensors_keys(&draft.info.weight_path).expect("invariant: clés");
+        let mut required = dflash_required_keys(&draft.info);
+        present.sort();
+        required.sort();
+        assert_eq!(present, required, "liste requise = clés lues par le loader");
 
         assert_eq!(draft.info.hidden_size, 4);
         assert_eq!(draft.info.target_layer_ids, vec![0, 2]);

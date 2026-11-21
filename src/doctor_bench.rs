@@ -345,10 +345,9 @@ fn load_model_summary(path: &Path) -> CliResult<ModelSummary> {
     }
     #[cfg(feature = "devtools")]
     // Même critère que l'activation automatique : dense BF16 seulement.
-    if let Some(config) = config
-        .as_ref()
-        .filter(|config| mtp_present && config.quantization.is_none() && !config.is_moe())
-    {
+    if let Some(config) = config.as_ref().filter(|config| {
+        mtp_present && config.quantization.is_none() && !config.is_moe() && raw_is_bf16(&raw)
+    }) {
         advice.extend(drafter_advice(path, &name, config));
     }
     let context = config_context(&raw);
@@ -596,6 +595,16 @@ fn config_context(raw: &Value) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(feature = "devtools")]
+/// Poids déclarés en bfloat16 (`torch_dtype` ou `dtype`, racine ou `text_config`) :
+/// F16 et F32 ne sont pas le cas `dense_bf16_mlp` qui active DFlash seul.
+fn raw_is_bf16(raw: &Value) -> bool {
+    ["torch_dtype", "dtype"].into_iter().any(|key| {
+        json_string(raw, &[key]).or_else(|| json_string(raw, &["text_config", key]))
+            == Some("bfloat16".to_string())
+    })
 }
 
 fn json_string(raw: &Value, path: &[&str]) -> Option<String> {
@@ -1212,6 +1221,16 @@ fn print_bench_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "devtools")]
+    #[test]
+    fn bf16_detection_rejects_f16_and_f32() {
+        assert!(raw_is_bf16(&json!({"torch_dtype": "bfloat16"})));
+        assert!(raw_is_bf16(&json!({"text_config": {"dtype": "bfloat16"}})));
+        assert!(!raw_is_bf16(&json!({"torch_dtype": "float16"})));
+        assert!(!raw_is_bf16(&json!({"dtype": "float32"})));
+        assert!(!raw_is_bf16(&json!({})));
+    }
 
     #[test]
     fn doctor_args_accept_repeated_model_dirs() {
