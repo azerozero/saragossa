@@ -344,7 +344,11 @@ fn load_model_summary(path: &Path) -> CliResult<ModelSummary> {
         advice.push(command);
     }
     #[cfg(feature = "devtools")]
-    if let Some(config) = config.as_ref().filter(|_| mtp_present) {
+    // Même critère que l'activation automatique : dense BF16 seulement.
+    if let Some(config) = config
+        .as_ref()
+        .filter(|config| mtp_present && config.quantization.is_none() && !config.is_moe())
+    {
         advice.extend(drafter_advice(path, &name, config));
     }
     let context = config_context(&raw);

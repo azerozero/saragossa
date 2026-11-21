@@ -114,7 +114,40 @@ fn check_compatible(target: &ModelConfig, dir: &Path) -> Result<(), String> {
             info.vocab_size, target.vocab_size
         ));
     }
+    // Le loader exige ces tenseurs : sans eux le chargement échouerait après coup.
+    let keys =
+        crate::catalog::read_safetensors_keys(&info.weight_path).map_err(|err| err.to_string())?;
+    let layers = (0..info.num_hidden_layers).map(|i| format!("layers.{i}.input_layernorm.weight"));
+    let required = ["fc.weight", "hidden_norm.weight", "norm.weight"]
+        .map(String::from)
+        .into_iter()
+        .chain(layers);
+    for key in required {
+        if !keys.contains(&key) {
+            return Err(format!("tenseur {key} absent du checkpoint"));
+        }
+    }
     Ok(())
+}
+
+/// Le nom du modèle est-il `base` seul, ou `base` suivi de suffixes de
+/// quantification reconnus (`-4bit`, `-bf16`, `-mlx`…) ? Écarte `-instruct`
+/// et les dérivés.
+fn is_same_model(name: &str, base: &str) -> bool {
+    let Some(rest) = name.strip_prefix(base) else {
+        return false;
+    };
+    rest.is_empty()
+        || rest.strip_prefix('-').is_some_and(|rest| {
+            rest.split('-').all(|part| {
+                matches!(
+                    part,
+                    "mlx" | "bf16" | "fp16" | "fp8" | "nvfp4" | "mxfp4" | "mxfp8"
+                ) || part
+                    .strip_suffix("bit")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
 }
 
 /// Nom du modèle en minuscules : dernier segment d'un snapshot HF
@@ -143,7 +176,7 @@ fn base_model_name(snapshot: &Path) -> Option<String> {
 }
 
 /// Premier snapshot HF (ordre lexicographique) dont le README déclare une base
-/// qui préfixe le nom du modèle (`Qwen3.8-27B` pour `Qwen3.8-27B-4bit`).
+/// identifie le modèle (`Qwen3.8-27B` pour `Qwen3.8-27B-4bit`, pas `-Instruct`).
 fn find_in_hf_cache(cache: &Path, model_dir: &Path, target: &ModelConfig) -> Option<PathBuf> {
     let name = model_name(model_dir);
     let mut snapshots = Vec::new();
@@ -161,7 +194,7 @@ fn find_in_hf_cache(cache: &Path, model_dir: &Path, target: &ModelConfig) -> Opt
     }
     snapshots.sort();
     snapshots.into_iter().find(|snap| {
-        base_model_name(snap).is_some_and(|base| !base.is_empty() && name.starts_with(&base))
+        base_model_name(snap).is_some_and(|base| !base.is_empty() && is_same_model(&name, &base))
             && check_compatible(target, snap).is_ok()
     })
 }

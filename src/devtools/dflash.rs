@@ -1359,12 +1359,75 @@ mod tests {
         );
         std::fs::write(dir.join("config.json"), config).expect("invariant: write config");
         let mut tensors = HashMap::new();
-        insert_f32(&mut tensors, "fc.weight", &[1, 4]);
+        for key in [
+            "fc.weight",
+            "hidden_norm.weight",
+            "norm.weight",
+            "layers.0.input_layernorm.weight",
+            "layers.1.input_layernorm.weight",
+            "layers.2.input_layernorm.weight",
+            "layers.3.input_layernorm.weight",
+            "layers.4.input_layernorm.weight",
+            "layers.5.input_layernorm.weight",
+        ] {
+            insert_f32(&mut tensors, key, &[1, 4]);
+        }
         std::fs::write(
             dir.join("model.safetensors"),
             serialize(tensors, None).expect("invariant: serialize"),
         )
         .expect("invariant: write safetensors");
+    }
+
+    #[test]
+    fn discovery_rejects_incomplete_checkpoint_and_derived_variants() {
+        let root = tempfile::tempdir().expect("invariant: tempdir");
+        let target = target_config();
+        // Checkpoint réduit à fc.weight : écarté.
+        let model = root.path().join("m");
+        let sibling = model.join("dflash");
+        write_draft(&sibling, 40, None);
+        let mut tensors = HashMap::new();
+        insert_f32(&mut tensors, "fc.weight", &[1, 4]);
+        std::fs::write(
+            sibling.join("model.safetensors"),
+            serialize(tensors, None).expect("invariant: serialize"),
+        )
+        .expect("invariant: write");
+        let r = resolve_dflash_draft(&model, &target, None, None);
+        assert_eq!(r.dir, None);
+        assert!(r.note.contains("hidden_norm.weight"), "{}", r.note);
+
+        // Cache HF : base Qwen3.8-27B ne couvre pas -Instruct.
+        let cache = root.path().join("hub");
+        let snap = cache.join("models--x--d/snapshots/a");
+        write_draft(&snap, 40, None);
+        std::fs::write(
+            snap.join("README.md"),
+            "base_model:\n  - Qwen/Qwen3.8-27B\n",
+        )
+        .expect("invariant: readme");
+        for name in [
+            "Qwen3.8-27B-Instruct",
+            "Qwen3.8-27B-4bit-distill",
+            "Qwen3.8-27B-A3B",
+        ] {
+            let other = root.path().join(name);
+            assert_eq!(
+                resolve_dflash_draft(&other, &target, None, Some(&cache)).dir,
+                None,
+                "{name}"
+            );
+        }
+        for name in ["Qwen3.8-27B", "Qwen3.8-27B-BF16", "Qwen3.8-27B-mlx-4bit"] {
+            let ok = root.path().join(name);
+            assert!(
+                resolve_dflash_draft(&ok, &target, None, Some(&cache))
+                    .dir
+                    .is_some(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

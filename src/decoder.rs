@@ -2954,7 +2954,7 @@ impl CausalDecoder {
     ///
     /// Mêmes erreurs que [`Self::with_dflash_draft_from_env`].
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-    pub fn with_dflash_draft_auto(self, assets: &crate::ModelAssets) -> Result<Self> {
+    pub fn with_dflash_draft_auto(mut self, assets: &crate::ModelAssets) -> Result<Self> {
         let env = crate::runtime_flags::env_var_os(crate::devtools::DFLASH_DRAFT_DIR_ENV);
         let hf_cache = crate::hf_resolve::hf_cache_dir_from_env();
         let found = crate::devtools::resolve_dflash_draft(
@@ -2971,7 +2971,16 @@ impl CausalDecoder {
             }
             Some(dir) => {
                 eprintln!("saragossa {}", found.note);
-                self.with_dflash_draft_dir(&assets.config, dir)
+                if found.forced {
+                    return self.with_dflash_draft_dir(&assets.config, dir);
+                }
+                // Un drafter découvert ne doit jamais bloquer le modèle : repli MTP.
+                if let Err(err) = self.load_dflash_draft_dir(&assets.config, dir) {
+                    eprintln!(
+                        "saragossa DFlash : drafter découvert inutilisable ({err}), repli MTP"
+                    );
+                }
+                Ok(self)
             }
             None => {
                 eprintln!("saragossa {}", found.note);
@@ -2986,6 +2995,16 @@ impl CausalDecoder {
         target: &crate::ModelConfig,
         dir: std::path::PathBuf,
     ) -> Result<Self> {
+        self.load_dflash_draft_dir(target, dir)?;
+        Ok(self)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    fn load_dflash_draft_dir(
+        &mut self,
+        target: &crate::ModelConfig,
+        dir: std::path::PathBuf,
+    ) -> Result<()> {
         self.ensure_metal_supported()?;
         let metal = self.runtime.metal.as_deref().ok_or_else(|| {
             InferError::Config("drafter DFlash : runtime Metal requis".to_string())
@@ -3013,7 +3032,7 @@ impl CausalDecoder {
                 self.snapshot_sources.append(draft.snapshot_sources.clone());
             }
         }
-        Ok(self)
+        Ok(())
     }
 
     /// Drafter DFlash chargé par `with_dflash_draft_from_env`, s'il y en a un.
