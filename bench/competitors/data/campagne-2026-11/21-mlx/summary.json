@@ -1,0 +1,11 @@
+{
+ "entries": 27,
+ "entries_by_status": {
+  "ok": 27
+ },
+ "measures_planned": 81,
+ "measures_ok": 81,
+ "measures_failed": 0,
+ "missing": [],
+ "finished": "2026-11-21T03:35:37+0100"
+}

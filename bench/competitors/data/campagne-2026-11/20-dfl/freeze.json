@@ -1,0 +1,424 @@
+{
+ "created": "2026-11-20T17:07:30+0100",
+ "repo_commit": "1006eca0eb93c68d7a3db0f0a55426c057c35ef6",
+ "engines": {
+  "saragossa": {
+   "bin": "~/workspace/saragossa-oss/.claude/worktrees/campagne/.claude/worktrees/campagne-bin/target/release/saragossa",
+   "source": "origin/main, cargo build --release",
+   "version": "origin/main 0af21022817435821d309da3c6b8dda1110d1810",
+   "settings_source": "défauts de serve ; caches de préfixe coupés ; MTP profondeur 2 gelée en night1 (matrix.frozen.json) ; DFlash arbre par défaut (PR #97-#104) ; tête MTP du 35B par SARAGOSSA_RUST_MTP_SIDECAR (docs/perf/mtp-pairwise.md)",
+   "sha256": "238ae18fd4561daba9e3569584d9ae6cbc2b4c66ae97471bc2905875fe073244",
+   "commit": "0af21022817435821d309da3c6b8dda1110d1810",
+   "built": "2026-11-20T19:59:41+0100"
+  },
+  "llama": {
+   "bin": "<scratch>/ext-engines/llama.cpp/v1.0.0/llama-b12359/llama-server",
+   "source": "github.com/ggml-org/llama.cpp release b12359 (= v1.0.0, b1b770d), llama-b12359-bin-macos-arm64.tar.gz, sha256 82b00abc…",
+   "version": "version: 1.0.0-dev (build 12359, commit b1b770d90)",
+   "settings_source": "night1 matrix.frozen.json : -fa on, -ngl all, KV f16, -b 2048 -ub 512, MTP --spec-draft-n-max 1, DFlash --spec-draft-n-max 3, cache de prompt coupé",
+   "sha256": "685941b8df982e4e205fd20492f9aaa9418f2d1224ba3d311a686abd0edb0439"
+  },
+  "mlx": {
+   "bin": "<scratch>/ext-engines/mlx-lm/venv/bin/python",
+   "source": "PyPI mlx-lm 0.32.2 (mlx 0.32.4), venv dédié",
+   "version": "mlx-lm 0.32.2 mlx 0.32.4",
+   "settings_source": "night1 matrix.frozen.json : --prefill-step-size 2048, cache de prompt 0, un flux",
+   "sha256": "042454a41d6c32f2be126c4bbae2a4b8a54488c66f4b07379cd24dee75f93abb"
+  },
+  "llmd": {
+   "bin": "<scratch>/ext-engines/llmd/llmd",
+   "source": "zml/homebrew-zml llmd 20261114.0, mirror.zml.ai tar.zst, sha256 9fd6d1c6…",
+   "version": "llmd 20261114.0",
+   "settings_source": "night1 matrix.frozen.json : --token-batch-size=2048 --prefill-chunk-size=2048 --top-k=1 (--topk retiré en 20261114), fractions 0,5/0,5 (4 bits) ; BF16 : 0,85/0,3 pour loger 54 Go ; drafter natif retenté (en échec avec 20261029)",
+   "sha256": "8b9f80ee75d72603b7438ea271882f56f35eac5d17188278b2747a39ea92a3ee"
+  },
+  "ollama": {
+   "bin": "<scratch>/ext-engines/ollama/v0.40.16/ollama",
+   "source": "github.com/ollama/ollama release v0.40.16, ollama-darwin.tgz, sha256 a7437174…",
+   "version": "Warning: client version is 0.40.16",
+   "settings_source": "envconfig v0.40.16 : OLLAMA_FLASH_ATTENTION=1, KV f16, NUM_PARALLEL=1, KEEP_ALIVE=-1, num_gpu 999 ; GGUF locaux par Modelfile (pas de spéculatif GGUF)",
+   "sha256": "5c3cf935be8d896433a5caefefc8857bc2bb9e32c77c35e7c3d38b7c5919822f"
+  },
+  "mistralrs": {
+   "bin": "<scratch>/ext-engines/mistralrs/v0.9.5/mistralrs",
+   "source": "github.com/EricLBuehler/mistral.rs release v0.9.5, mistralrs-metal-aarch64-apple-darwin.tar.gz, sha256 dcfb2e6c…",
+   "version": "mistralrs 0.9.5",
+   "settings_source": "docs v0.9.5 guides/perf/speculative-decoding : `--quant 4` depuis le BF16 (ISQ), `--mtp` (tête intégrée), `--mtp-model` DFlash 2, paged attention auto sur Metal ; --max-seqs 1, --prefix-cache-n 0",
+   "sha256": "63980ead69a65963cdd988e392d6bab8d63a3e6dce63ecf4ad18d45821eb6a61"
+  }
+ },
+ "machine": {
+  "model": "Mac17,6",
+  "cpu": "Apple M5 Max",
+  "memsize": "137438953472",
+  "macos": "ProductName:\t\tmacOS\nProductVersion:\t\t26.5.1\nBuildVersion:\t\t25F80",
+  "kernel": "25.5.0",
+  "power": {
+   "on_ac": false,
+   "low_power": true,
+   "source_raw": "Now drawing from 'Battery Power'\n -InternalBattery-0\t80%; discharging; 6:49 remaining present: true",
+   "mode_raw": [
+    "powermode 1"
+   ],
+   "errors": []
+  }
+ },
+ "models": {
+  "27b-bf16": {
+   "mlx": "~/workspace/ai_model/Qwen3.8-27B-BF16",
+   "bf16": "~/workspace/ai_model/Qwen3.8-27B-BF16",
+   "dflash": "~/workspace/saragossa-oss/models/Qwen3.8-27B-DFlash2",
+   "mtp_sidecar": null,
+   "gguf": "~/workspace/ai_model/Qwen3.8-27B-GGUF-ggml/Qwen3.8-27B-BF16.gguf",
+   "gguf_mtp": "~/workspace/ai_model/Qwen3.8-27B-GGUF-ggml/mtp-Qwen3.8-27B-BF16.gguf",
+   "gguf_dflash": "~/workspace/ai_model/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-BF16.gguf",
+   "nvfp4": null
+  }
+ },
+ "configs": {
+  "27b-bf16": {
+   "sar-ar": {
+    "engine": "saragossa",
+    "env": {
+     "SARAGOSSA_SERVE_PREFIX_CACHE": "0",
+     "SARAGOSSA_RUST_PREFIX_CACHE": "0",
+     "SARAGOSSA_API_KEY": "bench",
+     "SARAGOSSA_RUST_MTP_DECODE": "0"
+    },
+    "model_name": "qwen38",
+    "argv": [
+     "~/workspace/saragossa-oss/.claude/worktrees/campagne/.claude/worktrees/campagne-bin/target/release/saragossa",
+     "serve",
+     "--port",
+     "18090",
+     "--model",
+     "qwen38=~/workspace/ai_model/Qwen3.8-27B-BF16",
+     "--preload"
+    ],
+    "files": [
+     "~/workspace/ai_model/Qwen3.8-27B-BF16"
+    ]
+   },
+   "sar-mtp": {
+    "engine": "saragossa",
+    "env": {
+     "SARAGOSSA_SERVE_PREFIX_CACHE": "0",
+     "SARAGOSSA_RUST_PREFIX_CACHE": "0",
+     "SARAGOSSA_API_KEY": "bench",
+     "SARAGOSSA_RUST_MTP_DECODE": "1",
+     "SARAGOSSA_RUST_MTP_MAX_DRAFT": "2"
+    },
+    "model_name": "qwen38",
+    "argv": [
+     "~/workspace/saragossa-oss/.claude/worktrees/campagne/.claude/worktrees/campagne-bin/target/release/saragossa",
+     "serve",
+     "--port",
+     "18090",
+     "--model",
+     "qwen38=~/workspace/ai_model/Qwen3.8-27B-BF16",
+     "--preload"
+    ],
+    "files": [
+     "~/workspace/ai_model/Qwen3.8-27B-BF16"
+    ]
+   },
+   "sar-dflash": {
+    "engine": "saragossa",
+    "env": {
+     "SARAGOSSA_SERVE_PREFIX_CACHE": "0",
+     "SARAGOSSA_RUST_PREFIX_CACHE": "0",
+     "SARAGOSSA_API_KEY": "bench",
+     "SARAGOSSA_RUST_MTP_DECODE": "1",
+     "SARAGOSSA_RUST_DFLASH_DRAFT_DIR": "~/workspace/saragossa-oss/models/Qwen3.8-27B-DFlash2"
+    },
+    "model_name": "qwen38",
+    "argv": [
+     "~/workspace/saragossa-oss/.claude/worktrees/campagne/.claude/worktrees/campagne-bin/target/release/saragossa",
+     "serve",
+     "--port",
+     "18090",
+     "--model",
+     "qwen38=~/workspace/ai_model/Qwen3.8-27B-BF16",
+     "--preload"
+    ],
+    "files": [
+     "~/workspace/ai_model/Qwen3.8-27B-BF16",
+     "~/workspace/saragossa-oss/models/Qwen3.8-27B-DFlash2"
+    ]
+   }
+  }
+ },
+ "prompts": {
+  "27b-bf16": {
+   "512": {
+    "prompt_tokens": 512,
+    "sha256": "d9015bd9a2ef9d1b5c70f1652740dd64f0a1e0592d3f0eeb036b3f977adb43ca"
+   },
+   "4096": {
+    "prompt_tokens": 4096,
+    "sha256": "baa2ecb94984cca1a835f91e142d23252a794bd02de42a8740f64f72a7f86853"
+   },
+   "16384": {
+    "prompt_tokens": 16383,
+    "sha256": "189379275cce66ebaac4454173d8b4258f8c142e2bd9ea3ebad6158bb56a5fa8"
+   }
+  }
+ },
+ "prompt_source": "~/workspace/saragossa-oss/.claude/worktrees/campagne/src",
+ "protocol": {
+  "lengths": [
+   512,
+   4096,
+   16384
+  ],
+  "reps": 3,
+  "max_tokens": 256,
+  "warmup_tokens": 32,
+  "ctx": 20480,
+  "port": 18090,
+  "load_max": 2.0,
+  "cpu_max_pct": 50.0,
+  "cooldown": [
+   45,
+   300,
+   50
+  ],
+  "sampling": "greedy, temperature 0, top_p 1"
+ },
+ "plan": [
+  {
+   "id": "27b-bf16|sar-ar|r0",
+   "model": "27b-bf16",
+   "config": "sar-ar",
+   "rep": 0,
+   "lengths": [
+    512,
+    4096,
+    16384
+   ]
+  },
+  {
+   "id": "27b-bf16|sar-mtp|r0",
+   "model": "27b-bf16",
+   "config": "sar-mtp",
+   "rep": 0,
+   "lengths": [
+    512,
+    4096,
+    16384
+   ]
+  },
+  {
+   "id": "27b-bf16|sar-dflash|r0",
+   "model": "27b-bf16",
+   "config": "sar-dflash",
+   "rep": 0,
+   "lengths": [
+    512,
+    4096,
+    16384
+   ]
+  },
+  {
+   "id": "27b-bf16|sar-dflash|r1",
+   "model": "27b-bf16",
+   "config": "sar-dflash",
+   "rep": 1,
+   "lengths": [
+    4096,
+    16384,
+    512
+   ]
+  },
+  {
+   "id": "27b-bf16|sar-mtp|r1",
+   "model": "27b-bf16",
+   "config": "sar-mtp",
+   "rep": 1,
+   "lengths": [
+    4096,
+    16384,
+    512
+   ]
+  },
+  {
+   "id": "27b-bf16|sar-ar|r1",
+   "model": "27b-bf16",
+   "config": "sar-ar",
+   "rep": 1,
+   "lengths": [
+    4096,
+    16384,
+    512
+   ]
+  },
+  {
+   "id": "27b-bf16|sar-ar|r2",
+   "model": "27b-bf16",
+   "config": "sar-ar",
+   "rep": 2,
+   "lengths": [
+    16384,
+    512,
+    4096
+   ]
+  },
+  {
+   "id": "27b-bf16|sar-mtp|r2",
+   "model": "27b-bf16",
+   "config": "sar-mtp",
+   "rep": 2,
+   "lengths": [
+    16384,
+    512,
+    4096
+   ]
+  },
+  {
+   "id": "27b-bf16|sar-dflash|r2",
+   "model": "27b-bf16",
+   "config": "sar-dflash",
+   "rep": 2,
+   "lengths": [
+    16384,
+    512,
+    4096
+   ]
+  }
+ ],
+ "estimate_min": 48,
+ "weights_sha256": {
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/README.md": {
+   "bytes": 65056,
+   "sha256": "7c24f46af1e0024e6ce9b799df6f4865f9200acf3b6f92b6530c37248cc9e821"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/chat_template.jinja": {
+   "bytes": 9004,
+   "sha256": "af16f654968d47d09a6c604e00370b12dbc21f76456f59c9e98b82e84d9f6375"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/config.json": {
+   "bytes": 4312,
+   "sha256": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/crc32.txt": {
+   "bytes": 238,
+   "sha256": "b42dd291f5f98b05807e458f5b47849969a9b3326acbf0c97d28b05826740b83"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/generation_config.json": {
+   "bytes": 202,
+   "sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/merges.txt": {
+   "bytes": 3353259,
+   "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00001-of-00018.safetensors": {
+   "bytes": 3966730552,
+   "sha256": "ba0ce20aae489ad196733da5064bcdf159a1fe84f53336648196e1ebb7751b1c"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00002-of-00018.safetensors": {
+   "bytes": 3043080328,
+   "sha256": "06a148c01bfbe3faa14a5f184a7ff29a706f7ae1c8b2705d2058e26d17a001fb"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00003-of-00018.safetensors": {
+   "bytes": 2542796952,
+   "sha256": "2e1bf62cbcd406eaa64b60d10353e1f0ef4039d0976e56f05cabe953454f9968"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00004-of-00018.safetensors": {
+   "bytes": 3988973152,
+   "sha256": "511e34063187882659753c4d93f3859f93c019fd438d8813071921c81d9a3f1a"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00005-of-00018.safetensors": {
+   "bytes": 2099339864,
+   "sha256": "635cb53446dc74f219740fc59e18b774f877b803b9722e289ca62575a6efa701"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00006-of-00018.safetensors": {
+   "bytes": 3979553696,
+   "sha256": "0bc5214fac607f0e6cc92eec3789d4b8559410ef9fce66621ba8158e8410dae0"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00007-of-00018.safetensors": {
+   "bytes": 2108759344,
+   "sha256": "80b0c49033e9a0d5762562aa12f4acdb7f54da586f3d0110f28c48d91cf07892"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00008-of-00018.safetensors": {
+   "bytes": 3979553696,
+   "sha256": "7192c5b66185d3592927daabee1cc19e6f6e0ce75988ee20e824b624765fda79"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00009-of-00018.safetensors": {
+   "bytes": 2108759344,
+   "sha256": "af3c48cc37af44f3db6ae0579baf019180d48d9c527caa0a1f03ff85813a56d8"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00010-of-00018.safetensors": {
+   "bytes": 3979553696,
+   "sha256": "163490a76f3bea3a40855b7efc04ce6d27afaf1a34f0bbde495b9491f76457c9"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00011-of-00018.safetensors": {
+   "bytes": 2108759344,
+   "sha256": "5f3ae1b948aeee39da77aec558e8236cd65fe4d7cb7686a76bb007acc563c6d8"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00012-of-00018.safetensors": {
+   "bytes": 3979553696,
+   "sha256": "a3de1c7114677a8f5ac5c4892c90e8238ea5c1e2038c80e757dfc87c3902ca55"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00013-of-00018.safetensors": {
+   "bytes": 2108759344,
+   "sha256": "06ab79a41f74c9c5cb734816feb0c7fc364104b227165ee7391231e1155aa02a"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00014-of-00018.safetensors": {
+   "bytes": 3979553696,
+   "sha256": "4138ed94603065ba884bbcadedb04d7718bb40117e85e6f5c6fc5b9c05b7a85b"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00015-of-00018.safetensors": {
+   "bytes": 2108759344,
+   "sha256": "69224e27b9de4e7dbf6fc936c6eaae08447bda3b80a6c31a871ab451173afd22"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00016-of-00018.safetensors": {
+   "bytes": 3979564040,
+   "sha256": "73cb9a1089fb6155cb648609478d6633be8a5c7d9ca5a05bc8925ce8a553cefe"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00017-of-00018.safetensors": {
+   "bytes": 2108759344,
+   "sha256": "beb51f01056142ac4984bd800507b0dd0fd18de57f8e9ef6ea41d1a3598983a8"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model-00018-of-00018.safetensors": {
+   "bytes": 3392197344,
+   "sha256": "1d3479509e21494658f9b64d317f5ea8e55c4025d28c702d6c4d0b356ce8ea06"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/model.safetensors.index.json": {
+   "bytes": 112216,
+   "sha256": "77042094076611b69791a610065f28b7013b8c621795fa86ddccc8bac7d1b9df"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/preprocessor_config.json": {
+   "bytes": 390,
+   "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/tokenizer.json": {
+   "bytes": 12809320,
+   "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/tokenizer_config.json": {
+   "bytes": 9984,
+   "sha256": "207c03c41a06a9c3b0cc527d8a56115159c1eac6b59a4ffae85b646e773d074e"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/video_preprocessor_config.json": {
+   "bytes": 385,
+   "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+  },
+  "~/workspace/ai_model/Qwen3.8-27B-BF16/vocab.json": {
+   "bytes": 6722759,
+   "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+  },
+  "~/workspace/saragossa-oss/models/Qwen3.8-27B-DFlash2/README.md": {
+   "bytes": 5397,
+   "sha256": "0c06405ffff835f4da26115114a6dd7bb4a8b8a6881c17edd3a1086a99281269"
+  },
+  "~/workspace/saragossa-oss/models/Qwen3.8-27B-DFlash2/config.json": {
+   "bytes": 1239,
+   "sha256": "873e3556509b0da06e29654ba00d4944888d4b5e8a33afde25f7eb27d321e980"
+  },
+  "~/workspace/saragossa-oss/models/Qwen3.8-27B-DFlash2/model.safetensors": {
+   "bytes": 3848817896,
+   "sha256": "67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c"
+  }
+ }
+}

@@ -1,0 +1,14 @@
+{
+ "512": {
+  "prompt_tokens": 512,
+  "sha256": "d9015bd9a2ef9d1b5c70f1652740dd64f0a1e0592d3f0eeb036b3f977adb43ca"
+ },
+ "4096": {
+  "prompt_tokens": 4096,
+  "sha256": "baa2ecb94984cca1a835f91e142d23252a794bd02de42a8740f64f72a7f86853"
+ },
+ "16384": {
+  "prompt_tokens": 16383,
+  "sha256": "189379275cce66ebaac4454173d8b4258f8c142e2bd9ea3ebad6158bb56a5fa8"
+ }
+}
