@@ -1,0 +1,429 @@
+//! `saragossa convert` : checkpoint HF BF16 officiel → affine u4/u8 gs64, en flux.
+//!
+//! Contrat des conversions MLX (`mlx_lm.convert -q`) : toute matrice BF16
+//! `.weight` de rang 2 dont la largeur est un multiple de 64 est quantifiée
+//! (embeddings et `lm_head` compris), hors tour vision ; normes, `A_log`,
+//! `dt_bias` et `conv1d` restent bf16. Le routeur MoE et `shared_expert_gate`
+//! passent en 8 bits comme le `quant_predicate` de mlx-lm. Contrairement aux
+//! conversions mlx-community, la tête `mtp.*` est conservée et quantifiée.
+//!
+//! Les noms et layouts HF bruts sont conservés (le loader applique lui-même
+//! l'offset `1 + w` des normes et accepte le conv1d `[C, 1, K]`) : un shard de
+//! sortie par shard source, mêmes noms de fichiers, donc la tête MTP reste dans
+//! un seul shard et le loader la trouve sans sidecar. Un tenseur est lu par
+//! blocs bornés (~64 Mo), quantifié en parallèle par lignes et écrit à son
+//! offset : la mémoire ne dépend pas de la taille du modèle. Sortie
+//! déterministe, reprise par shard (journal), `--verify` rehache les shards.
+
+use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use safetensors::Dtype;
+use serde::{Deserialize, Serialize};
+
+use super::plan::{
+    affine_outputs, dtype_name, file_sha256, io_err, shard_size, strip_weight, write_shard,
+    AffineFit, Job, OutTensor, PeakTracker, ShardPlan, Source, TensorRef,
+};
+use super::rules::GROUP_SIZE;
+use super::{
+    check_done, check_shard, json_err, read_json, refuse_in_place, sha256_bytes, sync_dir,
+    write_atomic, write_json, DestLock, OutputFile, ShardRecord, JOURNAL,
+};
+use crate::{InferError, Result};
+
+const FORMAT: &str = "saragossa-convert-hf/1";
+const MANIFEST: &str = "convert_manifest.json";
+/// Fichiers annexes recopiés à l'octet ; seul `tokenizer.json` est obligatoire
+/// (jamais régénéré : voir `tools/quant/tokenizer_sidecar.py`).
+const SIDE_FILES: &[(&str, bool)] = &[
+    ("tokenizer.json", true),
+    ("tokenizer_config.json", false),
+    ("vocab.json", false),
+    ("merges.txt", false),
+    ("special_tokens_map.json", false),
+    ("added_tokens.json", false),
+    ("chat_template.jinja", false),
+    ("chat_template.json", false),
+    ("generation_config.json", false),
+    ("preprocessor_config.json", false),
+    ("video_preprocessor_config.json", false),
+    ("processor_config.json", false),
+    ("LICENSE", false),
+];
+
+/// Options de `saragossa convert`.
+#[derive(Clone, Debug)]
+pub struct HfConvertOptions {
+    /// Checkpoint HF BF16 (`config.json`, index, shards).
+    pub src: PathBuf,
+    /// Dossier de sortie (reprise si un journal compatible existe).
+    pub dst: PathBuf,
+    /// Largeur par défaut : 4 ou 8.
+    pub bits: usize,
+    /// Min-max bf16 seul au lieu des moindres carrés.
+    pub minmax: bool,
+    /// Sous-chaînes de noms de tenseurs gardés en 8 bits.
+    pub keep_8bit: Vec<String>,
+    /// Sous-chaînes de noms de tenseurs recopiés en bf16.
+    pub keep_bf16: Vec<String>,
+    /// Rehache les shards déjà terminés au lieu de contrôler leur taille.
+    pub verify: bool,
+}
+
+/// Bilan de la conversion.
+#[derive(Clone, Debug, Serialize)]
+pub struct HfConvertReport {
+    /// Tenseurs quantifiés par largeur.
+    pub quantized: BTreeMap<usize, usize>,
+    /// Tenseurs recopiés tels quels.
+    pub copied: usize,
+    pub units_written: Vec<String>,
+    pub units_resumed: Vec<String>,
+    pub elapsed_s: f64,
+    /// Pic d'empreinte physique échantillonné (`phys_footprint`).
+    pub peak_footprint_bytes: u64,
+    pub output_bytes: u64,
+    pub files: Vec<OutputFile>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Identity {
+    format: String,
+    source_index_sha256: String,
+    source_config_sha256: String,
+    bits: usize,
+    fit: AffineFit,
+    keep_8bit: Vec<String>,
+    keep_bf16: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Journal {
+    identity: Identity,
+    shards: BTreeMap<String, ShardRecord>,
+}
+
+fn is_vision(name: &str) -> bool {
+    name.starts_with("model.visual.")
+        || name.starts_with("visual.")
+        || name.contains("vision_tower")
+}
+
+fn is_router(name: &str) -> bool {
+    name.ends_with(".mlp.gate.weight") || name.ends_with(".shared_expert_gate.weight")
+}
+
+/// Largeur de quantification d'un tenseur source, `None` pour une copie.
+fn width(tensor: &TensorRef, options: &HfConvertOptions) -> Result<Option<usize>> {
+    let name = tensor.name.as_str();
+    // ponytail: les experts MoE HF devraient être empilés en `switch_mlp` pour
+    // le loader ; refus explicite tant que seul le dense est converti.
+    if name.contains(".mlp.experts.") {
+        return Err(InferError::Config(format!(
+            "experts MoE non pris en charge par `convert` : {name}"
+        )));
+    }
+    let matches = |list: &[String]| list.iter().any(|pattern| name.contains(pattern.as_str()));
+    let quantizable = tensor.dtype == Dtype::BF16
+        && name.ends_with(".weight")
+        && matches!(tensor.shape[..], [rows, cols] if rows > 0 && cols % GROUP_SIZE == 0 && cols > 0)
+        && !is_vision(name);
+    if !quantizable || matches(&options.keep_bf16) {
+        return Ok(None);
+    }
+    Ok(Some(if matches(&options.keep_8bit) || is_router(name) {
+        8
+    } else {
+        options.bits
+    }))
+}
+
+/// Un shard de sortie par shard source, tenseurs triés par nom.
+fn plan(source: &Source, refs: &[TensorRef], options: &HfConvertOptions) -> Result<Vec<ShardPlan>> {
+    let fit = if options.minmax {
+        AffineFit::MinMax
+    } else {
+        AffineFit::LeastSquares
+    };
+    let mut plans = source
+        .headers
+        .iter()
+        .map(|header| {
+            let file = header
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| InferError::Config(format!("shard sans nom: {:?}", header.path)))?;
+            Ok(ShardPlan {
+                file: file.to_string(),
+                jobs: Vec::new(),
+                tensors: Vec::new(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for tensor in refs {
+        let plan = &mut plans[tensor.shard];
+        match width(tensor, options)? {
+            Some(bits) => {
+                let [rows, cols] = tensor.shape[..] else {
+                    return Err(InferError::Dimension(tensor.name.clone()));
+                };
+                let base = strip_weight(&tensor.name)?.to_string();
+                plan.tensors
+                    .extend(affine_outputs(&base, &[], rows, cols, bits));
+                plan.jobs.push(Job::Affine {
+                    src: tensor.clone(),
+                    out_base: base,
+                    bits,
+                    fit,
+                });
+            }
+            None => {
+                plan.tensors.push(OutTensor {
+                    name: tensor.name.clone(),
+                    dtype: dtype_name(tensor.dtype),
+                    shape: tensor.shape.clone(),
+                    nbytes: tensor.len as u64,
+                });
+                plan.jobs.push(Job::Copy {
+                    src: tensor.clone(),
+                    out: tensor.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(plans)
+}
+
+/// Config source + `quantization` (et son alias) avec les exceptions par
+/// tenseur : `{bits: 8}` pour les largeurs hautes, `false` pour les bf16
+/// gardés (convention MLX).
+fn output_config(
+    src_config: &serde_json::Value,
+    plans: &[ShardPlan],
+    options: &HfConvertOptions,
+) -> Result<serde_json::Value> {
+    let mut quant = serde_json::Map::new();
+    quant.insert("group_size".into(), GROUP_SIZE.into());
+    quant.insert("bits".into(), options.bits.into());
+    quant.insert("mode".into(), "affine".into());
+    for job in plans.iter().flat_map(|plan| &plan.jobs) {
+        match job {
+            Job::Affine { out_base, bits, .. } if *bits != options.bits => {
+                quant.insert(
+                    out_base.clone(),
+                    serde_json::json!({ "group_size": GROUP_SIZE, "bits": bits }),
+                );
+            }
+            Job::Copy { src, out } if src.shape.len() == 2 && !is_vision(out) => {
+                if let Some(base) = out.strip_suffix(".weight") {
+                    if options
+                        .keep_bf16
+                        .iter()
+                        .any(|pattern| out.contains(pattern.as_str()))
+                    {
+                        quant.insert(base.to_string(), false.into());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut config = src_config.clone();
+    let map = config
+        .as_object_mut()
+        .ok_or_else(|| InferError::Config("config.json n'est pas un objet".to_string()))?;
+    map.insert("quantization".into(), quant.clone().into());
+    map.insert("quantization_config".into(), quant.into());
+    Ok(config)
+}
+
+/// Lance (ou reprend) la conversion.
+///
+/// # Errors
+///
+/// Renvoie une erreur si la source est incohérente ou contient des experts MoE,
+/// si la largeur n'est ni 4 ni 8, si l'identité diffère d'une reprise, si la
+/// destination est verrouillée, ou sur toute erreur de lecture, de
+/// quantification ou d'écriture.
+pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
+    let started = Instant::now();
+    let peak = PeakTracker::default();
+    if !matches!(options.bits, 4 | 8) {
+        return Err(InferError::Config(format!(
+            "--bits {} : 4 ou 8 attendu",
+            options.bits
+        )));
+    }
+    refuse_in_place(&options.src, &options.dst)?;
+    let config_path = options.src.join("config.json");
+    let src_config = read_json(&config_path)?;
+    let (source, refs) = Source::open(&options.src)?;
+    let plans = plan(&source, &refs, options)?;
+    let read = |path: &Path| std::fs::read(path).map_err(|e| io_err(path, e));
+    let identity = Identity {
+        format: FORMAT.to_string(),
+        source_index_sha256: sha256_bytes(&read(&source.dir.join("model.safetensors.index.json"))?),
+        source_config_sha256: sha256_bytes(&read(&config_path)?),
+        bits: options.bits,
+        fit: if options.minmax {
+            AffineFit::MinMax
+        } else {
+            AffineFit::LeastSquares
+        },
+        keep_8bit: options.keep_8bit.clone(),
+        keep_bf16: options.keep_bf16.clone(),
+    };
+
+    let dst = &options.dst;
+    let convert_dir = dst.join(".convert");
+    std::fs::create_dir_all(&convert_dir).map_err(|e| io_err(&convert_dir, e))?;
+    let _lock = DestLock::acquire(dst)?;
+    let journal_path = dst.join(JOURNAL);
+    let mut journal = if journal_path.exists() {
+        let journal: Journal = serde_json::from_value(read_json(&journal_path)?)
+            .map_err(|e| json_err(&journal_path, e))?;
+        if journal.identity != identity {
+            return Err(InferError::Config(format!(
+                "reprise refusée: identité différente (journal {:?}, travail {:?})",
+                journal.identity, identity
+            )));
+        }
+        journal
+    } else {
+        Journal {
+            identity: identity.clone(),
+            shards: BTreeMap::new(),
+        }
+    };
+
+    let mut written = Vec::new();
+    let mut resumed = Vec::new();
+    for plan in &plans {
+        let path = dst.join(&plan.file);
+        let size = shard_size(plan)?;
+        if let Some(done) = journal.shards.get(&plan.file) {
+            if done.size == size && check_done(&path, size, &done.sha256, options.verify)? {
+                resumed.push(plan.file.clone());
+                continue;
+            }
+        }
+        let tmp = dst.join(format!("{}.tmp", plan.file));
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| io_err(&tmp, e))?;
+        file.set_len(size).map_err(|e| io_err(&tmp, e))?;
+        let tensors = write_shard(&source, &BTreeMap::new(), plan, &file, &tmp, &peak)?;
+        file.sync_all().map_err(|e| io_err(&tmp, e))?;
+        drop(file);
+        std::fs::rename(&tmp, &path).map_err(|e| io_err(&path, e))?;
+        sync_dir(dst)?;
+        let sha256 = file_sha256(&path)?;
+        journal.shards.insert(
+            plan.file.clone(),
+            ShardRecord {
+                file: plan.file.clone(),
+                size,
+                sha256,
+                tensors,
+            },
+        );
+        write_json(&journal_path, &journal)?;
+        written.push(plan.file.clone());
+        peak.sample();
+    }
+
+    let mut files = Vec::new();
+    let mut weight_map = serde_json::Map::new();
+    for plan in &plans {
+        let done = journal
+            .shards
+            .get(&plan.file)
+            .ok_or_else(|| InferError::Config(format!("shard {} non terminé", plan.file)))?;
+        let path = dst.join(&plan.file);
+        let sha256 = match check_shard(&path, plan, &done.sha256) {
+            Ok(sha256) => sha256,
+            Err(error) => {
+                journal.shards.remove(&plan.file);
+                write_json(&journal_path, &journal)?;
+                return Err(InferError::Config(format!(
+                    "{}: {error} ; shard invalidé, relancer la conversion",
+                    plan.file
+                )));
+            }
+        };
+        for tensor in &plan.tensors {
+            weight_map.insert(tensor.name.clone(), plan.file.clone().into());
+        }
+        files.push(OutputFile {
+            name: plan.file.clone(),
+            size: done.size,
+            sha256,
+        });
+    }
+    let total: u64 = files.iter().map(|f| f.size).sum();
+    write_json(
+        &dst.join("model.safetensors.index.json"),
+        &serde_json::json!({ "metadata": { "total_size": total }, "weight_map": weight_map }),
+    )?;
+    for (name, required) in SIDE_FILES {
+        let from = options.src.join(name);
+        if !from.exists() {
+            if *required {
+                return Err(InferError::MissingArtifact {
+                    path: from,
+                    what: "fichier annexe",
+                });
+            }
+            continue;
+        }
+        let bytes = read(&from)?;
+        write_atomic(&dst.join(name), &bytes)?;
+        files.push(OutputFile {
+            name: (*name).to_string(),
+            size: bytes.len() as u64,
+            sha256: sha256_bytes(&bytes),
+        });
+    }
+    let records: Vec<_> = journal.shards.values().flat_map(|s| &s.tensors).collect();
+    write_json(
+        &dst.join(MANIFEST),
+        &serde_json::json!({
+            "format": FORMAT,
+            "identity": identity,
+            "files": files,
+            "tensors": records,
+        }),
+    )?;
+    // La config en dernier : sans elle, la sortie n'est pas chargeable.
+    write_json(
+        &dst.join("config.json"),
+        &output_config(&src_config, &plans, options)?,
+    )?;
+
+    let mut quantized = BTreeMap::new();
+    let mut copied = 0;
+    for job in plans.iter().flat_map(|plan| &plan.jobs) {
+        match job {
+            Job::Affine { bits, .. } => *quantized.entry(*bits).or_insert(0) += 1,
+            _ => copied += 1,
+        }
+    }
+    peak.sample();
+    Ok(HfConvertReport {
+        quantized,
+        copied,
+        units_written: written,
+        units_resumed: resumed,
+        elapsed_s: started.elapsed().as_secs_f64(),
+        peak_footprint_bytes: peak.peak(),
+        output_bytes: files.iter().map(|f| f.size).sum(),
+        files,
+    })
+}

@@ -14,6 +14,28 @@ fabriquer des poids, pas à les exécuter.
 | `tokenizer_sidecar.py` | Recopie `tokenizer.json` de la source à l'identique et refuse une regex de pré-tokenizer réécrite par transformers (`test_tokenizer_sidecar.py`) |
 | `chat_kl.py` | KL en régime chat contre les poids officiels bf16 (référence transformers, candidat mlx-lm) |
 
+## Conversion native, sans Python
+
+`saragossa convert` fait la même quantification affine gs64 directement depuis
+le checkpoint HF BF16 officiel, sans MLX ni template :
+
+```bash
+saragossa convert Qwen3.8-27B-BF16 Qwen3.8-27B-u4          # u4, moindres carrés
+saragossa convert SRC DST --bits 8                          # u8
+saragossa convert SRC DST --minmax                          # min-max bf16 seul
+saragossa convert SRC DST --keep-8bit self_attn --keep-bf16 lm_head
+```
+
+Contrat des conversions MLX : toute matrice BF16 `.weight` de rang 2 dont la
+largeur est un multiple de 64 est quantifiée, embeddings et `lm_head` compris ;
+normes, `A_log`, `dt_bias`, `conv1d` et tour vision restent bf16 ; routeur MoE
+et `shared_expert_gate` en 8 bits. Les motifs `--keep-*` sont des
+sous-chaînes du nom HF. La tête `mtp.*` est conservée (les conversions
+mlx-community la retirent) et reste dans son shard : le MTP démarre sans
+sidecar. Noms et layouts HF bruts conservés, un tenseur lu par blocs de
+~64 Mo, sortie déterministe, reprise par shard ; `tokenizer.json` est recopié
+à l'octet. Les experts MoE ne sont pas encore pris en charge (refus explicite).
+
 ## Méthode
 
 Pour chaque couche linéaire, on mesure l'erreur relative de la largeur basse :
