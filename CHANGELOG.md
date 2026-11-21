@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.29](https://github.com/azerozero/saragossa/compare/v0.3.28...v0.3.29) - 2026-11-21
+
+### Fixed
+
+- *(mtp)* with_mtp_weights pour toute tête détectée par ModelAssets
+- *(mtp)* provenance de la tête et convention du tronc transmises par l'appelant
+- *(mtp)* décalage des normes décidé par la convention du checkpoint, non par le préfixe
+- *(mtp)* normes 1+w pour la tête dense à clés mtp.* (tête embarquée du 27B BF16)
+
+### Other
+
+- Merge pull request #314 from azerozero/perf/mtp-bf16
+- *(perf)* mesure des normes 1+w de la tête MTP BF16
+
 ## [0.3.28](https://github.com/azerozero/saragossa/compare/v0.3.27...v0.3.28) - 2026-11-21
 
 ### Added
