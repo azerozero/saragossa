@@ -1,10 +1,18 @@
 # Campagne quantification ≤ 4,2 bpw — Qwen3.8-27B (21 nov. 2026)
 
-Plan v2 relu par Astra, critères d'arrêt écrits avant chaque mesure. Résultat :
-**arrêt pré-enregistré en E0**. Le candidat 3 bits de référence D passe les gates
-de qualité moteur, mais pas les contrôles runtime. Aucun candidat ≤ 4,2 bpw
-n'est réalisable sur le runtime actuel, et rien n'est à porter en Rust côté
-allocation.
+Plan v2 relu par Astra, critères d'arrêt écrits avant chaque mesure. Résultat
+mesuré : **D (base 3 bits, 4,200 bpw) échoue au critère runtime** (ratio ≥ 0,97,
+prefill ≤ 1,10 × u4ls). Il passe la gate kld moteur et l'identité greedy.
+D a donc déclenché l'arrêt pré-enregistré de la campagne en E0.
+
+Inférence, non démontrée : avec ce runtime, une base 4 bits coûte au moins
+4,5 bpw (codes plus 0,5 bpw d'échelles et biais gs64). La base 3 bits passe
+par qmv faute de GEMM de prefill u3. Un autre candidat ≤ 4,2 bpw buterait donc
+probablement sur le même chemin. Seul D a été mesuré. Rien n'est à porter en
+Rust côté allocation.
+
+Données brutes (SHA-256 des prompts, pas leur texte ; chemins anonymisés) :
+[`data/quant-campagne-42bpw/`](data/quant-campagne-42bpw/).
 
 ## Protocole figé
 
@@ -14,6 +22,7 @@ allocation.
 | Validation aveugle | `tools/quant/sets/validation.json`, 16 prompts : no_robots test (11) et aya_dataset test (5 langues), règle déterministe `prompt_sets.py build-validation`, SHA-256 `6892204e…`. **Non ouverte** (E4 non atteint) |
 | Disjonction | aucune fenêtre commune de 32 caractères alphanumériques normalisés (NFKC, casse) ; les prompts des deux ensembles sont refusés dans un corpus de calibration (`imatrix.reject_eval_text`) |
 | Référence | transformers 5.22.2 BF16 sur MPS, greedy, 192 tokens par prompt, top-64 ; 4 608 positions, aucune sous le minimum de 128 ; vocabulaire complet pour 2 prompts |
+| Données | [ensembles et références](data/quant-campagne-42bpw/sets.json), [KL par prompt et par modèle, D mesuré deux fois](data/quant-campagne-42bpw/kl_per_prompt.json), [comparaisons appariées](data/quant-campagne-42bpw/paired.json), [audit d'octets](data/quant-campagne-42bpw/audit_bytes.json) |
 | Mesure | `chat_kl.py eval --json` par prompt : KL moyenne, p99, max, top-1, NLL ; `paired.py` : IC 95 % par bootstrap sur les prompts, refus si une catégorie régresse de plus de 10 % |
 | Budget | `audit_bytes.py` : octets `language_model.*` sérialisés / 26 895 998 464, refus au-delà de 4,200 |
 
@@ -41,7 +50,11 @@ introuvable. Sa disjonction n'est vérifiée que contre les 8 prompts historique
 - Gate kld moteur, oracle `external_kld_qwen38` inchangé, référence mlx-lm de D capturée hors dépôt via `SARAGOSSA_GOLDEN_ROOT` : **réussie**, ratio KL 0,04, ratio p99 Δp 0,17, même top-1 99,61 %. Contrôle u4ls avec les fixtures du dépôt : ratio 0,03 et 0,18.
 - Identité greedy AR = MTP = DFlash sur D : md5 identiques à 1 k et à 32 k.
 
-Runtime, `bench/ab.py`, ABBA, 4 blocs, 256 tokens, même binaire (main 7cb2f3e). Ratio D / u4ls :
+Sorties des gates kld : [`gates.json`](data/quant-campagne-42bpw/gates.json).
+
+Runtime, `bench/ab.py`, ABBA, 4 blocs (16 passes par mode et par contexte), 256 tokens,
+même binaire (main 7cb2f3e). Ratio D / u4ls, rapports complets et md5 d'identité dans
+[`runtime.json`](data/quant-campagne-42bpw/runtime.json) :
 
 | Mode | decode 1 k | decode 32 k | débit prefill 1 k / 32 k |
 |---|---|---|---|
@@ -49,11 +62,12 @@ Runtime, `bench/ab.py`, ABBA, 4 blocs, 256 tokens, même binaire (main 7cb2f3e).
 | MTP | 0,699 | 0,763 | 0,112 / 0,115 |
 | DFlash | 0,700 | 0,769 | 0,113 / 0,115 |
 
-Seuils ≥ 0,97 et prefill ≤ 1,10 × u4ls échoués : la base 3 bits est suspendue
-pour ce checkpoint. La base 4 coûte au minimum 4,5 bpw (codes et 0,5 bpw
-d'échelles/biais gs64). E1 à E4 sont donc arrêtés.
+Seuils ≥ 0,97 et prefill ≤ 1,10 × u4ls échoués par D : selon le critère
+pré-enregistré, la base 3 bits est suspendue pour ce checkpoint, et E1 à E4
+sont arrêtés (voir l'inférence en tête).
 
-Cause, d'après la trace de dispatch (`SARAGOSSA_RUST_TRACE_DISPATCH_PATH`, prefill
+Cause probable, d'après la trace de dispatch
+([`dispatch_trace_prefill512.json`](data/quant-campagne-42bpw/dispatch_trace_prefill512.json)) (`SARAGOSSA_RUST_TRACE_DISPATCH_PATH`, prefill
 de 512 tokens) : les 247 modules u3 passent par
 `affine_qmv_fast_aligned_u3_gs64_f32` à M = 32, 44 ou 480 (1 720 dispatchs), là
 où u4 utilise `gemm_nax_coop_qb_tiled_u4`. Les u5/u6 passent par

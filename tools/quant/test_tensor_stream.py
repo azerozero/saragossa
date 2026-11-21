@@ -90,12 +90,15 @@ def mlx_checks():
         x = mx.array(np.random.default_rng(17).normal(size=(2, 14, 128)), mx.bfloat16)
         fused = "model.language_model.layers.0.experts.gate_up_proj"
         mx.save_safetensors(str(source / "model.safetensors"), {fused: x})
+        # convert_ls exige le tokenizer source et le recopie à l'identique.
+        (source / "tokenizer.json").write_text('{"fixture": true}')
         bases = ["language_model.model.layers.0.experts.switch_glu." + p
                  for p in ("gate_proj", "up_proj")]
         matrix = {base: mx.array([0 if i % 13 == 0 else i + 1 for i in range(128)], mx.float32)
                   for base in bases}
         matrix_path = root / "imatrix.safetensors"
         mx.save_safetensors(str(matrix_path), matrix)
+        checked = 0
         for bits in (3, 4, 5, 6, 8):
             for blend in (False, True):
                 shards = [{}, {}]
@@ -124,6 +127,9 @@ def mlx_checks():
                 for key in actual:
                     assert payload_hash(actual[key]) == payload_hash(reference[key]), (bits, blend, key)
                 assert not list(destination.glob("*.partial"))
+                assert (destination / "tokenizer.json").read_bytes() == (source / "tokenizer.json").read_bytes()
+                checked += 1
+    assert checked == 10, checked
     print("tensor_stream: SHA-256 identiques 3/4/5/6/8 bits, blend, experts et shards croisés")
 
 

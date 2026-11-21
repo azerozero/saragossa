@@ -1,0 +1,43 @@
+{
+ "kld_D": [
+  "kld/qwen38: saragossa Stats { positions: 2048, mean_kl: 6.641640791046903e-5, p99_delta_p: 0.014299225580108876, max_delta_p: 0.09165674337318225, same_top: 0.99609375 }",
+  "kld/qwen38: mlx bf16  Stats { positions: 2048, mean_kl: 0.0017450655900478778, p99_delta_p: 0.08329883717299713, max_delta_p: 0.13505066389477371, same_top: 0.9892578125 }",
+  "kld/qwen38: ratio KL 0.04, ratio p99 Δp 0.17",
+  "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1071 filtered out; finished in 255.59s"
+ ],
+ "kld_u4ls_ctl": [
+  "kld/qwen38: saragossa Stats { positions: 2048, mean_kl: 4.3772147445626204e-5, p99_delta_p: 0.015068542209365487, max_delta_p: 0.03366497699433657, same_top: 0.99951171875 }",
+  "kld/qwen38: mlx bf16  Stats { positions: 2048, mean_kl: 0.001585999101451039, p99_delta_p: 0.08591220673237188, max_delta_p: 0.17333789496593677, same_top: 0.98876953125 }",
+  "kld/qwen38: ratio KL 0.03, ratio p99 Δp 0.18",
+  "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1071 filtered out; finished in 188.29s"
+ ],
+ "kld_u4ls": [
+  "assertion `left == right` failed: kld/qwen38/tokenizer.json: provenance différente",
+  "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1071 filtered out; finished in 0.03s"
+ ],
+ "kld_capture_D": [
+  "qwen38 mlx bf16 / f32 : {'positions': 2048, 'mean_kl': 0.0017450655900478778, 'p99_delta_p': 0.08329883717299713, 'max_delta_p': 0.13505066389477371, 'same_top': 0.9892578125}"
+ ],
+ "ci": [
+  "prompt_sets.py rc=0",
+  "chat_kl.py rc=0",
+  "paired.py rc=0",
+  "audit_bytes.py rc=0",
+  "sensitivity.py rc=0",
+  "imatrix.py rc=0",
+  "convert_ls.py rc=0",
+  "mixed_quant.py rc=0",
+  "test_quant.py rc=0",
+  "test_tensor_stream.py rc=0",
+  "test_gptq.py rc=0",
+  "test_tokenizer_sidecar.py rc=0",
+  "test_quant.py --mlx-cpu rc=0",
+  "test_gptq.py --mlx-cpu rc=0",
+  "test_tensor_stream.py --mlx-cpu rc=0",
+  "fmt rc=0",
+  "clippy all rc=0",
+  "clippy metal rc=0",
+  "golden tests rc=0"
+ ],
+ "ci_tensor_stream_mlx": "tensor_stream: SHA-256 identiques 3/4/5/6/8 bits, blend, experts et shards croisés"
+}
