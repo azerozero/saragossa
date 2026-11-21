@@ -17,7 +17,15 @@ fabriquer des poids, pas à les exécuter.
 | `imatrix.py` | Capture BF16 de E[x²] par canal d'entrée, corpus indépendant |
 | `sensitivity.py` | Allocation calibrée 3/4/5/6/8 bits sous budget réel, appelée par `mixed_quant.py` |
 | `test_quant.py` | Auto-tests stdlib et contrôle facultatif MLX CPU sur de petits tenseurs |
-| `chat_kl.py` | KL en régime chat contre les poids officiels bf16 (référence transformers, candidat mlx-lm) |
+| `chat_kl.py` | KL en régime chat contre les poids officiels bf16 (référence transformers, candidat mlx-lm) ; `--prompts`, `--json` par prompt, `--full-vocab`, `--reverse` |
+| `prompt_sets.py` | Ensembles figés `sets/selection.json` et `sets/validation.json` (aveugle), disjonction et SHA-256 |
+| `paired.py` | Différences appariées par prompt, IC 95 % bootstrap, plan factoriel 2×2 |
+| `audit_bytes.py` | bpw langage et total depuis les en-têtes safetensors, refus au-delà d'une limite |
+
+Sans `--imatrix`, `mixed_quant.py --target-bpw` classe en espace des poids
+(taille · ‖ΔW‖²/‖W‖² du fit uniforme, sans corpus). `convert_ls.py --uniform-fit`
+remplit un template imatrix sans pondération. Résultats de la campagne ≤ 4,2 bpw :
+[docs/perf/quant-campagne-42bpw.md](../../docs/perf/quant-campagne-42bpw.md).
 
 ## Qwen3.8-27B : alternative GPTQ à 4,2 bpw
 
