@@ -50,8 +50,10 @@ Normes de la tête embarquée (2026-11-21) : la tête MTP du shard BF16 (clés
 `mtp.*`, disposition transformers) stocke ses normes centrées sur zéro. Avant le
 correctif, l'heuristique de moyenne y ratait q_norm, k_norm et la norme finale
 (moyennes 0,78 à 1,25) : l'acceptation BF16 restait à 0,97 draft par tour contre
-1,37 en 4 bits (sidecar à clés nues, non concerné). Elles reçoivent désormais
-`1 + weight`, comme dans `sanitize` de mlx-vlm. ABBA 2×2, serve, D2 fixe, tête
+1,37 en 4 bits. Une tête embarquée dans un checkpoint détecté transformers brut
+(conv1d `[canaux, 1, noyau]`, même critère que le tronc) reçoit désormais
+`1 + weight`, comme dans `sanitize` de mlx-vlm ; un sidecar séparé (4 bits,
+OptiQ, montage mixte) garde l'heuristique, quel que soit son préfixe. ABBA 2×2, serve, D2 fixe, tête
 u4, charge < 2 ; tous les md5 sont identiques à l'AR :
 
 | Prompt | heuristique | 1 + w | drafts acceptés |
