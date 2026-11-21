@@ -45,5 +45,6 @@ ceux publiés ; le prompt dépend du commit des sources.
 - TTFT à 512 tokens en BF16 bimodal.
 - mistral.rs en mode spéculatif se dégrade en contexte long (pression mémoire).
 - llmd n'a ni MTP ni DFlash.
-- `20-dfl/freeze.json` indique une alimentation sur batterie au gel (80 %), contrairement
-  aux deux autres campagnes sur secteur.
+- `20-dfl/freeze.json` indique une alimentation sur batterie : le gel date d'un premier
+  lancement arrêté par la porte d'alimentation avant toute mesure. La reprise a mesuré sur
+  secteur, comme le montrent les 9 entrées `on_ac: true` du journal.
