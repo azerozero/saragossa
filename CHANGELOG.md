@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.26](https://github.com/azerozero/saragossa/compare/v0.3.25...v0.3.26) - 2026-11-21
+
+### Fixed
+
+- *(quant)* quantification u4 disponible hors devtools pour la tête de draft MTP
+
+### Other
+
+- Merge pull request #309 from azerozero/perf/mtp-profondeur
+- *(mtp)* ne quantifie pas la tête de draft quand un sidecar la remplace
+- *(mtp)* profondeur fixe 2 en greedy committed et tête de draft u4 sur cible bf16
+
 ## [0.3.25](https://github.com/azerozero/saragossa/compare/v0.3.24...v0.3.25) - 2026-11-21
 
 ### Other
