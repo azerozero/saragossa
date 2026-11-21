@@ -138,6 +138,26 @@ fn qwen_kv_nax_x3_shape(
         .then_some(QWEN_27B_KV_SHAPE)
 }
 
+/// Provenance d'une tête MTP, qui fixe la convention de ses normes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MtpHeadSource {
+    /// Fichier sidecar séparé : normes telles que stockées (heuristique).
+    Sidecar,
+    /// Shard du modèle : même convention de normes que le tronc.
+    Embedded,
+}
+
+impl MtpHeadSource {
+    /// Provenance détectée par `ModelAssets` (shard du modèle ou sidecar).
+    fn of(weights: &crate::MtpWeightsInfo) -> Self {
+        if weights.embedded {
+            Self::Embedded
+        } else {
+            Self::Sidecar
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 /// Décrit les dimensions et options d'un décodeur causal.
 pub struct CausalDecoderConfig {
@@ -1366,6 +1386,9 @@ pub struct CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     dflash: Option<crate::DFlashDraft>,
     snapshot_sources: SnapshotSources,
+    /// Le loader du tronc a appliqué l'offset `1 + weight` des normes d'un
+    /// checkpoint transformers brut (`qwen_loader::bake_qwen35_norm_offset`).
+    trunk_hf_raw_norms: bool,
     prefix_cache: Arc<Mutex<PrefixCache>>,
     /// Alignement et queue des reprises du cache de préfixe, choisis au
     /// chargement (`runtime_flags::prefix_align_for_model`).
@@ -2035,6 +2058,7 @@ impl CausalDecoder {
             #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
             dflash: None,
             snapshot_sources: SnapshotSources::default(),
+            trunk_hf_raw_norms: false,
             prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
             prefix_align,
             memory_guard: None,
@@ -2803,12 +2827,53 @@ impl CausalDecoder {
         }
     }
 
-    /// Charge une tête MTP depuis un sidecar safetensors.
+    /// Charge une tête MTP depuis un fichier sidecar séparé, normes telles que
+    /// stockées. Pour la tête détectée par `ModelAssets` (sidecar ou shard du
+    /// modèle), utiliser [`Self::with_mtp_weights`].
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si le sidecar est incomplet ou incompatible.
-    pub fn with_mtp_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
+    pub fn with_mtp_sidecar(self, path: impl AsRef<Path>) -> Result<Self> {
+        self.with_mtp_head(path, MtpHeadSource::Sidecar)
+    }
+
+    /// Charge la tête MTP détectée par `ModelAssets` : chemin et provenance
+    /// (sidecar ou shard du modèle) voyagent ensemble, la convention des
+    /// normes suit donc la vraie source.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur sans tête détectée, ou si elle est incomplète ou
+    /// incompatible.
+    pub fn with_mtp_weights(self, weights: &crate::MtpWeightsInfo) -> Result<Self> {
+        let path = weights.path.as_ref().ok_or_else(|| {
+            InferError::MissingWeight("tête MTP (aucun sidecar ni shard mtp.*)".to_string())
+        })?;
+        self.with_mtp_head(path, MtpHeadSource::of(weights))
+    }
+
+    pub(crate) fn with_trunk_hf_raw_norms(mut self, hf_raw: bool) -> Self {
+        self.trunk_hf_raw_norms = hf_raw;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trunk_hf_raw_norms(&self) -> bool {
+        self.trunk_hf_raw_norms
+    }
+
+    /// Charge une tête MTP depuis `path`, fichier sidecar ou shard du modèle. Embarquée dans un tronc transformers brut,
+    /// la tête dense reçoit le même offset de normes `1 + weight` que lui
+    /// (kill-switch `SARAGOSSA_RUST_MTP_HF_NORM_OFFSET=0`).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la tête est incomplète ou incompatible.
+    fn with_mtp_head(mut self, path: impl AsRef<Path>, source: MtpHeadSource) -> Result<Self> {
+        let hf_norm_offset = source == MtpHeadSource::Embedded
+            && self.trunk_hf_raw_norms
+            && crate::runtime_flags::mtp_hf_norm_offset_enabled();
         self.ensure_metal_supported()?;
         let sources = SnapshotSources::capture([path.as_ref()]);
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2823,8 +2888,13 @@ impl CausalDecoder {
             not(all(target_os = "macos", feature = "metal")),
             expect(unused_mut, reason = "single-copy Metal seulement")
         )]
-        let mut head =
-            MtpHead::from_sidecar(&path, &self.config, self.final_norm.data().len(), &context)?;
+        let mut head = MtpHead::from_sidecar(
+            &path,
+            &self.config,
+            self.final_norm.data().len(),
+            &context,
+            hf_norm_offset,
+        )?;
         // La tête arrive après `enable_single_copy_weights` du tronc : sans ce
         // passage, ses linéaires quantifiées à la charge (fc, attention, expert
         // partagé, routeur) gardaient une copie CPU à scales f32 en plus de la

@@ -44,8 +44,7 @@ mod benchmark {
         let mut decoder: CausalDecoder =
             saragossa::load_causal_decoder(&assets)?.with_metal_runtime()?;
         if args[4] == "mtp" {
-            let sidecar = assets.mtp.path.as_ref().ok_or("sidecar MTP absent")?;
-            decoder = decoder.with_mtp_sidecar(sidecar)?;
+            decoder = decoder.with_mtp_weights(&assets.mtp)?;
             #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
             {
                 decoder = decoder.with_dflash_draft_from_env(&assets.config)?;

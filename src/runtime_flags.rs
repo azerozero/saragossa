@@ -701,6 +701,14 @@ pub(crate) fn mtp_draft_lm_head_u4_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_DRAFT_LM_HEAD_U4", true))
 }
 
+/// Normes `1 + weight` pour une tête MTP dense à clés `mtp.*` (disposition
+/// transformers, dont la tête embarquée du 27B BF16). Défaut ON ;
+/// `SARAGOSSA_RUST_MTP_HF_NORM_OFFSET=0` rend l'heuristique de moyenne.
+pub(crate) fn mtp_hf_norm_offset_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_HF_NORM_OFFSET", true))
+}
+
 /// Lissage EMA (`alpha`) de la deep-acceptance MTP adaptative. Défaut 0,3, borné
 /// dans `]0,1]` par le contrôleur. Lu depuis `SARAGOSSA_RUST_MTP_ADAPTIVE_ALPHA`.
 pub(super) fn mtp_adaptive_alpha() -> f32 {
