@@ -46,6 +46,24 @@ D3 fixe (cycle fusionné généralisé, mesuré puis retiré) : +1,8/+5,7/+5,8 %
 partout. Retours : `SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=1` et
 `SARAGOSSA_RUST_MTP_DRAFT_LM_HEAD_U4=0`.
 
+Normes de la tête embarquée (2026-11-21) : la tête MTP du shard BF16 (clés
+`mtp.*`, disposition transformers) stocke ses normes centrées sur zéro. Avant le
+correctif, l'heuristique de moyenne y ratait q_norm, k_norm et la norme finale
+(moyennes 0,78 à 1,25) : l'acceptation BF16 restait à 0,97 draft par tour contre
+1,37 en 4 bits (sidecar à clés nues, non concerné). Elles reçoivent désormais
+`1 + weight`, comme dans `sanitize` de mlx-vlm. ABBA 2×2, serve, D2 fixe, tête
+u4, charge < 2 ; tous les md5 sont identiques à l'AR :
+
+| Prompt | heuristique | 1 + w | drafts acceptés |
+|---:|---:|---:|---:|
+| 512 | 17,8 | 21,1 (+18,5 %) | 126 → 148 |
+| 4096 | 17,7 | 22,1 (+25,0 %) | 130 → 156 |
+| 16384 | 15,1 | 19,6 (+29,6 %) | 113 → 147 |
+
+mlx-vlm 0.8.0 (bloc 3, sortie non identique) : 20,0/19,9/18,5. Le coût d'un tour
+était déjà au niveau de mlx-vlm (110 à 120 ms contre 108 à 118) : tout l'écart
+venait de l'acceptation. Retour : `SARAGOSSA_RUST_MTP_HF_NORM_OFFSET=0`.
+
 ## Protocole
 
 - 19 configurations effectives, chacune sur trois entrées : T0 (26 tokens),
