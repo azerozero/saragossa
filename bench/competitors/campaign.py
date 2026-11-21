@@ -436,6 +436,11 @@ def descendants(pid):
     return found
 
 
+def identity(pid):
+    """Heure de démarrage et commande du PID ; vide si le processus n'existe plus."""
+    return sh("ps", "-o", "lstart=,command=", "-p", pid)
+
+
 def busy_processes(own):
     out = sh("ps", "-A", "-o", "pid=,pcpu=,comm=")
     busy = []
@@ -520,7 +525,7 @@ class Server:
 
     def stop(self):
         """SIGTERM puis SIGKILL au moteur et à ses descendants ; vrai si tout a disparu."""
-        tree = descendants(self.proc.pid)
+        tree = {pid: identity(pid) for pid in descendants(self.proc.pid)}
         if self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -528,14 +533,15 @@ class Server:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout=30)
-        for pid in tree:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        for pid, ident in tree.items():
+            if ident and identity(pid) == ident:   # PID recyclé pendant l'attente : on ne tue pas
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         self.log.close()
         time.sleep(1)
-        return all(sh("ps", "-p", pid, "-o", "pid=") == "" for pid in tree)
+        return all(identity(pid) != ident for pid, ident in tree.items())
 
 
 def prepare_ollama(spec, port, log):
@@ -777,7 +783,7 @@ def main_run(args):
         # Binaire compilé au tour de saragossa (fin de campagne), sauf --saragossa-bin.
         sar_bin = pathlib.Path(args.saragossa_bin) if args.saragossa_bin else \
             pathlib.Path(args.saragossa_src) / "target/release/saragossa"
-        commit = sh("git", "-C", REPO, "rev-parse", "HEAD") if args.saragossa_bin else \
+        commit = (args.saragossa_commit or "inconnu") if args.saragossa_bin else \
             "compilé depuis origin/main au tour de saragossa"
         eng = engines(ext, sar_bin)
         cfgs = {m: configs(m, inv[m], eng) for m in models}
@@ -860,6 +866,7 @@ def main_run(args):
                                    "run", "--owner", "campagne", "--prio", str(args.prio), "--",
                                    sys.executable, "-I", "-B", str(HERE / "campaign.py"),
                                    *sys.argv[1:]], {**os.environ, "GPU_LOCK": str(lock)})
+    verify_freeze(run_dir, freeze, log)
     journal = Journal(run_dir)
     child = {"proc": None}
     flag = pathlib.Path(args.busy_flag)
@@ -885,6 +892,31 @@ def main_run(args):
     finally:
         if flag.exists():
             flag.unlink()
+
+
+def verify_freeze(run_dir, freeze, log):
+    """Revérifie poids, prompts et binaires des moteurs contre le gel avant de mesurer."""
+    drift = []
+    files = {f for m, cs in freeze["configs"].items() for s in cs.values()
+             if "unsupported" not in s for f in s["files"]}
+    # Le cache (taille, mtime) évite de relire les poids inchangés.
+    now = hash_weights(files, run_dir / ".sha-cache.json")
+    for f, ref in freeze["weights_sha256"].items():
+        if f in files and now.get(f, {}).get("sha256") != ref["sha256"]:
+            drift.append(f"poids {f}")
+    for m, ref in freeze["prompts"].items():
+        path = run_dir / "prompts" / f"{m}.json"
+        cur = {k: v["sha256"] for k, v in json.loads(path.read_text()).items()} \
+            if path.exists() else {}
+        if cur != {k: v["sha256"] for k, v in ref.items()}:
+            drift.append(f"prompts {m}")
+    for name, e in freeze["engines"].items():
+        if name != "saragossa" and e["sha256"] and (
+                not pathlib.Path(e["bin"]).is_file() or sha256_file(e["bin"]) != e["sha256"]):
+            drift.append(f"binaire {name} {e['bin']}")
+    if drift:
+        raise SystemExit("écart avec le gel, reprise refusée : " + " ; ".join(drift))
+    log("gel revérifié : poids, prompts et binaires identiques")
 
 
 def ensure_saragossa(args, run_dir, freeze, journal, log):
@@ -1023,6 +1055,8 @@ if __name__ == "__main__":
     parser.add_argument("--saragossa-src", default=str(REPO / ".claude/worktrees/campagne-bin"),
                         help="worktree détaché sur origin/main, compilé au lancement")
     parser.add_argument("--saragossa-bin", help="binaire existant (sans compilation)")
+    parser.add_argument("--saragossa-commit",
+                        help="commit du binaire --saragossa-bin (sinon enregistré « inconnu »)")
     parser.add_argument("--prompt-source", default=str(REPO / "src"),
                         help="sources .rs découpées en prompts (figées dans RUN_DIR/prompts)")
     parser.add_argument("--gpu-lock", default=os.environ.get("GPU_LOCK", f"{scratch}/gpu.lock"))

@@ -210,13 +210,15 @@ python3 -I -B bench/competitors/campaign.py run "$BENCH_SCRATCH/campagne/nuit"
 
 - **Lancement** : compile `origin/main` dans le worktree détaché
   `.claude/worktrees/campagne-bin` sous `build.lock` (`--saragossa-bin` pour
-  un binaire existant), découpe les prompts 512/4096/16384 tokens exacts
-  (template et nonce compris), calcule les SHA-256 des poids, puis écrit
+  un binaire existant), découpe les prompts de longueur cible 512/4096/16384 tokens (template et nonce
+  compris ; la longueur effective vaut 16 383 pour la cible 16 384), calcule les SHA-256 des poids, puis écrit
   `freeze.json` : plan figé, commits, versions, source et réglages de chaque
   moteur, binaires, matériel, macOS. `--reps` (3), `--models`, `--configs` et
   `--lengths` restreignent la campagne.
 - **Ordre** : par modèle (cache de pages chaud), les configurations passent en
-  round-robin, ordre inversé à chaque répétition (ABBA). Une entrée = un
+  round-robin, ordre inversé à chaque répétition (ABBA). Tous les concurrents
+  passent avant saragossa, compilé à son premier tour (`--saragossa-commit`
+  note le commit d'un binaire fourni). Une entrée = un
   chargement, une chauffe non comptée, une requête de 256 tokens par longueur.
 - **Portes** : la campagne tient `tools/gpulock.py` du début à la fin (priorité 2), sans laisser d’autre travail GPU s’intercaler, et crée `bench-en-cours` ; avant chaque
   requête, loadavg < 2 et aucun autre processus > 50 % CPU, sinon attente sans
