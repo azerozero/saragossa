@@ -265,6 +265,8 @@ kernel void dense_qmv_rhs_bf16_rows_f32(
     kernel void dense_qmv_rhs_bf16_rows_f32<R, NR>(device const float*, device const bfloat*, \
     device float*, constant uint3&, uint, uint, uint2);
 DENSE_QMV_BF16_ROWS(2, 1) DENSE_QMV_BF16_ROWS(3, 1) DENSE_QMV_BF16_ROWS(4, 1)
+DENSE_QMV_BF16_ROWS(5, 1) DENSE_QMV_BF16_ROWS(6, 1) DENSE_QMV_BF16_ROWS(7, 1)
+DENSE_QMV_BF16_ROWS(8, 1)
 #define DENSE_QMV_BF16_ROWS_ALL(R) DENSE_QMV_BF16_ROWS(R, 4)
 DENSE_QMV_BF16_ROWS_ALL(5) DENSE_QMV_BF16_ROWS_ALL(6) DENSE_QMV_BF16_ROWS_ALL(7)
 DENSE_QMV_BF16_ROWS_ALL(8) DENSE_QMV_BF16_ROWS_ALL(9) DENSE_QMV_BF16_ROWS_ALL(10)

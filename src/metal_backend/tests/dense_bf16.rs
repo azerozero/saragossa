@@ -589,6 +589,7 @@ fn dense_bf16_qmv_stage_rows_matches_stage_bitwise() -> Result<()> {
     // 9 lignes = arbre DFlash B=8 ; 17 et 33 traversent plusieurs groupes de 16.
     let shapes = [
         (37, 512, 2),
+        (1024, 5120, 6),
         (1024, 5120, 9),
         (48, 5120, 17),
         (6, 17408, 33),
@@ -706,4 +707,118 @@ fn dense_bf16_qmv_stage_bandwidth_probe() -> Result<()> {
         ],
         true,
     )
+}
+
+/// Temps moyen par dispatch d'une variante nommée du qmv bf16 en lignes.
+fn named_rows_probe_run(
+    metal: &MetalExecutor,
+    name: &str,
+    (r, nr): (usize, usize),
+    buffers: [&metal::Buffer; 3],
+    dims: [u32; 3],
+    reps: usize,
+) -> Result<f64> {
+    let pipeline = metal.qmvt_pipeline(name)?;
+    let cb = metal.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    for (index, buffer) in buffers.iter().enumerate() {
+        enc.set_buffer(index as u64, Some(buffer), 0);
+    }
+    set_u32_bytes(enc, 3, &dims, "rows_dims")?;
+    for _ in 0..reps {
+        enc.dispatch_thread_groups(
+            MTLSize::new(
+                u64::from(dims[1]).div_ceil(4 * nr as u64),
+                u64::from(dims[0]).div_ceil(r as u64),
+                1,
+            ),
+            MTLSize::new(128, 1, 1),
+        );
+        post_dispatch_barrier_buffer(enc, buffers[2]);
+    }
+    enc.end_encoding();
+    let start = std::time::Instant::now();
+    commit_and_wait(cb)?;
+    Ok(start.elapsed().as_secs_f64() / reps as f64)
+}
+
+#[test]
+#[ignore = "sonde du qmv bf16 en lignes par NR (lignes de poids par simdgroup), GPU au repos"]
+fn dense_bf16_qmv_rows_variants_probe() -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    for (n, k) in [(17408_usize, 5120_usize), (5120, 17408), (248_320, 5120)] {
+        let bits: Vec<u16> = (0..n * k)
+            .map(|i| {
+                let v = ((i.wrapping_mul(2_654_435_761) >> 7) % 4093) as f32 / 4093.0 - 0.5;
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let rhs = metal.buffer_from_slice(&bits, "probe_rhs")?;
+        drop(bits);
+        for batch in [4_usize, 5, 6, 7, 8, 9] {
+            let x: Vec<f32> = (0..batch * k)
+                .map(|i| ((i * 40_503 % 997) as f32 / 997.0 - 0.5) * 1.37)
+                .collect();
+            let lhs = metal.upload_f32_buffer(&x, "probe_lhs")?;
+            let dims = [batch as u32, n as u32, k as u32];
+            let stage_out = metal.uncached_f32_buffer(batch * n, "probe_stage")?;
+            let m1 = stage_probe_run(&metal, true, [&lhs, &rhs, &stage_out], dims, 4)?;
+            let _ = m1;
+            let expected: Vec<u32> = read_f32_buffer(&stage_out, batch * n)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            let nrs: &[usize] = if batch == 4 { &[1] } else { &[1, 4] };
+            let mut variants = Vec::new();
+            for &nr in nrs {
+                variants.push((format!("dense_qmv_rhs_bf16_rows_f32_r{batch}_n{nr}"), nr));
+            }
+            let mut samples = vec![Vec::new(); variants.len()];
+            let out = metal.uncached_f32_buffer(batch * n, "probe_out")?;
+            for trial in 0..9 {
+                for offset in 0..variants.len() {
+                    let index = (offset + trial) % variants.len();
+                    let (name, nr) = &variants[index];
+                    let t = named_rows_probe_run(
+                        &metal,
+                        name,
+                        (batch, *nr),
+                        [&lhs, &rhs, &out],
+                        dims,
+                        4,
+                    )?;
+                    let got: Vec<u32> = read_f32_buffer(&out, batch * n)?
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect();
+                    assert_eq!(got, expected, "{name} N={n} K={k}");
+                    if trial >= 2 {
+                        samples[index].push(t);
+                    }
+                }
+            }
+            let mut m1s = Vec::new();
+            for _ in 0..7 {
+                m1s.push(stage_probe_run(
+                    &metal,
+                    true,
+                    [&lhs, &rhs, &stage_out],
+                    [1, n as u32, k as u32],
+                    4,
+                )?);
+            }
+            m1s.sort_by(f64::total_cmp);
+            eprintln!("N={n} K={k} M=1 stage median={:.3}ms", m1s[3] * 1e3);
+            for ((name, _), values) in variants.iter().zip(samples.iter_mut()) {
+                values.sort_by(f64::total_cmp);
+                eprintln!(
+                    "N={n} K={k} M={batch} {name} median={:.3}ms {:.0}GB/s",
+                    values[3] * 1e3,
+                    (n * k * 2) as f64 / values[3] / 1e9
+                );
+            }
+        }
+    }
+    Ok(())
 }
