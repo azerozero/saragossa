@@ -1,11 +1,21 @@
 //! Échelle et biais affines ajustés aux moindres carrés, format MLX gs64 inchangé.
 //!
-//! Portage de `tools/quant/opt_quant.py` : on part du min-max bf16, on
-//! réajuste en alternance les codes et `(scale, bias)` par les équations
-//! normales, puis chaque groupe garde la meilleure des deux solutions après
-//! arrondi bf16. L'erreur quadratique d'un groupe ne peut donc pas augmenter et
-//! les kernels ne changent pas. L'échelle peut être négative : seul zéro est
-//! dégénéré (le loader restitue `q·scale + bias` quel que soit le signe).
+//! Portage de `tools/quant/opt_quant.py`. Par groupe, trois candidats sont
+//! comparés sur l'erreur quadratique de la restitution `q·scale + bias` lue par
+//! le loader, et le meilleur est gardé (égalité : ordre ci-dessous) :
+//!
+//! 1. le min-max bf16 de [`quantize_affine_bitstream_bf16`] (sortie de `--minmax`) ;
+//! 2. la grille de `mx.quantize` (`affine_quantize`,
+//!    `mlx/backend/metal/kernels/quantized.h`), paramètres arrondis bf16 et codes
+//!    recalculés contre eux, comme le `e0` de `opt_quant.fit` ;
+//! 3. 8 alternances codes ↔ équations normales partant de (2), arrondies bf16.
+//!
+//! Le résultat n'est donc jamais pire que l'un ou l'autre min-max. Écarts
+//! connus avec `opt_quant.py` : équations normales en f64 (f32 chez MLX) et
+//! candidat (1) en plus. L'alternance est une descente locale : sur une grille
+//! dont des codes restent inutilisés, elle peut s'arrêter avant l'optimum
+//! exact. L'échelle peut être négative (MLX en produit) : seul zéro est
+//! dégénéré.
 
 use crate::quantization::{bf16_bits, bf16_value, quantize_affine_bitstream_bf16, QuantError};
 use crate::{InferError, Result};
@@ -36,9 +46,46 @@ fn group_error(values: &[f32], codes: &[u32], scale: f32, bias: f32) -> f64 {
         .sum()
 }
 
-/// Quantifie `data` (`[rows, cols]`) en affine u4/u8 gs64 : min-max bf16 de
-/// [`quantize_affine_bitstream_bf16`], puis ajustement aux moindres carrés
-/// des groupes qu'il améliore. Mêmes sorties et même erreur rapportée.
+/// `(scale, bias)` f32 de `affine_quantize` (MLX, bits ≥ 2), à la lettre :
+/// `w_max` part de 0, l'échelle prend le signe du bord de plus grande valeur
+/// absolue et le biais est ce bord, sauf s'il tombe sur le code 0.
+fn mlx_params(values: &[f32], levels: f32) -> (f32, f32) {
+    let (w_min, w_max) = values
+        .iter()
+        .fold((f32::MAX, 0.0_f32), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    let scale = ((w_max - w_min) / levels).max(1.0e-7);
+    let side = w_min.abs() > w_max.abs();
+    let scale = if side { scale } else { -scale };
+    let edge = if side { w_min } else { w_max };
+    let q0 = (edge / scale).round();
+    if q0 == 0.0 {
+        (scale, 0.0)
+    } else {
+        (edge / q0, edge)
+    }
+}
+
+/// Paramètres bf16 finis `(bits scale, bits biais, codes, erreur)` d'un groupe.
+fn candidate(
+    values: &[f32],
+    scale: f32,
+    bias: f32,
+    levels: f64,
+    q: &mut [u32],
+) -> Option<(u16, u16, f64)> {
+    let (s_bits, b_bits) = (bf16_bits(scale), bf16_bits(bias));
+    let (s, b) = (bf16_value(s_bits), bf16_value(b_bits));
+    if !(s.is_finite() && b.is_finite() && (levels as f32 * s + b).is_finite()) {
+        return None;
+    }
+    codes(values, f64::from(s), f64::from(b), levels, q);
+    Some((s_bits, b_bits, group_error(values, q, s, b)))
+}
+
+/// Quantifie `data` (`[rows, cols]`) en affine u4/u8 gs64 : meilleur des
+/// candidats décrits en tête de module, groupe par groupe. Mêmes sorties que
+/// [`quantize_affine_bitstream_bf16`] ; l'erreur rapportée est celle de la
+/// sortie retenue.
 ///
 /// # Errors
 ///
@@ -64,19 +111,40 @@ pub(crate) fn quantize_affine_ls_bf16(
     let words_per_group = group_size / lanes;
     let groups = cols / group_size;
     let n = group_size as f64;
-    let mut q0 = vec![0_u32; group_size];
+    let mut best_q = vec![0_u32; group_size];
     let mut q = vec![0_u32; group_size];
     let mut error = QuantError::default();
     for (index, values) in data.chunks_exact(group_size).enumerate() {
         let (row, group) = (index / groups, index % groups);
         let word0 = row * (cols / lanes) + group * words_per_group;
         let words = &mut packed[word0..word0 + words_per_group];
-        for (lane, code) in q0.iter_mut().enumerate() {
+        for (lane, code) in best_q.iter_mut().enumerate() {
             *code = (words[lane / lanes] >> ((lane % lanes) * bits)) & mask;
         }
-        let (s0, b0) = (bf16_value(scales[index]), bf16_value(biases[index]));
-        let e0 = group_error(values, &q0, s0, b0);
-        let (mut s, mut b) = (f64::from(s0), f64::from(b0));
+        let mut best = (
+            scales[index],
+            biases[index],
+            group_error(
+                values,
+                &best_q,
+                bf16_value(scales[index]),
+                bf16_value(biases[index]),
+            ),
+        );
+        let minmax = best;
+        let mut keep = |cand: Option<(u16, u16, f64)>, q: &[u32], best_q: &mut [u32]| {
+            if let Some(cand) = cand.filter(|cand| cand.2 < best.2) {
+                best = cand;
+                best_q.copy_from_slice(q);
+            }
+        };
+        let (ms, mb) = mlx_params(values, levels as f32);
+        keep(candidate(values, ms, mb, levels, &mut q), &q, &mut best_q);
+        // Départ de l'alternance : la grille MLX arrondie bf16, comme opt_quant.
+        let (mut s, mut b) = (
+            f64::from(bf16_value(bf16_bits(ms))),
+            f64::from(bf16_value(bf16_bits(mb))),
+        );
         for _ in 0..ITERS {
             codes(values, s, b, levels, &mut q);
             let (mut sq, mut sqq, mut sw, mut sqw) = (0.0, 0.0, 0.0, 0.0);
@@ -96,24 +164,20 @@ pub(crate) fn quantize_affine_ls_bf16(
                 }
             }
         }
-        let (s_bits, b_bits) = (bf16_bits(s as f32), bf16_bits(b as f32));
-        let (s1, b1) = (bf16_value(s_bits), bf16_value(b_bits));
-        let finite = s1.is_finite() && b1.is_finite() && (levels as f32 * s1 + b1).is_finite();
-        let mut e = e0;
-        if finite {
-            codes(values, f64::from(s1), f64::from(b1), levels, &mut q);
-            let e1 = group_error(values, &q, s1, b1);
-            if e1 < e0 {
-                e = e1;
-                scales[index] = s_bits;
-                biases[index] = b_bits;
-                words.fill(0);
-                for (lane, &code) in q.iter().enumerate() {
-                    words[lane / lanes] |= code << ((lane % lanes) * bits);
-                }
+        keep(
+            candidate(values, s as f32, b as f32, levels, &mut q),
+            &q,
+            &mut best_q,
+        );
+        if best != minmax {
+            scales[index] = best.0;
+            biases[index] = best.1;
+            words.fill(0);
+            for (lane, &code) in best_q.iter().enumerate() {
+                words[lane / lanes] |= code << ((lane % lanes) * bits);
             }
         }
-        error.sum_sq_err += e;
+        error.sum_sq_err += best.2;
         error.sum_sq += values.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>();
     }
     Ok(error)
@@ -134,22 +198,89 @@ mod tests {
             .collect()
     }
 
-    /// Jamais pire que le min-max, groupe par groupe, en u4 comme en u8.
+    fn quantize(data: &[f32], bits: usize) -> (Vec<u32>, Vec<u16>, Vec<u16>, QuantError) {
+        let groups = data.len() / 64;
+        let (mut p, mut s, mut b) = (
+            vec![0; data.len() * bits / 32],
+            vec![0; groups],
+            vec![0; groups],
+        );
+        let error = quantize_affine_ls_bf16(data, data.len(), 64, bits, &mut p, &mut s, &mut b)
+            .expect("invariant: groupe valide");
+        (p, s, b, error)
+    }
+
+    /// Grilles exactes couvrant les codes extrêmes, paramètres bf16 exacts : l'optimum
+    /// (erreur nulle) est unique à la symétrie `q ↔ L − q` près. Oracle
+    /// indépendant : régression des valeurs sur les codes construits.
     #[test]
-    fn never_worse_than_minmax_per_group() {
+    fn recovers_exact_grids_like_regression_oracle() {
+        for (scale, bias, bits) in [(-0.5_f32, 4.0_f32, 4), (0.375, -2.25, 4), (0.0625, -8.0, 8)] {
+            let levels = (1_u32 << bits) - 1;
+            // u4 : les 16 codes (7 premier avec 16) ; u8 : 0, 4, …, 248 puis 255.
+            let q: Vec<f32> = (0..64_u32)
+                .map(|i| match bits {
+                    4 => (i * 7) % 16,
+                    _ if i == 63 => levels,
+                    _ => i * 4,
+                } as f32)
+                .collect();
+            let data: Vec<f32> = q.iter().map(|&q| q * scale + bias).collect();
+            let n = 64.0_f64;
+            let (sq, sqq): (f64, f64) = q.iter().fold((0.0, 0.0), |(a, b), &v| {
+                (a + f64::from(v), b + f64::from(v * v))
+            });
+            let (sw, sqw): (f64, f64) = q.iter().zip(&data).fold((0.0, 0.0), |(a, b), (&c, &w)| {
+                (a + f64::from(w), b + f64::from(c * w))
+            });
+            let oracle = (n * sqw - sq * sw) / (n * sqq - sq * sq);
+            assert_eq!(oracle as f32, scale, "oracle");
+            let (p, s, b, error) = quantize(&data, bits);
+            assert_eq!(error.sum_sq_err, 0.0, "{scale} {bias}");
+            assert_eq!(dequant(&p, &s, &b, bits), data);
+            let got = (bf16_value(s[0]), bf16_value(b[0]));
+            let mirror = (-scale, bias + levels as f32 * scale);
+            assert!(got == (scale, bias) || got == mirror, "{got:?}");
+        }
+    }
+
+    /// Groupe constant : restitué exactement (codes nuls ou biais seul).
+    #[test]
+    fn constant_group_is_exact() {
+        let (p, s, b, error) = quantize(&[2.0; 64], 4);
+        assert_eq!(error.sum_sq_err, 0.0);
+        assert_eq!(dequant(&p, &s, &b, 4), vec![2.0; 64]);
+    }
+
+    /// La grille MLX est celle de `affine_quantize` (bord de plus grande valeur
+    /// absolue, échelle négative), valeurs calculées à la main.
+    #[test]
+    fn mlx_params_follow_metal_kernel() {
+        let values: Vec<f32> = (0..64).map(|i| -3.0 + 0.5 * (i % 15) as f32).collect();
+        // w_min = −3, w_max = 4 : bord 4, échelle −7/15, q0 = round(4 / −7/15) = −9.
+        assert_eq!(mlx_params(&values, 15.0), (4.0 / -9.0, 4.0));
+        // Tout positif : w_max part de 0 mais w_min reste le vrai minimum.
+        let positive: Vec<f32> = (0..64).map(|i| 1.0 + (i % 4) as f32).collect();
+        let (scale, bias) = mlx_params(&positive, 15.0);
+        assert_eq!(bias, 4.0);
+        assert_eq!(scale, 4.0 / (4.0_f32 / (-3.0 / 15.0)).round());
+    }
+
+    /// Jamais pire que les deux min-max, groupe par groupe, en u4 comme en u8.
+    #[test]
+    fn never_worse_than_either_minmax() {
         let data: Vec<f32> = (0..4 * 256)
             .map(|i| ((i as f32 * 0.37).sin() * 3.0).powi(3) + (i % 7) as f32 * 0.01)
             .collect();
         for bits in [4, 8] {
+            let levels = (1_u32 << bits) - 1;
             let words = data.len() * bits / 32;
             let groups = data.len() / 64;
             let (mut p0, mut s0, mut b0) = (vec![0; words], vec![0; groups], vec![0; groups]);
-            let (mut p1, mut s1, mut b1) = (vec![0; words], vec![0; groups], vec![0; groups]);
             let mm =
                 quantize_affine_bitstream_bf16(&data, 256, 64, bits, &mut p0, &mut s0, &mut b0)
                     .expect("invariant: min-max valide");
-            let ls = quantize_affine_ls_bf16(&data, 256, 64, bits, &mut p1, &mut s1, &mut b1)
-                .expect("invariant: moindres carrés valides");
+            let (p1, s1, b1, ls) = quantize(&data, bits);
             assert!(ls.sum_sq_err < mm.sum_sq_err, "{bits} bits");
             let (d0, d1) = (dequant(&p0, &s0, &b0, bits), dequant(&p1, &s1, &b1, bits));
             for (g, values) in data.chunks(64).enumerate() {
@@ -160,7 +291,12 @@ mod tests {
                         .map(|(&v, &x)| f64::from(v - x).powi(2))
                         .sum()
                 };
+                let mut q = vec![0; 64];
+                let (ms, mb) = mlx_params(values, levels as f32);
+                let mlx = candidate(values, ms, mb, f64::from(levels), &mut q)
+                    .map_or(f64::INFINITY, |c| c.2);
                 assert!(err(&d1) <= err(&d0), "{bits} bits, groupe {g}");
+                assert!(err(&d1) <= mlx, "{bits} bits, groupe {g} contre MLX");
             }
             let total: f64 = data
                 .iter()

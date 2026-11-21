@@ -100,10 +100,51 @@ struct Identity {
     keep_bf16: Vec<String>,
 }
 
+/// Empreinte d'un shard source : une reprise sur d'autres poids de mêmes
+/// noms et formes est refusée. Hors manifeste (la date dépend de la copie).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SourceShard {
+    file: String,
+    size: u64,
+    mtime_ns: String,
+    header_sha256: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Journal {
     identity: Identity,
+    sources: Vec<SourceShard>,
     shards: BTreeMap<String, ShardRecord>,
+}
+
+fn source_shards(source: &Source) -> Result<Vec<SourceShard>> {
+    source
+        .headers
+        .iter()
+        .map(|header| {
+            let path = &header.path;
+            let meta = std::fs::metadata(path).map_err(|e| io_err(path, e))?;
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            let len = usize::try_from(header.data_start)
+                .map_err(|_| InferError::Config(format!("en-tête trop grand: {path:?}")))?;
+            let mut bytes = vec![0_u8; len];
+            let file = std::fs::File::open(path).map_err(|e| io_err(path, e))?;
+            crate::safetensor::pread_exact(&file, &mut bytes, 0).map_err(|e| io_err(path, e))?;
+            Ok(SourceShard {
+                file: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                size: meta.len(),
+                mtime_ns: mtime.to_string(),
+                header_sha256: sha256_bytes(&bytes),
+            })
+        })
+        .collect()
 }
 
 fn is_vision(name: &str) -> bool {
@@ -134,6 +175,16 @@ fn width(tensor: &TensorRef, options: &HfConvertOptions) -> Result<Option<usize>
     if !quantizable || matches(&options.keep_bf16) {
         return Ok(None);
     }
+    // Le loader MTP (`decoder/mtp.rs`, `load_mtp_linear`) n'accepte que u4 ou
+    // bf16 : la tête reste en u4 quelle que soit `--bits`.
+    if name.starts_with("mtp.") {
+        if matches(&options.keep_8bit) {
+            return Err(InferError::Config(format!(
+                "tête MTP : u4 ou bf16 seulement (--keep-bf16), pas 8 bits : {name}"
+            )));
+        }
+        return Ok(Some(4));
+    }
     Ok(Some(if matches(&options.keep_8bit) || is_router(name) {
         8
     } else {
@@ -141,7 +192,19 @@ fn width(tensor: &TensorRef, options: &HfConvertOptions) -> Result<Option<usize>
     }))
 }
 
-/// Un shard de sortie par shard source, tenseurs triés par nom.
+/// Shard de sortie qui reçoit toute la tête `mtp.*` : celui de `mtp.fc.weight`,
+/// sinon le premier qui en porte. Le loader ne lit une tête embarquée que dans
+/// un seul shard (`assets::embedded_mtp_weights`).
+fn mtp_shard(refs: &[TensorRef]) -> Option<usize> {
+    let mtp = || refs.iter().filter(|t| t.name.starts_with("mtp."));
+    mtp()
+        .find(|t| t.name == "mtp.fc.weight")
+        .or_else(|| mtp().min_by_key(|t| t.shard))
+        .map(|t| t.shard)
+}
+
+/// Un shard de sortie par shard source (tête MTP regroupée), tenseurs triés
+/// par nom.
 fn plan(source: &Source, refs: &[TensorRef], options: &HfConvertOptions) -> Result<Vec<ShardPlan>> {
     let fit = if options.minmax {
         AffineFit::MinMax
@@ -164,8 +227,13 @@ fn plan(source: &Source, refs: &[TensorRef], options: &HfConvertOptions) -> Resu
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let mtp = mtp_shard(refs);
     for tensor in refs {
-        let plan = &mut plans[tensor.shard];
+        let shard = match mtp {
+            Some(shard) if tensor.name.starts_with("mtp.") => shard,
+            _ => tensor.shard,
+        };
+        let plan = &mut plans[shard];
         match width(tensor, options)? {
             Some(bits) => {
                 let [rows, cols] = tensor.shape[..] else {
@@ -283,6 +351,7 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
     std::fs::create_dir_all(&convert_dir).map_err(|e| io_err(&convert_dir, e))?;
     let _lock = DestLock::acquire(dst)?;
     let journal_path = dst.join(JOURNAL);
+    let sources = source_shards(&source)?;
     let mut journal = if journal_path.exists() {
         let journal: Journal = serde_json::from_value(read_json(&journal_path)?)
             .map_err(|e| json_err(&journal_path, e))?;
@@ -292,10 +361,17 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
                 journal.identity, identity
             )));
         }
+        if journal.sources != sources {
+            return Err(InferError::Config(
+                "reprise refusée: shards source modifiés (taille, date ou en-tête) depuis le journal"
+                    .to_string(),
+            ));
+        }
         journal
     } else {
         Journal {
             identity: identity.clone(),
+            sources,
             shards: BTreeMap::new(),
         }
     };

@@ -31,9 +31,10 @@ largeur est un multiple de 64 est quantifiée, embeddings et `lm_head` compris ;
 normes, `A_log`, `dt_bias`, `conv1d` et tour vision restent bf16 ; routeur MoE
 et `shared_expert_gate` en 8 bits. Les motifs `--keep-*` sont des
 sous-chaînes du nom HF. La tête `mtp.*` est conservée (les conversions
-mlx-community la retirent) et reste dans son shard : le MTP démarre sans
-sidecar. Noms et layouts HF bruts conservés, un tenseur lu par blocs de
-~64 Mo, sortie déterministe, reprise par shard ; `tokenizer.json` est recopié
+mlx-community la retirent), toujours en u4 (le loader MTP n'accepte que u4
+ou bf16), et regroupée dans un seul shard : le MTP démarre sans sidecar. Noms et layouts HF bruts conservés, un tenseur lu par blocs de
+~64 Mo, sortie déterministe, reprise par shard refusée si un shard source a changé
+(taille, date, en-tête) ; `tokenizer.json` est recopié
 à l'octet. Les experts MoE ne sont pas encore pris en charge (refus explicite).
 
 ## Méthode

@@ -51,14 +51,27 @@ fn values(shape: &[usize], seed: usize) -> Vec<f32> {
 }
 
 fn write_source(dir: &Path) {
+    write_source_with(dir, false, 0);
+}
+
+/// `split_mtp` déplace `mtp.norm.weight` dans le premier shard ; `salt`
+/// change les valeurs sans changer noms ni formes.
+fn write_source_with(dir: &Path, split_mtp: bool, salt: usize) {
     let mut weight_map = serde_json::Map::new();
     for (shard, file) in SHARDS.iter().enumerate() {
         let owned: Vec<(String, Vec<usize>, Vec<u8>)> = tensors()
             .into_iter()
             .enumerate()
-            .filter(|(_, (s, _, _))| *s == shard)
+            .filter(|(_, (s, name, _))| {
+                let s = if split_mtp && *name == "mtp.norm.weight" {
+                    0
+                } else {
+                    *s
+                };
+                s == shard
+            })
             .map(|(seed, (_, name, shape))| {
-                let bytes = values(&shape, seed)
+                let bytes = values(&shape, seed + salt)
                     .iter()
                     .flat_map(|v| bf16_bits(*v).to_le_bytes())
                     .collect();
@@ -259,4 +272,53 @@ fn least_squares_lowers_error_and_honours_keep_lists_and_resume() {
         convert_hf(&opts).is_err(),
         "reprise avec d'autres options acceptée"
     );
+}
+
+#[test]
+fn mtp_head_is_regrouped_and_stays_u4() {
+    let root = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let src = root.path().join("src");
+    std::fs::create_dir(&src).expect("invariant: src");
+    write_source_with(&src, true, 0);
+    let dst = root.path().join("u8");
+    let mut opts = options(&src, &dst);
+    opts.bits = 8;
+    convert_hf(&opts).expect("invariant: conversion u8");
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dst.join("model.safetensors.index.json")).expect("invariant: index"),
+    )
+    .expect("invariant: index JSON");
+    let map = index["weight_map"]
+        .as_object()
+        .expect("invariant: weight_map");
+    let mtp: Vec<_> = map.iter().filter(|(k, _)| k.starts_with("mtp.")).collect();
+    assert_eq!(mtp.len(), 7, "{mtp:?}");
+    assert!(mtp.iter().all(|(_, file)| *file == SHARDS[1]), "{mtp:?}");
+    // u4 : 256 colonnes → 32 mots ; le tronc suit --bits 8 (128 → 32 mots).
+    assert_eq!(tensor_bytes(&dst, SHARDS[1], "mtp.fc.weight").1, [8, 32]);
+    let up = "model.language_model.layers.0.mlp.up_proj.weight";
+    assert_eq!(tensor_bytes(&dst, SHARDS[0], up).1, [8, 32]);
+    assert_eq!(
+        config(&dst)["quantization"]["mtp.fc"]["bits"].as_u64(),
+        Some(4)
+    );
+
+    let mut opts = options(&src, &root.path().join("refus"));
+    opts.keep_8bit = vec!["mtp.".to_string()];
+    let error = convert_hf(&opts).expect_err("tête MTP 8 bits acceptée");
+    assert!(error.to_string().contains("MTP"), "{error}");
+}
+
+#[test]
+fn resume_refuses_rewritten_source_weights() {
+    let root = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let src = root.path().join("src");
+    std::fs::create_dir(&src).expect("invariant: src");
+    write_source(&src);
+    let dst = root.path().join("dst");
+    convert_hf(&options(&src, &dst)).expect("invariant: première conversion");
+    // Mêmes noms, formes, index et config : seules les valeurs changent.
+    write_source_with(&src, false, 1);
+    let error = convert_hf(&options(&src, &dst)).expect_err("reprise sur d'autres poids acceptée");
+    assert!(error.to_string().contains("shards source"), "{error}");
 }
