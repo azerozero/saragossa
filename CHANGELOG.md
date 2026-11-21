@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.28](https://github.com/azerozero/saragossa/compare/v0.3.27...v0.3.28) - 2026-11-21
+
+### Added
+
+- *(bench)* configurations mlx-mtp et mlx-dflash par mlx-vlm 0.8.0
+- *(bench)* saragossa en fin de campagne, drapeau bench-en-cours et arrêt sans blocage
+- *(bench)* campagne autonome de bench concurrents en une commande
+
+### Fixed
+
+- *(bench)* un descendant déjà disparu à la capture compte comme arrêté
+- *(bench)* PID vérifiés avant kill, gel revérifié à la reprise, commit explicite, docs corrigées
+- *(bench)* DONE seulement si le plan est clos, port occupé rejoué, chauffe sans longueur codée en dur
+- *(bench)* prompts sans tokens spéciaux, top-k de llmd 20261114, mistral.rs 35B noté non supporté
+- *(bench)* verrou GPU tenu pour toute la campagne, refroidissement borné à 5 min
+
+### Other
+
+- Merge pull request #284 from azerozero/feat/campagne-autonome
+- *(bench)* données brutes des campagnes du 21 novembre (mlx et finale)
+- *(bench)* précise l'alimentation de la campagne 20-dfl
+- *(bench)* données brutes des campagnes du 19 et 20 novembre
+
 ## [0.3.27](https://github.com/azerozero/saragossa/compare/v0.3.26...v0.3.27) - 2026-11-21
 
 ### Fixed
