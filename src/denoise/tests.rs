@@ -47,9 +47,9 @@ fn stft_round_trip_is_identity_after_one_hop() {
 #[test]
 #[ignore = "requiert SARAGOSSA_DFN3_DIR (dfn3.safetensors + golden.safetensors)"]
 fn dfn3_matches_pytorch_reference() {
-    let dir = std::path::PathBuf::from(
-        std::env::var("SARAGOSSA_DFN3_DIR").expect("invariant: test ignoré sans la variable"),
-    );
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_DFN3_DIR") else {
+        return;
+    };
     let model = DeepFilterNet3::load(dir.join("dfn3.safetensors")).unwrap();
     let golden = crate::safetensor::load_f32_tensors(dir.join("golden.safetensors")).unwrap();
     let audio = golden["audio"].data();
@@ -123,9 +123,9 @@ fn dfn3_matches_pytorch_reference() {
 #[test]
 #[ignore = "mesure ; requiert SARAGOSSA_DFN3_DIR"]
 fn dfn3_hop_latency() {
-    let dir = std::path::PathBuf::from(
-        std::env::var("SARAGOSSA_DFN3_DIR").expect("invariant: test ignoré sans la variable"),
-    );
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_DFN3_DIR") else {
+        return;
+    };
     let name = std::env::var("SARAGOSSA_DFN3_MODEL").unwrap_or_else(|_| "dfn3.safetensors".into());
     let model = DeepFilterNet3::load(dir.join(name)).unwrap();
     let golden = crate::safetensor::load_f32_tensors(dir.join("golden.safetensors")).unwrap();
@@ -220,9 +220,9 @@ fn config_reads_low_latency_metadata_and_defaults_to_std() {
 #[test]
 #[ignore = "requiert SARAGOSSA_DFN3_LL_DIR (dfn3_ll.safetensors + golden_ll.safetensors)"]
 fn dfn3_ll_matches_onnxruntime() {
-    let dir = std::path::PathBuf::from(
-        std::env::var("SARAGOSSA_DFN3_LL_DIR").expect("invariant: test ignoré sans la variable"),
-    );
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_DFN3_LL_DIR") else {
+        return;
+    };
     let model = DeepFilterNet3::load(dir.join("dfn3_ll.safetensors")).unwrap();
     assert_eq!(model.net.config.lookahead, 0);
     assert_eq!(model.stream().delay_samples(), FFT_SIZE - HOP_SIZE);
@@ -427,11 +427,16 @@ fn dfn3_gpu_gru_step_probe() {
 #[test]
 #[ignore = "requiert SARAGOSSA_DFN3_DIR et SARAGOSSA_DFN3_LONG_WAV ; GPU sous verrou"]
 fn dfn3_gpu_long_file_bit_exact_and_speed() {
-    let dir = std::path::PathBuf::from(
-        std::env::var("SARAGOSSA_DFN3_DIR").expect("invariant: test ignoré sans la variable"),
-    );
-    let wav =
-        std::env::var("SARAGOSSA_DFN3_LONG_WAV").expect("invariant: test ignoré sans la variable");
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_DFN3_DIR") else {
+        return;
+    };
+    let Some(wav) = crate::test_support::require_real_model(
+        std::env::var("SARAGOSSA_DFN3_LONG_WAV").ok(),
+        "SARAGOSSA_DFN3_LONG_WAV",
+    ) else {
+        eprintln!("skip: SARAGOSSA_DFN3_LONG_WAV absent");
+        return;
+    };
     let model = DeepFilterNet3::load(dir.join("dfn3.safetensors")).unwrap();
     let (raw, rate) = decode_wav(&std::fs::read(wav).unwrap()).unwrap();
     let audio = resample(&raw, rate, SAMPLE_RATE).unwrap();

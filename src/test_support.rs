@@ -88,6 +88,19 @@ pub(crate) fn voice_fixture(name: &str) -> Option<PathBuf> {
     workspace.is_file().then_some(workspace)
 }
 
+/// Répertoire local désigné par `var` ; `None` (test sauté, ou échec en mode
+/// strict) si la variable est absente, vide ou ne désigne pas un répertoire.
+pub(crate) fn local_dir(var: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir());
+    if dir.is_none() {
+        eprintln!("skip: {var} absent ou introuvable (test sur poids locaux)");
+    }
+    require_real_model(dir, var)
+}
+
 /// Exige une précondition de modèle réel quand le mode strict est actif.
 pub(crate) fn require_real_model<T>(candidate: Option<T>, missing: &str) -> Option<T> {
     require_real_model_when(

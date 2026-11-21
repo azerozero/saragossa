@@ -9,6 +9,9 @@ fn qwen_moe_prefill_variants_greedy_identity() -> Result<()> {
         linear_nax_hv32_calls, moe_coop_tiled_trace_for_test, with_flint_moe_coop_tiled_override,
         with_linear_nax_disabled,
     };
+    let Some(path) = crate::test_support::local_dir("SARAGOSSA_TEST_PREFILL_MODEL") else {
+        return Ok(());
+    };
     assert!(
         !crate::runtime_flags::prefix_cache_enabled(),
         "SARAGOSSA_RUST_PREFIX_CACHE=0 requis"
@@ -17,10 +20,7 @@ fn qwen_moe_prefill_variants_greedy_identity() -> Result<()> {
         crate::runtime_flags::gated_delta_nax_hv32_enabled(),
         "SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1 et NAX linéaire requis"
     );
-    let path = std::env::var_os("SARAGOSSA_TEST_PREFILL_MODEL").expect(
-        "précondition du test ignoré : SARAGOSSA_TEST_PREFILL_MODEL doit désigner le modèle local",
-    );
-    let assets = ModelAssets::load_local(std::path::Path::new(&path))?;
+    let assets = ModelAssets::load_local(&path)?;
     let executor = crate::MetalExecutor::new()?;
     let model =
         crate::load_causal_decoder_for_metal(&assets, &executor)?.with_metal_executor(executor)?;
