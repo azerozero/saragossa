@@ -16,8 +16,7 @@ const MTP_MAX_DRAFT_ENV: &str = "SARAGOSSA_RUST_MTP_MAX_DRAFT";
 
 /// Indique si le modèle peut charger automatiquement sa tête MTP.
 ///
-/// MTP demandé explicitement (`SARAGOSSA_RUST_MTP_DECODE=1`) ou drafter DFlash
-/// configuré mais chemin inactif : une ligne d'avertissement, decode AR.
+/// Journalise le choix : tête MTP retenue, ou raison du decode AR.
 pub(crate) fn active_for(assets: &ModelAssets, backend: crate::RuntimeKind) -> bool {
     let flag = saragossa::runtime_flags::env_var(MTP_DECODE_ENV);
     let reason = if decode_enabled(flag.as_deref()) {
@@ -31,20 +30,36 @@ pub(crate) fn active_for(assets: &ModelAssets, backend: crate::RuntimeKind) -> b
         Some("désactivé par SARAGOSSA_RUST_MTP_DECODE")
     };
     let Some(reason) = reason else {
+        let head = if assets.mtp.embedded {
+            "tête embarquée".to_string()
+        } else {
+            assets
+                .mtp
+                .path
+                .as_ref()
+                .map_or_else(String::new, |path| format!("sidecar {}", path.display()))
+        };
+        eprintln!("saragossa MTP : {head} (décodage spéculatif)");
         return true;
     };
-    let dflash = saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_some();
-    if flag.is_some_and(|value| decode_enabled(Some(&value))) || dflash {
-        eprintln!(
-            "saragossa MTP demandé mais inactif model_dir={} raison={reason}{} : decode AR",
-            assets.model_dir.display(),
-            if dflash {
-                " (drafter DFlash ignoré, joignable par le seul chemin MTP)"
-            } else {
-                ""
-            }
-        );
-    }
+    let dflash = saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR")
+        .is_some_and(|value| !value.is_empty() && value != "0");
+    eprintln!(
+        "saragossa MTP inactif model_dir={} raison={reason}{} : decode AR{}",
+        assets.model_dir.display(),
+        if dflash {
+            " (drafter DFlash ignoré, joignable par le seul chemin MTP)"
+        } else {
+            ""
+        },
+        if flag.is_some_and(|value| !decode_enabled(Some(&value))) {
+            ""
+        } else if assets.config.is_moe() {
+            ", gain possible avec une tête MTP désignée par SARAGOSSA_RUST_MTP_SIDECAR"
+        } else {
+            ", gain possible avec mtp.safetensors dans le dossier du modèle"
+        }
+    );
     false
 }
 

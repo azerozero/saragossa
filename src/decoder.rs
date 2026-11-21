@@ -2859,18 +2859,53 @@ impl CausalDecoder {
 
     /// Charge le drafter DFlash 2 désigné par `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`
     /// (quantification `SARAGOSSA_RUST_DFLASH_QUANT_BITS`, u4 gs64 si absente :
-    /// la configuration mesurée en phase 7). Sans la variable, le décodeur est
-    /// rendu inchangé : c'est le kill-switch.
+    /// la configuration mesurée en phase 7). Sans la variable, ou à `0`, le
+    /// décodeur est rendu inchangé : c'est le kill-switch.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si le runtime Metal est absent, si le checkpoint est
     /// incompatible avec `target` ou si la quantification demandée est invalide.
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-    pub fn with_dflash_draft_from_env(mut self, target: &crate::ModelConfig) -> Result<Self> {
-        let Some(dir) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR") else {
-            return Ok(self);
-        };
+    pub fn with_dflash_draft_from_env(self, target: &crate::ModelConfig) -> Result<Self> {
+        match crate::runtime_flags::env_var_os(crate::devtools::DFLASH_DRAFT_DIR_ENV) {
+            Some(dir) if !dir.is_empty() && dir != "0" => {
+                self.with_dflash_draft_dir(target, std::path::PathBuf::from(dir))
+            }
+            _ => Ok(self),
+        }
+    }
+
+    /// Comme [`Self::with_dflash_draft_from_env`], mais le drafter est aussi
+    /// découvert : variable, sous-dossier `dflash/` du modèle, puis cache HF
+    /// (cf. [`crate::devtools::resolve_dflash_draft`]). Journalise le choix.
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que [`Self::with_dflash_draft_from_env`].
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    pub fn with_dflash_draft_auto(self, assets: &crate::ModelAssets) -> Result<Self> {
+        let env = crate::runtime_flags::env_var_os(crate::devtools::DFLASH_DRAFT_DIR_ENV);
+        let hf_cache = crate::hf_resolve::hf_cache_dir_from_env();
+        let found = crate::devtools::resolve_dflash_draft(
+            &assets.model_dir,
+            &assets.config,
+            env.as_deref(),
+            hf_cache.as_deref(),
+        );
+        eprintln!("saragossa {}", found.note);
+        match found.dir {
+            Some(dir) => self.with_dflash_draft_dir(&assets.config, dir),
+            None => Ok(self),
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    fn with_dflash_draft_dir(
+        mut self,
+        target: &crate::ModelConfig,
+        dir: std::path::PathBuf,
+    ) -> Result<Self> {
         self.ensure_metal_supported()?;
         let metal = self.runtime.metal.as_deref().ok_or_else(|| {
             InferError::Config("drafter DFlash : runtime Metal requis".to_string())
@@ -2886,7 +2921,7 @@ impl CausalDecoder {
         self.dflash = Some(
             crate::devtools::dflash::load_dflash_draft_weights_with_runtime(
                 target,
-                std::path::PathBuf::from(dir),
+                dir,
                 quant,
                 ForwardRuntime::metal(metal),
             )?,

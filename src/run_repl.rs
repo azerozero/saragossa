@@ -189,7 +189,7 @@ impl ReplModel {
             }
             #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
             {
-                decoder = decoder.with_dflash_draft_from_env(&assets.config)?;
+                decoder = decoder.with_dflash_draft_auto(&assets)?;
             }
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]

@@ -30,7 +30,10 @@ pub mod error;
 #[cfg(test)]
 mod golden;
 pub mod guided;
-#[cfg(test)]
+#[cfg(any(
+    test,
+    all(target_os = "macos", feature = "metal", feature = "devtools")
+))]
 #[path = "hf_cache.rs"]
 pub(crate) mod hf_resolve;
 pub mod linear;

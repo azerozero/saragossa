@@ -8,8 +8,12 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 mod codebook;
+mod discover;
 mod weights;
 pub use codebook::DFlashCodebook;
+pub use discover::{
+    resolve_dflash_draft, DraftResolution, DFLASH_DRAFT_DIR_ENV, DFLASH_SIBLING_DIR,
+};
 use weights::DraftWeights;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1340,6 +1344,93 @@ mod tests {
         assert_eq!(info.rms_norm_eps, 1e-6);
         assert_eq!(info.rope_theta, 10_000_000.0);
         assert_eq!(info.tensor_count, 1);
+    }
+
+    fn write_draft(dir: &Path, target_layers: usize, vocab: Option<usize>) {
+        std::fs::create_dir_all(dir).expect("invariant: mkdir");
+        let vocab = vocab.map_or(String::new(), |v| format!("\"vocab_size\":{v},"));
+        let config = format!(
+            r#"{{"architectures":["DFlashDraftModel"],{vocab}"hidden_size":2048,
+            "num_hidden_layers":6,"num_target_layers":{target_layers},"intermediate_size":6144,
+            "num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,
+            "rms_norm_eps":0.000001,"rope_parameters":{{"rope_theta":10000000.0}},
+            "dflash_config":{{"block_size":16,"mask_token_id":1,"target_layer_ids":[1,6]}}}}"#
+        );
+        std::fs::write(dir.join("config.json"), config).expect("invariant: write config");
+        let mut tensors = HashMap::new();
+        insert_f32(&mut tensors, "fc.weight", &[1, 4]);
+        std::fs::write(
+            dir.join("model.safetensors"),
+            serialize(tensors, None).expect("invariant: serialize"),
+        )
+        .expect("invariant: write safetensors");
+    }
+
+    #[test]
+    fn discovery_env_has_priority_and_zero_disables() {
+        let model = tempfile::tempdir().expect("invariant: tempdir");
+        write_draft(&model.path().join("dflash"), 40, None);
+        let target = target_config();
+        let forced = resolve_dflash_draft(model.path(), &target, Some("/x/draft".as_ref()), None);
+        assert_eq!(forced.dir, Some(PathBuf::from("/x/draft")));
+        for off in ["", "0"] {
+            let r = resolve_dflash_draft(model.path(), &target, Some(off.as_ref()), None);
+            assert_eq!(r.dir, None, "{off:?} désactive");
+        }
+    }
+
+    #[test]
+    fn discovery_finds_sibling_and_rejects_incompatible() {
+        let model = tempfile::tempdir().expect("invariant: tempdir");
+        let target = target_config();
+        let none = resolve_dflash_draft(model.path(), &target, None, None);
+        assert_eq!(none.dir, None);
+        assert!(none.note.contains("aucun drafter DFlash"));
+
+        let sibling = model.path().join("dflash");
+        write_draft(&sibling, 40, None);
+        let found = resolve_dflash_draft(model.path(), &target, None, None);
+        assert_eq!(found.dir, Some(sibling.clone()));
+
+        write_draft(&sibling, 41, None);
+        let bad_layers = resolve_dflash_draft(model.path(), &target, None, None);
+        assert_eq!(bad_layers.dir, None);
+        assert!(bad_layers.note.contains("ignoré"), "{}", bad_layers.note);
+
+        write_draft(&sibling, 40, Some(1234));
+        let bad_vocab = resolve_dflash_draft(model.path(), &target, None, None);
+        assert_eq!(bad_vocab.dir, None);
+        assert!(
+            bad_vocab.note.contains("vocab_size=1234"),
+            "{}",
+            bad_vocab.note
+        );
+    }
+
+    #[test]
+    fn discovery_hf_cache_matches_base_model_name() {
+        let root = tempfile::tempdir().expect("invariant: tempdir");
+        let cache = root.path().join("hub");
+        let snap = cache.join("models--incoai--Qwen3.8-27B-DFlash2/snapshots/abc");
+        write_draft(&snap, 40, None);
+        std::fs::write(
+            snap.join("README.md"),
+            "---\nbase_model:\n  - Qwen/Qwen3.8-27B\n---\n",
+        )
+        .expect("invariant: readme");
+        let target = target_config();
+        let model = root.path().join("Qwen3.8-27B-4bit");
+        let hit = resolve_dflash_draft(&model, &target, None, Some(&cache));
+        assert_eq!(hit.dir, Some(snap));
+        let other = root.path().join("Qwen3.6-35B-A3B-4bit");
+        assert_eq!(
+            resolve_dflash_draft(&other, &target, None, Some(&cache)).dir,
+            None
+        );
+        let hf_model = cache.join("models--Qwen--Qwen3.8-27B-8bit/snapshots/r1");
+        assert!(resolve_dflash_draft(&hf_model, &target, None, Some(&cache))
+            .dir
+            .is_some());
     }
 
     #[test]
