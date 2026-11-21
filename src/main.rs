@@ -211,7 +211,7 @@ fn run() -> CliResult<()> {
             assets.mtp.path.as_ref().ok_or_else(|| {
                 cli_error("decode/oracle MTP demandé mais aucun sidecar MTP détecté")
             })?;
-        decoder = decoder.with_mtp_sidecar(path)?;
+        decoder = decoder.with_mtp_head(path, saragossa::MtpHeadSource::of(&assets.mtp))?;
         if let Some(path) = saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_MTP_DRAFT_LM_HEAD")
         {
             decoder = decoder.with_mtp_draft_lm_head_sidecar(PathBuf::from(path))?;

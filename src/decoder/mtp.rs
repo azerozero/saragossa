@@ -87,19 +87,42 @@ impl MtpHead {
         config: &CausalDecoderConfig,
         hidden: usize,
         context: &MtpLoadContext<'_>,
+        hf_norm_offset: bool,
     ) -> Result<Self> {
-        Self::from_sidecar_with(path, config, hidden, context, MtpMoeQuant::Affine)
+        Self::from_sidecar_with_norms(
+            path,
+            config,
+            hidden,
+            context,
+            MtpMoeQuant::Affine,
+            hf_norm_offset,
+        )
     }
 
     /// `hidden` est la largeur du tronc (norme finale) : toutes les formes de la
     /// tête sont validées contre elle et la config avant tout encodage GPU,
     /// dont les kernels lisent `hidden` coefficients sans borner le buffer.
+    #[cfg(test)]
     pub(super) fn from_sidecar_with(
         path: impl AsRef<Path>,
         config: &CausalDecoderConfig,
         hidden: usize,
         context: &MtpLoadContext<'_>,
         moe_quant: MtpMoeQuant,
+    ) -> Result<Self> {
+        Self::from_sidecar_with_norms(path, config, hidden, context, moe_quant, false)
+    }
+
+    /// `hf_norm_offset` : la tête dense vient des shards d'un tronc dont le
+    /// loader a appliqué l'offset transformers (`1 + weight`), décidé par
+    /// l'appelant (`CausalDecoder::with_mtp_head`) ; sinon heuristique de moyenne.
+    pub(super) fn from_sidecar_with_norms(
+        path: impl AsRef<Path>,
+        config: &CausalDecoderConfig,
+        hidden: usize,
+        context: &MtpLoadContext<'_>,
+        moe_quant: MtpMoeQuant,
+        hf_norm_offset: bool,
     ) -> Result<Self> {
         let sidecar = LazySidecar::open(path.as_ref())?;
         // Résout les clés normalisées (sans préfixe `language_model.`) → clé réelle.
@@ -134,17 +157,11 @@ impl MtpHead {
             resolve.contains_key(MTP_MOE_MARKER),
         ) {
             (true, false) => {
-                // Tête embarquée dans un checkpoint transformers brut (détecté
-                // comme le tronc : conv1d `[canaux, 1, noyau]`) : normes centrées
-                // sur zéro, `1 + weight` partout comme `sanitize` de mlx-vlm.
-                // L'heuristique de moyenne y ratait q_norm, k_norm et la norme
-                // finale du 27B BF16 (0,78 à 1,25). Un sidecar séparé (OptiQ,
-                // mlx, montage mixte) garde l'heuristique, quel que soit son préfixe.
-                let hf_raw = embedded && checkpoint_is_hf_raw(path.as_ref(), &sidecar.header)?;
-                let convention = dense_norm_convention(
-                    hf_raw,
-                    crate::runtime_flags::mtp_hf_norm_offset_enabled(),
-                );
+                let convention = if hf_norm_offset {
+                    MtpNormConvention::UnitOffset
+                } else {
+                    MtpNormConvention::MeanHeuristic
+                };
                 Self::dense_from_tensors(&sidecar, &resolve, config, &dims, context, convention)
             }
             (false, true) => {
@@ -978,49 +995,6 @@ fn is_bare_mtp_sidecar_key(key: &str) -> bool {
         || key.starts_with("norm.")
 }
 
-/// Convention des normes d'une tête dense : `1 + weight` seulement embarquée
-/// dans un checkpoint transformers brut et sans kill-switch.
-fn dense_norm_convention(hf_raw_embedded: bool, offset_enabled: bool) -> MtpNormConvention {
-    if hf_raw_embedded && offset_enabled {
-        MtpNormConvention::UnitOffset
-    } else {
-        MtpNormConvention::MeanHeuristic
-    }
-}
-
-/// Le checkpoint du shard `path` est-il un export transformers brut ? Même
-/// critère que le tronc (`qwen_loader::bake_qwen35_norm_offset`) : conv1d de
-/// linear_attn en `[canaux, 1, noyau]`, cherchée dans ce shard puis, via
-/// `model.safetensors.index.json`, dans le shard qui la porte. Sans conv1d
-/// trouvée : `false` (heuristique conservée).
-fn checkpoint_is_hf_raw(path: &Path, own: &ShardHeader) -> Result<bool> {
-    const CONV: &str = ".linear_attn.conv1d.weight";
-    let hf_conv =
-        |entry: &ShardTensorEntry| matches!(entry.shape.as_slice(), [_, 1, kernel] if *kernel > 1);
-    if let Some(entry) = own.tensors.iter().find(|(name, _)| name.ends_with(CONV)) {
-        return Ok(hf_conv(entry.1));
-    }
-    let Some(dir) = path.parent() else {
-        return Ok(false);
-    };
-    let index = dir.join("model.safetensors.index.json");
-    let Ok(text) = std::fs::read_to_string(&index) else {
-        return Ok(false);
-    };
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|err| InferError::Config(format!("{} : {err}", index.display())))?;
-    let shard = json
-        .get("weight_map")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|map| map.iter().find(|(name, _)| name.ends_with(CONV)))
-        .and_then(|(name, shard)| Some((name.clone(), shard.as_str()?.to_string())));
-    let Some((name, shard)) = shard else {
-        return Ok(false);
-    };
-    let header = read_shard_header(&dir.join(shard))?;
-    Ok(header.tensors.get(&name).is_some_and(hf_conv))
-}
-
 /// Résout une vue tensor par clé normalisée.
 fn st_view<'a>(
     st: &'a LazySidecar,
@@ -1727,19 +1701,15 @@ mod tests {
             }
         }
 
-        fn load_dense_at(path: &std::path::Path) -> crate::Result<MtpHead> {
-            MtpHead::from_sidecar_with(
+        fn load_dense_at(path: &std::path::Path, hf_norm_offset: bool) -> crate::Result<MtpHead> {
+            MtpHead::from_sidecar_with_norms(
                 path,
                 &dense_config(),
                 H,
                 &MtpLoadContext::cpu(),
                 MtpMoeQuant::Dense,
+                hf_norm_offset,
             )
-        }
-
-        fn write_at(path: &std::path::Path, tensors: &[(String, Raw)]) {
-            let tmp = write_sidecar(&f32_typed(tensors));
-            std::fs::copy(tmp.path(), path).expect("invariant: copie du shard");
         }
 
         /// Les 7 normes : embedding, hidden, entrée, post-attention, q, k, finale.
@@ -1760,18 +1730,8 @@ mod tests {
         const UNIT_OFFSET: [f32; 7] = [1.25, 1.5, 1.0, 1.75, 1.625, 1.625, 2.875];
         const MEAN_HEURISTIC: [f32; 7] = [1.25, 0.5, 1.0, 0.75, 0.625, 0.625, 1.875];
 
-        /// Shard de tronc portant la tête et une conv1d de linear_attn.
-        fn embedded_shard(conv_shape: &[usize]) -> Vec<(String, Raw)> {
-            let mut tensors = dense_tensors("mtp.");
-            tensors.push((
-                "model.language_model.layers.0.linear_attn.conv1d.weight".into(),
-                tensor(conv_shape, ramp),
-            ));
-            tensors
-        }
-
         #[test]
-        fn separate_sidecars_keep_mean_heuristic_whatever_the_prefix() {
+        fn sidecars_keep_mean_heuristic_whatever_the_prefix() {
             // OptiQ : clés `mtp.*`, normes déjà décalées à 1,0 → restent à 1,0.
             for prefix in ["mtp.", "language_model.mtp.", ""] {
                 let tensors: Vec<_> = dense_tensors(prefix)
@@ -1786,68 +1746,43 @@ mod tests {
                     })
                     .collect();
                 let tmp = write_sidecar(&f32_typed(&tensors));
-                let head = load_dense_at(tmp.path()).expect("invariant: tête dense");
+                let head = load_dense_at(tmp.path(), false).expect("invariant: tête dense");
                 assert_eq!(norms(&head), [1.0; 7], "préfixe `{prefix}`");
                 let tmp = write_sidecar(&f32_typed(&dense_tensors(prefix)));
-                let head = load_dense_at(tmp.path()).expect("invariant: tête dense");
+                let head = load_dense_at(tmp.path(), false).expect("invariant: tête dense");
                 assert_eq!(norms(&head), MEAN_HEURISTIC, "préfixe `{prefix}`");
             }
         }
 
         #[test]
-        fn head_embedded_in_raw_transformers_checkpoint_gets_unit_offset() {
+        fn sidecar_with_lm_head_beside_raw_index_keeps_mean_heuristic() {
+            // Clés MTP + `lm_head.weight` à côté d'un index transformers brut :
+            // seul l'appelant décide, le fichier voisin n'est plus lu.
             let dir = tempfile::tempdir().expect("invariant: répertoire temporaire");
-            // conv1d dans le même shard.
-            let shard = dir.path().join("model-00002-of-00002.safetensors");
-            write_at(&shard, &embedded_shard(&[4, 1, 4]));
-            assert_eq!(norms(&load_dense_at(&shard).expect("tête")), UNIT_OFFSET);
-            // Export MLX sanitizé (`[canaux, noyau, 1]`) : heuristique.
-            write_at(&shard, &embedded_shard(&[4, 4, 1]));
-            assert_eq!(norms(&load_dense_at(&shard).expect("tête")), MEAN_HEURISTIC);
-        }
-
-        #[test]
-        fn raw_checkpoint_conv_is_found_through_the_index() {
-            let dir = tempfile::tempdir().expect("invariant: répertoire temporaire");
+            let mut tensors = dense_tensors("mtp.");
+            tensors.push(("lm_head.weight".into(), tensor(&[4, H], ramp)));
+            let path = dir.path().join("mtp.safetensors");
+            let tmp = write_sidecar(&f32_typed(&tensors));
+            std::fs::copy(tmp.path(), &path).expect("invariant: copie");
             let conv = "model.language_model.layers.0.linear_attn.conv1d.weight";
-            let mut head_shard = dense_tensors("mtp.");
-            head_shard.push((
-                "model.language_model.norm.weight".into(),
-                tensor(&[H], ramp),
-            ));
-            let shard = dir.path().join("model-00002-of-00002.safetensors");
-            write_at(&shard, &head_shard);
-            for (shape, expected) in [([4, 1, 4], UNIT_OFFSET), ([4, 4, 1], MEAN_HEURISTIC)] {
-                write_at(
-                    &dir.path().join("model-00001-of-00002.safetensors"),
-                    &[(conv.into(), tensor(&shape, ramp))],
-                );
-                let index = serde_json::json!({
-                    "weight_map": { conv: "model-00001-of-00002.safetensors" }
-                });
-                std::fs::write(
-                    dir.path().join("model.safetensors.index.json"),
-                    index.to_string(),
-                )
-                .expect("invariant: index");
-                assert_eq!(norms(&load_dense_at(&shard).expect("tête")), expected);
-            }
+            std::fs::write(
+                dir.path().join("model.safetensors.index.json"),
+                serde_json::json!({ "weight_map": { conv: "model-00001-of-00002.safetensors" } })
+                    .to_string(),
+            )
+            .expect("invariant: index");
+            assert_eq!(
+                norms(&load_dense_at(&path, false).expect("tête")),
+                MEAN_HEURISTIC
+            );
         }
 
         #[test]
-        fn kill_switch_restores_mean_heuristic() {
-            use super::super::{dense_norm_convention, MtpNormConvention};
+        fn embedded_head_of_raw_trunk_gets_unit_offset_on_all_norms() {
+            let tmp = write_sidecar(&f32_typed(&dense_tensors("mtp.")));
             assert_eq!(
-                dense_norm_convention(true, true),
-                MtpNormConvention::UnitOffset
-            );
-            assert_eq!(
-                dense_norm_convention(true, false),
-                MtpNormConvention::MeanHeuristic
-            );
-            assert_eq!(
-                dense_norm_convention(false, true),
-                MtpNormConvention::MeanHeuristic
+                norms(&load_dense_at(tmp.path(), true).expect("tête")),
+                UNIT_OFFSET
             );
         }
 
