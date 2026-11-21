@@ -43,8 +43,8 @@ impl MtpLoadContext<'_> {
 /// Convention de stockage des normes de la tête.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MtpNormConvention {
-    /// Sidecars 27B (mlx-community, OptiQ) : décalage détecté par la moyenne,
-    /// chemin historique conservé tel quel.
+    /// Sidecars 27B à clés nues (mlx-community, OptiQ) : décalage détecté par
+    /// la moyenne, chemin historique conservé tel quel.
     MeanHeuristic,
     /// Checkpoint transformers officiel Qwen3.5/3.6 : chaque `RMSNorm` applique
     /// `1 + weight`, quelle que soit la moyenne stockée (une norme finale
@@ -133,7 +133,22 @@ impl MtpHead {
             resolve.contains_key(MTP_DENSE_MARKER),
             resolve.contains_key(MTP_MOE_MARKER),
         ) {
-            (true, false) => Self::dense_from_tensors(&sidecar, &resolve, config, &dims, context),
+            (true, false) => {
+                // Clés `mtp.*` = disposition transformers (shard du tronc, THX-02) :
+                // normes stockées centrées sur zéro, `1 + weight` comme `sanitize`
+                // de mlx-vlm. L'heuristique de moyenne y manquait q_norm, k_norm et
+                // la norme finale (moyennes 0,78 à 1,25) : acceptation BF16 basse.
+                let hf_layout = resolve
+                    .get("mtp.norm.weight")
+                    .is_some_and(|name| prefixed(name))
+                    && crate::runtime_flags::mtp_hf_norm_offset_enabled();
+                let convention = if hf_layout {
+                    MtpNormConvention::UnitOffset
+                } else {
+                    MtpNormConvention::MeanHeuristic
+                };
+                Self::dense_from_tensors(&sidecar, &resolve, config, &dims, context, convention)
+            }
             (false, true) => {
                 Self::moe_from_tensors(&sidecar, &resolve, config, &dims, context, moe_quant)
             }
@@ -154,8 +169,9 @@ impl MtpHead {
         config: &CausalDecoderConfig,
         dims: &MtpDims,
         context: &MtpLoadContext<'_>,
+        convention: MtpNormConvention,
     ) -> Result<Self> {
-        let norms = MtpNorms::load(st, resolve, MtpNormConvention::MeanHeuristic)?;
+        let norms = MtpNorms::load(st, resolve, convention)?;
         let fc = load_mtp_linear(st, resolve, "mtp.fc", context)?;
         let attention = mtp_attention(
             [
@@ -1640,6 +1656,59 @@ mod tests {
             assert_eq!(head.norm.data()[0], 2.875);
             let q_norm = head.layer.attention.q_norm.as_ref().map(|n| n.data()[0]);
             assert_eq!(q_norm, Some(1.625));
+        }
+
+        /// Tête dense : la tête MoE sans ses experts, MLP dense à la place.
+        fn dense_tensors(prefix: &str) -> Vec<(String, Raw)> {
+            let mut out: Vec<(String, Raw)> = moe_tensors()
+                .into_iter()
+                .filter(|(name, _)| !name.contains(".mlp."))
+                .collect();
+            for name in ["gate_proj", "up_proj"] {
+                out.push((
+                    format!("mtp.layers.0.mlp.{name}.weight"),
+                    tensor(&[I, H], ramp),
+                ));
+            }
+            out.push((
+                "mtp.layers.0.mlp.down_proj.weight".into(),
+                tensor(&[H, I], ramp),
+            ));
+            out.into_iter()
+                .map(|(name, raw)| (name.replacen("mtp.", prefix, 1), raw))
+                .collect()
+        }
+
+        fn load_dense(prefix: &str) -> crate::Result<MtpHead> {
+            let tmp = write_sidecar(&f32_typed(&dense_tensors(prefix)));
+            let config = CausalDecoderConfig {
+                num_experts: None,
+                ..moe_config(Some(16), E)
+            };
+            MtpHead::from_sidecar_with(
+                tmp.path(),
+                &config,
+                H,
+                &MtpLoadContext::cpu(),
+                MtpMoeQuant::Dense,
+            )
+        }
+
+        #[test]
+        fn dense_transformers_layout_norms_get_unit_offset() {
+            // Clés `mtp.*` (tête embarquée du 27B BF16) : `1 + weight` partout,
+            // y compris la norme finale stockée à 1,875 que la moyenne manquait.
+            let head = load_dense("mtp.").expect("invariant: tête dense");
+            assert_eq!(head.pre_fc_norm_embedding.data()[0], 1.25);
+            assert_eq!(head.norm.data()[0], 2.875);
+            let q_norm = head.layer.attention.q_norm.as_ref().map(|n| n.data()[0]);
+            assert_eq!(q_norm, Some(1.625));
+            // Clés nues (sidecar mlx) : heuristique de moyenne inchangée.
+            let head = load_dense("").expect("invariant: tête dense nue");
+            assert_eq!(head.pre_fc_norm_embedding.data()[0], 1.25);
+            assert_eq!(head.norm.data()[0], 1.875);
+            let q_norm = head.layer.attention.q_norm.as_ref().map(|n| n.data()[0]);
+            assert_eq!(q_norm, Some(0.625));
         }
 
         #[test]
