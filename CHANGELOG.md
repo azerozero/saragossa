@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.25](https://github.com/azerozero/saragossa/compare/v0.3.24...v0.3.25) - 2026-11-21
+
+### Other
+
+- *(metal)* identité au bit du qmv bf16 en lignes pour 5, 7 et 8 lignes
+- *(dflash)* arbre B = 4 par défaut en greedy sur cible bf16 dense
+- *(metal)* qmv bf16 en lignes à une ligne de poids par simdgroup jusqu'à 8 lignes
+
 ## [0.3.24](https://github.com/azerozero/saragossa/compare/v0.3.23...v0.3.24) - 2026-11-20
 
 ### Other
