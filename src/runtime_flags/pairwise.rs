@@ -201,7 +201,10 @@ mod tests {
         assert!(adaptive_fresh.fresh());
         {
             let _guard = Guard::set(adaptive_fresh, false)?;
-            assert!(crate::runtime_flags::mtp_adaptive_depth_enabled());
+            assert_eq!(
+                crate::runtime_flags::mtp_adaptive_depth_override(),
+                Some(true)
+            );
             assert!(crate::runtime_flags::mtp_fresh_cache_enabled());
         }
         assert!(Case {

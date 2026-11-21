@@ -597,16 +597,6 @@ pub(crate) fn mtp_gpu_block_enabled() -> bool {
     false
 }
 
-/// Active la profondeur de draft MTP **adaptative** (GammaTune-style).
-///
-/// **Défaut ON depuis le 2026-10-15** (`SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0` pour
-/// revenir à la profondeur fixe `SARAGOSSA_RUST_MTP_MAX_DRAFT`) ; avec le cache
-/// fresh c'est la configuration PW04 de la campagne pairwise, cf.
-/// [`mtp_fresh_cache_enabled`]. Activé, la profondeur est choisie PAR PAS entre 1 et le
-/// plafond `SARAGOSSA_RUST_MTP_MAX_DRAFT` selon une EMA de la deep-acceptance récente
-/// (cf. `decoder::mtp_adaptive`). La séquence générée reste byte-identique
-/// (le vérifieur trunk exact décide *lesquels* des tokens proposés sont acceptés,
-/// pas *combien* on en propose).
 /// Drafts par pas du lookup n-grammes (`decoder::lookup`), 0 = désactivé.
 /// `SARAGOSSA_RUST_MTP_LOOKUP_DRAFT=n` force la valeur, bornée à 15 (16 lignes de
 /// vérification au plus). Sans variable : 8 quand l'historique MTP reste committed
@@ -641,16 +631,74 @@ pub(super) fn mtp_lookup_draft_tokens() -> usize {
     0
 }
 
-pub(super) fn mtp_adaptive_depth_enabled() -> bool {
+/// Profondeur de draft MTP **adaptative** (GammaTune-style) : choisie PAR PAS
+/// entre 1 et le plafond `SARAGOSSA_RUST_MTP_MAX_DRAFT` selon une EMA de la
+/// deep-acceptance récente (cf. `decoder::mtp_adaptive`). La séquence générée
+/// reste identique au bit : le vérifieur exact décide *lesquels* des tokens
+/// proposés sont acceptés, pas *combien* on en propose.
+///
+/// Rend le choix explicite (pairwise, réglage de test, puis
+/// `SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=0|1`) ; `None` laisse le défaut à
+/// `decoder::generation` : profondeur fixe en greedy dense avec historique
+/// committed, adaptatif ailleurs (cache fresh, PW04 de la campagne pairwise du
+/// 2026-10-15 ; échantillonné et MoE non remesurés).
+///
+/// MESURE (2026-11-21, ABBA 2×2, serve, Qwen3.8-27B, prompts 512/4096/16384,
+/// 256 tokens greedy, historique committed) : profondeur fixe 2 contre
+/// l'adaptatif plafonné à 2, qui reste presque toujours en D1 : +3,7/+4,8/+4,5 %
+/// en 4 bits, sorties identiques au bit.
+pub(super) fn mtp_adaptive_depth_override() -> Option<bool> {
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     if let Some(case) = pairwise::current() {
-        return matches!(
+        return Some(matches!(
             case.mode,
             pairwise::Mode::Adaptive | pairwise::Mode::AdaptiveFresh
-        );
+        ));
     }
+    #[cfg(test)]
+    if let Some(forced) = MTP_ADAPTIVE_DEPTH_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return Some(forced);
+    }
+    static ENABLED: OnceLock<Option<bool>> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env_var("SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH").and_then(|value| env_flag_value(&value))
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static MTP_ADAPTIVE_DEPTH_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Profondeur MTP fixe sur ce thread le temps de `run` : adaptatif et lookup
+/// coupés (oracles de profondeur).
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+pub(crate) fn with_mtp_fixed_depth_override<R>(run: impl FnOnce() -> R) -> R {
+    /// Rétablit les réglages précédents, panique comprise.
+    struct Restore(Option<bool>, Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MTP_ADAPTIVE_DEPTH_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+            MTP_LOOKUP_DRAFT_TEST_OVERRIDE.with(|cell| cell.set(self.1));
+        }
+    }
+    let _restore = Restore(
+        MTP_ADAPTIVE_DEPTH_TEST_OVERRIDE.with(|cell| cell.replace(Some(false))),
+        MTP_LOOKUP_DRAFT_TEST_OVERRIDE.with(|cell| cell.replace(Some(0))),
+    );
+    run()
+}
+
+/// Tête de draft MTP u4 gs64 quantifiée au chargement depuis un lm_head bf16
+/// (`decoder::mtp::quantize_draft_lm_head_u4`). Défaut ON ;
+/// `SARAGOSSA_RUST_MTP_DRAFT_LM_HEAD_U4=0` garde le lm_head bf16 du tronc.
+///
+/// MESURE (2026-11-21, ABBA 2×2, serve, Qwen3.8-27B BF16, D2 fixe) : +6,9/+4,4/
+/// +3,3 % à 512/4096/16384 tokens de prompt, sorties identiques au bit.
+pub(crate) fn mtp_draft_lm_head_u4_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH", true))
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_DRAFT_LM_HEAD_U4", true))
 }
 
 /// Lissage EMA (`alpha`) de la deep-acceptance MTP adaptative. Défaut 0,3, borné

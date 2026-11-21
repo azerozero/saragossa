@@ -23,6 +23,29 @@ elle-même ; sur un long prompt l'historique lui rend du contexte et relève
 l'acceptance en position 2. `SARAGOSSA_RUST_MTP_FRESH_MAX_PROMPT=0` force le
 committed partout ; `SARAGOSSA_RUST_MTP_FRESH_CACHE=0` reste prioritaire.
 
+Depuis le 2026-11-21, le greedy dense avec historique committed garde la
+profondeur fixe 2 (cycle D2 fusionné) au lieu de l'adaptatif, qui y restait en
+D1 sur 70 à 80 % des pas ; le cache fresh, l'échantillonné et le MoE restent
+adaptatifs. Sur une cible bf16, les drafts lisent une tête u4 gs64 quantifiée au
+chargement depuis le lm_head (0,64 Go au lieu de 2,5 Go sur le 27B), la
+vérification restant faite en bf16 (sans objet en 4 bits, où le lm_head est
+déjà quantifié). ABBA 2×2 en serve, Qwen3.8-27B, 256 tokens
+greedy, médianes en tok/s, md5 identiques à l'AR dans tous les bras :
+
+| Modèle | Prompt | main | D2 fixe | D2 fixe + tête u4 |
+|---|---:|---:|---:|---:|
+| 4 bits | 512 | 51,5 | 53,4 (+3,7 %) | sans objet |
+| 4 bits | 4096 | 49,3 | 51,7 (+4,8 %) | sans objet |
+| 4 bits | 16384 | 43,6 | 45,6 (+4,5 %) | sans objet |
+| BF16 | 512 | 15,8 | 16,6 (+5,1 %) | 17,8 (+12,3 %) |
+| BF16 | 4096 | 16,0 | 16,9 (+5,8 %) | 17,7 (+10,5 %) |
+| BF16 | 16384 | 14,4 | 14,6 (+0,9 %) | 15,0 (+4,3 %) |
+
+D3 fixe (cycle fusionné généralisé, mesuré puis retiré) : +1,8/+5,7/+5,8 % en
+4 bits, soit moins de 3 % au-dessus de D2 ; en BF16, −5 % sous D2 ; D4 perd
+partout. Retours : `SARAGOSSA_RUST_MTP_ADAPTIVE_DEPTH=1` et
+`SARAGOSSA_RUST_MTP_DRAFT_LM_HEAD_U4=0`.
+
 ## Protocole
 
 - 19 configurations effectives, chacune sur trois entrées : T0 (26 tokens),

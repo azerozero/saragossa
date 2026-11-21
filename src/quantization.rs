@@ -1032,7 +1032,7 @@ pub(crate) fn bf16_bits(value: f32) -> u16 {
 }
 
 /// Erreur cumulée d'une quantification : `Σ(w − dq)²` et `Σw²`, en f64.
-#[cfg(feature = "devtools")]
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct QuantError {
     pub(crate) sum_sq_err: f64,
@@ -1072,7 +1072,8 @@ impl QuantError {
 /// multiple de `group_size`, si une ligne ne tombe pas sur une frontière de
 /// `u32`, si les tranches ont une mauvaise taille ou si une valeur n'est pas
 /// finie.
-#[cfg(feature = "devtools")]
+// NOTE: aussi hors `devtools` : la tête de draft MTP u4 la quantifie au chargement.
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 pub(crate) fn quantize_affine_bitstream_bf16(
     data: &[f32],
     cols: usize,
@@ -1159,7 +1160,7 @@ pub(crate) fn quantize_affine_bitstream_bf16(
 /// Le biais est arrondi **vers −∞** (`bias ≤ min`) et la scale **vers +∞**
 /// jusqu'à couvrir `max` (`bias + levels·scale ≥ max`) : aucun code n'est alors
 /// écrêté et l'erreur reste bornée par un demi-pas de la scale sérialisée.
-#[cfg(feature = "devtools")]
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 pub(crate) fn affine_params_bf16(min: f32, max: f32, levels: f32) -> Result<(u16, u16)> {
     let mut bias_bits = bf16_bits(min);
     if bf16_value(bias_bits) > min {
@@ -1184,13 +1185,13 @@ pub(crate) fn affine_params_bf16(min: f32, max: f32, levels: f32) -> Result<(u16
     Ok((scale_bits, bias_bits))
 }
 
-#[cfg(feature = "devtools")]
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 pub(crate) fn bf16_value(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
 /// bf16 immédiatement inférieur (vers −∞) à une valeur finie.
-#[cfg(feature = "devtools")]
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 fn bf16_step_down(bits: u16) -> u16 {
     match bits {
         // +0 → plus petit sous-normal négatif.
@@ -1201,7 +1202,7 @@ fn bf16_step_down(bits: u16) -> u16 {
 }
 
 /// bf16 immédiatement supérieur d'une scale strictement positive et finie.
-#[cfg(feature = "devtools")]
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 fn bf16_step_up_positive(bits: u16) -> u16 {
     bits + 1
 }

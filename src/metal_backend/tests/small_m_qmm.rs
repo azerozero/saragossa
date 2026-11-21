@@ -54,7 +54,13 @@ fn small_m_qmm_microbench() -> Result<()> {
                 .map(|_| ())
         })?;
         eprintln!("{label} ({:.0} MB u4)", bytes / 1e6);
-        for m in widths {
+        // Hors portée puis sous portée de vérification greedy (choix des
+        // vérifications MTP et DFlash greedy ; strict selon l'environnement).
+        for (strict, m) in [false, true]
+            .into_iter()
+            .flat_map(|strict| widths.into_iter().map(move |m| (strict, m)))
+        {
+            let _greedy = super::install_verify_greedy_scope(strict);
             let kernel = executor.select_owned_affine_matmul_kernel(m, in_dim, &affine, false);
             let lhs_buf = executor.upload_f32_buffer(&lhs_all[..m * in_dim], "small_m_lhs")?;
             let out = executor.uncached_f32_buffer(m * out_dim, "small_m_out")?;
@@ -64,7 +70,8 @@ fn small_m_qmm_microbench() -> Result<()> {
                     .map(|_| ())
             })?;
             eprintln!(
-                "  M={m:>2} {kernel:<22?} {ms:>7.3} ms  {:>6.0} GB/s  | rembourré à 16 : {m16:.3} ms ({:.2}x)",
+                "  greedy={} M={m:>2} {kernel:<22?} {ms:>7.3} ms  {:>6.0} GB/s  | rembourré à 16 : {m16:.3} ms ({:.2}x)",
+                u8::from(strict),
                 bytes / (ms / 1000.0) / 1e9,
                 ms / m16,
             );
