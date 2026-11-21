@@ -1426,6 +1426,116 @@ fn infer_mtp_affine_layout(
     Ok((bits, cols / groups))
 }
 
+/// Fixtures de `quantize_draft_lm_head_u4` : lm_head bf16 partagé Metal (le seul
+/// usage du Metal est le stockage ; la quantification est calculée sur CPU).
+#[cfg(all(test, target_os = "macos", feature = "metal"))]
+mod draft_head_u4_tests {
+    use super::quantize_draft_lm_head_u4;
+    use crate::{DenseBf16Tensor, Linear, LinearWeight, Tensor};
+
+    fn bf16_head(rows: usize, cols: usize, bias: bool) -> Option<(Linear, Vec<f32>)> {
+        let device = metal::Device::system_default()?;
+        let bits: Vec<u16> = (0..rows * cols)
+            .map(|i| {
+                let x = i as f32;
+                let v = ((x * 0.37).sin() * 3.0 + (x * 0.011).cos())
+                    * if i % 7 == 0 { 0.01 } else { 1.0 };
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let buffer = device.new_buffer_with_data(
+            bits.as_ptr().cast(),
+            (bits.len() * 2) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let weight = DenseBf16Tensor::new(&[rows, cols], buffer).expect("invariant: forme valide");
+        let bias =
+            bias.then(|| Tensor::from_vec(vec![rows], vec![0.0; rows]).expect("invariant: biais"));
+        let values = bits
+            .iter()
+            .map(|&b| f32::from_bits(u32::from(b) << 16))
+            .collect();
+        Some((
+            Linear::from_weight(LinearWeight::DenseBf16(weight), bias).expect("invariant: linear"),
+            values,
+        ))
+    }
+
+    /// 300 lignes : deux blocs de 256 lignes, dont un partiel ; le résultat doit
+    /// être celui d'une quantification en une passe, bit à bit.
+    #[test]
+    fn draft_head_u4_matches_reference_quantizer() {
+        let (rows, cols) = (300, 128);
+        let Some((head, values)) = bf16_head(rows, cols, false) else {
+            return;
+        };
+        let draft = quantize_draft_lm_head_u4(&head)
+            .expect("invariant: quantification valide")
+            .expect("invariant: tête quantifiable");
+        let LinearWeight::AffineQuantized(got) = draft.weight() else {
+            panic!("tête u4 affine attendue");
+        };
+        let groups = cols / 64;
+        let mut packed = vec![0_u32; rows * cols * 4 / 32];
+        let mut scales = vec![0_u16; rows * groups];
+        let mut biases = vec![0_u16; rows * groups];
+        crate::quantization::quantize_affine_bitstream_bf16(
+            &values,
+            cols,
+            64,
+            4,
+            &mut packed,
+            &mut scales,
+            &mut biases,
+        )
+        .expect("invariant: référence valide");
+        let bf16 = |bits: &[u16]| {
+            bits.iter()
+                .map(|&b| f32::from_bits(u32::from(b) << 16))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(got.packed_data(), packed.as_slice());
+        assert_eq!(got.scales_f32().as_ref(), bf16(&scales).as_slice());
+        assert_eq!(got.biases_f32().as_ref(), bf16(&biases).as_slice());
+        // Aller-retour : erreur bornée par le demi-pas de la scale bf16.
+        let restored = got
+            .dequantize()
+            .expect("invariant: déquantification valide");
+        for (idx, (&w, &r)) in values.iter().zip(restored.data()).enumerate() {
+            let scale = f32::from_bits(u32::from(scales[idx / 64]) << 16);
+            assert!(
+                (w - r).abs() <= scale * 0.5 + scale * 1.0e-2 + 1.0e-6,
+                "idx={idx} w={w} r={r}"
+            );
+        }
+    }
+
+    /// Hors contrat (cols non multiple de 64, biais, poids non bf16) : la tête
+    /// du tronc reste utilisée, sans erreur.
+    #[test]
+    fn draft_head_u4_declines_outside_contract() {
+        // 96 colonnes : 96 * 4 % 32 == 0 mais 96 % 64 != 0.
+        if let Some((head, _)) = bf16_head(4, 96, false) {
+            assert!(quantize_draft_lm_head_u4(&head)
+                .expect("invariant: pas d'erreur")
+                .is_none());
+        }
+        if let Some((head, _)) = bf16_head(4, 128, true) {
+            assert!(quantize_draft_lm_head_u4(&head)
+                .expect("invariant: pas d'erreur")
+                .is_none());
+        }
+        let dense = Linear::new(
+            Tensor::from_vec(vec![2, 64], vec![0.5; 128]).expect("invariant: poids"),
+            None,
+        )
+        .expect("invariant: linear");
+        assert!(quantize_draft_lm_head_u4(&dense)
+            .expect("invariant: pas d'erreur")
+            .is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{concat_rows, infer_mtp_affine_layout, normalize_mtp_sidecar_key};

@@ -3920,6 +3920,61 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
     Ok(())
 }
 
+/// Défaut greedy sur cible dense BF16 : l'entrée publique (sans
+/// `SARAGOSSA_RUST_DFLASH_TREE`) vérifie un arbre B = 4 et sort exactement les
+/// tokens de l'AR. Requiert une cible BF16 (`SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`)
+/// et `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`.
+#[test]
+#[ignore = "modèle réel BF16 + draft DFlash requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_default_tree_b4_bf16_matches_ar_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none()
+        || crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_TREE").is_some()
+    {
+        eprintln!("skip DFlash B=4 : drafter absent ou SARAGOSSA_RUST_DFLASH_TREE posée");
+        return Ok(());
+    }
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    // Chargement de `serve` : poids créés directement en Metal (MLP bf16 gardés).
+    let executor = crate::MetalExecutor::new_with_kernel_profile(
+        crate::KernelProfile::for_model_dir(&assets.model_dir),
+    )?;
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)?
+        .with_metal_executor(executor)?
+        .with_dflash_draft_from_env(&assets.config)?;
+    let draft = model
+        .dflash_draft()
+        .ok_or_else(|| InferError::Config("drafter DFlash non chargé".to_string()))?
+        .clone();
+    assert!(model.dense_bf16_mlp(), "le test exige une cible dense BF16");
+    assert_eq!(
+        crate::runtime_flags::dflash_tree_default_budget(true, true),
+        4,
+        "défaut greedy BF16 : B = 4 (hors mode strict)"
+    );
+    let options = mtp_verifier_options(Vec::new());
+    for text in [
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+        "Raconte en quelques phrases l'histoire d'un phare isolé sur une côte bretonne.",
+    ] {
+        let prompt = mtp_verifier_prompt_ids(&assets, text)?;
+        let ar = model.generate_greedy_cached_with_options(&prompt, 64, &options)?;
+        let spec = model.generate_greedy_dflash_resident_with_options(
+            &prompt,
+            64,
+            &options,
+            &draft,
+            draft.info.block_size,
+        )?;
+        assert!(spec.stats.verifications > 0 && spec.stats.accepted > 0);
+        assert_eq!(spec.tokens, ar, "DFlash arbre B=4 diverge de l'AR");
+    }
+    Ok(())
+}
+
 // --- DFlash : boucle résidente contre boucle CPU (GPU + modèle réel + draft) ---
 
 /// Oracle de la boucle DFlash résidente : mêmes tokens que la boucle CPU et que
@@ -6586,6 +6641,60 @@ fn mtp_fixed_depths_match_ar_synthetic() -> Result<()> {
             );
             assert!(output.stats.rejected > 0, "D{depth} : aucun rejet");
         }
+        Ok(())
+    })
+}
+
+/// Profondeur fixe 2 avec tête de draft u4 tirée du lm_head bf16 du tronc
+/// (`quantize_draft_lm_head_u4`, défaut des cibles bf16) : la vérification reste
+/// faite par le lm_head bf16, la sortie greedy est donc celle de l'AR.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_d2_u4_draft_head_matches_ar_synthetic() -> Result<()> {
+    assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
+    let (mut model, prompt) = mtp_sign_synthetic_model()?;
+    let device = metal::Device::system_default()
+        .ok_or_else(|| InferError::Config("device Metal absent".into()))?;
+    // Tête bf16 du tronc : même motif de signes que la fixture, plus un bruit
+    // hors des colonnes vues par la norme, pour que la quantification u4 arrondisse.
+    let (hidden, vocab) = (model.final_norm.len(), 97);
+    let mut head = vec![0.0_f32; vocab * hidden];
+    for (i, value) in head.iter_mut().enumerate().skip(3 * hidden) {
+        *value = ((i * 7919) % 1009) as f32 / 1009.0 - 0.5;
+    }
+    head[0] = 1.0;
+    head[hidden] = -1.0;
+    head[2 * hidden + 1] = -1.0;
+    let bits: Vec<u16> = head.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+    let buffer = device.new_buffer_with_data(
+        bits.as_ptr().cast(),
+        (bits.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    model.lm_head = Linear::from_weight(
+        crate::LinearWeight::DenseBf16(crate::DenseBf16Tensor::new(&[vocab, hidden], buffer)?),
+        None,
+    )?;
+    model.mtp_draft_lm_head = Some(
+        mtp::quantize_draft_lm_head_u4(&model.lm_head)?
+            .ok_or_else(|| InferError::Config("tête u4 refusée".into()))?,
+    );
+    let options = GenerationOptions::default();
+    crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || -> Result<()> {
+        model.clear_prefix_cache();
+        let ar = model.generate_greedy_cached_with_options(&prompt, 48, &options)?;
+        assert_eq!(ar.len(), 48);
+        model.clear_prefix_cache();
+        let output = crate::runtime_flags::with_mtp_fixed_depth_override(|| {
+            model.generate_greedy_mtp_batched_with_options(&prompt, 48, &options, 2)
+        })?;
+        eprintln!(
+            "D2 u4 : proposés={:?} acceptés={:?}",
+            output.stats.proposed_by_position, output.stats.accepted_by_position
+        );
+        assert_eq!(output.tokens, ar, "D2 + tête u4 diverge de l'AR");
+        assert!(output.stats.accepted > 0, "aucun draft accepté");
         Ok(())
     })
 }
