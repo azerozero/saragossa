@@ -17,13 +17,21 @@ from chat_kl import PROMPTS
 from opt_quant import validate_weight
 
 
+def reserved_prompts():
+    """PROMPTS de chat_kl.py et ensembles figés sélection/validation (sets/*.json)."""
+    reserved = list(PROMPTS)
+    for path in sorted((Path(__file__).resolve().parent / "sets").glob("*.json")):
+        reserved += [p["prompt"] for p in json.loads(path.read_text(encoding="utf-8"))["prompts"]]
+    return reserved
+
+
 def reject_eval_text(text):
     """Refuse les prompts réservés, y compris casse, espaces et ponctuation modifiés."""
     def normalize(value):
         return "".join(c for c in unicodedata.normalize("NFKC", value).casefold() if c.isalnum())
     normalized = normalize(text)
-    if any(normalize(prompt) in normalized for prompt in PROMPTS):
-        raise ValueError("calibration contaminée par un PROMPT réservé de chat_kl.py")
+    if any(normalize(prompt) in normalized for prompt in reserved_prompts()):
+        raise ValueError("calibration contaminée par un prompt réservé (chat_kl.py ou sets/)")
 
 
 def calibration_chunks(tokenizer, text, samples=128, length=512, chat=False):
@@ -176,6 +184,12 @@ def _self_check():
         except ValueError:
             pass
     reject_eval_text("Un corpus indépendant sur la botanique et la mécanique.")
+    for prompt in reserved_prompts()[len(PROMPTS):]:
+        try:
+            reject_eval_text("x " + prompt + " y")
+            raise AssertionError("prompt d'un ensemble figé accepté")
+        except ValueError:
+            pass
     class Tokenizer:
         def encode(self, text, **kwargs):
             return list(text)

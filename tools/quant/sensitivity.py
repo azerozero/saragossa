@@ -82,6 +82,15 @@ def allocate(scores, sizes, total_params, fixed_bits, target_bpw, forced=(), hig
     return assignment, used / total_params
 
 
+def weight_space_score(errors, energy, size):
+    """Erreurs absolues ‖ΔW‖² d'un module → size · ‖ΔW‖² / ‖W‖²."""
+    if not math.isfinite(energy) or energy < 0:
+        raise ValueError("énergie de poids invalide")
+    if energy == 0:
+        return dict.fromkeys(errors, 0.0)
+    return {bits: size * error / energy for bits, error in errors.items()}
+
+
 def scan(model, matrix, force_high, target_bpw, high_bits, imatrix_blend=False, base_bits=4):
     """Score le fit réellement utilisé par convert_ls, par blocs pour borner la mémoire."""
     if imatrix_blend and matrix is None:
@@ -108,8 +117,11 @@ def scan(model, matrix, force_high, target_bpw, high_bits, imatrix_blend=False, 
         rows = module.weight.reshape(-1, columns)
         blend = imatrix_blend and importance is not None
         errors = dict.fromkeys(WIDTHS, 0.0)
+        energy = 0.0
         for start in range(0, rows.shape[0], 256):
             block = rows[start:start + 256]
+            if matrix is None:
+                energy += (block.astype(mx.float32) ** 2).sum().item()
             mass = opt_quant.error_mass(block, importance, blend)
             # L'entrée one-hot choisit une ligne avec probabilité 1/vocab.
             # Le dénominateur est celui de la table entière, jamais du bloc.
@@ -120,16 +132,21 @@ def scan(model, matrix, force_high, target_bpw, high_bits, imatrix_blend=False, 
                     block, bits=bits, weight=importance, imatrix_blend=blend)
                 errors[bits] += rmse.item() ** 2 * mass
                 del packed, scales, biases, rmse
+        if matrix is None:
+            # Sans corpus : erreur relative ‖ΔW‖²/‖W‖² pondérée par la taille,
+            # soit l'objectif additif du classement rel_err historique.
+            errors = weight_space_score(errors, energy, sizes[name])
         scores[name] = errors
         mx.clear_cache()
         print(f"score {name} : {errors}", flush=True)
     assignment, bpw = allocate(scores, sizes, total, fixed, target_bpw, forced, high_bits, base_bits)
-    report = dict(target_bpw=target_bpw, actual_bpw=bpw, total_parameters=total,
+    report = dict(allocation="imatrix" if matrix is not None else "weights", target_bpw=target_bpw, actual_bpw=bpw, total_parameters=total,
                   fixed_bits=fixed, scores=scores, sizes=sizes, assignment=assignment,
                   forced=sorted(forced), pinned_bits=high_bits, base_bits=base_bits,
                   widths=list(WIDTHS), imatrix_blend=imatrix_blend,
-                  metric=("sum E[x²] * sqrt(mean_row(W²) + W_ij²) * (W_quant-W)²"
-                          if imatrix_blend else "sum E[x²] * (W_quant-W)²"),
+                  metric=("sum E[x²] * sqrt(mean_row(W²) + W_ij²) * (W_quant-W)²" if imatrix_blend
+                          else "sum E[x²] * (W_quant-W)²" if matrix is not None
+                          else "size * sum (W_quant-W)² / sum W², fit LS uniforme"),
                   embedding_metric="sum (W_quant-W)² / vocab; fréquence uniforme")
     return assignment, report
 
@@ -191,6 +208,10 @@ def _self_check():
         raise AssertionError("trio incomplet accepté")
     except ValueError:
         pass
+    # Score poids : invariance d'échelle d'un module, et module nul sans gain.
+    a = weight_space_score({3: 4.0, 4: 1.0}, 8.0, 64)
+    assert a == {3: 32.0, 4: 8.0} and a == weight_space_score({3: 400.0, 4: 100.0}, 800.0, 64)
+    assert weight_space_score({3: 0.0}, 0.0, 64) == {3: 0.0}
     assert "mlx.core" not in sys.modules
 
 

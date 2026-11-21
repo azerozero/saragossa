@@ -200,7 +200,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="largeur de départ avec --target-bpw (défaut 4)")
     parser.add_argument("--high-bits", type=int, default=None, help="largeur haute (défaut 4 ; 6 avec --target-bpw)")
     parser.add_argument("--target-bpw", type=float, help="budget langage réel, allocation 3/4/5/6/8 gs64")
-    parser.add_argument("--imatrix", type=Path, help="E[x²] par colonne, requise avec --target-bpw")
+    parser.add_argument("--imatrix", type=Path,
+                        help="E[x²] par colonne ; sans elle, --target-bpw classe en espace des poids")
     parser.add_argument("--imatrix-blend", action="store_true",
                         help="pondérer E[x²] par sqrt(moyenne_ligne(W²) + W_ij²) pendant le fit")
     parser.add_argument(
@@ -254,8 +255,10 @@ def validate(args: argparse.Namespace) -> None:
                 or args.base_bits > args.high_bits or args.group_size != 64):
             raise SystemExit("--target-bpw positif et fini, --low-bits égal à --base-bits, "
                              "--base-bits <= --high-bits 5/6/8 et --group-size 64 requis")
-        if args.imatrix is None or not args.imatrix.is_file():
-            raise SystemExit("--target-bpw exige --imatrix FICHIER")
+        if args.imatrix is not None and not args.imatrix.is_file():
+            raise SystemExit(f"imatrix introuvable : {args.imatrix}")
+        if args.imatrix_blend and args.imatrix is None:
+            raise SystemExit("--imatrix-blend exige --imatrix")
     elif args.imatrix is not None or args.imatrix_blend:
         raise SystemExit("--imatrix et --imatrix-blend exigent --target-bpw")
     elif args.base_bits != 4:
@@ -341,7 +344,8 @@ def target_template(args):
     from imatrix import load_bf16
     from sensitivity import scan
 
-    matrix = mx.load(str(args.imatrix))
+    # Sans imatrix : score en espace des poids, sans corpus (sensitivity.weight_space_score).
+    matrix = mx.load(str(args.imatrix)) if args.imatrix is not None else None
     model, _ = load_bf16(args.input)
     config = json.loads((args.input / "config.json").read_text())
     assignment, report = scan(model, matrix, args.force_high, args.target_bpw, args.high_bits,

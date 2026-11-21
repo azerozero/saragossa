@@ -94,10 +94,12 @@ def validate_shapes(shard, base, shape, bits):
 
 
 def convert(src, template, dst, imatrix=None, imatrix_blend=False,
-            block_rows=256, min_free_gib=30, workers=1):
+            block_rows=256, min_free_gib=30, workers=1, uniform_fit=False):
     sources, shards = validate(src, template, dst)
     if imatrix_blend and imatrix is None:
         raise ValueError("--imatrix-blend exige --imatrix")
+    if uniform_fit and imatrix is not None:
+        raise ValueError("--uniform-fit exclut --imatrix")
     if workers <= 0:
         raise ValueError("nombre de processus positif requis")
     if block_rows <= 0 or not math.isfinite(min_free_gib) or min_free_gib < 0:
@@ -105,10 +107,11 @@ def convert(src, template, dst, imatrix=None, imatrix_blend=False,
     config = json.loads((template / "config.json").read_text())
     allocation = template / "allocation.json"
     if allocation.is_file():
-        if imatrix is None:
-            raise ValueError("un template allocation.json exige --imatrix")
         report = json.loads(allocation.read_text())
-        if report.get("imatrix_blend", False) != imatrix_blend:
+        # Les templates antérieurs au score poids n'ont pas de champ « allocation » : imatrix.
+        if imatrix is None and report.get("allocation", "imatrix") == "imatrix" and not uniform_fit:
+            raise ValueError("un template allocation.json imatrix exige --imatrix ou --uniform-fit")
+        if imatrix is not None and report.get("imatrix_blend", False) != imatrix_blend:
             raise ValueError("--imatrix-blend doit correspondre au mode du template allocation.json")
     # Le refus d'une destination existante précède même l'import de MLX.
     import mlx.core as mx
@@ -321,11 +324,13 @@ def main():
     parser.add_argument("--min-free-gib", type=float, default=30, help="réserve disque minimale en Gio")
     parser.add_argument("--imatrix-blend", action="store_true",
                         help="pondérer E[x²] par sqrt(moyenne_ligne(W²) + W_ij²)")
+    parser.add_argument("--uniform-fit", action="store_true",
+                        help="fit uniforme explicite sur un template d'allocation imatrix (ablation E1)")
     args = parser.parse_args()
     if args.imatrix_blend and args.imatrix is None:
         parser.error("--imatrix-blend exige --imatrix")
     convert(args.src, args.template, args.dst, args.imatrix, args.imatrix_blend,
-            args.block_rows, args.min_free_gib, args.workers)
+            args.block_rows, args.min_free_gib, args.workers, args.uniform_fit)
 
 
 if __name__ == "__main__":

@@ -237,6 +237,35 @@ def mlx_checks():
                                          imatrix_blend=blend and name != embed)
                 for suffix, value in zip((".weight", ".scales", ".biases"), expected[:3]):
                     assert mx.array_equal(result[name + suffix], value).item()
+        # Score poids sans corpus : size · ‖ΔW‖²/‖W‖² du fit uniforme, template
+        # rempli sans imatrix ; un template imatrix exige --uniform-fit explicite.
+        assignment, report = sensitivity.scan(model, None, "lm_head", 5.0, 6, base_bits=3)
+        assert report["allocation"] == "weights" and report["actual_bpw"] <= 5.0
+        for name, module in imatrix.language_modules(model).items():
+            w = module.weight.astype(mx.float32)
+            for bits in sensitivity.WIDTHS:
+                p, s, b, _, _ = opt_quant.fit(module.weight, bits=bits)
+                back = mx.dequantize(p, s.astype(mx.float32), b.astype(mx.float32), group_size=64, bits=bits)
+                error = ((back - w) ** 2).sum().item() / (w.shape[0] if name == embed else 1)
+                expected = w.size * error / (w * w).sum().item()
+                assert abs(report["scores"][name][bits] - expected) < 1e-4 * max(expected, 1)
+        template, destination = root / "template-weights", root / "destination-weights"
+        with patch.object(imatrix, "load_bf16", return_value=(model, Tokenizer())):
+            assert mixed_quant.main(["--input", str(source), "--output", str(template), "--target-bpw", "5.0",
+                                     "--base-bits", "3", "--force-high", "lm_head"]) == 0
+        assert json.loads((template / "allocation.json").read_text())["allocation"] == "weights"
+        convert_ls.convert(source, template, destination, min_free_gib=0)
+        imx_template = root / "template-3-4.2-False"
+        try:
+            convert_ls.convert(source, imx_template, root / "uniform", uniform_fit=False)
+            raise AssertionError("template imatrix sans --uniform-fit accepté")
+        except ValueError:
+            pass
+        convert_ls.convert(source, imx_template, root / "uniform", uniform_fit=True, min_free_gib=0)
+        result = mx.load(str(root / "uniform" / "model.safetensors"))
+        expected = opt_quant.fit(original[head + ".weight"], bits=json.loads(
+            (imx_template / "allocation.json").read_text())["assignment"][head])
+        assert mx.array_equal(result[head + ".weight"], expected[0]).item()
         # Répéter le vocabulaire conserve son erreur moyenne ; 272 lignes
         # franchissent la frontière des blocs de 256 du scan.
         model.language_model.model.embed_tokens.weight = mx.tile(original[embed + ".weight"], (17, 1))
