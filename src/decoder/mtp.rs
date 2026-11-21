@@ -1106,6 +1106,70 @@ fn load_mtp_dense_linear(
     )
 }
 
+/// Tête de draft MTP u4 gs64 tirée du lm_head bf16 du tronc, au chargement.
+///
+/// POURQUOI : sur une cible bf16, chaque draft relit le lm_head plein
+/// vocabulaire (2,5 Go sur le 27B) ; en u4 il pèse 0,64 Go. La vérification
+/// reste faite par le lm_head bf16 du tronc : la sortie greedy ne change pas,
+/// seule l'acceptance des drafts peut bouger. `None` hors lm_head bf16 dense
+/// sans biais. Scales et minimums arrondis en bf16 avant le calcul des codes,
+/// comme les poids MLX que lisent les kernels u4.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(super) fn quantize_draft_lm_head_u4(lm_head: &Linear) -> Result<Option<Linear>> {
+    const GROUP: usize = 64;
+    const BITS: usize = 4;
+    const BLOCK_ROWS: usize = 256;
+    let LinearWeight::DenseBf16(weight) = lm_head.weight() else {
+        return Ok(None);
+    };
+    let &[rows, cols] = weight.shape() else {
+        return Ok(None);
+    };
+    if lm_head.bias().is_some() || cols % GROUP != 0 {
+        return Ok(None);
+    }
+    let packed_cols = cols * BITS / 32;
+    let groups = cols / GROUP;
+    let data = weight.data();
+    let mut packed = vec![0_u32; rows * packed_cols];
+    let mut scales = vec![0_u16; rows * groups];
+    let mut biases = vec![0_u16; rows * groups];
+    packed
+        .par_chunks_mut(BLOCK_ROWS * packed_cols)
+        .zip(scales.par_chunks_mut(BLOCK_ROWS * groups))
+        .zip(biases.par_chunks_mut(BLOCK_ROWS * groups))
+        .enumerate()
+        .try_for_each(|(block, ((packed, scales), biases))| -> Result<()> {
+            let start = block * BLOCK_ROWS * cols;
+            let len = packed.len() / packed_cols * cols;
+            let values = data[start..start + len]
+                .iter()
+                .map(|&bits| f32::from_bits(u32::from(bits) << 16))
+                .collect::<Vec<_>>();
+            crate::quantization::quantize_affine_bitstream_bf16(
+                &values, cols, GROUP, BITS, packed, scales, biases,
+            )
+            .map(|_| ())
+        })?;
+    let to_f32 = |bits: Vec<u16>| -> Result<Tensor> {
+        Tensor::from_vec(
+            vec![rows, groups],
+            bits.into_iter()
+                .map(|bits| f32::from_bits(u32::from(bits) << 16))
+                .collect(),
+        )
+    };
+    let quantized = AffineQuantizedTensor::new(
+        &[rows, packed_cols],
+        packed,
+        to_f32(scales)?,
+        to_f32(biases)?,
+        GROUP,
+        BITS,
+    )?;
+    Linear::new_quantized(quantized, None).map(Some)
+}
+
 pub(super) fn load_mtp_draft_lm_head(
     path: impl AsRef<Path>,
     expected_in_dim: usize,

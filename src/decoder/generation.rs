@@ -1696,11 +1696,16 @@ impl CausalDecoder {
         };
         stats.proposed_by_position.resize(draft_headroom, 0);
         stats.accepted_by_position.resize(draft_headroom, 0);
-        // Profondeur de draft adaptative (défaut OFF). Quand OFF, `step_depth`
-        // vaut toujours `max_draft_tokens` → dispatch et sortie strictement
-        // inchangés. Le contrôleur ne décide QUE de la profondeur ; le vérifieur
-        // trunk exact garantit la byte-identité.
-        let adaptive_depth = mtp_adaptive_depth_enabled();
+        // Profondeur de draft adaptative. Quand OFF, `step_depth` vaut toujours
+        // `max_draft_tokens`. Le contrôleur ne décide QUE de la profondeur ; le
+        // vérifieur trunk exact garantit l'identité au bit. Défaut : fixe en
+        // greedy dense avec historique committed (cycle D2 fusionné, mesuré
+        // plus rapide), adaptatif ailleurs (cf. `mtp_adaptive_depth_override`).
+        let adaptive_depth = mtp_adaptive_depth_override().unwrap_or(
+            options.temperature > f32::EPSILON
+                || !use_committed_mtp_history
+                || self.config.num_experts.is_some(),
+        );
         #[cfg(all(target_os = "macos", feature = "metal"))]
         // Les baux D1 et les lignes D2 restent vivants jusqu'au cycle suivant.
         // Seul un repli CPU consomme et matérialise l'état.

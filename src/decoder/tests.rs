@@ -3088,7 +3088,7 @@ fn d1_strict_model() -> Result<(crate::ModelAssets, CausalDecoder)> {
             "test D1 strict : flags MTP/résident absents".to_string(),
         ));
     }
-    if super::flags::mtp_adaptive_depth_enabled() {
+    if super::flags::mtp_adaptive_depth_override() == Some(true) {
         return Err(InferError::Config(
             "test D1 strict : ADAPTIVE_DEPTH off requis".to_string(),
         ));
@@ -6547,8 +6547,78 @@ fn mtp_seed_shared_prefix_keeps_allocations() -> Result<()> {
     Ok(())
 }
 
+/// Profondeurs MTP fixes 1 à 4 (cycle fusionné en D2, chemin général sinon) :
+/// la sortie greedy reste celle de l'AR, avec acceptations à chaque position et
+/// rejets, donc retour arrière du KV MTP exercé à chaque profondeur.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_fixed_depths_match_ar_synthetic() -> Result<()> {
+    assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
+    let (model, prompt) = mtp_sign_synthetic_model()?;
+    let options = GenerationOptions::default();
+    crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || -> Result<()> {
+        model.clear_prefix_cache();
+        let ar = model.generate_greedy_cached_with_options(&prompt, 48, &options)?;
+        assert_eq!(ar.len(), 48);
+        for depth in 1..=4 {
+            model.clear_prefix_cache();
+            let output = crate::runtime_flags::with_mtp_fixed_depth_override(|| {
+                model.generate_greedy_mtp_batched_with_options(&prompt, 48, &options, depth)
+            })?;
+            let accepted = &output.stats.accepted_by_position;
+            eprintln!(
+                "D{depth}: proposés={:?} acceptés={accepted:?}",
+                output.stats.proposed_by_position
+            );
+            assert_eq!(output.tokens, ar, "D{depth} diverge de l'AR");
+            assert!(
+                accepted.iter().take(depth).all(|&count| count > 0),
+                "D{depth} : une position de draft jamais acceptée ({accepted:?})"
+            );
+            assert!(output.stats.rejected > 0, "D{depth} : aucun rejet");
+        }
+        Ok(())
+    })
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
+    mtp_synthetic_model_with(|_| Ok(()))
+}
+
+/// Comme [`mtp_seed_synthetic_model`], logits restreints aux tokens 0 à 2 : la
+/// norme finale ne laisse passer que h₀ et h₁, et le lm_head donne `+h₀` au
+/// token 0, `−h₀` au token 1 et `−h₁` au token 2. Tronc et tête MTP partagent
+/// norme et lm_head mais pas leurs états cachés : le token 2 sort de façon
+/// irrégulière chez l'un ou l'autre. Avec ce poids `−1` (mesuré : `−0,5` et
+/// `−2` ne laissent que des acceptations ou que des rejets), chaque profondeur
+/// 1 à 4 voit des acceptations à toutes les positions et des rejets.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn mtp_sign_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
+    mtp_synthetic_model_with(|weights| {
+        let hidden = weights["norm.weight"].data().len();
+        let vocab = weights["lm_head.weight"].data().len() / hidden;
+        let mut norm = vec![0.0; hidden];
+        norm[0] = 1.0;
+        norm[1] = 1.0;
+        let mut head = vec![0.0; vocab * hidden];
+        head[0] = 1.0;
+        head[hidden] = -1.0;
+        head[2 * hidden + 1] = -1.0;
+        weights.insert("norm.weight".into(), Tensor::from_vec(vec![hidden], norm)?);
+        weights.insert(
+            "lm_head.weight".into(),
+            Tensor::from_vec(vec![vocab, hidden], head)?,
+        );
+        Ok(())
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn mtp_synthetic_model_with(
+    tweak: impl FnOnce(&mut HashMap<String, Tensor>) -> Result<()>,
+) -> Result<(CausalDecoder, Vec<usize>)> {
     const VOCAB: usize = 97;
     const HIDDEN: usize = 64;
     let config = CausalDecoderConfig {
@@ -6561,7 +6631,8 @@ fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
         attn_output_gate: true,
         ..CausalDecoderConfig::default()
     };
-    let weights = resident_bf16_qwen_weights(VOCAB, HIDDEN, config.attn_output_gate)?;
+    let mut weights = resident_bf16_qwen_weights(VOCAB, HIDDEN, config.attn_output_gate)?;
+    tweak(&mut weights)?;
     let mut model = CausalDecoder::from_tensors(weights, config)?;
     let layer = &model.layers[0];
     let AttentionBlock::Full(attention) = &layer.attention else {

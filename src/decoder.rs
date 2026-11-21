@@ -2838,6 +2838,18 @@ impl CausalDecoder {
         }
         self.snapshot_sources.append(sources);
         self.mtp = Some(head);
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if self.mtp_draft_lm_head.is_none() && crate::runtime_flags::mtp_draft_lm_head_u4_enabled()
+        {
+            if let Some(mut draft) = mtp::quantize_draft_lm_head_u4(&self.lm_head)? {
+                if let Some(metal) = self.runtime.metal.as_deref() {
+                    if crate::runtime_flags::single_copy_weights_enabled() {
+                        draft.move_packed_to_metal_shared(metal)?;
+                    }
+                }
+                self.mtp_draft_lm_head = Some(draft);
+            }
+        }
         Ok(self)
     }
 
