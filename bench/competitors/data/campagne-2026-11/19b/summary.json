@@ -1,0 +1,13 @@
+{
+ "entries": 90,
+ "entries_by_status": {
+  "load_failed": 6,
+  "ok": 81,
+  "skipped_after_load_failures": 3
+ },
+ "measures_planned": 270,
+ "measures_ok": 234,
+ "measures_failed": 9,
+ "missing": [],
+ "finished": "2026-11-20T11:55:36+0100"
+}
