@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.31](https://github.com/azerozero/saragossa/compare/v0.3.30...v0.3.31) - 2026-11-21
+
+### Added
+
+- *(convert)* quantification native HF BF16 vers affine u4/u8 gs64
+- *(quant)* fige le protocole de campagne ≤ 4,2 bpw
+- *(dflash)* découverte automatique du drafter, journal du décodage choisi et conseils doctor
+- *(quant)* ajoute GPTQ avec Hessiennes séparées par expert
+- *(quant)* ajoute une base 3 bits à l’allocation imatrix
+- *(quant)* ajoute le 5 bits et le mélange imatrix explicite
+- *(quant)* ajoute la calibration imatrix et le budget 4/6/8
+
+### Fixed
+
+- *(quant)* fixture tokenizer du test tensor_stream, données brutes et conclusion restreinte à D
+- *(convert)* reprise par sha256 des sources, alias language_model.mtp
+- *(dflash)* un drafter découvert au chargement invalide laisse place au candidat suivant
+- *(dflash)* clés requises du loader partagées avec la découverte, conseil doctor limité au dtype bf16
+- *(quant)* fusionne main et recopie le tokenizer source dans gptq
+- *(convert)* tête MTP en u4 regroupée, reprise liée aux poids source, init MLX
+- *(dflash)* checkpoint complet exigé, identité exacte du modèle, repli MTP et conseil doctor limité au BF16 dense
+- *(dflash)* un drafter découvert n'est activé que sur cible dense BF16
+- *(doctor)* retire le dépôt deviné du conseil drafter, note sur la conversion native
+- *(quant)* conserve les destinations à créer
+- *(quant)* borne la mémoire de conversion par blocs
+- *(quant)* convert_ls retrouve les tenseurs d'un module répartis sur plusieurs shards
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/convert-natif
+- *(convert)* fixture modifiée en place plutôt que par un paramètre constant
+- Merge pull request #322 from azerozero/feat/quant-campagne
+- *(quant)* consigne la campagne ≤ 4,2 bpw arrêtée en E0
+- Merge origin/main dans feat/auto-sidecars
+- *(quant)* couvre le score poids et la référence de candidat hors dépôt
+- Merge commit '098aa97' into feat/quant-campagne
+- *(quant)* parallélise les blocs avec une file bornée
+
 ## [0.3.30](https://github.com/azerozero/saragossa/compare/v0.3.29...v0.3.30) - 2026-11-21
 
 ### Fixed
