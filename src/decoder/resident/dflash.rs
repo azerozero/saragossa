@@ -77,10 +77,10 @@ impl DFlashTreeMode {
     /// `SARAGOSSA_RUST_DFLASH_TREE`, l'arbre par défaut retombe sur la chaîne
     /// quand le modèle ne le supporte pas, au lieu d'échouer. `greedy` : requête
     /// à température nulle (le mode strict n'abaisse le défaut qu'en greedy).
-    fn from_env(greedy: bool) -> Result<(Self, bool)> {
+    fn from_env(greedy: bool, dense_bf16: bool) -> Result<(Self, bool)> {
         Self::from_flag(
             crate::runtime_flags::dflash_tree_budget(),
-            crate::runtime_flags::dflash_tree_default_budget(greedy),
+            crate::runtime_flags::dflash_tree_default_budget(greedy, dense_bf16),
         )
     }
 
@@ -255,9 +255,18 @@ impl CausalDecoder {
             options,
             draft,
             max_draft_tokens,
-            DFlashTreeMode::from_env(options.temperature <= f32::EPSILON)?,
+            DFlashTreeMode::from_env(options.temperature <= f32::EPSILON, self.dense_bf16_mlp())?,
             on_token,
         )
+    }
+
+    /// Vrai si un MLP dense de la cible garde ses poids en bf16 (budget d'arbre
+    /// par défaut, cf. `dflash_tree_default_budget`).
+    pub(in crate::decoder) fn dense_bf16_mlp(&self) -> bool {
+        self.layers.iter().any(|layer| {
+            matches!(&layer.mlp, Some(crate::FeedForward::Dense(mlp))
+                if matches!(mlp.projections().0.weight(), crate::LinearWeight::DenseBf16(_)))
+        })
     }
 
     /// Boucle DFlash résidente, vérification en chaîne ou en arbre (`tree`).

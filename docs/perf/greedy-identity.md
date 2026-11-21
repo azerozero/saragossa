@@ -94,6 +94,26 @@ Le strict B = 3 coûte −4 % à 4k et −12 % à 32k face au défaut rapide. Le
 strict B = 8 coûte −29 % et −41 %. Mesures croisées strict B = 8 / B = 3 :
 39,5 / 52,4 à 4k et 30,1 / 45,1 à 32k.
 
+### Arbre DFlash sur cible bf16 dense (21 nov. 2026)
+
+Sur une cible dont le MLP garde ses poids en bf16 dense, le greedy sans
+`SARAGOSSA_RUST_DFLASH_TREE` prend B = 4 (5 lignes vérifiées) au lieu de 8.
+La vérification relit tous les poids bf16 (~54 Go sur le 27B) : elle coûte un
+token AR (~96 ms) tant que le qmv en lignes reste au débit mémoire. Le qmv bf16
+en lignes garde une ligne de poids par simdgroup (NR = 1) jusqu'à 8 lignes
+d'activation, au lieu de 4 ; même arithmétique par couple (ligne, sortie),
+identité vérifiée par `dense_bf16_qmv_stage_rows_matches_stage_bitwise`.
+
+Vérification par tour (27B BF16, serve, 256 tokens, ms) : 3-5 lignes ~101-111,
+6 lignes 113-128, 9 lignes ~220. Avant le passage à NR = 1, 5 lignes coûtaient
+155 ms. Débit (tok/s, prompts 512 / 4096) : B = 3 24,2 / 23,0, B = 4
+25,9 / 24,0, B = 5 25,4 / 22,7, B = 8 15,1 / 15,1.
+
+ABBA (main 0af2102 contre la branche, 2 × 2 passages par bras) : 15,0 → 25,7
+tok/s à 512, 15,2 → 24,5 à 4096 ; 12,6 → 21,9 à 16384 (un passage). Sorties
+identiques en md5 à l'AR aux trois longueurs, MTP compris.
+`SARAGOSSA_RUST_DFLASH_TREE=8` rétablit l'ancien budget.
+
 Le scan gated-delta inverse
 (`SARAGOSSA_RUST_LINEAR_INV_DELTA`, opt-in) reste hors périmètre : la
 vérification en lignes n'a pas de variante inverse.
