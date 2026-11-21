@@ -22,6 +22,8 @@ pub struct DraftResolution {
     pub dir: Option<PathBuf>,
     /// Explication prête à journaliser.
     pub note: String,
+    /// Autres drafters compatibles, à essayer si le chargement de `dir` échoue.
+    pub fallbacks: Vec<PathBuf>,
     /// Vrai si la variable désigne le drafter : DFlash est alors forcé.
     pub forced: bool,
 }
@@ -54,6 +56,7 @@ pub fn resolve_dflash_draft(
                 dir: None,
                 note: format!("DFlash : désactivé par {DFLASH_DRAFT_DIR_ENV}"),
                 forced: true,
+                fallbacks: Vec::new(),
             };
         }
         let dir = PathBuf::from(value);
@@ -64,9 +67,11 @@ pub fn resolve_dflash_draft(
             ),
             dir: Some(dir),
             forced: true,
+            fallbacks: Vec::new(),
         };
     }
     let mut warnings = Vec::new();
+    let mut hf = hf_cache.map_or_else(Vec::new, |cache| find_in_hf_cache(cache, model_dir, target));
     let sibling = model_dir.join(DFLASH_SIBLING_DIR);
     if sibling.is_dir() {
         match check_compatible(target, &sibling) {
@@ -78,16 +83,19 @@ pub fn resolve_dflash_draft(
                     ),
                     dir: Some(sibling),
                     forced: false,
+                    fallbacks: hf,
                 }
             }
             Err(why) => warnings.push(format!("{} ignoré ({why})", sibling.display())),
         }
     }
-    if let Some(hit) = hf_cache.and_then(|cache| find_in_hf_cache(cache, model_dir, target)) {
+    if !hf.is_empty() {
+        let hit = hf.remove(0);
         return DraftResolution {
             note: format!("DFlash : drafter {} (cache Hugging Face)", hit.display()),
             dir: Some(hit),
             forced: false,
+            fallbacks: hf,
         };
     }
     let mut note = format!(
@@ -102,7 +110,32 @@ pub fn resolve_dflash_draft(
         dir: None,
         note,
         forced: false,
+        fallbacks: Vec::new(),
     }
+}
+
+impl DraftResolution {
+    /// Drafters à essayer dans l'ordre : `dir`, puis les repli.
+    pub fn candidates(&self) -> impl Iterator<Item = &Path> {
+        self.dir.iter().chain(&self.fallbacks).map(PathBuf::as_path)
+    }
+}
+
+/// Premier candidat que `load` accepte ; chaque échec est journalisé.
+pub fn first_loadable<'a, T, E: std::fmt::Display>(
+    candidates: impl IntoIterator<Item = &'a Path>,
+    mut load: impl FnMut(&Path) -> Result<T, E>,
+) -> Option<(&'a Path, T)> {
+    candidates.into_iter().find_map(|dir| match load(dir) {
+        Ok(value) => Some((dir, value)),
+        Err(err) => {
+            eprintln!(
+                "saragossa DFlash : drafter {} inutilisable ({err})",
+                dir.display()
+            );
+            None
+        }
+    })
 }
 
 /// Hidden size, couches, vocabulaire : le drafter peut-il servir `target` ?
@@ -170,12 +203,12 @@ fn base_model_name(snapshot: &Path) -> Option<String> {
     Some(entry.rsplit('/').next()?.trim().to_lowercase())
 }
 
-/// Premier snapshot HF (ordre lexicographique) dont le README déclare une base
+/// Snapshots HF compatibles (ordre lexicographique) dont le README déclare une base
 /// identifie le modèle (`Qwen3.8-27B` pour `Qwen3.8-27B-4bit`, pas `-Instruct`).
-fn find_in_hf_cache(cache: &Path, model_dir: &Path, target: &ModelConfig) -> Option<PathBuf> {
+fn find_in_hf_cache(cache: &Path, model_dir: &Path, target: &ModelConfig) -> Vec<PathBuf> {
     let name = model_name(model_dir);
     let mut snapshots = Vec::new();
-    for repo in std::fs::read_dir(cache).ok()?.flatten() {
+    for repo in std::fs::read_dir(cache).into_iter().flatten().flatten() {
         if !repo.file_name().to_string_lossy().starts_with("models--") {
             continue;
         }
@@ -188,8 +221,9 @@ fn find_in_hf_cache(cache: &Path, model_dir: &Path, target: &ModelConfig) -> Opt
         }
     }
     snapshots.sort();
-    snapshots.into_iter().find(|snap| {
+    snapshots.retain(|snap| {
         base_model_name(snap).is_some_and(|base| !base.is_empty() && is_same_model(&name, &base))
             && check_compatible(target, snap).is_ok()
-    })
+    });
+    snapshots
 }

@@ -12,7 +12,7 @@ mod discover;
 mod weights;
 pub use codebook::DFlashCodebook;
 pub use discover::{
-    dflash_beats_mtp, resolve_dflash_draft, DraftResolution, DFLASH_DRAFT_DIR_ENV,
+    dflash_beats_mtp, first_loadable, resolve_dflash_draft, DraftResolution, DFLASH_DRAFT_DIR_ENV,
     DFLASH_SIBLING_DIR, DFLASH_SKIPPED_NOTE,
 };
 use weights::DraftWeights;
@@ -1480,6 +1480,59 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_shape_candidate_falls_through_to_next() {
+        let root = tempfile::tempdir().expect("invariant: tempdir");
+        let tiny = tiny_target_config();
+        // Deux drafters minimaux : le premier (trié avant) a un hidden_norm de forme [1].
+        let mk = |name: &str, norm_dim: usize| {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).expect("invariant: mkdir");
+            std::fs::write(
+                dir.join("config.json"),
+                r#"{"architectures":["DFlashDraftModel"],"hidden_size":4,"num_hidden_layers":1,
+                "num_target_layers":4,"intermediate_size":8,"num_attention_heads":2,
+                "num_key_value_heads":1,"head_dim":2,"rms_norm_eps":0.000001,"rope_theta":10000.0,
+                "sliding_window":8,"layer_types":["sliding_attention"],
+                "dflash_config":{"block_size":4,"mask_token_id":15,"target_layer_ids":[0,2]}}"#,
+            )
+            .expect("invariant: config");
+            let mut t = HashMap::new();
+            insert_f32(&mut t, "hidden_norm.weight", &[norm_dim]);
+            insert_f32(&mut t, "fc.weight", &[4, 8]);
+            insert_f32(&mut t, "layers.0.input_layernorm.weight", &[4]);
+            insert_f32(&mut t, "layers.0.post_attention_layernorm.weight", &[4]);
+            insert_f32(&mut t, "layers.0.self_attn.q_proj.weight", &[4, 4]);
+            insert_f32(&mut t, "layers.0.self_attn.k_proj.weight", &[2, 4]);
+            insert_f32(&mut t, "layers.0.self_attn.v_proj.weight", &[2, 4]);
+            insert_f32(&mut t, "layers.0.self_attn.o_proj.weight", &[4, 4]);
+            insert_f32(&mut t, "layers.0.self_attn.q_norm.weight", &[2]);
+            insert_f32(&mut t, "layers.0.self_attn.k_norm.weight", &[2]);
+            insert_f32(&mut t, "layers.0.mlp.gate_proj.weight", &[8, 4]);
+            insert_f32(&mut t, "layers.0.mlp.up_proj.weight", &[8, 4]);
+            insert_f32(&mut t, "layers.0.mlp.down_proj.weight", &[4, 8]);
+            insert_f32(&mut t, "norm.weight", &[4]);
+            std::fs::write(
+                dir.join("model.safetensors"),
+                serialize(t, None).expect("invariant: serialize"),
+            )
+            .expect("invariant: safetensors");
+            dir
+        };
+        let (bad, good) = (mk("a-bad", 1), mk("b-good", 4));
+        let resolution = DraftResolution {
+            dir: Some(bad.clone()),
+            note: String::new(),
+            forced: false,
+            fallbacks: vec![good.clone()],
+        };
+        let (picked, _) = first_loadable(resolution.candidates(), |dir| {
+            load_dflash_draft_weights_for_target(&tiny, dir)
+        })
+        .expect("invariant: le valide est pris");
+        assert_eq!(picked, good.as_path());
     }
 
     #[test]

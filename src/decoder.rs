@@ -2964,7 +2964,7 @@ impl CausalDecoder {
             hf_cache.as_deref(),
         );
         let dense_bf16 = self.dense_bf16_mlp();
-        match found.dir {
+        match found.dir.clone() {
             Some(_) if !crate::devtools::dflash_beats_mtp(found.forced, dense_bf16) => {
                 eprintln!("saragossa {}", crate::devtools::DFLASH_SKIPPED_NOTE);
                 Ok(self)
@@ -2974,11 +2974,18 @@ impl CausalDecoder {
                 if found.forced {
                     return self.with_dflash_draft_dir(&assets.config, dir);
                 }
-                // Un drafter découvert ne doit jamais bloquer le modèle : repli MTP.
-                if let Err(err) = self.load_dflash_draft_dir(&assets.config, dir) {
-                    eprintln!(
-                        "saragossa DFlash : drafter découvert inutilisable ({err}), repli MTP"
-                    );
+                // Un drafter découvert ne doit jamais bloquer le modèle : essai du
+                // candidat suivant, puis repli MTP.
+                let config = &assets.config;
+                let loaded = crate::devtools::first_loadable(found.candidates(), |dir| {
+                    self.load_dflash_draft_dir(config, dir.to_path_buf())
+                });
+                match loaded {
+                    Some((dir, ())) if Some(dir) != found.dir.as_deref() => {
+                        eprintln!("saragossa DFlash : drafter {} (repli)", dir.display());
+                    }
+                    Some(_) => {}
+                    None => eprintln!("saragossa DFlash : aucun drafter utilisable, repli MTP"),
                 }
                 Ok(self)
             }
