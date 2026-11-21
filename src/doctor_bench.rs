@@ -406,6 +406,8 @@ fn quantize_advice(
     if !dense || !role.starts_with("LLM") || weight_bytes < 4 * 1024 * 1024 * 1024 {
         return None;
     }
+    // NOTE: ce conseil `mlx_lm convert` sera remplacé par `saragossa convert`
+    // (chantier feat/convert-natif).
     Some(format!(
         "modèle non quantifié ({}) : un 4 bits décode plus vite et tient en mémoire : \
          python3 -m mlx_lm convert --hf-path {} --mlx-path {}-4bit -q --q-bits 4 --q-group-size 64",
@@ -425,16 +427,10 @@ fn drafter_advice(path: &Path, name: &str, config: &ModelConfig) -> Option<Strin
     if found.dir.is_some() || env.is_some() {
         return None;
     }
-    let base = name
-        .rsplit_once('-')
-        .filter(|(_, suffix)| {
-            let suffix = suffix.to_ascii_lowercase();
-            suffix.ends_with("bit") || suffix == "bf16"
-        })
-        .map_or(name, |(base, _)| base);
     Some(format!(
         "aucun drafter DFlash : le décodage spéculatif peut gagner 30 à 90 % sur le code : \
-         hf download incoai/{base}-DFlash2 --local-dir {}/{}",
+         poser un drafter DFlash 2 de {name} dans {}/{} (hidden_size, num_target_layers et \
+         vocab_size identiques au modèle)",
         path.display(),
         saragossa::devtools::DFLASH_SIBLING_DIR
     ))
