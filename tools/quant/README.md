@@ -23,6 +23,29 @@ fabriquer des poids, pas à les exécuter.
 | `paired.py` | Différences appariées par prompt, IC 95 % bootstrap, plan factoriel 2×2 |
 | `audit_bytes.py` | bpw langage et total depuis les en-têtes safetensors, refus au-delà d'une limite |
 
+## Conversion native, sans Python
+
+`saragossa convert` fait la même quantification affine gs64 directement depuis
+le checkpoint HF BF16 officiel, sans MLX ni template :
+
+```bash
+saragossa convert Qwen3.8-27B-BF16 Qwen3.8-27B-u4          # u4, moindres carrés
+saragossa convert SRC DST --bits 8                          # u8
+saragossa convert SRC DST --minmax                          # min-max bf16 seul
+saragossa convert SRC DST --keep-8bit self_attn --keep-bf16 lm_head
+```
+
+Contrat des conversions MLX : toute matrice BF16 `.weight` de rang 2 dont la
+largeur est un multiple de 64 est quantifiée, embeddings et `lm_head` compris ;
+normes, `A_log`, `dt_bias`, `conv1d` et tour vision restent bf16 ; routeur MoE
+et `shared_expert_gate` en 8 bits. Les motifs `--keep-*` sont des
+sous-chaînes du nom HF. La tête `mtp.*` est conservée (les conversions
+mlx-community la retirent), toujours en u4 (le loader MTP n'accepte que u4
+ou bf16), et regroupée dans un seul shard : le MTP démarre sans sidecar. Noms et layouts HF bruts conservés, un tenseur lu par blocs de
+~64 Mo, sortie déterministe, reprise par shard refusée si un shard source a changé
+(taille ou sha256) ; `tokenizer.json` est recopié
+à l'octet. Les experts MoE ne sont pas encore pris en charge (refus explicite).
+
 Sans `--imatrix`, `mixed_quant.py --target-bpw` classe en espace des poids
 (taille · ‖ΔW‖²/‖W‖² du fit uniforme, sans corpus). `convert_ls.py --uniform-fit`
 remplit un template imatrix sans pondération. Résultats de la campagne ≤ 4,2 bpw :

@@ -6,12 +6,18 @@
 //! fois, lectures bornées, en-têtes figés avant écriture, reprise par shard de
 //! sortie et par segment n-gram, journal persistant les entrées du manifeste.
 
+mod hf;
+mod least_squares;
 mod ngram;
 mod plan;
 mod rules;
 
 #[cfg(test)]
+mod hf_tests;
+#[cfg(test)]
 mod tests;
+
+pub use self::hf::{convert_hf, HfConvertOptions, HfConvertReport};
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -631,7 +637,7 @@ pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
             .open(&tmp)
             .map_err(|e| io_err(&tmp, e))?;
         file.set_len(size).map_err(|e| io_err(&tmp, e))?;
-        let tensors = write_shard(&source, &inventory, plan, &file, &tmp, &peak)?;
+        let tensors = write_shard(&source, &inventory.experts, plan, &file, &tmp, &peak)?;
         file.sync_all().map_err(|e| io_err(&tmp, e))?;
         drop(file);
         std::fs::rename(&tmp, &path).map_err(|e| io_err(&path, e))?;
