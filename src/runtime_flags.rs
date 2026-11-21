@@ -2349,17 +2349,26 @@ pub(crate) const DFLASH_TREE_DEFAULT_BUDGET: usize = 8;
 #[cfg(feature = "devtools")]
 pub(crate) const DFLASH_TREE_STRICT_DEFAULT_BUDGET: usize = 3;
 
-/// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE` : B = 3 pour une
-/// requête greedy (`greedy`, température nulle) en mode strict, B = 8 sinon
-/// (échantillonné compris, que le mode strict ne touche pas).
+/// Budget de l'arbre DFlash 2 par défaut en greedy quand le MLP de la cible est
+/// en bf16 dense : B = 4. La vérification lit les poids bf16 (~54 Go sur le
+/// 27B) au débit mémoire jusqu'à 5-6 lignes, puis le coût croît vite (27B BF16,
+/// ms par tour : 5 lignes ~105-110, 9 lignes ~220). `SARAGOSSA_RUST_DFLASH_TREE=8`
+/// rétablit l'ancien défaut. Mesures : docs/perf/greedy-identity.md.
 #[cfg(feature = "devtools")]
-pub(crate) fn dflash_tree_default_budget(greedy: bool) -> usize {
+pub(crate) const DFLASH_TREE_BF16_DEFAULT_BUDGET: usize = 4;
+
+/// Budget de l'arbre DFlash 2 sans `SARAGOSSA_RUST_DFLASH_TREE`, pour une requête
+/// greedy (`greedy`, température nulle) : B = 3 en mode strict, B = 4 sur une
+/// cible bf16 dense (`dense_bf16`) ; B = 8 sinon (échantillonné compris).
+#[cfg(feature = "devtools")]
+pub(crate) fn dflash_tree_default_budget(greedy: bool, dense_bf16: bool) -> usize {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     if greedy && verify_strict_enabled() {
         return DFLASH_TREE_STRICT_DEFAULT_BUDGET;
     }
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
-    let _ = greedy;
+    if greedy && dense_bf16 {
+        return DFLASH_TREE_BF16_DEFAULT_BUDGET;
+    }
     DFLASH_TREE_DEFAULT_BUDGET
 }
 

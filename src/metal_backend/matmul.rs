@@ -539,12 +539,13 @@ impl MetalExecutor {
         // fois pour R ≤ 16 lignes au lieu d'une, même arithmétique par ligne.
         let rows = (stage && batch > 1 && crate::runtime_flags::dense_bf16_qmv_rows_enabled())
             .then(|| batch.min(16));
-        // Lignes de poids par simdgroup : 1 jusqu'à 4 lignes d'activation (MTP),
-        // 4 au-delà (DFlash) pour réutiliser chaque activation chargée. Sonde
-        // `dense_bf16_qmv_rows_probe` (27B, gate 17408×5120) : R = 3-4 0,36 ms
-        // en NR = 1 contre 0,41-0,44 en NR = 4 ; R = 9 0,77 ms en NR = 4 contre
-        // 0,94 en NR = 1 et 0,97 relu par ligne ; lm_head R = 9 6,6 contre 13,5 ms.
-        let per_simdgroup = if batch <= 4 { 1 } else { 4 };
+        // Lignes de poids par simdgroup : 1 jusqu'à 8 lignes d'activation, 4 au-delà
+        // pour réutiliser chaque activation chargée. Sonde
+        // `dense_bf16_qmv_rows_variants_probe` (27B, ms, NR = 1 contre NR = 4) :
+        // gate 17408×5120 R = 5 0,36/0,53, R = 6 0,36/0,58, R = 8 0,47/0,76,
+        // R = 9 0,93/0,70 ; down 5120×17408 R = 6 0,49/0,67 ; lm_head R = 6
+        // 4,7/7,5, R = 9 12,1/6,6. M = 1 : gate 0,35, down 0,38, lm_head 4,4.
+        let per_simdgroup = if batch <= 8 { 1 } else { 4 };
         let rows_pipeline = rows
             .map(|r| {
                 self.qmvt_pipeline(&format!(
