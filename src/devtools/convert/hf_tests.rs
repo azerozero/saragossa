@@ -51,13 +51,12 @@ fn values(shape: &[usize], seed: usize) -> Vec<f32> {
 }
 
 fn write_source(dir: &Path) {
-    write_source_with(dir, false, 0, "mtp.");
+    write_source_with(dir, false, "mtp.");
 }
 
-/// `split_mtp` déplace `mtp.norm.weight` dans le premier shard ; `salt`
-/// change les valeurs sans changer noms ni formes ; `mtp` remplace le préfixe
-/// `mtp.` (alias `language_model.mtp.`).
-fn write_source_with(dir: &Path, split_mtp: bool, salt: usize, mtp: &str) {
+/// `split_mtp` déplace `mtp.norm.weight` dans le premier shard ; `mtp`
+/// remplace le préfixe `mtp.` (alias `language_model.mtp.`).
+fn write_source_with(dir: &Path, split_mtp: bool, mtp: &str) {
     let mut weight_map = serde_json::Map::new();
     for (shard, file) in SHARDS.iter().enumerate() {
         let owned: Vec<(String, Vec<usize>, Vec<u8>)> = tensors()
@@ -77,7 +76,7 @@ fn write_source_with(dir: &Path, split_mtp: bool, salt: usize, mtp: &str) {
                     None => name.to_string(),
                 };
                 let name = name.as_str();
-                let bytes = values(&shape, seed + salt)
+                let bytes = values(&shape, seed)
                     .iter()
                     .flat_map(|v| bf16_bits(*v).to_le_bytes())
                     .collect();
@@ -101,6 +100,18 @@ fn write_source_with(dir: &Path, split_mtp: bool, salt: usize, mtp: &str) {
         .expect("invariant: config écrite");
     std::fs::write(dir.join("tokenizer.json"), "{\"pre_tokenizer\":null}\n")
         .expect("invariant: tokenizer écrit");
+}
+
+/// Bascule le bit de poids faible de chaque valeur bf16 (valeurs finies,
+/// en-tête et taille intacts) : mêmes noms et formes, autres poids.
+fn perturb_data(path: &Path) {
+    let mut bytes = std::fs::read(path).expect("invariant: shard source");
+    let header = u64::from_le_bytes(bytes[..8].try_into().expect("invariant: en-tête"));
+    let start = 8 + usize::try_from(header).expect("invariant: en-tête borné");
+    for low in bytes[start..].iter_mut().step_by(2) {
+        *low ^= 1;
+    }
+    std::fs::write(path, bytes).expect("invariant: shard réécrit");
 }
 
 fn options(src: &Path, dst: &Path) -> HfConvertOptions {
@@ -286,7 +297,7 @@ fn mtp_head_is_regrouped_and_stays_u4() {
         let root = tempfile::tempdir().expect("invariant: dossier temporaire");
         let src = root.path().join("src");
         std::fs::create_dir(&src).expect("invariant: src");
-        write_source_with(&src, true, 0, prefix);
+        write_source_with(&src, true, prefix);
         let dst = root.path().join("u8");
         let mut opts = options(&src, &dst);
         opts.bits = 8;
@@ -336,8 +347,8 @@ fn resume_refuses_rewritten_source_weights() {
                 .expect("invariant: date source")
         })
         .collect();
-    write_source_with(&src, false, 1, "mtp.");
     for (file, date) in SHARDS.iter().zip(dates) {
+        perturb_data(&src.join(file));
         std::fs::File::options()
             .write(true)
             .open(src.join(file))
