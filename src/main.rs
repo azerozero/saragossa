@@ -225,7 +225,7 @@ fn run() -> CliResult<()> {
         && !saragossa::devtools::mtp_acceptance_enabled()
         && !saragossa::devtools::dflash_acceptance_enabled()
     {
-        decoder = decoder.with_dflash_draft_from_env(&assets.config)?;
+        decoder = decoder.with_dflash_draft_auto(&assets)?;
     }
     let load_elapsed = load_started.elapsed();
     if args.load_only {
