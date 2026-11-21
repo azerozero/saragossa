@@ -3938,8 +3938,12 @@ fn dflash_default_tree_b4_bf16_matches_ar_real_model() -> Result<()> {
         return Ok(());
     }
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let model = crate::load_causal_decoder(&assets)?
-        .with_metal_runtime()?
+    // Chargement de `serve` : poids créés directement en Metal (MLP bf16 gardés).
+    let executor = crate::MetalExecutor::new_with_kernel_profile(
+        crate::KernelProfile::for_model_dir(&assets.model_dir),
+    )?;
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)?
+        .with_metal_executor(executor)?
         .with_dflash_draft_from_env(&assets.config)?;
     let draft = model
         .dflash_draft()
