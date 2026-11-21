@@ -10,10 +10,10 @@ mod pairwise;
 use std::time::{Duration, Instant};
 
 pub use dflash::{
-    load_dflash_draft_for_target, load_dflash_draft_weights_for_target,
+    dflash_beats_mtp, load_dflash_draft_for_target, load_dflash_draft_weights_for_target,
     load_dflash_draft_weights_quantized, resolve_dflash_draft, DFlashAttentionWeights,
     DFlashCodebook, DFlashConv, DFlashDraft, DFlashDraftInfo, DFlashDraftLayer, DFlashQuant,
-    DFlashSelector, DraftResolution, DFLASH_DRAFT_DIR_ENV, DFLASH_SIBLING_DIR,
+    DFlashSelector, DraftResolution, DFLASH_DRAFT_DIR_ENV, DFLASH_SIBLING_DIR, DFLASH_SKIPPED_NOTE,
 };
 
 use crate::runtime_flags::env_flag;

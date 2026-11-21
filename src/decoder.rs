@@ -2893,10 +2893,20 @@ impl CausalDecoder {
             env.as_deref(),
             hf_cache.as_deref(),
         );
-        eprintln!("saragossa {}", found.note);
+        let dense_bf16 = self.dense_bf16_mlp();
         match found.dir {
-            Some(dir) => self.with_dflash_draft_dir(&assets.config, dir),
-            None => Ok(self),
+            Some(_) if !crate::devtools::dflash_beats_mtp(found.forced, dense_bf16) => {
+                eprintln!("saragossa {}", crate::devtools::DFLASH_SKIPPED_NOTE);
+                Ok(self)
+            }
+            Some(dir) => {
+                eprintln!("saragossa {}", found.note);
+                self.with_dflash_draft_dir(&assets.config, dir)
+            }
+            None => {
+                eprintln!("saragossa {}", found.note);
+                Ok(self)
+            }
         }
     }
 

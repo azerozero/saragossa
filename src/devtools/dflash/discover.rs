@@ -22,7 +22,21 @@ pub struct DraftResolution {
     pub dir: Option<PathBuf>,
     /// Explication prête à journaliser.
     pub note: String,
+    /// Vrai si la variable désigne le drafter : DFlash est alors forcé.
+    pub forced: bool,
 }
+
+/// Un drafter découvert (non forcé) n'est activé que sur une cible dense BF16 :
+/// mesures du 21 nov., DFlash y bat MTP (24,7 contre 21-22 tok/s) mais fait
+/// jeu égal en 4 bits et perd sur MoE.
+pub fn dflash_beats_mtp(forced: bool, dense_bf16: bool) -> bool {
+    forced || dense_bf16
+}
+
+/// Ligne de log quand un drafter découvert est écarté au profit de MTP.
+pub const DFLASH_SKIPPED_NOTE: &str =
+    "drafter DFlash disponible mais MTP plus rapide sur cette cible \
+     (forcer avec SARAGOSSA_RUST_DFLASH_DRAFT_DIR)";
 
 /// Résout le drafter du modèle `model_dir` (cible `target`).
 ///
@@ -39,6 +53,7 @@ pub fn resolve_dflash_draft(
             return DraftResolution {
                 dir: None,
                 note: format!("DFlash : désactivé par {DFLASH_DRAFT_DIR_ENV}"),
+                forced: true,
             };
         }
         let dir = PathBuf::from(value);
@@ -48,6 +63,7 @@ pub fn resolve_dflash_draft(
                 dir.display()
             ),
             dir: Some(dir),
+            forced: true,
         };
     }
     let mut warnings = Vec::new();
@@ -61,6 +77,7 @@ pub fn resolve_dflash_draft(
                         sibling.display()
                     ),
                     dir: Some(sibling),
+                    forced: false,
                 }
             }
             Err(why) => warnings.push(format!("{} ignoré ({why})", sibling.display())),
@@ -70,6 +87,7 @@ pub fn resolve_dflash_draft(
         return DraftResolution {
             note: format!("DFlash : drafter {} (cache Hugging Face)", hit.display()),
             dir: Some(hit),
+            forced: false,
         };
     }
     let mut note = format!(
@@ -80,7 +98,11 @@ pub fn resolve_dflash_draft(
     for warning in warnings {
         note.push_str(&format!(" ; avertissement : drafter {warning}"));
     }
-    DraftResolution { dir: None, note }
+    DraftResolution {
+        dir: None,
+        note,
+        forced: false,
+    }
 }
 
 /// Hidden size, couches, vocabulaire : le drafter peut-il servir `target` ?

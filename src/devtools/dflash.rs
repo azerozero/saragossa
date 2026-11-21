@@ -12,7 +12,8 @@ mod discover;
 mod weights;
 pub use codebook::DFlashCodebook;
 pub use discover::{
-    resolve_dflash_draft, DraftResolution, DFLASH_DRAFT_DIR_ENV, DFLASH_SIBLING_DIR,
+    dflash_beats_mtp, resolve_dflash_draft, DraftResolution, DFLASH_DRAFT_DIR_ENV,
+    DFLASH_SIBLING_DIR, DFLASH_SKIPPED_NOTE,
 };
 use weights::DraftWeights;
 
@@ -1364,6 +1365,13 @@ mod tests {
             serialize(tensors, None).expect("invariant: serialize"),
         )
         .expect("invariant: write safetensors");
+    }
+
+    #[test]
+    fn discovered_drafter_only_wins_on_dense_bf16() {
+        assert!(dflash_beats_mtp(true, false), "variable : forcé");
+        assert!(dflash_beats_mtp(false, true), "BF16 dense : DFlash");
+        assert!(!dflash_beats_mtp(false, false), "4 bits ou MoE : MTP");
     }
 
     #[test]
