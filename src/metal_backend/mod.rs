@@ -106,6 +106,8 @@ pub(crate) use self::flags::with_flint_moe_coop_override;
 #[cfg(test)]
 pub(crate) use self::flags::with_flint_moe_coop_tiled_override;
 #[cfg(test)]
+pub(crate) use self::flags::with_moe_coop_override;
+#[cfg(test)]
 pub(crate) use self::flags::with_qmm_na_u4_min_dim_override;
 #[cfg(test)]
 pub(crate) use self::flags::MMAP_WEIGHT_VIEWS;
