@@ -1,3 +1,4 @@
+use super::model::{GeneratedCodes, TtsStopReason};
 use super::{
     clone_effective_frame_cap, clone_sample_seed, tts_generation_trace_enabled,
     tts_internal_profile_enabled, tts_stream_first_lot, usize_from_i32, TtsForwardOutput, TtsModel,
@@ -9,6 +10,40 @@ use crate::{InferError, Result};
 use std::time::{Duration, Instant};
 
 impl TtsModel {
+    /// Graine par requête ; `None` rétablit la graine déterministe 0 hors clonage.
+    pub fn set_seed(&mut self, seed: Option<u64>) {
+        self.seed = seed;
+    }
+
+    fn default_sample_params(&self) -> Option<TtsSampleParams> {
+        if self.clone_ctx.is_some() {
+            return Some(TtsSampleParams {
+                temperature: CLONE_SAMPLE_TEMPERATURE,
+                top_k: CLONE_SAMPLE_TOP_K,
+                top_p: CLONE_SAMPLE_TOP_P,
+                repetition_penalty: CLONE_SAMPLE_REPETITION_PENALTY,
+                seed: self.seed.unwrap_or_else(clone_sample_seed),
+            });
+        }
+        self.generation_config
+            .as_ref()
+            .map(|config| config.talker_params(self.seed.unwrap_or(0)))
+    }
+
+    fn default_frame_cap(&self, text: &str, max_frames: usize) -> Result<usize> {
+        if self.clone_ctx.is_some() {
+            Ok(clone_effective_frame_cap(
+                max_frames,
+                self.encode_ids(text)?.len(),
+            ))
+        } else {
+            Ok(self
+                .generation_config
+                .as_ref()
+                .map_or(max_frames, |config| max_frames.min(config.max_new_tokens)))
+        }
+    }
+
     /// Exécute le forward talker autoregressif sur le préfixe VoiceDesign.
     ///
     /// # Errors
@@ -16,6 +51,9 @@ impl TtsModel {
     /// Renvoie une erreur si la tokenisation, la préparation des embeddings ou le
     /// forward échoue.
     pub fn forward_voicedesign_prefix(&self, text: &str) -> Result<TtsForwardOutput> {
+        let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+            crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+        );
         let prepared = self.prepare_voicedesign_inputs(text)?;
         let (cache, final_state) = self.prefill_talker(&prepared.input)?;
         let logits = self.talker.logits_from_final_state(&final_state)?;
@@ -39,10 +77,17 @@ impl TtsModel {
     }
 
     pub fn synthesize_greedy(&self, text: &str, max_frames: usize) -> Result<TtsSynthesisOutput> {
-        let codes = self.generate_codes_greedy(text, max_frames)?;
-        let samples = self.decode_codes_for_mode(&codes)?;
+        let generated = self.generate_codes_greedy_trace(
+            text,
+            max_frames,
+            tts_generation_trace_enabled(),
+            &mut |_| Ok(()),
+        )?;
+        let codes = generated.codes;
+        let samples = self.decode_codes_for_mode(&codes, true)?;
         Ok(TtsSynthesisOutput {
-            frame_limit_reached: codes.len() == self.greedy_frame_cap(max_frames),
+            frame_limit_reached: generated.stop_reason == TtsStopReason::Cap,
+            stop_reason: generated.stop_reason,
             codes,
             samples,
             sample_rate: self.codec.sample_rate(),
@@ -55,19 +100,33 @@ impl TtsModel {
     ///
     /// Renvoie une erreur si la génération des codes ou le codec échoue.
     pub fn synthesize_default(&self, text: &str, max_frames: usize) -> Result<TtsSynthesisOutput> {
-        let effective_max_frames = if self.clone_ctx.is_some() {
-            clone_effective_frame_cap(max_frames, self.encode_ids(text)?.len())
+        if crate::runtime_flags::tts_greedy_enabled() {
+            return self.synthesize_greedy(text, max_frames);
+        }
+        let effective_max_frames = self.default_frame_cap(text, max_frames)?;
+        let exact = self.default_sample_params().is_none();
+        let generated = if let Some(params) = self.default_sample_params() {
+            self.generate_codes_clone_sampled_trace(
+                text,
+                max_frames,
+                effective_max_frames,
+                params,
+                tts_generation_trace_enabled(),
+                &mut |_| Ok(()),
+            )?
         } else {
-            max_frames
+            self.generate_codes_greedy_trace(
+                text,
+                effective_max_frames,
+                tts_generation_trace_enabled(),
+                &mut |_| Ok(()),
+            )?
         };
-        let codes = if self.clone_ctx.is_some() {
-            self.generate_codes_clone_sampled(text, max_frames)?
-        } else {
-            self.generate_codes_greedy(text, max_frames)?
-        };
-        let samples = self.decode_codes_for_mode(&codes)?;
+        let codes = generated.codes;
+        let samples = self.decode_codes_for_mode(&codes, exact)?;
         Ok(TtsSynthesisOutput {
-            frame_limit_reached: codes.len() == effective_max_frames,
+            frame_limit_reached: generated.stop_reason == TtsStopReason::Cap,
+            stop_reason: generated.stop_reason,
             codes,
             samples,
             sample_rate: self.codec.sample_rate(),
@@ -76,9 +135,7 @@ impl TtsModel {
 
     /// Synthétise en streaming avec la politique de décodage adaptée au mode.
     ///
-    /// VoiceDesign conserve le chemin greedy historique. Le clone Base/ICL passe
-    /// par le sampling + cap adaptatif utilisés par [`Self::synthesize_default`],
-    /// ce qui évite de réintroduire le chemin greedy clone qui boucle.
+    /// Utilise les mêmes paramètres et la même graine que [`Self::synthesize_default`].
     ///
     /// # Errors
     ///
@@ -92,16 +149,11 @@ impl TtsModel {
     where
         F: FnMut(&[f32]) -> Result<()>,
     {
-        if self.clone_ctx.is_some() {
-            let target_tokens = self.encode_ids(text)?.len();
-            let effective_max_frames = clone_effective_frame_cap(max_frames, target_tokens);
-            let params = TtsSampleParams {
-                temperature: CLONE_SAMPLE_TEMPERATURE,
-                top_k: CLONE_SAMPLE_TOP_K,
-                top_p: CLONE_SAMPLE_TOP_P,
-                repetition_penalty: CLONE_SAMPLE_REPETITION_PENALTY,
-                seed: clone_sample_seed(),
-            };
+        if crate::runtime_flags::tts_greedy_enabled() {
+            return self.synthesize_greedy_streaming(text, max_frames, on_audio);
+        }
+        let effective_max_frames = self.default_frame_cap(text, max_frames)?;
+        if let Some(params) = self.default_sample_params() {
             let trace = tts_generation_trace_enabled();
             return self.synthesize_streaming_from_frames(
                 |on_frame| {
@@ -114,11 +166,11 @@ impl TtsModel {
                         on_frame,
                     )
                 },
-                effective_max_frames,
                 on_audio,
+                false,
             );
         }
-        self.synthesize_greedy_streaming(text, max_frames, on_audio)
+        self.synthesize_greedy_streaming(text, effective_max_frames, on_audio)
     }
 
     /// Synthétise en STREAMING : `on_audio(&[f32])` est appelé avec chaque nouveau
@@ -151,8 +203,8 @@ impl TtsModel {
                     on_frame,
                 )
             },
-            self.greedy_frame_cap(max_frames),
             on_audio,
+            true,
         )
     }
 
@@ -164,42 +216,67 @@ impl TtsModel {
         }
     }
 
+    /// `exact` : préfixe codec CPU, PCM historique au bit près (glouton).
     fn synthesize_streaming_from_frames<F, G>(
         &self,
         generate_codes: G,
-        effective_max_frames: usize,
         on_audio: F,
+        exact: bool,
     ) -> Result<TtsSynthesisOutput>
     where
         F: FnMut(&[f32]) -> Result<()>,
-        G: FnOnce(&mut dyn FnMut(&[Vec<i32>]) -> Result<()>) -> Result<Vec<Vec<i32>>>,
+        G: FnOnce(&mut dyn FnMut(&[Vec<i32>]) -> Result<()>) -> Result<GeneratedCodes>,
     {
-        let mut decode_state = self.new_stream_decode_state();
+        let mut decode_state = self.new_stream_decode_state(exact);
         let fixed_lots = uses_fixed_lots(&decode_state);
+        let decode =
+            |codes: &[Vec<i32>]| self.decode_codes_for_mode_streaming(&mut decode_state, codes);
+        if crate::runtime_flags::tts_codec_overlap_enabled() {
+            return synthesize_streaming_overlapped(
+                generate_codes,
+                on_audio,
+                decode,
+                tts_stream_first_lot(),
+                fixed_lots,
+                self.codec.sample_rate(),
+            );
+        }
         synthesize_streaming_from_frames(
             generate_codes,
-            effective_max_frames,
             on_audio,
-            |codes| self.decode_codes_for_mode_streaming(&mut decode_state, codes),
+            decode,
             tts_stream_first_lot(),
             fixed_lots,
             self.codec.sample_rate(),
         )
     }
 
-    pub(super) fn decode_codes_for_mode(&self, codes: &[Vec<i32>]) -> Result<Vec<f32>> {
+    /// Décode `codes` (préfixe de référence du clone compris). `exact` garde le
+    /// préfixe codec CPU, au PCM historique près au bit (glouton, goldens).
+    pub(super) fn decode_codes_for_mode(
+        &self,
+        codes: &[Vec<i32>],
+        exact: bool,
+    ) -> Result<Vec<f32>> {
+        let decode = |codes: &[Vec<i32>]| {
+            if exact {
+                self.codec.decode_codes_exact(codes)
+            } else {
+                self.codec.decode_codes(codes)
+            }
+        };
         let Some(ctx) = self.clone_ctx.as_ref() else {
-            return self.codec.decode_codes(codes);
+            return decode(codes);
         };
         if codes.is_empty() {
             return Ok(Vec::new());
         }
         if ctx.mode.is_xvec_only() {
-            return self.codec.decode_codes(codes);
+            return decode(codes);
         }
         let mut prefixed = ctx.ref_codes.clone();
         prefixed.extend_from_slice(codes);
-        let mut samples = self.codec.decode_codes(&prefixed)?;
+        let mut samples = decode(&prefixed)?;
         let skip = ctx
             .ref_codes
             .len()
@@ -215,11 +292,12 @@ impl TtsModel {
         Ok(samples)
     }
 
-    fn new_stream_decode_state(&self) -> TtsStreamDecodeState {
+    fn new_stream_decode_state(&self, exact: bool) -> TtsStreamDecodeState {
         match self.clone_ctx.as_ref() {
             Some(ctx) if !ctx.mode.is_xvec_only() => {
-                TtsStreamDecodeState::FullPrefixDelta { emitted: 0 }
+                TtsStreamDecodeState::FullPrefixDelta { emitted: 0, exact }
             }
+            _ if exact => TtsStreamDecodeState::Incremental(self.codec.new_stream_state_exact()),
             _ => TtsStreamDecodeState::Incremental(self.codec.new_stream_state()),
         }
     }
@@ -233,8 +311,8 @@ impl TtsModel {
             TtsStreamDecodeState::Incremental(codec_state) => {
                 self.codec.decode_codes_streaming(codec_state, codes)
             }
-            TtsStreamDecodeState::FullPrefixDelta { emitted } => {
-                let pcm = self.decode_codes_for_mode(codes)?;
+            TtsStreamDecodeState::FullPrefixDelta { emitted, exact } => {
+                let pcm = self.decode_codes_for_mode(codes, *exact)?;
                 if pcm.len() < *emitted {
                     return Err(InferError::Dimension(format!(
                         "streaming TTS PCM régressif: {} < {}",
@@ -258,7 +336,6 @@ fn uses_fixed_lots(state: &TtsStreamDecodeState) -> bool {
 // sans charger de modèle ; la production utilise exactement cette boucle.
 fn synthesize_streaming_from_frames<F, G, D>(
     generate_codes: G,
-    effective_max_frames: usize,
     mut on_audio: F,
     mut decode: D,
     first_lot: usize,
@@ -267,7 +344,7 @@ fn synthesize_streaming_from_frames<F, G, D>(
 ) -> Result<TtsSynthesisOutput>
 where
     F: FnMut(&[f32]) -> Result<()>,
-    G: FnOnce(&mut dyn FnMut(&[Vec<i32>]) -> Result<()>) -> Result<Vec<Vec<i32>>>,
+    G: FnOnce(&mut dyn FnMut(&[Vec<i32>]) -> Result<()>) -> Result<GeneratedCodes>,
     D: FnMut(&[Vec<i32>]) -> Result<Vec<f32>>,
 {
     let mut all_samples: Vec<f32> = Vec::new();
@@ -286,6 +363,10 @@ where
         let codec_started = Instant::now();
         let pcm = decode(generated)?;
         let codec_elapsed = codec_started.elapsed();
+        super::memory::checkpoint(
+            "first_pcm",
+            &[("pcm_chunk", pcm.capacity() * size_of::<f32>())],
+        );
         if profile {
             codec_calls += 1;
             codec_total += codec_elapsed;
@@ -299,17 +380,11 @@ where
             on_audio(&pcm)?;
             all_samples.extend_from_slice(&pcm);
         }
-        // Seul le codec à contextes causaux évite de redécoder le passé.
-        threshold = if fixed_lots {
-            generated.len().saturating_add(first_lot)
-        } else {
-            threshold
-                .saturating_mul(2)
-                .max(generated.len().saturating_add(1))
-        };
+        threshold = next_lot_threshold(generated.len(), threshold, first_lot, fixed_lots);
         Ok(())
     };
-    let codes = generate_codes(&mut on_frame)?;
+    let generated = generate_codes(&mut on_frame)?;
+    let codes = generated.codes;
     // Flush final : décode le suffixe non couvert par le dernier lot.
     let final_flush_started = Instant::now();
     let pcm = decode(&codes)?;
@@ -343,11 +418,166 @@ where
         );
     }
     Ok(TtsSynthesisOutput {
-        frame_limit_reached: codes.len() == effective_max_frames,
+        frame_limit_reached: generated.stop_reason == TtsStopReason::Cap,
+        stop_reason: generated.stop_reason,
         codes,
         samples: all_samples,
         sample_rate,
     })
+}
+
+/// Seuil du lot suivant, partagé par les variantes synchrone et recouverte.
+fn next_lot_threshold(generated: usize, threshold: usize, first_lot: usize, fixed: bool) -> usize {
+    // Seul le codec à contextes causaux évite de redécoder le passé.
+    if fixed {
+        generated.saturating_add(first_lot)
+    } else {
+        threshold.saturating_mul(2).max(generated.saturating_add(1))
+    }
+}
+
+/// Variante de [`synthesize_streaming_from_frames`] où le codec tourne sur un
+/// thread dédié : la trame suivante du talker se calcule pendant le décodage
+/// du lot courant (double tampon). Les lots arrivés pendant un décodage sont
+/// fusionnés en un seul appel ; le codec étant causal, le PCM ne dépend pas du
+/// découpage. `on_audio` reste appelé sur le thread appelant, dans l'ordre,
+/// au fil des trames puis à la fin.
+fn synthesize_streaming_overlapped<F, G, D>(
+    generate_codes: G,
+    mut on_audio: F,
+    decode: D,
+    first_lot: usize,
+    fixed_lots: bool,
+    sample_rate: u32,
+) -> Result<TtsSynthesisOutput>
+where
+    F: FnMut(&[f32]) -> Result<()>,
+    G: FnOnce(&mut dyn FnMut(&[Vec<i32>]) -> Result<()>) -> Result<GeneratedCodes>,
+    D: FnMut(&[Vec<i32>]) -> Result<Vec<f32>> + Send,
+{
+    use std::sync::mpsc;
+    let profile = tts_internal_profile_enabled();
+    let profile_started = Instant::now();
+    std::thread::scope(|scope| {
+        let (job_tx, job_rx) = mpsc::channel::<Vec<Vec<i32>>>();
+        let (pcm_tx, pcm_rx) = mpsc::channel::<Result<Vec<f32>>>();
+        let worker = scope.spawn(move || codec_worker(job_rx, pcm_tx, decode));
+        let mut all_samples: Vec<f32> = Vec::new();
+        let mut first_emit = None;
+        let mut emit = |pcm: Result<Vec<f32>>, all: &mut Vec<f32>| -> Result<()> {
+            let pcm = pcm?;
+            if !pcm.is_empty() {
+                first_emit.get_or_insert_with(|| profile_started.elapsed());
+                on_audio(&pcm)?;
+                all.extend_from_slice(&pcm);
+            }
+            Ok(())
+        };
+        // Le worker s'arrête sur une erreur codec : la remonter plutôt que l'arrêt.
+        let worker_gone = || match pcm_rx.try_recv() {
+            Ok(Err(error)) => error,
+            _ => InferError::Metal("thread codec TTS arrêté".to_string()),
+        };
+        let outcome = (|| {
+            let job_tx = job_tx;
+            let mut sent = 0_usize;
+            let mut threshold = first_lot;
+            let generated = generate_codes(&mut |generated: &[Vec<i32>]| -> Result<()> {
+                while let Ok(pcm) = pcm_rx.try_recv() {
+                    emit(pcm, &mut all_samples)?;
+                }
+                if generated.len() < threshold {
+                    return Ok(());
+                }
+                job_tx
+                    .send(generated[sent..].to_vec())
+                    .map_err(|_| worker_gone())?;
+                sent = generated.len();
+                threshold = next_lot_threshold(generated.len(), threshold, first_lot, fixed_lots);
+                Ok(())
+            })?;
+            // Flush final : le suffixe non couvert par le dernier lot.
+            if generated.codes.len() > sent {
+                job_tx
+                    .send(generated.codes[sent..].to_vec())
+                    .map_err(|_| worker_gone())?;
+            }
+            drop(job_tx);
+            for pcm in pcm_rx.iter() {
+                emit(pcm, &mut all_samples)?;
+            }
+            Ok(generated)
+        })();
+        // Canal de travaux fermé dans tous les cas : le thread codec se termine.
+        let stats = worker
+            .join()
+            .map_err(|_| InferError::Metal("thread codec TTS en panique".to_string()))?;
+        let generated = outcome?;
+        if profile {
+            eprintln!(
+                "perf tts.internal.stream_codec overlap=1 first_lot={} frames={} samples={} codec_calls={} codec_ms={:.3} first_codec_ms={:.3} first_emit_ms={:.3} total_ms={:.3}",
+                first_lot,
+                generated.codes.len(),
+                all_samples.len(),
+                stats.calls,
+                stats.total.as_secs_f64() * 1e3,
+                stats.first.unwrap_or_default().as_secs_f64() * 1e3,
+                first_emit.unwrap_or_default().as_secs_f64() * 1e3,
+                profile_started.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        Ok(TtsSynthesisOutput {
+            frame_limit_reached: generated.stop_reason == TtsStopReason::Cap,
+            stop_reason: generated.stop_reason,
+            codes: generated.codes,
+            samples: all_samples,
+            sample_rate,
+        })
+    })
+}
+
+#[derive(Default)]
+struct CodecWorkerStats {
+    calls: usize,
+    total: Duration,
+    first: Option<Duration>,
+}
+
+/// Décode les lots reçus dans l'ordre ; s'arrête au premier échec ou quand
+/// l'un des canaux est fermé.
+fn codec_worker<D>(
+    jobs: std::sync::mpsc::Receiver<Vec<Vec<i32>>>,
+    results: std::sync::mpsc::Sender<Result<Vec<f32>>>,
+    mut decode: D,
+) -> CodecWorkerStats
+where
+    D: FnMut(&[Vec<i32>]) -> Result<Vec<f32>>,
+{
+    let mut stats = CodecWorkerStats::default();
+    let mut prefix = Vec::new();
+    while let Ok(job) = jobs.recv() {
+        prefix.extend(job);
+        while let Ok(more) = jobs.try_recv() {
+            prefix.extend(more);
+        }
+        let started = Instant::now();
+        let pcm = decode(&prefix);
+        let elapsed = started.elapsed();
+        if let Ok(pcm) = &pcm {
+            super::memory::checkpoint(
+                "first_pcm",
+                &[("pcm_chunk", pcm.capacity() * size_of::<f32>())],
+            );
+        }
+        stats.calls += 1;
+        stats.total += elapsed;
+        stats.first.get_or_insert(elapsed);
+        let failed = pcm.is_err();
+        if results.send(pcm).is_err() || failed {
+            break;
+        }
+    }
+    stats
 }
 
 #[cfg(test)]

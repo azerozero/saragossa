@@ -138,12 +138,17 @@ impl CausalDecoder {
         };
 
         // Borrows disjoints par flux : états par couche (mutables) vs arène.
+        let rope_positions = caches
+            .iter()
+            .map(|cache| cache.current_pos())
+            .collect::<Result<Vec<_>>>()?;
         let mut parts = Vec::with_capacity(rows);
         for cache in caches.iter_mut() {
             let CausalDecoderCache {
                 layers,
                 position,
                 resident,
+                ..
             } = &mut **cache;
             let arena = resident
                 .as_ref()
@@ -224,14 +229,19 @@ impl CausalDecoder {
                         sigmoid_moe: resolved.sigmoid_moe_weights(),
                     };
                     let mut streams = Vec::with_capacity(rows);
-                    for ((layers, position, _), slot) in parts.iter_mut().zip(&slots) {
+                    for (((layers, _, _), slot), &rope_position) in
+                        parts.iter_mut().zip(&slots).zip(&rope_positions)
+                    {
                         let kv = layers[index].full.as_mut().ok_or_else(|| {
                             InferError::Metal("KV full-attn absent (multi)".to_string())
                         })?;
                         let dims = self.plan.layers[index]
                             .resident
                             .resident_windowed_full_attn_layer_dims(
-                                hidden, **position, eps, theta,
+                                hidden,
+                                rope_position,
+                                eps,
+                                theta,
                             )?;
                         streams.push(MultiFullAttnStream {
                             kv,

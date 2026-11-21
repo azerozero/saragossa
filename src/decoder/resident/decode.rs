@@ -70,7 +70,10 @@ impl CausalDecoder {
         )?;
         crate::metal_backend::wait_for_completion(&inflight.command_buffer)?;
         if let Some(readback) = inflight.logits_readback {
-            let logits = crate::metal_backend::read_f32_buffer(&readback.buffer, readback.len)?;
+            let logits = crate::metal_backend::read_f32_buffer(
+                readback.lease.tensor().buffer(),
+                readback.len,
+            )?;
             let logits = self.finalize_logits(&Tensor::from_vec(vec![1, readback.len], logits)?)?;
             return sample_token_top_k_top_p(
                 logits.as_row()?,
@@ -128,11 +131,7 @@ impl CausalDecoder {
     }
 
     /// Renvoie la dernière ligne du prefill AVANT la norme finale.
-    #[cfg(all(
-        target_os = "macos",
-        feature = "metal",
-        any(test, feature = "devtools")
-    ))]
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     pub(crate) fn resident_reference_start(
         &self,
         prompt: &[usize],
@@ -200,18 +199,23 @@ impl CausalDecoder {
             hidden,
             self.config.rms_eps,
         )?;
-        let (buffer, len) = metal.encode_lm_head_logits_readback_buffers(
+        let logits = arena
+            .state
+            .scratch()
+            .lease(metal.linear_weight_out_dim(&arena.lm_head), GpuElement::F32)?;
+        let len = metal.encode_lm_head_logits_readback_buffers(
             encoder,
             normed.tensor().buffer(),
             &arena.lm_head,
             hidden,
+            logits.tensor().buffer(),
         )?;
         encoder.end_encoding();
         crate::metal_backend::commit_nonblocking(command_buffer);
         crate::metal_backend::wait_for_completion(command_buffer)?;
         #[cfg(test)]
         REFERENCE_INITIAL_PROJECTIONS.with(|count| count.set(count.get() + 1));
-        let raw = crate::metal_backend::read_f32_buffer(&buffer, len)?;
+        let raw = crate::metal_backend::read_f32_buffer(logits.tensor().buffer(), len)?;
         Ok(self.finalize_logits(&Tensor::row(raw)?)?.data().to_vec())
     }
 
@@ -251,7 +255,7 @@ impl CausalDecoder {
         let readback = inflight
             .logits_readback
             .ok_or_else(|| InferError::Metal("logits résidents absents".into()))?;
-        crate::metal_backend::read_f32_buffer(&readback.buffer, readback.len)
+        crate::metal_backend::read_f32_buffer(readback.lease.tensor().buffer(), readback.len)
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -409,7 +413,7 @@ impl CausalDecoder {
         let eps = self.config.rms_eps;
 
         let hidden = self.final_norm.data().len();
-        let position = cache.position;
+        let position = cache.current_pos()?;
         let linear_dims = if self.has_resident_linear_attention_layer() {
             let la_config = self.config.linear_attention_config()?;
             let la_spec = LinearAttentionStepSpec {
@@ -439,6 +443,7 @@ impl CausalDecoder {
             layers,
             position: cache_position,
             resident,
+            ..
         } = cache;
         let arena = resident.as_mut().ok_or_else(|| {
             InferError::Metal("arène résidente absente (decode résident)".to_string())
@@ -586,6 +591,7 @@ impl CausalDecoder {
                         hidden,
                         sample.temperature,
                         sample.rng_state,
+                        self.config.final_logit_softcapping,
                     )?;
                 }
                 ResidentSampleMode::OnDevice => {
@@ -600,16 +606,24 @@ impl CausalDecoder {
                         sample.top_p,
                         sample.top_k,
                         sample.rng_state,
+                        self.config.final_logit_softcapping,
                     )?;
                 }
                 ResidentSampleMode::Readback => {
-                    let (buffer, len) = metal.encode_lm_head_logits_readback_buffers(
+                    // Le bail est rendu après wait + lecture CPU, jamais pendant
+                    // qu'un command buffer peut encore écrire ses logits.
+                    let lease = arena
+                        .state
+                        .scratch()
+                        .lease(metal.linear_weight_out_dim(&arena.lm_head), GpuElement::F32)?;
+                    let len = metal.encode_lm_head_logits_readback_buffers(
                         encoder,
                         final_normed.tensor().buffer(),
                         &arena.lm_head,
                         hidden,
+                        lease.tensor().buffer(),
                     )?;
-                    logits_readback = Some(ResidentLogitsReadback { buffer, len });
+                    logits_readback = Some(ResidentLogitsReadback { lease, len });
                 }
             }
         } else {
@@ -670,10 +684,10 @@ impl CausalDecoder {
 
     /// Décode UN pas en résident depuis un EMBEDDING d'entrée (TTS talker/cp) : la
     /// boucle des couches tourne en **UN** command buffer, puis selon `head` :
-    /// `None` → renvoie le `final_state` **post `final_norm`** relu (talker, l'argmax
-    /// reste côté hôte) ; `Some(head)` → matmul `head` + argmax greedy on-device dans
-    /// le même command buffer, renvoie le token (cp, tue le readback `cp_state` + le
-    /// matmul de tête CPU). Réutilise les kernels résidents et le KV seedé par
+    /// `None` relit le `final_state` post-norm ; `Greedy` projette la tête et relit
+    /// l'argmax ; `Logits` relit uniquement les logits pour le sampling CPU ;
+    /// `StateLogits` relit aussi l'état nécessaire au code predictor du talker.
+    /// Toute projection est encodée avant la synchronisation. Réutilise le KV seedé par
     /// [`Self::setup_resident_full_decode`].
     ///
     /// Renvoie `Ok(None)` si l'executor Metal ou l'arène résidente est absent
@@ -688,7 +702,7 @@ impl CausalDecoder {
         &self,
         cache: &mut CausalDecoderCache,
         embedding: &Tensor,
-        head: Option<&crate::metal_backend::MetalLinearWeightBuffers>,
+        head: Option<ResidentEmbeddingHead<'_>>,
     ) -> Result<Option<ResidentEmbeddingOut>> {
         let Some(metal) = self.forward_runtime().metal_executor() else {
             return Ok(None);
@@ -705,7 +719,7 @@ impl CausalDecoder {
             InferError::Config("rope_theta manquant (decode résident embedding)".to_string())
         })?;
         let eps = self.config.rms_eps;
-        let position = cache.position;
+        let position = cache.current_pos()?;
         let linear_dims = if self.has_resident_linear_attention_layer() {
             let la_config = self.config.linear_attention_config()?;
             let la_spec = LinearAttentionStepSpec {
@@ -734,6 +748,7 @@ impl CausalDecoder {
             layers,
             position: cache_position,
             resident,
+            ..
         } = cache;
         let Some(arena) = resident.as_mut() else {
             return Ok(None);
@@ -758,18 +773,43 @@ impl CausalDecoder {
                 let dims = self.plan.layers[index]
                     .resident
                     .resident_windowed_full_attn_layer_dims(hidden, position, eps, theta)?;
-                self.encode_resident_full_layer(
-                    metal,
-                    arena,
-                    layer_cache,
-                    layer,
-                    index,
-                    encoder,
-                    &mut owned,
-                    dims,
-                    current.buffer(),
-                    other.buffer(),
-                )?;
+                #[cfg(feature = "tts")]
+                let fused = match arena.tts_fused_qkv.as_ref().and_then(|qkv| qkv.get(index)) {
+                    Some(qkv_proj) => self.encode_tts_cp_fused_layer(
+                        metal,
+                        arena,
+                        layer_cache,
+                        index,
+                        qkv_proj,
+                        encoder,
+                        &mut owned,
+                        dims,
+                        current.buffer(),
+                        other.buffer(),
+                    )?,
+                    None => false,
+                };
+                #[cfg(not(feature = "tts"))]
+                let fused = false;
+                #[cfg(all(test, feature = "tts"))]
+                if fused {
+                    crate::runtime_flags::TTS_FUSED_LAYER_ENCODES
+                        .with(|count| count.set(count.get() + 1));
+                }
+                if !fused {
+                    self.encode_resident_full_layer(
+                        metal,
+                        arena,
+                        layer_cache,
+                        layer,
+                        index,
+                        encoder,
+                        &mut owned,
+                        dims,
+                        current.buffer(),
+                        other.buffer(),
+                    )?;
+                }
             } else {
                 let Some((la_spec, key_dim, value_dim, conv_dim)) = linear_dims else {
                     return Err(InferError::Config(
@@ -811,6 +851,7 @@ impl CausalDecoder {
             hidden,
             eps,
         )?;
+        let keep_state = matches!(head, Some(ResidentEmbeddingHead::StateLogits(_)));
         match head {
             None => {
                 encoder.end_encoding();
@@ -821,7 +862,7 @@ impl CausalDecoder {
                 *cache_position += 1;
                 Ok(Some(ResidentEmbeddingOut::State(Tensor::row(state)?)))
             }
-            Some(head) => {
+            Some(ResidentEmbeddingHead::Greedy(head)) => {
                 // Tête fournie : matmul + argmax greedy on-device dans le MÊME command
                 // buffer → readback d'1 u32 (pas de cp_state relu + matmul tête CPU).
                 let token_index = arena.state.scratch().lease(1, GpuElement::U32)?;
@@ -846,6 +887,36 @@ impl CausalDecoder {
                     InferError::Metal(format!("token cp résident hors usize: {raw}"))
                 })?;
                 Ok(Some(ResidentEmbeddingOut::Token(token)))
+            }
+            Some(
+                ResidentEmbeddingHead::Logits(head) | ResidentEmbeddingHead::StateLogits(head),
+            ) => {
+                let vocab = metal.linear_weight_out_dim(head);
+                let logits = arena.state.scratch().lease(vocab, GpuElement::F32)?;
+                metal.encode_lm_head_logits_readback_buffers(
+                    encoder,
+                    final_normed.tensor().buffer(),
+                    head,
+                    hidden,
+                    logits.tensor().buffer(),
+                )?;
+                encoder.end_encoding();
+                crate::metal_backend::commit_and_wait(command_buffer)?;
+                let logits = Tensor::row(crate::metal_backend::read_f32_buffer(
+                    logits.tensor().buffer(),
+                    vocab,
+                )?)?;
+                *cache_position += 1;
+                if keep_state {
+                    // Le talker fournit aussi l'état qui amorce le code predictor.
+                    let state = Tensor::row(crate::metal_backend::read_f32_buffer(
+                        final_normed.tensor().buffer(),
+                        hidden,
+                    )?)?;
+                    Ok(Some(ResidentEmbeddingOut::StateLogits(state, logits)))
+                } else {
+                    Ok(Some(ResidentEmbeddingOut::Logits(logits)))
+                }
             }
         }
     }

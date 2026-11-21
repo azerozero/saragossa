@@ -5,6 +5,22 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 using namespace mpp;
+// Déroulement complet des pas de 16 sur K dans les GEMM tuilés NAX : le
+// compilateur ne le fait pas seul, et le GEMM u4 [1024, 5120] × [17408]ᵀ passe
+// de 50 à 57 TFLOP/s (de 43 à 55 sur le down_proj). Même suite d'opérations,
+// résultats égaux au bit. Kill-switch `SARAGOSSA_RUST_NAX_KK_UNROLL=0`, qui
+// définit la macro vide avant cette source. NOTE: seuls les GEMM à une tuile B
+// la portent (`gemm_nax_coop_qb_tiled_u4`, `micro_gemm_*`). Elle ralentit de
+// 20 à 28 % le gate+up fusionné et le bf16×3 (pression de registres, sonde
+// `nax_kk_unroll_probe`) ; u8, gs128, align64 et MoE groupés ne sont pas mesurés.
+#ifndef NAX_KK_UNROLL
+#define NAX_KK_UNROLL _Pragma("clang loop unroll(full)")
+#endif
+// Déroulement du gate+up fusionné, vide par défaut (le déroulement complet le
+// ralentit) ; la sonde `nax_kk_unroll_probe` essaie un déroulement partiel.
+#ifndef NAX_KK_UNROLL_GU
+#define NAX_KK_UNROLL_GU
+#endif
 kernel void gemm_nax(device const bfloat* Ap [[buffer(0)]],
                      device const bfloat* Bp [[buffer(1)]],
                      device float* Cp         [[buffer(2)]],
@@ -40,6 +56,69 @@ kernel void gemm_nax_bf16_bn128(device const bfloat* Ap [[buffer(0)]],
   auto mB = B.slice(n0, 0);
   auto mC = C.slice(n0, m0);
   op.run(mA, mB, mC);
+}
+// C[M,N] = A[M,K]·B[N,K]^T, A et B bf16 (poids dense non transposé), accum f32.
+// matmul2d MPP tuiles 64×128 sur 8 simdgroups ; exige N%128=0. Sert aux
+// modèles de décision et au prefill des LLM Qwen dense bf16 (portée
+// `DenseBf16X1Scope`) : l'activation y est arrondie en bf16, écart mesuré par
+// KL dans docs/perf/prefill-bf16.md.
+// Grille N en x : les groupes voisins partagent la même tuile A (64×K) ; à
+// M=2048, N=12288, K=4096, 64 TFLOP/s contre 26 avec M en x, à l'identique.
+kernel void gemm_nax_bf16_nt_bn128(device const bfloat* Ap [[buffer(0)]],
+                                   device const bfloat* Bp [[buffer(1)]],
+                                   device float* Cp         [[buffer(2)]],
+                                   constant uint3& mnk       [[buffer(3)]],
+                                   uint2 tgid [[threadgroup_position_in_grid]]) {
+  uint M = mnk.x, N = mnk.y, K = mnk.z;
+  auto A = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>((device bfloat*)Ap, dextents<int32_t,2>(int32_t(K), int32_t(M)));
+  auto B = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>((device bfloat*)Bp, dextents<int32_t,2>(int32_t(K), int32_t(N)));
+  auto C = tensor<device float,  dextents<int32_t,2>, tensor_inline>(Cp, dextents<int32_t,2>(int32_t(N), int32_t(M)));
+  constexpr auto desc = tensor_ops::matmul2d_descriptor(
+      64, 128, static_cast<int>(dynamic_extent), false, true, false);
+  tensor_ops::matmul2d<desc, execution_simdgroups<8>> op;
+  uint m0 = tgid.y * 64, n0 = tgid.x * 128;
+  auto mA = A.slice(0, m0);
+  auto mB = B.slice(0, n0);
+  auto mC = C.slice(n0, m0);
+  op.run(mA, mB, mC);
+}
+// MLP bf16 dense fusionné du prefill : la tuile 64×128 de gate et celle de up
+// passent par le même matmul2d que `gemm_nax_bf16_nt_bn128`, en tenseurs
+// coopératifs, puis H = bf16(silu(g)·u) est écrit directement. Même expression
+// que `swiglu_f32` suivi de `f32_to_bf16` : égal au bit au chemin en trois
+// passes, sans les tampons f32 gate, up et hidden. Exige N%128=0.
+kernel void gemm_nax_bf16_nt_gate_up_swiglu(device const bfloat* Ap [[buffer(0)]],
+                                            device const bfloat* Gp [[buffer(1)]],
+                                            device const bfloat* Up [[buffer(2)]],
+                                            device bfloat* Hp       [[buffer(3)]],
+                                            constant uint3& mnk     [[buffer(4)]],
+                                            uint2 tgid [[threadgroup_position_in_grid]]) {
+  uint M = mnk.x, N = mnk.y, K = mnk.z;
+  auto A = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>((device bfloat*)Ap, dextents<int32_t,2>(int32_t(K), int32_t(M)));
+  auto G = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>((device bfloat*)Gp, dextents<int32_t,2>(int32_t(K), int32_t(N)));
+  auto U = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>((device bfloat*)Up, dextents<int32_t,2>(int32_t(K), int32_t(N)));
+  auto H = tensor<device bfloat, dextents<int32_t,2>, tensor_inline>(Hp, dextents<int32_t,2>(int32_t(N), int32_t(M)));
+  constexpr auto desc = tensor_ops::matmul2d_descriptor(
+      64, 128, static_cast<int>(dynamic_extent), false, true, false);
+  tensor_ops::matmul2d<desc, execution_simdgroups<8>> op;
+  uint m0 = tgid.y * 64, n0 = tgid.x * 128;
+  auto mA = A.slice(0, m0);
+  auto mG = G.slice(0, n0);
+  auto mU = U.slice(0, n0);
+  auto mH = H.slice(n0, m0);
+  auto cG = op.get_destination_cooperative_tensor<decltype(mA), decltype(mG), float>();
+  auto cU = op.get_destination_cooperative_tensor<decltype(mA), decltype(mU), float>();
+  auto cH = op.get_destination_cooperative_tensor<decltype(mA), decltype(mG), bfloat>();
+  op.run(mA, mG, cG);
+  op.run(mA, mU, cU);
+  _Pragma("clang loop unroll(full)")
+  for (uint16_t i = 0; i < cG.get_capacity(); ++i) {
+    if (cG.is_valid_element(i)) {
+      float g = cG[i];
+      cH[i] = bfloat((g / (1.0f + exp(-g))) * cU[i]);
+    }
+  }
+  cH.store(mH);
 }
 // ===== Port qmm_t_nax brique 1 : primitive cooperative_tensor à fragments registres.
 // Transcription de BaseNAXFrag (mlx steel/gemm/nax.h:27) : fragment 16x16, 8 élts/thread
@@ -90,6 +169,19 @@ struct NaxFrag {
     for (short i = 0; i < 2; i++)
       for (short j = 0; j < 4; j++)
         dst[(i * 8) * str_x + j] = src[i * 4 + j];
+  }
+  static void store_c_masked_mn(const thread metal::vec<float,8>& src, device float* dst,
+                                uint m_base, uint n_base, uint N, uint M) {
+    short2 sc = get_coord();
+    for (short i = 0; i < 2; i++) {
+      uint row = m_base + uint(sc.y) + uint(i) * 8u;
+      if (row < M) {
+        for (short j = 0; j < 4; j++) {
+          uint col = n_base + uint(sc.x) + uint(j);
+          if (col < N) { dst[row * N + col] = src[i * 4 + j]; }
+        }
+      }
+    }
   }
   static void store_c_masked(const thread metal::vec<float,8>& src, device float* dst,
                              uint m_base, uint n_base, uint N, uint M) {
@@ -304,18 +396,18 @@ kernel void gemm_nax_coop_qb(device const bfloat* A [[buffer(0)]],
                              device float* C         [[buffer(4)]],
                              constant uint3& mnk     [[buffer(5)]],
                              uint2 tgid [[threadgroup_position_in_grid]]) {
-  uint N = mnk.y, K = mnk.z;
+  uint M = mnk.x, N = mnk.y, K = mnk.z;
   uint m0 = tgid.x * 16u, n0 = tgid.y * 32u;
   metal::vec<float,8> Cn0 = float(0), Cn1 = float(0);
   for (uint k = 0; k < K; k += 16u) {
     metal::vec<bfloat,8> Af, Bn0, Bn1;
-    NaxFrag::load_a(Af, A + m0 * K + k, int(K));
+    NaxFrag::load_a_masked(Af, A, m0, k, K, M);
     NaxFrag::load_b_quant(Bn0, Bp, Bs, Bb, n0, k, K);
     NaxFrag::load_b_quant(Bn1, Bp, Bs, Bb, n0 + 16u, k, K);
     NaxFrag::mma(Cn0, Cn1, Af, Bn0, Bn1);
   }
-  NaxFrag::store_c(Cn0, C + m0 * N + n0, int(N));
-  NaxFrag::store_c(Cn1, C + m0 * N + n0 + 16u, int(N));
+  NaxFrag::store_c_masked(Cn0, C, m0, n0, N, M);
+  NaxFrag::store_c_masked(Cn1, C, m0, n0 + 16u, N, M);
 }
 // Variante dense gs128. M et N doivent être alignés 16×32 côté gate Rust.
 kernel void gemm_nax_coop_qb_gs128(device const bfloat* A [[buffer(0)]],
@@ -523,6 +615,7 @@ kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
   for (uint k = 0; k < K; k += BK) {
     load_b_tile_quant_u4_gs64_vec(Ws, Bp, Bs, Bb, n0, k, N, K, lid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    NAX_KK_UNROLL
     for (uint kk = 0; kk < BK; kk += 16u) {
       metal::vec<bfloat,8> af0, af1, b0, b1;
       if (m0 + 32u <= M) {
@@ -552,21 +645,22 @@ kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
 // ici l'erreur relative descend vers 2⁻¹⁶ pour 3× les MMA. Deux tuiles B
 // (hi, lo) : 18 Ko de threadgroup, ce qui exclut une variante gate+up fusionnée
 // (quatre tuiles, au-delà des 32 Ko).
-kernel void gemm_nax_coop_qb_tiled_u4_x3(device const float* A [[buffer(0)]],
-                                         device const uint* Bp   [[buffer(1)]],
-                                         device const bfloat* Bs [[buffer(2)]],
-                                         device const bfloat* Bb [[buffer(3)]],
-                                         device float* C         [[buffer(4)]],
-                                         constant uint3& mnk     [[buffer(5)]],
-                                         uint2 tgid [[threadgroup_position_in_grid]],
-                                         uint lid [[thread_index_in_threadgroup]],
-                                         uint sgid [[simdgroup_index_in_threadgroup]]) {
+// X4 ajoute lo·lo (SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM=x4) : l'erreur ne tient
+// plus qu'au résidu de la scission hi + lo, pour 4× les MMA au lieu de 3×.
+template <bool X4>
+static void qb_tiled_u4_split(const device float* A,
+                              const device uint* Bp,
+                              const device bfloat* Bs,
+                              const device bfloat* Bb,
+                              device float* C,
+                              uint3 mnk,
+                              threadgroup bfloat* Wh,
+                              threadgroup bfloat* Wl,
+                              uint2 tgid,
+                              uint lid,
+                              uint sgid) {
   uint M = mnk.x, N = mnk.y, K = mnk.z;
   constexpr uint BN = 64, BK = 64, BKP = BK + 8, WN = 2;
-  threadgroup metal::vec<bfloat,8> Wh8[BN * BKP / 8];
-  threadgroup metal::vec<bfloat,8> Wl8[BN * BKP / 8];
-  threadgroup bfloat* Wh = (threadgroup bfloat*)Wh8;
-  threadgroup bfloat* Wl = (threadgroup bfloat*)Wl8;
   uint sg_m = sgid / WN;
   uint sg_n = sgid - sg_m * WN;
   uint m0 = tgid.x * 64u + sg_m * 32u;
@@ -590,6 +684,10 @@ kernel void gemm_nax_coop_qb_tiled_u4_x3(device const float* A [[buffer(0)]],
       NaxFrag::mma(c1a, c1b, a1h, b0h, b1h);
       NaxFrag::mma(c1a, c1b, a1h, b0l, b1l);
       NaxFrag::mma(c1a, c1b, a1l, b0h, b1h);
+      if (X4) {
+        NaxFrag::mma(c0a, c0b, a0l, b0l, b1l);
+        NaxFrag::mma(c1a, c1b, a1l, b0l, b1l);
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -597,6 +695,102 @@ kernel void gemm_nax_coop_qb_tiled_u4_x3(device const float* A [[buffer(0)]],
   NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
   NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
   NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+}
+#define QB_TILED_U4_SPLIT_KERNEL(NAME, X4)                                        \
+kernel void NAME(device const float* A [[buffer(0)]],                            \
+                 device const uint* Bp   [[buffer(1)]],                          \
+                 device const bfloat* Bs [[buffer(2)]],                          \
+                 device const bfloat* Bb [[buffer(3)]],                          \
+                 device float* C         [[buffer(4)]],                          \
+                 constant uint3& mnk     [[buffer(5)]],                          \
+                 uint2 tgid [[threadgroup_position_in_grid]],                    \
+                 uint lid [[thread_index_in_threadgroup]],                       \
+                 uint sgid [[simdgroup_index_in_threadgroup]]) {                 \
+  threadgroup metal::vec<bfloat,8> Wh8[64u * 72u / 8u];                         \
+  threadgroup metal::vec<bfloat,8> Wl8[64u * 72u / 8u];                         \
+  qb_tiled_u4_split<X4>(A, Bp, Bs, Bb, C, mnk, (threadgroup bfloat*)Wh8,        \
+                        (threadgroup bfloat*)Wl8, tgid, lid, sgid);              \
+}
+QB_TILED_U4_SPLIT_KERNEL(gemm_nax_coop_qb_tiled_u4_x3, false)
+QB_TILED_U4_SPLIT_KERNEL(gemm_nax_coop_qb_tiled_u4_x4, true)
+// GEMM NA à poids bf16 denses B[N,K] (modèles BF16 non quantifiés), même
+// tuilage 64×64×64 que `gemm_nax_coop_qb_tiled_u4_x3`. A f32 est scindé en
+// hi + lo bf16 et chaque pas fait hi·B + lo·B : le poids est exact en bf16,
+// seule l'activation perd sa mantisse, ramenée vers 2⁻¹⁶ comme le qmv f32
+// qu'il remplace en prefill. Exige K%64=0 et N%64=0.
+// MASK_N : lignes de B au-delà de N lues comme zéro et colonnes de C au-delà
+// de N jamais écrites, pour les petites projections (N%64≠0) ; les tuiles
+// pleines font exactement les mêmes opérations.
+template <bool MASK_N>
+inline void gemm_nax_bf16_nt_tiled_x2_body(device const float* A, device const bfloat* B,
+                                           device float* C, uint3 mnk, uint2 tgid,
+                                           uint lid, uint sgid,
+                                           threadgroup metal::vec<bfloat,8>* Ws8) {
+  uint M = mnk.x, K = mnk.z;
+  constexpr uint BN = 64, BK = 64, BKP = BK + 8, WN = 2;
+  threadgroup bfloat* Ws = (threadgroup bfloat*)Ws8;
+  uint sg_m = sgid / WN;
+  uint sg_n = sgid - sg_m * WN;
+  uint m0 = tgid.x * 64u + sg_m * 32u;
+  uint n0 = tgid.y * BN;
+  uint ns = sg_n * 32u;
+  metal::vec<float,8> c0a = float(0), c0b = float(0), c1a = float(0), c1b = float(0);
+  for (uint k = 0; k < K; k += BK) {
+    // 64 lignes × 8 vecteurs de 8 bf16 = 512 vecteurs pour 128 threads.
+    for (uint idx = lid; idx < BN * (BK / 8u); idx += 128u) {
+      uint nl = idx >> 3u, kv = idx & 7u;
+      Ws8[nl * (BKP / 8u) + kv] = (!MASK_N || n0 + nl < mnk.y)
+          ? *((const device metal::vec<bfloat,8>*)(B + (n0 + nl) * K + k) + kv)
+          : metal::vec<bfloat,8>(bfloat(0.0f));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint kk = 0; kk < BK; kk += 16u) {
+      metal::vec<bfloat,8> a0h, a0l, a1h, a1l, b0, b1;
+      NaxFrag::load_a_f32_masked<true>(a0h, a0l, A, m0, k + kk, K, M);
+      NaxFrag::load_a_f32_masked<true>(a1h, a1l, A, m0 + 16u, k + kk, K, M);
+      NaxFrag::load_a_tg(b0, Ws + ns * BKP + kk, int(BKP));
+      NaxFrag::load_a_tg(b1, Ws + (ns + 16u) * BKP + kk, int(BKP));
+      NaxFrag::mma(c0a, c0b, a0h, b0, b1);
+      NaxFrag::mma(c0a, c0b, a0l, b0, b1);
+      NaxFrag::mma(c1a, c1b, a1h, b0, b1);
+      NaxFrag::mma(c1a, c1b, a1l, b0, b1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  uint N = mnk.y;
+  if (MASK_N) {
+    NaxFrag::store_c_masked_mn(c0a, C, m0, n0 + ns, N, M);
+    NaxFrag::store_c_masked_mn(c0b, C, m0, n0 + ns + 16u, N, M);
+    NaxFrag::store_c_masked_mn(c1a, C, m0 + 16u, n0 + ns, N, M);
+    NaxFrag::store_c_masked_mn(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+  } else {
+    NaxFrag::store_c_masked(c0a, C, m0, n0 + ns, N, M);
+    NaxFrag::store_c_masked(c0b, C, m0, n0 + ns + 16u, N, M);
+    NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
+    NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
+  }
+}
+kernel void gemm_nax_bf16_nt_tiled_x2(device const float* A  [[buffer(0)]],
+                                      device const bfloat* B [[buffer(1)]],
+                                      device float* C        [[buffer(2)]],
+                                      constant uint3& mnk    [[buffer(3)]],
+                                      uint2 tgid [[threadgroup_position_in_grid]],
+                                      uint lid [[thread_index_in_threadgroup]],
+                                      uint sgid [[simdgroup_index_in_threadgroup]]) {
+  threadgroup metal::vec<bfloat,8> Ws8[64 * 72 / 8];
+  gemm_nax_bf16_nt_tiled_x2_body<false>(A, B, C, mnk, tgid, lid, sgid, Ws8);
+}
+// Même GEMM hi + lo pour N quelconque (projections b/a de la linear attention,
+// N = 2·48) : remplace le qmv par ligne au prefill, opt-in.
+kernel void gemm_nax_bf16_nt_tiled_x2_maskn(device const float* A  [[buffer(0)]],
+                                            device const bfloat* B [[buffer(1)]],
+                                            device float* C        [[buffer(2)]],
+                                            constant uint3& mnk    [[buffer(3)]],
+                                            uint2 tgid [[threadgroup_position_in_grid]],
+                                            uint lid [[thread_index_in_threadgroup]],
+                                            uint sgid [[simdgroup_index_in_threadgroup]]) {
+  threadgroup metal::vec<bfloat,8> Ws8[64 * 72 / 8];
+  gemm_nax_bf16_nt_tiled_x2_body<true>(A, B, C, mnk, tgid, lid, sgid, Ws8);
 }
 // MLP dense fusionné gate+up+SwiGLU (prefill) : mêmes tuiles 64×64×64 et
 // fragments que `gemm_nax_coop_qb_tiled_u4`, deux tuiles B (gate, up) par pas
@@ -633,6 +827,7 @@ kernel void gemm_nax_coop_qb_tiled_u4_gate_up_swiglu(
     load_b_tile_quant_u4_gs64_vec(Wg, Gp, Gs, Gb, n0, k, N, K, lid);
     load_b_tile_quant_u4_gs64_vec(Wu, Up, Us, Ub, n0, k, N, K, lid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    NAX_KK_UNROLL_GU
     for (uint kk = 0; kk < BK; kk += 16u) {
       metal::vec<bfloat,8> af0, af1, b0, b1;
       if (m0 + 32u <= M) {
@@ -779,7 +974,11 @@ kernel void gemm_nax_skinny_u4_x3(device const float* A [[buffer(0)]],
 // A_hi·q et A_lo·q sont exacts en f32 ; l'erreur vient de Â − A (2⁻¹⁶ relatif) et
 // des sommes f32, contre 2⁻¹⁶ sur A **et** sur B pour le ×3.
 // Split-K : span = K/4 multiple de 128 (K % 512 == 0), aucun groupe n'est coupé.
-static inline void gemm_nax_skinny_u4_x2_body(device const float* A, device const uint* Bp,
+// BITS ∈ {2, 3, 4} : q reste un entier exact en bf16. Les 4 codes d'une lane
+// commencent au bit 4·BITS·(kk/4) ; en u3 (12 bits) ils peuvent chevaucher deux
+// mots, lus seulement dans ce cas. En u4 l'extraction est celle d'origine.
+template <uint BITS>
+static inline void gemm_nax_skinny_x2_body(device const float* A, device const uint* Bp,
                                               device const bfloat* Bs, device const bfloat* Bb,
                                               device float* C, uint M, uint N, uint K,
                                               uint2 tgid, uint sgid, uint lid,
@@ -789,7 +988,7 @@ static inline void gemm_nax_skinny_u4_x2_body(device const float* A, device cons
   uint span = K / SG;
   uint kb = sgid * span, ke = kb + span;
   uint groups = K / 64u;
-  uint packed_cols = K / 8u;
+  uint packed_cols = K * BITS / 32u;
   short2 sc = NaxFrag::get_coord();
   // Lignes A de ce thread (fragment A et fragment C partagent le mapping lane→ligne).
   uint row0 = m0 + uint(sc.y), row1 = row0 + 8u;
@@ -821,13 +1020,21 @@ static inline void gemm_nax_skinny_u4_x2_body(device const float* A, device cons
         }
         if (i == 0) { sa0 += rs; } else { sa1 += rs; }
       }
-      uint shift = (kk & 7u) * 4u;
+      uint bit = kk * BITS;
+      uint word = bit >> 5u, shift = bit & 31u;
+      bool straddle = shift + 4u * BITS > 32u;
       for (short i = 0; i < 2; i++) {
-        uint w0 = Bp[(nb + uint(i) * 8u) * packed_cols + (kk >> 3)] >> shift;
-        uint w1 = Bp[(nb + 16u + uint(i) * 8u) * packed_cols + (kk >> 3)] >> shift;
+        const device uint* p0 = Bp + (nb + uint(i) * 8u) * packed_cols + word;
+        const device uint* p1 = Bp + (nb + 16u + uint(i) * 8u) * packed_cols + word;
+        uint w0 = p0[0] >> shift;
+        uint w1 = p1[0] >> shift;
+        if (straddle) {
+          w0 |= p0[1] << (32u - shift);
+          w1 |= p1[1] << (32u - shift);
+        }
         for (short j = 0; j < 4; j++) {
-          Q0[i * 4 + j] = bfloat(float((w0 >> (4u * uint(j))) & 0x0fu));
-          Q1[i * 4 + j] = bfloat(float((w1 >> (4u * uint(j))) & 0x0fu));
+          Q0[i * 4 + j] = bfloat(float((w0 >> (BITS * uint(j))) & ((1u << BITS) - 1u)));
+          Q1[i * 4 + j] = bfloat(float((w1 >> (BITS * uint(j))) & ((1u << BITS) - 1u)));
         }
       }
       NaxFrag::mma(P0, P1, Ah, Q0, Q1);
@@ -872,8 +1079,21 @@ kernel void gemm_nax_skinny_u4_x2(device const float* A [[buffer(0)]],
                                   uint sgid [[simdgroup_index_in_threadgroup]],
                                   uint lid [[thread_index_in_simdgroup]]) {
   threadgroup float red[4u * 512u];
-  gemm_nax_skinny_u4_x2_body(A, Bp, Bs, Bb, C, batch, dims.x, dims.y, tgid, sgid, lid, red);
+  gemm_nax_skinny_x2_body<4u>(A, Bp, Bs, Bb, C, batch, dims.x, dims.y, tgid, sgid, lid, red);
 }
+#define GEMM_NAX_SKINNY_X2(NAME, BITS)                                                   \
+  kernel void NAME(device const float* A [[buffer(0)]], device const uint* Bp [[buffer(1)]], \
+                   device const bfloat* Bs [[buffer(2)]], device const bfloat* Bb [[buffer(3)]], \
+                   device float* C [[buffer(4)]], constant uint4& dims [[buffer(5)]],      \
+                   constant uint& batch [[buffer(6)]],                                     \
+                   uint2 tgid [[threadgroup_position_in_grid]],                            \
+                   uint sgid [[simdgroup_index_in_threadgroup]],                           \
+                   uint lid [[thread_index_in_simdgroup]]) {                               \
+    threadgroup float red[4u * 512u];                                                      \
+    gemm_nax_skinny_x2_body<BITS>(A, Bp, Bs, Bb, C, batch, dims.x, dims.y, tgid, sgid, lid, red); \
+  }
+GEMM_NAX_SKINNY_X2(gemm_nax_skinny_u3_x2, 3u)
+GEMM_NAX_SKINNY_X2(gemm_nax_skinny_u2_x2, 2u)
 kernel void gemm_nax_coop_qb_tiled_gs128(device const bfloat* A [[buffer(0)]],
                                          device const uint* Bp   [[buffer(1)]],
                                          device const bfloat* Bs [[buffer(2)]],
@@ -1312,213 +1532,4 @@ kernel void gemm_nax_coop_qb_grouped(device const bfloat* A [[buffer(0)]],
   }
   NaxFrag::store_c(Cn0, C + m0 * N + n0, int(N));
   NaxFrag::store_c(Cn1, C + m0 * N + n0 + 16u, int(N));
-}
-// Port chunked-DeltaNet brique 4 : version LAYOUT RÉEL. 1 threadgroup/value_head, boucle
-// chunks. Lit les vrais buffers : k/q_norm [T, key_dim] par key_head (GQA repeat), v depuis
-// conv_out interleavé [T, conv_dim] à 2*key_dim+value_base, beta/decay [T, value_heads],
-// ssm_state [value_dim, 128] par tête. dims=(value_heads, value_head_dim, repeat, steps).
-// value_head_dim=128 requis (buffers threadgroup). Remplace linear_attn_gated_delta_seq.
-kernel void chunk_delta_seq_layout(device const float* conv_out [[buffer(0)]],
-                                   device const float* q_norm [[buffer(1)]],
-                                   device const float* k_norm [[buffer(2)]],
-                                   device const float* beta [[buffer(3)]],
-                                   device const float* decay [[buffer(4)]],
-                                   device float* ssm_state [[buffer(5)]],
-                                   device float* y [[buffer(6)]],
-                                   constant uint4& dims [[buffer(7)]], // (vheads, vhd, repeat, steps)
-                                   uint gid [[threadgroup_position_in_grid]],
-                                   uint tid [[thread_index_in_threadgroup]],
-                                   uint nthreads [[threads_per_threadgroup]]) {
-  const uint vheads = dims.x, vhd = dims.y, repeat = dims.z, steps = dims.w;
-  const uint dk = 128u, CM = 16u;
-  const uint vh = gid;
-  if (vh >= vheads || repeat == 0u) { return; }
-  const uint key_heads = vheads / repeat;
-  const uint key_dim = key_heads * dk;
-  const uint value_dim = vheads * vhd;
-  const uint conv_dim = 2u * key_dim + value_dim;
-  const uint key_base = (vh / repeat) * dk;
-  const uint value_base = vh * vhd;
-  threadgroup float gamma[16];
-  threadgroup float A[16 * 16];
-  threadgroup float P[16 * 16];
-  threadgroup float u[16 * 128];
-  threadgroup float delta[16 * 128];
-  threadgroup float qs[16 * 128];
-  const uint c = tid;
-  for (uint c0 = 0; c0 < steps; c0 += CM) {
-    const uint nc = min(CM, steps - c0);
-    if (tid == 0) {
-      float g = 1.0f;
-      for (uint i = 0; i < nc; i++) { g *= decay[(c0 + i) * vheads + vh]; gamma[i] = g; }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (c < vhd) {
-      const uint srow = (value_base + c) * dk;
-      for (uint i = 0; i < nc; i++) {
-        float ks = 0.0f, qsv = 0.0f;
-        const uint kq = (c0 + i) * key_dim + key_base;
-        for (uint k = 0; k < dk; k++) {
-          float s = ssm_state[srow + k];
-          ks += s * k_norm[kq + k];
-          qsv += s * q_norm[kq + k];
-        }
-        float vv = conv_out[(c0 + i) * conv_dim + 2u * key_dim + value_base + c];
-        u[i * vhd + c] = beta[(c0 + i) * vheads + vh] * (vv - gamma[i] * ks);
-        qs[i * vhd + c] = qsv;
-      }
-    }
-    for (uint e = tid; e < nc * nc; e += nthreads) {
-      uint i = e / nc, j = e % nc;
-      float kk = 0.0f, qk = 0.0f;
-      const uint ki = (c0 + i) * key_dim + key_base;
-      const uint kj = (c0 + j) * key_dim + key_base;
-      for (uint k = 0; k < dk; k++) {
-        kk += k_norm[ki + k] * k_norm[kj + k];
-        qk += q_norm[ki + k] * k_norm[kj + k];
-      }
-      float r = gamma[i] / gamma[j];
-      A[i * CM + j] = (j < i) ? (beta[(c0 + i) * vheads + vh] * r * kk) : 0.0f;
-      P[i * CM + j] = (j <= i) ? (r * qk) : 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (c < vhd) {
-      for (uint i = 0; i < nc; i++) {
-        float acc = u[i * vhd + c];
-        for (uint j = 0; j < i; j++) { acc -= A[i * CM + j] * delta[j * vhd + c]; }
-        delta[i * vhd + c] = acc;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (c < vhd) {
-      for (uint i = 0; i < nc; i++) {
-        float yv = gamma[i] * qs[i * vhd + c];
-        for (uint j = 0; j <= i; j++) { yv += P[i * CM + j] * delta[j * vhd + c]; }
-        y[(c0 + i) * value_dim + value_base + c] = yv;
-      }
-      const uint srow = (value_base + c) * dk;
-      const float glast = gamma[nc - 1];
-      for (uint k = 0; k < dk; k++) {
-        float s = glast * ssm_state[srow + k];
-        for (uint j = 0; j < nc; j++) {
-          s += (glast / gamma[j]) * delta[j * vhd + c] * k_norm[(c0 + j) * key_dim + key_base + k];
-        }
-        ssm_state[srow + k] = s;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-}
-// Brique 6c : chunk_delta_seq_layout en TENSOR-CORES (KS/QS + state-update sur
-// simdgroup_matrix, avec les offsets
-// multi-tête/GQA). 128 threads = 4 simdgroups. value_head_dim=128 requis.
-kernel void chunk_delta_seq_layout_tc(device const float* conv_out [[buffer(0)]],
-                                      device const float* q_norm [[buffer(1)]],
-                                      device const float* k_norm [[buffer(2)]],
-                                      device const float* beta [[buffer(3)]],
-                                      device const float* decay [[buffer(4)]],
-                                      device float* ssm_state [[buffer(5)]],
-                                      device float* y [[buffer(6)]],
-                                      constant uint4& dims [[buffer(7)]], // (vheads,vhd,repeat,steps)
-                                      uint gid [[threadgroup_position_in_grid]],
-                                      uint tid [[thread_index_in_threadgroup]],
-                                      uint nthreads [[threads_per_threadgroup]]) {
-  const uint vheads = dims.x, vhd = dims.y, repeat = dims.z, steps = dims.w;
-  const uint dk = 128u, CM = 16u;
-  const uint vh = gid;
-  if (vh >= vheads || repeat == 0u) { return; }
-  const uint key_heads = vheads / repeat;
-  const uint key_dim = key_heads * dk;
-  const uint value_dim = vheads * vhd;
-  const uint conv_dim = 2u * key_dim + value_dim;
-  const uint key_base = (vh / repeat) * dk;
-  const uint value_base = vh * vhd;
-  threadgroup float gamma[16];
-  threadgroup float A[16 * 16];
-  threadgroup float P[16 * 16];
-  threadgroup float u[16 * 128];
-  threadgroup float delta[16 * 128];
-  threadgroup float qs[16 * 128];
-  const uint c = tid;
-  const uint sgid = tid / 32u;
-  for (uint c0 = 0; c0 < steps; c0 += CM) {
-    const uint nc = min(CM, steps - c0);
-    if (tid == 0) {
-      float g = 1.0f;
-      for (uint i = 0; i < nc; i++) { g *= decay[(c0 + i) * vheads + vh]; gamma[i] = g; }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint tt = sgid; tt < (16u / 8u) * (vhd / 8u); tt += 4u) {
-      uint i0 = (tt / (vhd / 8u)) * 8u, c0t = (tt % (vhd / 8u)) * 8u;
-      metal::simdgroup_float8x8 acck = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-      metal::simdgroup_float8x8 accq = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-      for (uint kt = 0; kt < dk / 8u; kt++) {
-        uint k0 = kt * 8u;
-        metal::simdgroup_float8x8 ak, aq, bs;
-        metal::simdgroup_load(ak, k_norm + (c0 + i0) * key_dim + key_base + k0, key_dim);
-        metal::simdgroup_load(aq, q_norm + (c0 + i0) * key_dim + key_base + k0, key_dim);
-        metal::simdgroup_load(bs, ssm_state + (value_base + c0t) * dk + k0, dk, ulong2(0, 0), true);
-        metal::simdgroup_multiply_accumulate(acck, ak, bs, acck);
-        metal::simdgroup_multiply_accumulate(accq, aq, bs, accq);
-      }
-      metal::simdgroup_store(acck, u + i0 * vhd + c0t, vhd);
-      metal::simdgroup_store(accq, qs + i0 * vhd + c0t, vhd);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (c < vhd) {
-      for (uint i = 0; i < nc; i++) {
-        float vv = conv_out[(c0 + i) * conv_dim + 2u * key_dim + value_base + c];
-        u[i * vhd + c] = beta[(c0 + i) * vheads + vh] * (vv - gamma[i] * u[i * vhd + c]);
-      }
-    }
-    for (uint e = tid; e < nc * nc; e += nthreads) {
-      uint i = e / nc, j = e % nc;
-      float kk = 0.0f, qk = 0.0f;
-      const uint ki = (c0 + i) * key_dim + key_base;
-      const uint kj = (c0 + j) * key_dim + key_base;
-      for (uint k = 0; k < dk; k++) {
-        kk += k_norm[ki + k] * k_norm[kj + k];
-        qk += q_norm[ki + k] * k_norm[kj + k];
-      }
-      float r = gamma[i] / gamma[j];
-      A[i * CM + j] = (j < i) ? (beta[(c0 + i) * vheads + vh] * r * kk) : 0.0f;
-      P[i * CM + j] = (j <= i) ? (r * qk) : 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (c < vhd) {
-      for (uint i = 0; i < nc; i++) {
-        float acc = u[i * vhd + c];
-        for (uint j = 0; j < i; j++) { acc -= A[i * CM + j] * delta[j * vhd + c]; }
-        delta[i * vhd + c] = acc;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float glast = gamma[nc - 1];
-    if (c < vhd) {
-      for (uint i = 0; i < nc; i++) {
-        float yv = gamma[i] * qs[i * vhd + c];
-        for (uint j = 0; j <= i; j++) { yv += P[i * CM + j] * delta[j * vhd + c]; }
-        y[(c0 + i) * value_dim + value_base + c] = yv;
-      }
-      for (uint j = 0; j < CM; j++) {
-        delta[j * vhd + c] = (j < nc) ? (glast / gamma[j]) * delta[j * vhd + c] : 0.0f;
-      }
-      const uint srow = (value_base + c) * dk;
-      for (uint k = 0; k < dk; k++) { ssm_state[srow + k] *= glast; }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint t = sgid; t < (vhd / 8u) * (dk / 8u); t += 4u) {
-      uint c0t = (t / (dk / 8u)) * 8u, k0t = (t % (dk / 8u)) * 8u;
-      metal::simdgroup_float8x8 acc;
-      metal::simdgroup_load(acc, ssm_state + (value_base + c0t) * dk + k0t, dk);
-      for (uint jt = 0; jt < CM / 8u; jt++) {
-        metal::simdgroup_float8x8 a, b;
-        metal::simdgroup_load(a, delta + (jt * 8u) * vhd + c0t, vhd, ulong2(0, 0), true);
-        metal::simdgroup_load(b, k_norm + (c0 + jt * 8u) * key_dim + key_base + k0t, key_dim);
-        metal::simdgroup_multiply_accumulate(acc, a, b, acc);
-      }
-      metal::simdgroup_store(acc, ssm_state + (value_base + c0t) * dk + k0t, dk);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
 }

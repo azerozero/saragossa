@@ -8,16 +8,17 @@
 // Voir docs/perf/greedy-identity.md.
 
 /// Écarts connus (préfixe « kernel cas », R minimal, écart relatif max) : le
-/// matmul u4 gs64 passe au kernel skinny (MMA bf16 hi+lo) à partir de 5 lignes,
+/// matmul u4 (u3 et u2 aussi) gs64 passe au kernel skinny (MMA bf16 hi+lo) à partir de 5 lignes,
 /// et tout bloc qui en contient un hérite de l'écart. Bornes : 1e-5 pour un
 /// matmul (mesuré 2,4 à 4,6e-6, x2 et x3) et 5e-5 pour un bloc qui en enchaîne
 /// plusieurs (mesuré ≤ 1,7e-5). En mode strict (skinny coupé, mêmes lots),
 /// aucune exception ne s'applique. Il en va de même sans pipeline skinny de la
-/// variante choisie : `qmm_skinny_available()` est la garde matérielle utilisée
+/// variante choisie : `qmm_skinny_available(4)` est la garde matérielle utilisée
 /// par `select_resident_affine_matmul_kernel` (repli qmv sans NAX).
 const ROWS_EXACT_EXCEPTIONS: &[(&str, usize, f32)] = &[
     ("matmul u4", 5, 1.0e-5),
     ("attn QKV u4", 5, 1.0e-5),
+    ("attn QKV u3", 5, 1.0e-5),
     ("linear bloc", 5, 5.0e-5),
     ("linear S1 projection", 5, 1.0e-5),
     ("queue MoE", 5, 5.0e-5),
@@ -114,7 +115,7 @@ fn rows_exact_check_lot(
         .collect();
     let full = format!("{kernel} {case}");
     let strict = ROWS_EXACT_STRICT.with(std::cell::Cell::get);
-    let skinny_available = executor.qmm_skinny_available();
+    let skinny_available = executor.qmm_skinny_available(4);
     let bound = ROWS_EXACT_EXCEPTIONS
         .iter()
         .filter(|(key, from, _)| {
@@ -246,6 +247,7 @@ fn rows_exact_matmul_formats_body() -> Result<()> {
     for (kernel, case, weight) in &cases {
         let in_dim = match weight {
             LinearWeight::AffineQuantized(w) => w.shape()[1],
+            LinearWeight::MicroScaled(w) => w.shape()[1],
             LinearWeight::Dense(t) => t.shape()[1],
             LinearWeight::DenseBf16(t) => t.shape()[1],
             LinearWeight::DenseShared(t) => t.shape()[1],
@@ -1644,6 +1646,59 @@ fn rows_exact_qmvt_engaged_in_strict_mode() -> Result<()> {
                 ),
                 0,
                 "strict {out_dim}x{in_dim} R={rows} : lot ≠ mono"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Hors mode strict, les lots de 3 et 4 lignes (sous le skinny) prennent le
+/// qmv-T au lieu du qmv répliqué et rendent en bits les lignes du qmv mono ;
+/// à 5 lignes le skinny reprend la main.
+#[test]
+#[ignore = "oracle GPU en bits : lancer avec --ignored"]
+fn rows_exact_qmvt_engaged_below_skinny() -> Result<()> {
+    let executor = rows_exact_executor()?;
+    let (out_dim, in_dim) = (5120usize, 17408usize);
+    let buffers = executor.resolve_linear_weight_buffers(
+        &LinearWeight::AffineQuantized(test_affine_random_u4(out_dim, in_dim, 23)?),
+        "rexact_qmvt_small",
+    )?;
+    let x = rows_exact_lhs(5, in_dim, 5, 1.0);
+    let lhs = executor.buffer_from_slice(&x, "rexact_qmvt_small_lhs")?;
+    let out = executor.uncached_f32_buffer(5 * out_dim, "rexact_qmvt_small_out")?;
+    let mut mono = Vec::with_capacity(5 * out_dim);
+    for r in 0..5 {
+        let xr = executor.buffer_from_slice(&x[r * in_dim..(r + 1) * in_dim], "rexact_qmvt_small_x1")?;
+        let o = executor.uncached_f32_buffer(out_dim, "rexact_qmvt_small_o1")?;
+        rows_exact_cb(&executor, |enc| {
+            executor
+                .encode_matmul_weight_buffers(enc, &xr, 1, in_dim, &buffers, &o, false)
+                .map(|_| ())
+        })?;
+        mono.extend(read_f32_buffer(&o, out_dim)?);
+    }
+    let fast = super::flags::fast_affine_qmv_enabled(out_dim)
+        && super::eligibility::qmvt_small_enabled();
+    for rows in 3..=5 {
+        let count = || super::matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get);
+        let before = count();
+        rows_exact_cb(&executor, |enc| {
+            executor
+                .encode_matmul_weight_buffers(enc, &lhs, rows, in_dim, &buffers, &out, false)
+                .map(|_| ())
+        })?;
+        let engaged = count() > before;
+        assert_eq!(engaged, fast && rows < 5, "qmv-T R={rows} : engagé = {engaged}");
+        if engaged {
+            assert_eq!(
+                rows_exact_ndiff(
+                    &mono[..rows * out_dim],
+                    &read_f32_buffer(&out, rows * out_dim)?,
+                    "qmv-T"
+                ),
+                0,
+                "R={rows} : lot ≠ mono"
             );
         }
     }

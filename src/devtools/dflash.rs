@@ -942,7 +942,9 @@ pub(crate) fn load_dflash_draft_weights_with_runtime(
     quant: Option<DFlashQuant>,
     runtime: ForwardRuntime<'_>,
 ) -> Result<DFlashDraft> {
-    let sources = if crate::runtime_flags::state_snapshot_dir().is_some() {
+    let sources = if crate::runtime_flags::state_snapshot_dir().is_some()
+        || crate::decoder::persistent_prefix_enabled()
+    {
         crate::decoder::SnapshotSources::capture([draft_dir
             .as_ref()
             .join("model.safetensors")
@@ -1245,6 +1247,7 @@ mod tests {
     fn target_config() -> ModelConfig {
         ModelConfig {
             model_type: "qwen3_5_moe".to_string(),
+            vision_config: None,
             hidden_size: 2048,
             num_hidden_layers: 40,
             num_attention_heads: 16,

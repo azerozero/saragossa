@@ -1,39 +1,84 @@
 //! Politique du decode MTP partagée par la CLI, `run` et `serve`.
 
+#[cfg(feature = "serve")]
 use std::time::Duration;
 
-use saragossa::{GenerationOutput, GenerationTimings, ModelAssets, SpeculativeOutput};
+#[cfg(feature = "serve")]
+use saragossa::{GenerationOutput, GenerationTimings, SpeculativeOutput};
 
+#[cfg(feature = "serve")]
 use super::protocol::{ChatCompletionRequest, ResponseFormatMode};
+
+use saragossa::ModelAssets;
 
 const MTP_DECODE_ENV: &str = "SARAGOSSA_RUST_MTP_DECODE";
 const MTP_MAX_DRAFT_ENV: &str = "SARAGOSSA_RUST_MTP_MAX_DRAFT";
 
 /// Indique si le modèle peut charger automatiquement sa tête MTP.
+///
+/// MTP demandé explicitement (`SARAGOSSA_RUST_MTP_DECODE=1`) ou drafter DFlash
+/// configuré mais chemin inactif : une ligne d'avertissement, decode AR.
 pub(crate) fn active_for(assets: &ModelAssets, backend: crate::RuntimeKind) -> bool {
-    decode_enabled(saragossa::runtime_flags::env_var(MTP_DECODE_ENV).as_deref())
-        && supports_model(
+    let flag = saragossa::runtime_flags::env_var(MTP_DECODE_ENV);
+    let reason = if decode_enabled(flag.as_deref()) {
+        inactive_reason(
             &assets.config,
             &assets.mtp,
             backend,
             saragossa::runtime_flags::mtp_sidecar_override().as_deref(),
         )
+    } else {
+        Some("désactivé par SARAGOSSA_RUST_MTP_DECODE")
+    };
+    let Some(reason) = reason else {
+        return true;
+    };
+    let dflash = saragossa::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_some();
+    if flag.is_some_and(|value| decode_enabled(Some(&value))) || dflash {
+        eprintln!(
+            "saragossa MTP demandé mais inactif model_dir={} raison={reason}{} : decode AR",
+            assets.model_dir.display(),
+            if dflash {
+                " (drafter DFlash ignoré, joignable par le seul chemin MTP)"
+            } else {
+                ""
+            }
+        );
+    }
+    false
 }
 
 /// Un tronc MoE n'active le MTP qu'avec une tête désignée explicitement par
 /// `SARAGOSSA_RUST_MTP_SIDECAR` (tête officielle du 35B-A3B, qualifiée en
 /// greedy) : aucun sidecar MoE détecté en silence n'a passé ces portes.
+#[cfg(test)]
 fn supports_model(
     config: &saragossa::ModelConfig,
     mtp: &saragossa::MtpWeightsInfo,
     backend: crate::RuntimeKind,
     explicit_sidecar: Option<&std::path::Path>,
 ) -> bool {
-    backend == crate::RuntimeKind::Metal
-        && mtp.path.is_some()
-        && mtp.is_available()
-        && (!config.is_moe()
-            || explicit_sidecar.is_some_and(|path| mtp.path.as_deref() == Some(path)))
+    inactive_reason(config, mtp, backend, explicit_sidecar).is_none()
+}
+
+/// Raison pour laquelle le MTP reste inactif, `None` s'il est admis.
+fn inactive_reason(
+    config: &saragossa::ModelConfig,
+    mtp: &saragossa::MtpWeightsInfo,
+    backend: crate::RuntimeKind,
+    explicit_sidecar: Option<&std::path::Path>,
+) -> Option<&'static str> {
+    if backend != crate::RuntimeKind::Metal {
+        Some("backend non Metal")
+    } else if mtp.path.is_none() || !mtp.is_available() {
+        Some("aucune tête MTP (ni sidecar, ni tenseurs mtp.* dans un shard)")
+    } else if config.is_moe()
+        && explicit_sidecar.is_none_or(|path| mtp.path.as_deref() != Some(path))
+    {
+        Some("tronc MoE sans SARAGOSSA_RUST_MTP_SIDECAR")
+    } else {
+        None
+    }
 }
 
 /// Le MTP échantillonné est-il admis pour ce modèle ? Coupé sur un tronc MoE :
@@ -64,6 +109,7 @@ pub(crate) fn supports_options(options: &saragossa::GenerationOptions, sampled: 
 }
 
 /// Indique si une requête doit emprunter le chemin MTP.
+#[cfg(feature = "serve")]
 pub(super) fn routes_request(
     request: &ChatCompletionRequest,
     response_format: ResponseFormatMode,
@@ -87,6 +133,7 @@ pub(crate) fn max_draft_tokens() -> usize {
 }
 
 /// Convertit les métriques spéculatives vers le contrat de métriques serveur.
+#[cfg(feature = "serve")]
 pub(super) fn into_generation_output(
     output: SpeculativeOutput,
     elapsed: Duration,
@@ -114,6 +161,7 @@ fn decode_enabled(value: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "serve")]
     fn request(json: &str) -> ChatCompletionRequest {
         serde_json::from_str(json).expect("invariant: requête test valide")
     }
@@ -127,12 +175,11 @@ mod tests {
         }))
         .expect("invariant: configuration test valide");
         let mut mtp = saragossa::MtpWeightsInfo::default();
-        assert!(!supports_model(
-            &config,
-            &mtp,
-            crate::RuntimeKind::Metal,
-            None
-        ));
+        // Ni sidecar ni tenseurs embarqués : la raison de l'avertissement.
+        assert!(
+            inactive_reason(&config, &mtp, crate::RuntimeKind::Metal, None)
+                .is_some_and(|reason| reason.starts_with("aucune tête MTP"))
+        );
         mtp.path = Some("mtp.safetensors".into());
         assert!(!supports_model(
             &config,
@@ -222,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "serve")]
     fn request_routing_follows_sampled_opt_in() {
         let sampled = request(r#"{"model":"m","messages":[],"temperature":0.7}"#);
         assert!(!routes_request(&sampled, ResponseFormatMode::Text, false));
@@ -279,6 +327,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "serve")]
     fn routing_accepts_only_unguided_greedy_requests() {
         let absent = request(r#"{"model":"m","messages":[]}"#);
         let zero = request(r#"{"model":"m","messages":[],"temperature":0}"#);

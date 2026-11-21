@@ -11,6 +11,91 @@ use saragossa::{
 use super::*;
 
 #[test]
+fn json_schema_required_content_greedy_sampled_and_streaming() {
+    for temperature in [0.0, 0.8] {
+        for streaming in [false, true] {
+            for budget in [1, 8] {
+                let mut loaded = tiny_loaded_model_with_vocab(
+                    r#"{"{}":0,"{\"city\":\"Paris\"}":1,"<eos>":2}"#,
+                    "{}",
+                );
+                let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                    "model":"tiny", "messages":[{"role":"user","content":"Return {}"}],
+                    "temperature":temperature, "top_k":1, "top_p":0.5, "seed":42,
+                    "stream":streaming, "max_tokens":budget,
+                    "response_format":{"type":"json_schema", "json_schema":{
+                        "name":"weather", "strict":true, "schema":{
+                            "type":"object", "properties":{"city":{"enum":["Paris"]}},
+                            "required":["city"], "additionalProperties":false
+                        }
+                    }}
+                }))
+                .expect("request");
+                assert!(!request.batchable(8));
+                let mut deltas = String::new();
+                let completion = if streaming {
+                    loaded.complete_streaming(
+                        request,
+                        budget,
+                        None,
+                        &MemoryGuard::serve(),
+                        &mut |event| {
+                            if let CompletionStreamEvent::Delta(delta) = event {
+                                deltas.push_str(delta);
+                            }
+                            Ok(())
+                        },
+                    )
+                } else {
+                    loaded.complete(request, budget, None, &MemoryGuard::serve())
+                }
+                .expect("completion");
+                assert_eq!(completion.content, r#"{"city":"Paris"}"#);
+                assert_eq!(completion.finish_reason, "stop");
+                if streaming {
+                    assert_eq!(deltas, completion.content);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn json_schema_incomplete_budget_fails_and_text_keeps_lazy_catalogs() {
+    for streaming in [false, true] {
+        let mut loaded = tiny_loaded_model_with_vocab(r#"{"{":0,"}":1,"<eos>":2}"#, "{");
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model":"tiny", "messages":[], "response_format":{"type":"json_schema", "json_schema":{
+                "name":"empty", "schema":{"type":"object", "additionalProperties":false}
+            }}
+        }))
+        .expect("request");
+        let mut terminal = false;
+        let result = if streaming {
+            loaded.complete_streaming(request, 1, None, &MemoryGuard::serve(), &mut |event| {
+                terminal |= matches!(event, CompletionStreamEvent::TerminalError(_));
+                Ok(())
+            })
+        } else {
+            loaded.complete(request, 1, None, &MemoryGuard::serve())
+        };
+        assert!(matches!(result, Err(ServeError::IncompleteJson(_))));
+        assert_eq!(terminal, streaming);
+    }
+    let loaded = tiny_loaded_model();
+    let request: ChatCompletionRequest =
+        serde_json::from_value(serde_json::json!({"model":"tiny", "messages":[]}))
+            .expect("request");
+    assert!(loaded
+        .generation_options(&request, &[], ResponseFormatMode::Text)
+        .expect("options")
+        .token_constraint
+        .is_none());
+    assert!(loaded.schema_token_catalog.get().is_none());
+    assert!(loaded.json_token_catalog.get().is_none());
+}
+
+#[test]
 fn missing_qwen_profile_fails_before_prompt_encoding() {
     let mut loaded = tiny_loaded_model();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -378,6 +463,7 @@ pub(super) fn tiny_loaded_model_with_vocab(vocab_json: &str, unk_token: &str) ->
         preset: None,
         mtp_active: false,
         json_token_catalog: OnceLock::new(),
+        schema_token_catalog: OnceLock::new(),
         prefix_cache: BlockAwarePrefixCache::new(1, 0),
     }
 }

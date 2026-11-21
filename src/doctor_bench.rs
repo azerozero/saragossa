@@ -329,6 +329,8 @@ fn load_model_summary(path: &Path) -> CliResult<ModelSummary> {
     let weight_bytes = safetensor_bytes(path)?;
     let shard_count = list_safetensors(path)?.len();
     let tensor_count = match &assets {
+        // Une tête embarquée est déjà dans le catalogue du trunk.
+        Some(assets) if assets.mtp.embedded => assets.catalog.tensor_count(),
         Some(assets) => assets.catalog.tensor_count() + assets.mtp.tensor_count,
         None => count_safetensor_keys(path)?,
     };

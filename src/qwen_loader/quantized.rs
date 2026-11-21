@@ -14,6 +14,10 @@ pub(super) fn quantized_contract_shape(
             spec.source
         ))
     })?;
+    if let Some(mode) = micro_mode_for(quant, &spec.source)? {
+        validate_micro_params(quant, &spec.source, mode)?;
+        return micro_contract_shape(spec, entry, entries, mode);
+    }
     let scales_key = replace_weight_suffix(&spec.source, ".scales")?;
     let biases_key = replace_weight_suffix(&spec.source, ".biases")?;
     let (group_size, bits) = resolve_quant_params(quant, &spec.source, entry, entries)?;
@@ -254,7 +258,7 @@ fn expect_entry_shape(name: &str, entry: &ShardTensorEntry, expected: &[usize]) 
     Ok(())
 }
 
-fn read_entry_bytes(shard: &ShardHeader, entry: &ShardTensorEntry) -> Result<Vec<u8>> {
+pub(super) fn read_entry_bytes(shard: &ShardHeader, entry: &ShardTensorEntry) -> Result<Vec<u8>> {
     let len = entry.payload_len("poids")?;
     let offset = shard
         .data_start
@@ -291,6 +295,9 @@ pub(super) fn tensor_from_entry(
     let shard = headers
         .get(entry_ref.shard_index)
         .ok_or_else(|| InferError::Shape("index shard invalide".to_string()))?;
+    if let Some(module) = context.lora.and_then(|lora| lora.module(&spec.source)) {
+        return lora_merged_tensor(spec, entry, shard, module, context);
+    }
     if let Some(packed) = packed_u32_entry(entry, &spec.source)? {
         return quantized_tensor_from_entry(
             config, spec, &packed, shard, headers, entries, context,
@@ -307,7 +314,9 @@ pub(super) fn tensor_from_entry(
         && crate::runtime_flags::single_copy_weights_enabled()
     {
         if let Some(metal) = context.metal {
-            let view = bf16_entry_to_metal(headers, entry_ref, &spec.source, metal)?;
+            // NOTE: `DenseBf16Tensor` et ses kernels lient le buffer à
+            // l'offset 0 : jamais de vue mmap décalée ici, toujours la copie.
+            let view = bf16_entry_to_metal(headers, entry_ref, &spec.source, metal, false)?;
             return Ok(DecoderTensor::LinearWeight(LinearWeight::DenseBf16(
                 crate::DenseBf16Tensor::new(&view.shape, view.buffer)?,
             )));
@@ -319,6 +328,38 @@ pub(super) fn tensor_from_entry(
         tensor = apply_fp8_weight_scale_inv(spec, tensor, headers, entries)?;
     }
     Ok(DecoderTensor::Dense(tensor))
+}
+
+/// Lit un poids de base dense, y ajoute `s·B·A` en f32, puis le range comme le
+/// chemin sans LoRA : bf16 single-copy sous Metal pour une base BF16, f32 pour
+/// une base F16 ou F32 et sur CPU.
+/// La cible a été validée par `validate_lora_targets` (2D, non quantifiée).
+fn lora_merged_tensor(
+    spec: &TensorSpec,
+    entry: &ShardTensorEntry,
+    shard: &ShardHeader,
+    module: &super::lora::LoraModule,
+    context: &DecoderLoadContext<'_>,
+) -> Result<DecoderTensor> {
+    let bytes = read_entry_bytes(shard, entry)?;
+    let mut weight = crate::safetensor::bytes_to_dense_f32(&bytes, entry.dtype, &spec.source)?;
+    drop(bytes);
+    module.merge_into(&spec.source, &entry.shape, &mut weight)?;
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if entry.dtype == Dtype::BF16 && crate::runtime_flags::single_copy_weights_enabled() {
+        if let Some(metal) = context.metal {
+            let buffer = metal.weight_buffer_from_f32_as_bf16(&weight)?;
+            return Ok(DecoderTensor::LinearWeight(LinearWeight::DenseBf16(
+                crate::DenseBf16Tensor::new(&entry.shape, buffer)?,
+            )));
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let _ = context;
+    Ok(DecoderTensor::Dense(Tensor::from_vec(
+        entry.shape.clone(),
+        weight,
+    )?))
 }
 
 pub(super) fn quantized_tensor_from_entry(
@@ -336,6 +377,57 @@ pub(super) fn quantized_tensor_from_entry(
             spec.source
         ))
     })?;
+    if let Some(mode) = micro_mode_for(quant, &spec.source)? {
+        validate_micro_params(quant, &spec.source, mode)?;
+        let shape = micro_contract_shape(spec, entry, entries, mode)?;
+        let scale_name = replace_weight_suffix(&spec.source, ".scales")?;
+        let scale_entry = named_entry(headers, entries, &scale_name)?;
+        let scale_shard = headers
+            .get(scale_entry.shard_index)
+            .ok_or_else(|| InferError::Shape("index shard invalide".into()))?;
+        // Single-copy : codes et échelles sont lus directement dans les
+        // MTLBuffer partagés que lisent les kernels, sans vecteur CPU.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if crate::runtime_flags::single_copy_weights_enabled() {
+            if let Some(metal) = context.metal {
+                let file_offset = |header: &ShardHeader, entry: &ShardTensorEntry| {
+                    header
+                        .data_start
+                        .checked_add(entry.data_offsets[0] as u64)
+                        .ok_or_else(|| InferError::Shape("offset safetensors trop grand".into()))
+                };
+                let packed = metal.weight_buffer_from_u32_file(
+                    &shard.path,
+                    file_offset(shard, entry)?,
+                    entry.payload_len(&spec.source)?,
+                )?;
+                let scales = metal.weight_buffer_from_u8_file(
+                    &scale_shard.path,
+                    file_offset(scale_shard, &scale_entry.entry)?,
+                    scale_entry.entry.payload_len(&scale_name)?,
+                )?;
+                let weight = crate::MicroQuantizedTensor::new_metal_shared(
+                    [shape[0], shape[1]],
+                    packed,
+                    scales,
+                    mode,
+                )?;
+                return Ok(DecoderTensor::LinearWeight(LinearWeight::MicroScaled(
+                    weight,
+                )));
+            }
+        }
+        let scales = read_entry_bytes(scale_shard, &scale_entry.entry)?;
+        let bytes = read_entry_bytes(shard, entry)?;
+        let packed = bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let weight = crate::MicroQuantizedTensor::new([shape[0], shape[1]], packed, scales, mode)?;
+        return Ok(DecoderTensor::LinearWeight(LinearWeight::MicroScaled(
+            weight,
+        )));
+    }
     let (group_size, bits) = resolve_quant_params(quant, &spec.source, entry, entries)?;
     let scales_key = replace_weight_suffix(&spec.source, ".scales")?;
     let biases_key = replace_weight_suffix(&spec.source, ".biases")?;
@@ -345,8 +437,8 @@ pub(super) fn quantized_tensor_from_entry(
             let scales_entry = named_entry(headers, entries, &scales_key)?;
             let biases_entry = named_entry(headers, entries, &biases_key)?;
             if scales_entry.entry.dtype == Dtype::BF16 && biases_entry.entry.dtype == Dtype::BF16 {
-                let scales = bf16_entry_to_metal(headers, scales_entry, &scales_key, metal)?;
-                let biases = bf16_entry_to_metal(headers, biases_entry, &biases_key, metal)?;
+                let scales = bf16_entry_to_metal(headers, scales_entry, &scales_key, metal, true)?;
+                let biases = bf16_entry_to_metal(headers, biases_entry, &biases_key, metal, true)?;
                 let packed_len = element_count(&entry.shape, &spec.source)?;
                 let packed_bytes = entry.payload_len(&spec.source)?;
                 let packed_offset = shard
@@ -355,12 +447,18 @@ pub(super) fn quantized_tensor_from_entry(
                     .ok_or_else(|| {
                         InferError::Shape("offset safetensors trop grand".to_string())
                     })?;
-                let packed_buffer =
-                    metal.weight_buffer_from_u32_file(&shard.path, packed_offset, packed_bytes)?;
+                let (packed_buffer, packed_base) = metal.weight_view_from_file(
+                    &shard.path,
+                    packed_offset,
+                    packed_bytes,
+                    std::mem::size_of::<u32>(),
+                )?;
+                let packed_base = packed_base / std::mem::size_of::<u32>();
                 if is_moe_expert_weight(&spec.target) && entry.shape.len() == 3 {
                     return quantized_expert_weights_from_metal_views(
                         &entry.shape,
                         packed_buffer,
+                        packed_base,
                         packed_len,
                         scales,
                         biases,
@@ -371,15 +469,15 @@ pub(super) fn quantized_tensor_from_entry(
                 let weight = AffineQuantizedTensor::new_metal_shared_bf16(
                     &entry.shape,
                     packed_buffer,
-                    0,
+                    packed_base,
                     packed_len,
                     &scales.shape,
                     scales.buffer,
-                    0,
+                    scales.base,
                     scales.len,
                     &biases.shape,
                     biases.buffer,
-                    0,
+                    biases.base,
                     biases.len,
                     group_size,
                     bits,
@@ -468,11 +566,12 @@ pub(super) fn quantized_tensor_from_entry(
 #[cfg(all(target_os = "macos", feature = "metal"))]
 struct MetalBf16Entry {
     buffer: metal::Buffer,
+    /// Début de la vue dans `buffer`, en éléments bf16.
+    base: usize,
     shape: Vec<usize>,
     len: usize,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
 fn named_entry<'a>(
     headers: &[ShardHeader],
     entries: &'a HashMap<String, TensorEntryRef>,
@@ -488,11 +587,14 @@ fn named_entry<'a>(
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
+/// Charge un payload bf16 ; `allow_view` autorise une vue mmap décalée, que
+/// seuls les consommateurs qui lient leur offset (paramètres affines) acceptent.
 fn bf16_entry_to_metal(
     headers: &[ShardHeader],
     entry_ref: &TensorEntryRef,
     name: &str,
     metal: &crate::MetalExecutor,
+    allow_view: bool,
 ) -> Result<MetalBf16Entry> {
     let shard = headers
         .get(entry_ref.shard_index)
@@ -521,8 +623,21 @@ fn bf16_entry_to_metal(
         .data_start
         .checked_add(entry.data_offsets[0] as u64)
         .ok_or_else(|| InferError::Shape(format!("offset bf16 trop grand pour {name}")))?;
+    let (buffer, base) = if allow_view {
+        metal.weight_view_from_file(
+            &shard.path,
+            file_offset,
+            expected_bytes,
+            std::mem::size_of::<u16>(),
+        )?
+    } else {
+        let buffer =
+            metal.weight_buffer_from_bf16_file(&shard.path, file_offset, expected_bytes)?;
+        (buffer, 0)
+    };
     Ok(MetalBf16Entry {
-        buffer: metal.weight_buffer_from_bf16_file(&shard.path, file_offset, expected_bytes)?,
+        buffer,
+        base: base / std::mem::size_of::<u16>(),
         shape: entry.shape.clone(),
         len,
     })
@@ -534,9 +649,14 @@ fn is_moe_expert_weight(target: &str) -> bool {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "vue packed (buffer, base, longueur) et paramètres affines restent explicites"
+)]
 fn quantized_expert_weights_from_metal_views(
     packed_shape: &[usize],
     packed_buffer: metal::Buffer,
+    packed_base: usize,
     packed_len: usize,
     scales: MetalBf16Entry,
     biases: MetalBf16Entry,
@@ -589,10 +709,16 @@ fn quantized_expert_weights_from_metal_views(
     for expert in 0..*experts {
         let packed_offset = expert
             .checked_mul(packed_stride)
+            .and_then(|offset| offset.checked_add(packed_base))
             .ok_or_else(|| InferError::Shape("offset expert packed trop grand".to_string()))?;
         let affine_offset = expert
             .checked_mul(affine_stride)
             .ok_or_else(|| InferError::Shape("offset expert affine trop grand".to_string()))?;
+        let affine_at = |base: usize| {
+            affine_offset
+                .checked_add(base)
+                .ok_or_else(|| InferError::Shape("offset expert affine trop grand".to_string()))
+        };
         let weight = AffineQuantizedTensor::new_metal_shared_bf16(
             &[*rows, *packed_cols],
             packed_buffer.clone(),
@@ -600,11 +726,11 @@ fn quantized_expert_weights_from_metal_views(
             packed_stride,
             &affine_shape,
             scales.buffer.clone(),
-            affine_offset,
+            affine_at(scales.base)?,
             affine_stride,
             &affine_shape,
             biases.buffer.clone(),
-            affine_offset,
+            affine_at(biases.base)?,
             affine_stride,
             group_size,
             bits,
@@ -884,5 +1010,211 @@ mod tests {
         assert!(packed_u32_entry(&entry, "x.scales")
             .expect("invariant: non poids")
             .is_none());
+    }
+}
+
+fn micro_contract_shape(
+    spec: &TensorSpec,
+    entry: &ShardTensorEntry,
+    entries: &HashMap<String, TensorEntryRef>,
+    mode: crate::MicroMode,
+) -> Result<Vec<usize>> {
+    // `packed_u32_entry` normalise déjà l'empaquetage U8 ; tout autre dtype
+    // ferait relire des octets sous une mauvaise largeur.
+    if entry.dtype != Dtype::U32 {
+        return Err(InferError::UnsupportedDtype {
+            name: spec.source.clone(),
+            dtype: entry.dtype,
+        });
+    }
+    let [rows, packed_cols] = entry.shape.as_slice() else {
+        return Err(InferError::Dimension(format!(
+            "poids {} attendu rang 2, reçu {:?}",
+            mode.name(),
+            entry.shape
+        )));
+    };
+    let cols = unpacked_cols(*packed_cols, mode.group_size(), mode.bits())?;
+    if *rows == 0 || cols == 0 {
+        return Err(InferError::Shape("matrice micro vide".into()));
+    }
+    let scales_key = replace_weight_suffix(&spec.source, ".scales")?;
+    let scales = &entries
+        .get(&scales_key)
+        .ok_or_else(|| InferError::MissingWeight(scales_key.clone()))?
+        .entry;
+    if scales.dtype != Dtype::U8 {
+        return Err(InferError::UnsupportedDtype {
+            name: scales_key,
+            dtype: scales.dtype,
+        });
+    }
+    expect_entry_shape(&scales_key, scales, &[*rows, cols / mode.group_size()])?;
+    let biases_key = replace_weight_suffix(&spec.source, ".biases")?;
+    if entries.contains_key(&biases_key) {
+        return Err(InferError::Config(format!(
+            "{} interdit les biases affines: {biases_key}",
+            mode.name()
+        )));
+    }
+    Ok(vec![*rows, cols])
+}
+
+#[cfg(test)]
+mod micro_tests {
+    use super::*;
+
+    #[test]
+    fn micro_headers_require_u8_scales_without_biases() -> Result<()> {
+        let spec = TensorSpec {
+            source: "model.proj.weight".into(),
+            target: "proj.weight".into(),
+            required: true,
+        };
+        for mode in [
+            crate::MicroMode::Mxfp4,
+            crate::MicroMode::Nvfp4,
+            crate::MicroMode::Mxfp8,
+        ] {
+            let k = 64;
+            let packed = ShardTensorEntry {
+                dtype: Dtype::U32,
+                shape: vec![3, k * mode.bits() / 32],
+                data_offsets: [0, 3 * k * mode.bits() / 8],
+            };
+            let scales = ShardTensorEntry {
+                dtype: Dtype::U8,
+                shape: vec![3, k / mode.group_size()],
+                data_offsets: [0, 3 * k / mode.group_size()],
+            };
+            let key = "model.proj.scales".to_owned();
+            let mut entries = HashMap::from([(
+                key.clone(),
+                TensorEntryRef {
+                    shard_index: 0,
+                    entry: scales.clone(),
+                },
+            )]);
+            assert_eq!(
+                micro_contract_shape(&spec, &packed, &entries, mode)?,
+                vec![3, 64]
+            );
+            let mut wrong = packed.clone();
+            wrong.dtype = Dtype::I32;
+            assert!(matches!(
+                micro_contract_shape(&spec, &wrong, &entries, mode),
+                Err(InferError::UnsupportedDtype { .. })
+            ));
+            entries
+                .get_mut(&key)
+                .expect("invariant: scales présentes")
+                .entry
+                .dtype = Dtype::BF16;
+            assert!(matches!(
+                micro_contract_shape(&spec, &packed, &entries, mode),
+                Err(InferError::UnsupportedDtype { .. })
+            ));
+            entries
+                .get_mut(&key)
+                .expect("invariant: scales présentes")
+                .entry = scales.clone();
+            entries.insert(
+                "model.proj.biases".into(),
+                TensorEntryRef {
+                    shard_index: 0,
+                    entry: scales,
+                },
+            );
+            assert!(micro_contract_shape(&spec, &packed, &entries, mode).is_err());
+            entries.clear();
+            assert!(matches!(
+                micro_contract_shape(&spec, &packed, &entries, mode),
+                Err(InferError::MissingWeight(_))
+            ));
+        }
+        Ok(())
+    }
+    #[test]
+    fn micro_loads_packed_weights_and_scales_from_distinct_shards() -> Result<()> {
+        for mode in [
+            crate::MicroMode::Mxfp4,
+            crate::MicroMode::Nvfp4,
+            crate::MicroMode::Mxfp8,
+        ] {
+            let k = mode.group_size();
+            let words = 2 * k * mode.bits() / 32;
+            let word = if mode.bits() == 4 {
+                0x2222_2222u32
+            } else {
+                0x3838_3838u32
+            };
+            let data: Vec<u8> = (0..words).flat_map(|_| word.to_le_bytes()).collect();
+            let scale_data = if mode == crate::MicroMode::Nvfp4 {
+                vec![56u8, 64]
+            } else {
+                vec![127u8, 128]
+            };
+            let dir = tempfile::tempdir().expect("invariant: dossier de test");
+            let weight_path = dir.path().join("weights.bin");
+            let scales_path = dir.path().join("scales.bin");
+            std::fs::write(&weight_path, &data).expect("invariant: poids synthétiques");
+            std::fs::write(&scales_path, &scale_data).expect("invariant: échelles synthétiques");
+            let packed = ShardTensorEntry {
+                dtype: Dtype::U32,
+                shape: vec![2, words / 2],
+                data_offsets: [0, data.len()],
+            };
+            let scales = ShardTensorEntry {
+                dtype: Dtype::U8,
+                shape: vec![2, 1],
+                data_offsets: [0, 2],
+            };
+            let headers = vec![
+                ShardHeader {
+                    path: weight_path,
+                    data_start: 0,
+                    tensors: HashMap::new(),
+                },
+                ShardHeader {
+                    path: scales_path,
+                    data_start: 0,
+                    tensors: HashMap::new(),
+                },
+            ];
+            let entries = HashMap::from([(
+                "model.proj.scales".into(),
+                TensorEntryRef {
+                    shard_index: 1,
+                    entry: scales,
+                },
+            )]);
+            let mut config = super::super::test_fixtures::test_config();
+            config.quantization = Some(
+                serde_json::from_value(
+                    serde_json::json!({"mode":mode.name(),"bits":mode.bits(),"group_size":k}),
+                )
+                .expect("invariant: configuration synthétique"),
+            );
+            let spec = TensorSpec {
+                source: "model.proj.weight".into(),
+                target: "proj.weight".into(),
+                required: true,
+            };
+            let loaded = quantized_tensor_from_entry(
+                &config,
+                &spec,
+                &packed,
+                &headers[0],
+                &headers,
+                &entries,
+                &DecoderLoadContext::cpu(),
+            )?;
+            let DecoderTensor::LinearWeight(LinearWeight::MicroScaled(weight)) = loaded else {
+                return Err(InferError::Config("mauvais stockage micro".into()));
+            };
+            assert_eq!(weight.row(0)?, vec![1.0; k]);
+            assert_eq!(weight.row(1)?, vec![2.0; k]);
+        }
+        Ok(())
     }
 }

@@ -124,3 +124,30 @@ fn live_loads_voicedesign_snapshot_contract() -> Result<()> {
     assert!(assets.codec_catalog.tensor_count > 0);
     Ok(())
 }
+
+#[test]
+fn custom_voice_resolves_speaker_and_orders_codec_prompt() {
+    let mut cfg: TtsModelConfig = serde_json::from_str(&model_config_json("custom_voice", false))
+        .expect("invariant: fixture valide");
+    cfg.talker_config
+        .spk_id
+        .extend([("serena".into(), 3066), ("vivian".into(), 3065)]);
+    assert_eq!(
+        cfg.speaker_id(None).expect("invariant: Serena existe"),
+        Some(3066)
+    );
+    let speaker = cfg
+        .speaker_id(Some("Vivian"))
+        .expect("invariant: Vivian existe");
+    assert_eq!(
+        cfg.talker_config.codec_prompt_ids(speaker),
+        [3, 5, 42, 6, 3065, 0, 1]
+    );
+    assert!(cfg.speaker_id(Some("inconnue")).is_err());
+    cfg.tts_model_type = "voice_design".into();
+    assert_eq!(cfg.speaker_id(None).expect("invariant: VoiceDesign"), None);
+    assert_eq!(
+        cfg.talker_config.codec_prompt_ids(None),
+        [3, 5, 42, 6, 0, 1]
+    );
+}

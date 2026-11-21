@@ -1,0 +1,30 @@
+name: Fuzz des interfaces CPU
+
+on:
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wav_decode, multipart, sse_parse, chat_template]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Installer le nightly figé en CI
+        run: rustup toolchain install nightly-2026-09-02 --profile minimal
+      - name: Installer cargo-fuzz en CI seulement
+        run: cargo +nightly-2026-09-02 install cargo-fuzz --version 0.13.1 --locked
+      - name: Vérifier le lockfile et préparer les dépendances
+        run: cargo +nightly-2026-09-02 check --manifest-path fuzz/Cargo.toml --locked
+      - name: Fuzzer cinq minutes
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo +nightly-2026-09-02 fuzz run "${{ matrix.target }}" -- -max_total_time=300 -max_len=65536 -rss_limit_mb=2048

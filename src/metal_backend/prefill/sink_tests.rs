@@ -376,6 +376,9 @@ fn prefill_sink_attention_neutral_is_bit_identical_to_d128() -> Result<()> {
         return Ok(());
     }
     executor.prefill_sink_steel = false;
+    // Cet oracle compare les deux kernels naïfs f32 ; le NAX convertit ses
+    // entrées en bf16 et possède ses propres oracles contre le naïf et le CPU.
+    executor.causal_attention_prefill_nax_d128 = None;
     let (q_heads, kv_heads, seq) = (32, 4, 300);
     let (q, keys, values) = inputs(seq, q_heads, kv_heads);
     let spec = spec(seq, q_heads, kv_heads, None);

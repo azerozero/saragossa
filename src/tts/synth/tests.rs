@@ -18,7 +18,8 @@ fn fake_batch(codes: &[Vec<i32>]) -> Vec<f32> {
 #[test]
 fn prefix_fallbacks_keep_doubling() {
     assert!(!uses_fixed_lots(&TtsStreamDecodeState::FullPrefixDelta {
-        emitted: 0
+        emitted: 0,
+        exact: false
     }));
     assert!(!uses_fixed_lots(&TtsStreamDecodeState::Incremental(
         TtsCodecStreamState::default(),
@@ -43,9 +44,11 @@ fn fixed_and_doubled_lots_match_batch_with_fake_codec() -> Result<()> {
                 for end in 1..=codes.len() {
                     on_frame(&codes[..end])?;
                 }
-                Ok(codes.clone())
+                Ok(GeneratedCodes {
+                    codes: codes.clone(),
+                    stop_reason: TtsStopReason::Cap,
+                })
             },
-            17,
             |pcm| {
                 chunks.extend_from_slice(pcm);
                 Ok(())
@@ -97,9 +100,11 @@ fn final_flush_covers_empty_short_and_exact_lots() -> Result<()> {
                     for end in 1..=codes.len() {
                         on_frame(&codes[..end])?;
                     }
-                    Ok(codes.clone())
+                    Ok(GeneratedCodes {
+                        codes: codes.clone(),
+                        stop_reason: TtsStopReason::Eos,
+                    })
                 },
-                16,
                 |pcm| {
                     assert!(!pcm.is_empty());
                     chunks.extend_from_slice(pcm);
@@ -135,9 +140,11 @@ fn callback_failure_stops_generation_without_final_decode() {
                 generated += 1;
                 on_frame(&codes)?;
             }
-            Ok(codes)
+            Ok(GeneratedCodes {
+                codes,
+                stop_reason: TtsStopReason::Cap,
+            })
         },
-        17,
         |_| Err(InferError::Config("client déconnecté".into())),
         |prefix| {
             decodes += 1;
@@ -150,4 +157,126 @@ fn callback_failure_stops_generation_without_final_decode() {
     assert!(result.is_err());
     assert_eq!(generated, 4);
     assert_eq!(decodes, 1);
+}
+
+#[test]
+fn stop_reason_survives_streaming_even_at_the_frame_cap() -> Result<()> {
+    for reason in [
+        TtsStopReason::Eos,
+        TtsStopReason::Repeat,
+        TtsStopReason::Cap,
+    ] {
+        let output = synthesize_streaming_from_frames(
+            |on_frame| {
+                let codes = vec![vec![1]];
+                on_frame(&codes)?;
+                Ok(GeneratedCodes {
+                    codes,
+                    stop_reason: reason,
+                })
+            },
+            |_| Ok(()),
+            |_| Ok(Vec::new()),
+            4,
+            true,
+            24_000,
+        )?;
+        assert_eq!(output.stop_reason, reason);
+        assert_eq!(output.frame_limit_reached, reason == TtsStopReason::Cap);
+    }
+    Ok(())
+}
+
+#[test]
+fn overlapped_lots_match_batch_with_fake_codec() -> Result<()> {
+    for (fixed, lot) in [(true, 4), (false, 4), (true, 7), (false, 1)] {
+        let codes: Vec<_> = (1..=17).map(|n| vec![n]).collect();
+        let mut decoded = 0;
+        let mut previous = 0.0;
+        let mut ends = Vec::new();
+        let mut chunks = Vec::new();
+        let output = synthesize_streaming_overlapped(
+            |on_frame| {
+                for end in 1..=codes.len() {
+                    on_frame(&codes[..end])?;
+                }
+                Ok(GeneratedCodes {
+                    codes: codes.clone(),
+                    stop_reason: TtsStopReason::Cap,
+                })
+            },
+            |pcm| {
+                chunks.extend_from_slice(pcm);
+                Ok(())
+            },
+            |prefix: &[Vec<i32>]| {
+                ends.push(prefix.len());
+                let pcm = if fixed {
+                    prefix[decoded..]
+                        .iter()
+                        .flat_map(|frame| {
+                            let sample = frame[0] as f32 / 64.0;
+                            let pair = [previous + sample, sample];
+                            previous = sample;
+                            pair
+                        })
+                        .collect()
+                } else {
+                    fake_batch(prefix)[decoded * 2..].to_vec()
+                };
+                decoded = prefix.len();
+                Ok(pcm)
+            },
+            lot,
+            fixed,
+            24_000,
+        )?;
+        // Les lots fusionnés dépendent du minutage : seuls l'ordre et la
+        // couverture complète sont garantis, et le PCM reste celui du batch.
+        assert!(ends.windows(2).all(|pair| pair[0] < pair[1]), "{ends:?}");
+        assert_eq!(ends.last(), Some(&17));
+        assert_eq!(chunks, fake_batch(&codes));
+        assert_eq!(output.samples, chunks);
+        assert_eq!(output.codes, codes);
+        assert!(output.frame_limit_reached);
+    }
+    Ok(())
+}
+
+#[test]
+fn overlapped_failures_surface_on_the_calling_thread() {
+    let codes: Vec<_> = (1..=17).map(|n| vec![n]).collect();
+    let run = |audio_fails: bool, codec_fails: bool| {
+        synthesize_streaming_overlapped(
+            |on_frame| {
+                for end in 1..=codes.len() {
+                    on_frame(&codes[..end])?;
+                }
+                Ok(GeneratedCodes {
+                    codes: codes.clone(),
+                    stop_reason: TtsStopReason::Eos,
+                })
+            },
+            |_| {
+                if audio_fails {
+                    Err(InferError::Config("client déconnecté".into()))
+                } else {
+                    Ok(())
+                }
+            },
+            |prefix: &[Vec<i32>]| {
+                if codec_fails {
+                    Err(InferError::Metal("codec en échec".into()))
+                } else {
+                    Ok(fake_batch(prefix))
+                }
+            },
+            4,
+            true,
+            24_000,
+        )
+    };
+    assert!(run(true, false).is_err());
+    assert!(run(false, true).is_err());
+    assert!(run(false, false).is_ok());
 }

@@ -2,7 +2,8 @@
 
 use super::*;
 use metal::{
-    CompileOptions, ComputePipelineState, Device, FunctionConstantValues, MTLDataType, NSUInteger,
+    CompileOptions, ComputePipelineState, Device, FunctionConstantValues, Library, MTLDataType,
+    NSUInteger,
 };
 use std::borrow::Cow;
 use std::ffi::c_void;
@@ -113,28 +114,36 @@ fn read_runtime_kernel(root: &Path, names: &[&str]) -> Result<String> {
     )))
 }
 
-/// Compile le GEMM NA dans une bibliothèque SÉPARÉE (MPP `#include`). `None` si la
-/// MetalPerformancePrimitives est absente (macOS < 26) → fallback f32.
-fn compile_na_gemm(device: &Device, source: &str) -> Option<ComputePipelineState> {
-    let options = compile_options(true);
-    let library = device.new_library_with_source(source, &options).ok()?;
-    let function = library.get_function("gemm_nax", None).ok()?;
+/// Compile la bibliothèque NA SÉPARÉE (MPP `#include`), une seule fois pour tous
+/// ses pipelines. `None` si la MetalPerformancePrimitives est absente (macOS < 26)
+/// ou si la source ne compile pas → fallback f32, signalé une fois sur stderr :
+/// un seul noyau fautif désactive sinon tous les GEMM NA sans bruit.
+fn compile_na_library(device: &Device, source: &str) -> Option<Library> {
     device
-        .new_compute_pipeline_state_with_function(&function)
+        .new_library_with_source(source, &compile_options(true))
+        .map_err(|error| warn_na_once(&format!("bibliothèque NA non compilée : {error}")))
         .ok()
 }
 
-fn compile_na_gemm_named(
+/// Pipeline `name` de la bibliothèque NA, `None` (signalé une fois) s'il manque.
+fn na_pipeline(
     device: &Device,
-    source: &str,
+    library: Option<&Library>,
     name: &str,
 ) -> Option<ComputePipelineState> {
-    let options = compile_options(true);
-    let library = device.new_library_with_source(source, &options).ok()?;
-    let function = library.get_function(name, None).ok()?;
-    device
-        .new_compute_pipeline_state_with_function(&function)
+    let library = library?;
+    library
+        .get_function(name, None)
+        .and_then(|function| device.new_compute_pipeline_state_with_function(&function))
+        .map_err(|error| warn_na_once(&format!("pipeline NA {name} indisponible : {error}")))
         .ok()
+}
+
+fn warn_na_once(message: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!("saragossa: {message} ; GEMM NA concernés désactivés (repli f32)");
+    });
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -223,10 +232,10 @@ fn steel_causal_function(
     }
 }
 
-/// Compile l'attention causale NAX d256 (bibliothèque séparée, MPP). `None`
+/// Compile l'attention causale NAX d128/d256 sans sinks (constante 302=false). `None`
 /// si MetalPerformancePrimitives manque (macOS < 26) ou sans accélérateur.
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub(super) fn compile_steel_causal_nax_d256_attention(
+pub(super) fn compile_steel_causal_nax_attention(
     device: &Device,
     source: &str,
     shape: attention::NaxCausalAttnShape,
@@ -283,8 +292,9 @@ fn compile_nax_causal_attention(
 pub(super) fn compile_gated_delta_nax(
     device: &Device,
     source: &str,
+    name: &str,
 ) -> Option<ComputePipelineState> {
-    compile_nax_function(device, source, GATED_DELTA_NAX_HK16_HV48, &[(200, false)])
+    compile_nax_function(device, source, name, &[(200, false)])
 }
 
 pub(super) fn compile_nax_function(
@@ -358,7 +368,8 @@ impl MetalExecutor {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si Metal est indisponible ou si la compilation échoue.
+    /// Renvoie une erreur si un flag retiré est activé, si Metal est indisponible
+    /// ou si la compilation échoue.
     pub fn new() -> Result<Self> {
         Self::new_with_kernel_profile(crate::KernelProfile::for_legacy_executor())
     }
@@ -366,8 +377,10 @@ impl MetalExecutor {
     /// Construit un executor dont les choix de kernels restent propres au modèle.
     ///
     /// # Errors
-    /// Renvoie une erreur si le device ou les pipelines Metal sont indisponibles.
+    /// Renvoie une erreur si un flag retiré est activé ou si le device ou les
+    /// pipelines Metal sont indisponibles.
     pub fn new_with_kernel_profile(kernel_profile: crate::KernelProfile) -> Result<Self> {
+        super::flags::validate_linear_chunked_flag()?;
         let device = Device::system_default()
             .ok_or_else(|| InferError::Metal("aucun device Metal disponible".to_string()))?;
         let queue = device.new_command_queue();
@@ -378,6 +391,8 @@ impl MetalExecutor {
             .map_err(|message| InferError::Metal(format!("compile kernels: {message}")))?;
         let dense_matmul_rhs_t_f32 = pipeline(&library, &device, "dense_matmul_rhs_t_f32")?;
         let dense_qmv_rhs_bf16_f32 = pipeline(&library, &device, "dense_qmv_rhs_bf16_f32")?;
+        let dense_qmv_rhs_bf16_stage_f32 =
+            pipeline(&library, &device, "dense_qmv_rhs_bf16_stage_f32")?;
         let dense_qmv_fast_f32 = pipeline(&library, &device, "dense_qmv_fast_f32")?;
         let dense_gemm_rhs_t_f32 = pipeline(&library, &device, "dense_gemm_rhs_t_f32")?;
         let affine_matmul_rhs_t_u32_f32 =
@@ -397,10 +412,21 @@ impl MetalExecutor {
             pipeline(&library, &device, "affine_qmv_fast_aligned_u3_gs64_f32")?;
         let affine_qmv_fast_u4_gs64_align64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_u4_gs64_align64_f32")?;
+        let affine_qmv_fast_u5_gs64_f32 =
+            pipeline(&library, &device, "affine_qmv_fast_u5_gs64_f32")?;
+        let affine_qmv_fast_aligned_u5_gs64_f32 =
+            pipeline(&library, &device, "affine_qmv_fast_aligned_u5_gs64_f32")?;
         let affine_qmv_fast_u6_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_u6_gs64_f32")?;
         let affine_qmv_fast_aligned_u6_gs64_f32 =
             pipeline(&library, &device, "affine_qmv_fast_aligned_u6_gs64_f32")?;
+        let affine_gate_up_swiglu_aligned_u6_gs64_f32 = pipeline(
+            &library,
+            &device,
+            "affine_gate_up_swiglu_aligned_u6_gs64_f32",
+        )?;
+        let affine_qmv_residual_aligned_u6_gs64_f32 =
+            pipeline(&library, &device, "affine_qmv_residual_aligned_u6_gs64_f32")?;
         let affine_qmm_batched_u6_gs64_f32 =
             pipeline(&library, &device, "affine_qmm_batched_u6_gs64_f32")?;
         let affine_qmm2_fast_aligned_u4_gs64_f32 =
@@ -681,7 +707,12 @@ impl MetalExecutor {
         let whisper_attn_decode_vec64_f32 =
             pipeline(&library, &device, "whisper_attn_decode_vec64_f32")?;
         let im2col_f32 = pipeline(&library, &device, "im2col_f32")?;
+        let rms_norm_mrope_heads_f32 = pipeline(&library, &device, "rms_norm_mrope_heads_f32")?;
         let rms_norm_rope_heads_f32 = pipeline(&library, &device, "rms_norm_rope_heads_f32")?;
+        #[cfg(feature = "diar")]
+        let rope_heads_inplace_f32 = pipeline(&library, &device, "rope_heads_inplace_f32")?;
+        #[cfg(feature = "diar")]
+        let split_qkv_rows_f32 = pipeline(&library, &device, "split_qkv_rows_f32")?;
         let rms_norm_heads_no_scale_f32 =
             pipeline(&library, &device, "rms_norm_heads_no_scale_f32")?;
         let causal_attention_prefill_f32 =
@@ -690,6 +721,8 @@ impl MetalExecutor {
             pipeline(&library, &device, "causal_attention_prefill_mid_f32")?;
         let causal_attention_prefill_long_f32 =
             pipeline(&library, &device, "causal_attention_prefill_long_f32")?;
+        let causal_attention_prefill_long_d512_f32 =
+            pipeline(&library, &device, "causal_attention_prefill_long_d512_f32")?;
         let windowed_attention_prefill_f32 =
             pipeline(&library, &device, "windowed_attention_prefill_f32")?;
         let windowed_attention_prefill_mid_f32 =
@@ -719,9 +752,24 @@ impl MetalExecutor {
             attention_prefill_steel_sink_d128_f32,
             attention_prefill_steel_sink_d128_kv_bf16,
         ) = compile_steel_causal_attentions(&device, sources.steel_attention.as_ref());
+        let causal_attention_prefill_nax_d128 = if crate::runtime_flags::prefill_attn_nax_enabled()
+        {
+            let pipeline = compile_steel_causal_nax_attention(
+                &device,
+                sources.steel_attention_nax.as_ref(),
+                // Le d128 lit (NQ, H) ; 304 ne permute que le dsplit d256.
+                attention::NAX_CAUSAL_ATTN_D128,
+            );
+            if pipeline.is_none() {
+                eprintln!("attention prefill NAX d128 indisponible : repli naïf");
+            }
+            pipeline
+        } else {
+            None
+        };
         let causal_attention_prefill_steel_nax_d256 =
             if crate::runtime_flags::prefill_attn_nax_enabled() {
-                let pipeline = compile_steel_causal_nax_d256_attention(
+                let pipeline = compile_steel_causal_nax_attention(
                     &device,
                     sources.steel_attention_nax.as_ref(),
                     attention::NaxCausalAttnShape::from_flags(),
@@ -765,6 +813,29 @@ impl MetalExecutor {
             };
         let noncausal_attention_prefill_f32 =
             pipeline(&library, &device, "noncausal_attention_prefill_f32")?;
+        let decision_attention_nax = if crate::runtime_flags::decision_noncausal()
+            && crate::runtime_flags::decision_nax_enabled()
+        {
+            let shape = attention::NaxCausalAttnShape::from_flags();
+            compile_nax_function(
+                &device,
+                sources.steel_attention_nax.as_ref(),
+                shape.host_name,
+                &[
+                    (200, false),
+                    (201, false),
+                    (300, false),
+                    (301, false),
+                    (302, false),
+                    (303, false),
+                    (304, shape.head_major),
+                    (305, false),
+                ],
+            )
+            .map(|pipeline| attention::NaxCausalAttention { pipeline, shape })
+        } else {
+            None
+        };
         let steel_attention_f32_bq32_bk32_bd64 =
             compile_steel_attention(&device, sources.steel_attention.as_ref());
         let add_rms_norm_row_f32 = pipeline(&library, &device, "add_rms_norm_row_f32")?;
@@ -787,21 +858,48 @@ impl MetalExecutor {
         let sample_gumbel_blocks_f32 = pipeline(&library, &device, "sample_gumbel_blocks_f32")?;
         let sample_topk_blocks_f32 = pipeline(&library, &device, "sample_topk_blocks_f32")?;
         let sample_topk_finalize_f32 = pipeline(&library, &device, "sample_topk_finalize_f32")?;
+        let sample_topk_scan_blocks_f32 =
+            pipeline(&library, &device, "sample_topk_scan_blocks_f32")?;
+        let sample_topk_scan_finalize_f32 =
+            pipeline(&library, &device, "sample_topk_scan_finalize_f32")?;
         let argmax_blocks_f32 = pipeline(&library, &device, "argmax_blocks_f32")?;
         let argmax_finalize_f32 = pipeline(&library, &device, "argmax_finalize_f32")?;
         let talker_greedy_argmax_f32 = pipeline(&library, &device, "talker_greedy_argmax_f32")?;
         let f32_to_bf16 = pipeline(&library, &device, "f32_to_bf16")?;
+        let dequant_u5_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u5_to_bf16_t_gs64")?;
+        let dequant_u6_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u6_to_bf16_t_gs64")?;
         let dequant_u8_to_bf16_t_gs64 = pipeline(&library, &device, "dequant_u8_to_bf16_t_gs64")?;
-        let na_source = sources.na_gemm.as_ref();
-        let compile_na = |name: &str| compile_na_gemm_named(&device, na_source, name);
-        let na_gemm_bf16 = compile_na_gemm(&device, na_source);
+        let na_source = format!(
+            "{}{}",
+            super::flags::nax_source_prelude(),
+            sources.na_gemm.as_ref()
+        );
+        let na_source = na_source.as_str();
+        let na_library = compile_na_library(&device, na_source);
+        let compile_na = |name: &str| na_pipeline(&device, na_library.as_ref(), name);
+        let na_gemm_bf16 = compile_na("gemm_nax");
         let na_gemm_bf16_bn128 = compile_na("gemm_nax_bf16_bn128");
-        let chunk_delta_seq_layout = compile_na("chunk_delta_seq_layout");
-        let chunk_delta_seq_layout_tc = compile_na("chunk_delta_seq_layout_tc");
         let gated_delta_nax_hk16_hv48 = if crate::runtime_flags::prefill_linear_nax_enabled() {
-            let pipeline = compile_gated_delta_nax(&device, GATED_DELTA_NAX_KERNELS);
+            let pipeline = compile_gated_delta_nax(
+                &device,
+                GATED_DELTA_NAX_KERNELS,
+                GATED_DELTA_NAX_HK16_HV48,
+            );
             if pipeline.is_none() {
                 eprintln!("gated delta NAX indisponible : repli chunk-delta");
+            }
+            pipeline
+        } else {
+            None
+        };
+        let gated_delta_nax_hk16_hv32 = if crate::runtime_flags::gated_delta_nax_hv32_enabled() {
+            let pipeline = compile_gated_delta_nax(
+                &device,
+                GATED_DELTA_NAX_KERNELS,
+                GATED_DELTA_NAX_HK16_HV32,
+            );
+            if pipeline.is_none() {
+                eprintln!("gated delta NAX hv32 indisponible : repli séquentiel");
             }
             pipeline
         } else {
@@ -813,12 +911,20 @@ impl MetalExecutor {
         let na_gemm_coop_qb_tiled_gs128 = compile_na("gemm_nax_coop_qb_tiled_gs128");
         let na_gemm_coop_qb_tiled_u4 = compile_na("gemm_nax_coop_qb_tiled_u4");
         let na_gemm_coop_qb_tiled_u4_x3 = compile_na("gemm_nax_coop_qb_tiled_u4_x3");
+        let na_gemm_coop_qb_tiled_u4_x4 = compile_na("gemm_nax_coop_qb_tiled_u4_x4");
+        let na_gemm_bf16_nt_tiled_x2 = compile_na("gemm_nax_bf16_nt_tiled_x2");
+        let na_gemm_bf16_nt_tiled_x2_maskn = compile_na("gemm_nax_bf16_nt_tiled_x2_maskn");
+        let na_gemm_bf16_nt_bn128 = compile_na("gemm_nax_bf16_nt_bn128");
+        let na_gemm_bf16_nt_gate_up_swiglu = compile_na("gemm_nax_bf16_nt_gate_up_swiglu");
         let na_gemm_coop_qb_tiled_u4_align64 = compile_na("gemm_nax_coop_qb_tiled_u4_align64");
         let na_gemm_coop_qb_tiled_u4_gate_up_swiglu =
             compile_na("gemm_nax_coop_qb_tiled_u4_gate_up_swiglu");
         let na_gemm_skinny_u4 = compile_na("gemm_nax_skinny_u4");
         let na_gemm_skinny_u4_x3 = compile_na("gemm_nax_skinny_u4_x3");
         let na_gemm_skinny_u4_x2 = compile_na("gemm_nax_skinny_u4_x2");
+        let na_gemm_skinny_u3_x2 = compile_na("gemm_nax_skinny_u3_x2");
+        let na_gemm_skinny_u2_x2 = compile_na("gemm_nax_skinny_u2_x2");
+        #[cfg(test)]
         let na_gemm_coop_qb_grouped = compile_na("gemm_nax_coop_qb_grouped");
         let na_gemm_coop_qb_grouped_gather = compile_na("gemm_nax_coop_qb_grouped_gather");
         let na_gemm_coop_qb_grouped_gate_up_swiglu =
@@ -833,8 +939,6 @@ impl MetalExecutor {
         let na_gemm_coop_qb_grouped_scatter_u4_tiled = compile_na(
             format!("gemm_nax_coop_qb_grouped_scatter_u4_bm{MOE_COOP_TILED_BM}").as_str(),
         );
-        let moe_coop_gather_padded = compile_na("moe_coop_gather_padded");
-        let moe_coop_scatter_padded = compile_na("moe_coop_scatter_padded");
         let moe_g_fill_u32 = compile_na("moe_g_fill_u32");
         let moe_g_histogram = compile_na("moe_g_histogram");
         let moe_g_offsets = compile_na("moe_g_offsets");
@@ -847,6 +951,7 @@ impl MetalExecutor {
             queue,
             dense_matmul_rhs_t_f32,
             dense_qmv_rhs_bf16_f32,
+            dense_qmv_rhs_bf16_stage_f32,
             dense_qmv_fast_f32,
             dense_gemm_rhs_t_f32,
             affine_matmul_rhs_t_u32_f32,
@@ -856,8 +961,12 @@ impl MetalExecutor {
             affine_qmv_fast_aligned_u4_gs64_residual_f32,
             affine_qmv_fast_aligned_u3_gs64_f32,
             affine_qmv_fast_u4_gs64_align64_f32,
+            affine_qmv_fast_u5_gs64_f32,
+            affine_qmv_fast_aligned_u5_gs64_f32,
             affine_qmv_fast_u6_gs64_f32,
             affine_qmv_fast_aligned_u6_gs64_f32,
+            affine_gate_up_swiglu_aligned_u6_gs64_f32,
+            affine_qmv_residual_aligned_u6_gs64_f32,
             affine_qmm_batched_u6_gs64_f32,
             affine_qmm2_fast_aligned_u4_gs64_f32,
             affine_qmm8_fast_aligned_u4_gs64_f32,
@@ -966,10 +1075,16 @@ impl MetalExecutor {
             whisper_attn_decode_vec64_f32,
             im2col_f32,
             rms_norm_rope_heads_f32,
+            #[cfg(feature = "diar")]
+            rope_heads_inplace_f32,
+            #[cfg(feature = "diar")]
+            split_qkv_rows_f32,
+            rms_norm_mrope_heads_f32,
             rms_norm_heads_no_scale_f32,
             causal_attention_prefill_f32,
             causal_attention_prefill_mid_f32,
             causal_attention_prefill_long_f32,
+            causal_attention_prefill_long_d512_f32,
             windowed_attention_prefill_f32,
             windowed_attention_prefill_mid_f32,
             windowed_attention_prefill_long_f32,
@@ -985,8 +1100,10 @@ impl MetalExecutor {
             ),
             prefill_sink_steel: crate::runtime_flags::flint_prefill_steel_enabled(),
             qmm_na_u4_min_dim: QMM_NA_U4_DEFAULT_MIN_DIM,
+            qmm_na_u4_x4: false,
             qmm_na_u4_x3_weights: Vec::new(),
             prefill_window_kv: crate::runtime_flags::flint_window_kv_enabled(),
+            causal_attention_prefill_nax_d128,
             causal_attention_prefill_steel_nax_d256,
             attention_prefill_nax_sink_d128,
             attention_prefill_nax_sink_d128_window,
@@ -995,6 +1112,7 @@ impl MetalExecutor {
                 && crate::decode_resident::kv_bf16_dense_by_default())
             .then(crate::runtime_flags::kv_bf16_greedy_min_tokens),
             noncausal_attention_prefill_f32,
+            decision_attention_nax,
             steel_attention_f32_bq32_bk32_bd64,
             add_rms_norm_row_f32,
             topk_softmax_f32,
@@ -1010,15 +1128,18 @@ impl MetalExecutor {
             sample_gumbel_blocks_f32,
             sample_topk_blocks_f32,
             sample_topk_finalize_f32,
+            sample_topk_scan_blocks_f32,
+            sample_topk_scan_finalize_f32,
             argmax_blocks_f32,
             argmax_finalize_f32,
             talker_greedy_argmax_f32,
             f32_to_bf16,
+            dequant_u5_to_bf16_t_gs64,
+            dequant_u6_to_bf16_t_gs64,
             dequant_u8_to_bf16_t_gs64,
             na_gemm_bf16,
             na_gemm_bf16_bn128,
-            chunk_delta_seq_layout,
-            chunk_delta_seq_layout_tc,
+            gated_delta_nax_hk16_hv32,
             gated_delta_nax_hk16_hv48,
             na_gemm_coop_qb,
             na_gemm_coop_qb_gs128,
@@ -1026,11 +1147,19 @@ impl MetalExecutor {
             na_gemm_coop_qb_tiled_gs128,
             na_gemm_coop_qb_tiled_u4,
             na_gemm_coop_qb_tiled_u4_x3,
+            na_gemm_coop_qb_tiled_u4_x4,
+            na_gemm_bf16_nt_tiled_x2,
+            na_gemm_bf16_nt_tiled_x2_maskn,
+            na_gemm_bf16_nt_bn128,
+            na_gemm_bf16_nt_gate_up_swiglu,
             na_gemm_skinny_u4,
             na_gemm_skinny_u4_x3,
             na_gemm_skinny_u4_x2,
+            na_gemm_skinny_u3_x2,
+            na_gemm_skinny_u2_x2,
             na_gemm_coop_qb_tiled_u4_align64,
             na_gemm_coop_qb_tiled_u4_gate_up_swiglu,
+            #[cfg(test)]
             na_gemm_coop_qb_grouped,
             na_gemm_coop_qb_grouped_gather,
             na_gemm_coop_qb_grouped_gate_up_swiglu,
@@ -1039,8 +1168,6 @@ impl MetalExecutor {
             na_gemm_coop_qb_grouped_scatter_u4,
             na_gemm_coop_qb_grouped_gate_up_swiglu_u4_tiled,
             na_gemm_coop_qb_grouped_scatter_u4_tiled,
-            moe_coop_gather_padded,
-            moe_coop_scatter_padded,
             moe_g_fill_u32,
             moe_g_histogram,
             moe_g_offsets,
@@ -1051,6 +1178,8 @@ impl MetalExecutor {
             moe_stacks: Mutex::new(HashMap::new()),
             concat_buffers: Mutex::new(HashMap::new()),
             library: library.clone(),
+            micro_library: Mutex::new(None),
+            micro_fast_library: Mutex::new(None),
             qmvt_pipelines: Mutex::new(HashMap::new()),
             preserve_weight_caches: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

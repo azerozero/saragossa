@@ -291,11 +291,8 @@ impl DFlashResident {
         })
     }
 
-    pub(crate) fn dims(&self) -> DFlashResidentDims {
-        self.dims
-    }
-
     /// Positions de contexte déjà projetées dans le KV de chaque couche.
+    #[cfg(test)]
     pub(crate) fn context_len(&self) -> usize {
         self.context_len
     }
@@ -310,7 +307,7 @@ impl DFlashResident {
     pub(crate) fn rebase(&mut self, base: usize) -> Result<()> {
         if self.context_len != 0
             || self.layers.iter().any(|layer| {
-                !layer.sliding_window.is_some_and(|w| w > 0)
+                layer.sliding_window.is_none_or(|w| w == 0)
                     || !layer.kv.dflash_dense_unadopted()
                     || layer.kv.len() != 0
             })
@@ -351,25 +348,6 @@ impl DFlashResident {
             layer.kv.truncate(next)?;
         }
         self.context_len = next;
-        Ok(())
-    }
-
-    /// Ramène le contexte à `len` positions (rejet d'un bloc déjà projeté).
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si `len` dépasse le contexte courant.
-    pub(crate) fn truncate_context(&mut self, len: usize) -> Result<()> {
-        if len > self.context_len {
-            return Err(InferError::Dimension(format!(
-                "drafter résident: truncate {len} > contexte {}",
-                self.context_len
-            )));
-        }
-        for layer in &mut self.layers {
-            layer.kv.truncate(len)?;
-        }
-        self.context_len = len;
         Ok(())
     }
 

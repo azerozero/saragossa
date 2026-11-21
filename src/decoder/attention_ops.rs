@@ -447,6 +447,42 @@ pub(super) fn full_attention_prepare_rows(
             config.rms_eps,
         )?;
     }
+    if let Some(positions) = runtime.rope_positions() {
+        if layout.rope_dims != 64
+            || config.rope_theta != Some(10_000_000.0)
+            || config.rope_style != RopeStyle::Halves
+        {
+            return Err(InferError::Config(
+                "M-RoPE hors contrat Qwen [11,11,10]".into(),
+            ));
+        }
+        if let (Some(q_norm), Some(k_norm)) = (&attention.q_norm, &attention.k_norm) {
+            q = rms_norm_heads(
+                &q,
+                layout.num_attention_heads,
+                layout.head_dim,
+                q_norm,
+                config.rms_eps,
+            )?;
+            k = rms_norm_heads(
+                &k,
+                layout.num_key_value_heads,
+                layout.head_dim,
+                k_norm,
+                config.rms_eps,
+            )?;
+        }
+        if with_q {
+            q = crate::rope::apply_mrope(
+                &q,
+                layout.num_attention_heads,
+                layout.head_dim,
+                positions,
+            )?;
+        }
+        k = crate::rope::apply_mrope(&k, layout.num_key_value_heads, layout.head_dim, positions)?;
+        return Ok((q, gate, k, v, layout));
+    }
     if let (Some(rope), Some(q_norm), Some(k_norm)) = (
         rope_params(config, attention),
         &attention.q_norm,
@@ -1275,7 +1311,11 @@ pub(super) fn causal_attention_suffix(
     let mut out = vec![0.0_f32; seq * expected_q_dim];
     for pos in 0..seq {
         let q_row = q.row_slice(pos)?;
-        let absolute_pos = position_offset + pos;
+        let absolute_pos = if crate::runtime_flags::decision_noncausal() {
+            k_seq - 1
+        } else {
+            position_offset + pos
+        };
         // Fenêtre sliding Gemma 3 : la position `pos` ne voit que les `window`
         // dernières positions causales ; `None` → masque causal plein.
         let window_start = layout

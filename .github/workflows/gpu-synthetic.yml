@@ -2,6 +2,7 @@ name: GPU synthétique
 
 on:
   workflow_dispatch:
+  merge_group:
   schedule:
     - cron: "17 3 * * *"
   pull_request:
@@ -29,10 +30,12 @@ env:
 jobs:
   gpu-synthetic:
     name: Tests GPU à poids synthétiques
+    # La PR de release ne change que version, changelog et lock après la CI de main.
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-')
     runs-on: macos-15
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Rust toolchain
         run: |
           rustup default stable
@@ -50,6 +53,8 @@ jobs:
           # Liste fermée : aucun modèle externe, sidecar, cache HF ou bench manuel.
           # Les trois cas DFlash ci-dessous construisent leurs données en mémoire.
           # Les deux oracles NAX restent locaux au M5 ; les deux tests lourds suivent.
+          # Les tests exigeant GEMM NA (macos-15 n'a pas MPP) sont exclus ; la liste
+          # exacte des exemptions vit dans tests/gpu_synthetic_list.rs.
           # L'absence de device Metal fait échouer le job via les tests obligatoires.
           # Conserver les #[ignore] jusqu’à trois passages CI stables.
           tests=(
@@ -68,6 +73,7 @@ jobs:
             decode_resident::tests::full_attn_rows_fused_matches_row_loop
             decode_resident::tests::gpu_position_two_cycles_one_command_buffer_matches_host_positions
             decode_resident::tests::dflash_resident::dflash_fixed_base_window_start_bits
+            decoder::resident::dflash::tests::tree_default_budget_follows_bf16_mlp_synthetic
             decode_resident::tests::dflash_resident::dflash_fixed_base_capacity_boundary
             decode_resident::tests::dflash_resident::dflash_fixed_base_rejects_shifted_base
             decode_resident::utils::shared_rows_tests::resident_accesses_preserve_values_and_logical_bounds
@@ -90,11 +96,29 @@ jobs:
             metal_backend::tests::rows_exact_rms_prologue_u8
             metal_backend::tests::rows_exact_qmvt_engaged_in_strict_mode
             metal_backend::tests::rows_exact_qmvt_chained_in_one_encoder
+            metal_backend::tests::rows_exact_qmvt_engaged_below_skinny
+            metal_backend::tests::dense_bf16::dense_bf16_qmv_matches_f32
+            metal_backend::tests::dense_bf16::dense_bf16_embedding_matches_f32
+            metal_backend::tests::dense_bf16::dense_bf16_qmv_stage_matches_row_qmv_bitwise
+            metal_backend::tests::dense_bf16::dense_bf16_qmv_stage_rows_matches_stage_bitwise
+            metal_backend::tests::dequant_u56_bf16_transpose_matches_cpu
+            metal_backend::tests::qmv_u56_strict_rows_are_bit_exact
+            metal_backend::tests::affine_qmv_u5_runtime_flag_routes
+            metal_backend::tests::affine_qmv_u5_gs64_dequantizes_like_cpu_bit_exact
+            metal_backend::tests::affine_qmv_u5_gs64_matches_cpu_generic_and_routes
+            metal_backend::tests::affine_qmv_u5_offsets_bit_exact
+            metal_backend::tests::gdn_storage_full_or_z_beta_gate
+            metal_backend::tests::gdn_storage_qkv_z_alias_bytes_and_owners
+            metal_backend::tests::gdn_storage_no_alias_without_retained_full
+            metal_backend::tests::gdn_storage_alias_failure_keeps_caches_and_owners
+            metal_backend::tests::affine_offsets_residual_bit_exact
             metal_backend::tests::qmv_u4_residual_matches_two_step_and_cpu
             metal_backend::tests::qmv_u4_residual_falls_back_without_mutation
             metal_backend::tests::bf16_rhs_cache_recovers_after_poisoning
             metal_backend::prefill::tests::prefill_resident_capture_tail_matches_full
             decoder::tests::mtp_d1_resident_state_lease_survives_pool_reuse
+            decoder::tests::mtp_fixed_depths_match_ar_synthetic
+            decoder::tests::mtp_d2_u4_draft_head_matches_ar_synthetic
             qwen_loader::flint_tests::synthetic_flint_kl_reference_roundtrip
           )
 
@@ -151,8 +175,8 @@ jobs:
             RETI_RUST_SINGLE_COPY_WEIGHTS="$single_copy" cargo test --lib --features metal -- --exact "${tests[@]}" --test-threads=1
           done
       - name: Vérifier et mesurer les deux tests GPU lourds
-        # Environ 7 min à eux deux : hors des PR, ils tournent la nuit.
-        if: github.event_name != 'pull_request'
+        # Environ 7 min à eux deux : hors des PR et de la queue, la nuit ou à la demande.
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
           set -euo pipefail

@@ -14,6 +14,34 @@ regexes = ['''(?i)(value_head_dim|key_head_dim|head_dim)\s*=\s*\d+''']
 [[allowlists]]
 description = "SHA256 des tokenizers des références externes"
 condition = "AND"
-paths = ['''^tests/fixtures/goldens/(chat_templates|embedder|whisper|logits)/[^/]+\.json$''']
+paths = ['''^tests/fixtures/goldens/(chat_templates|embedder|whisper|logits|kld)/[^/]+\.json$''']
 regexTarget = "line"
 regexes = ['''^\s*"tokenizer(_config)?\.json": "[0-9a-f]{64}",?\s*$''']
+
+[[allowlists]]
+description = "SHA256 publics des tokenizers du manifeste vision"
+condition = "AND"
+paths = ['''^tests/fixtures/vision/manifest\.json$''']
+regexTarget = "line"
+regexes = ['''^\s*"tokenizer_sha256": "[0-9a-f]{64}",?\s*$''']
+
+[[allowlists]]
+description = "SHA256 publics des fichiers de la calibration LLM vision"
+condition = "AND"
+paths = ['''^tests/fixtures/vision/[^/]+/llm-calibration\.json$''']
+regexTarget = "line"
+regexes = ['''^\s*"[^"]+": "[0-9a-f]{64}",?\s*$''']
+
+[[allowlists]]
+description = "SHA256 publics en tête des fixtures tokenizer JSONL"
+condition = "AND"
+paths = ['''^tests/fixtures/tokenizer/[^/]+\.jsonl$''']
+regexTarget = "match"
+regexes = ['''"tokenizer_sha256":"[0-9a-f]{64}"''']
+
+[[allowlists]]
+description = "Clés de cache rust-cache des workflows, pas des secrets"
+condition = "AND"
+paths = ['''^\.github/workflows/[^/]+\.ya?ml$''']
+regexTarget = "line"
+regexes = ['''^\s*shared-key:\s*[A-Za-z0-9._-]+\s*$''']

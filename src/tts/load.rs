@@ -23,7 +23,9 @@ impl TtsModel {
     /// absent/incompatible.
     pub fn load_local(model_dir: impl AsRef<Path>) -> Result<Self> {
         let assets = TtsAssets::load_local(model_dir)?;
+        super::memory::checkpoint("start", &[]);
         let tokenizer = load_qwen3_tts_tokenizer(&assets.model_dir)?;
+        super::memory::checkpoint("tokenizer", &[]);
         let talker_header = SafetensorPayload::open(&assets.talker_weights)?;
         let codec_header = SafetensorPayload::open(&assets.codec_weights)?;
 
@@ -62,10 +64,29 @@ impl TtsModel {
                 "talker.code_predictor.model.codec_embedding.{index}.weight"
             ))?);
         }
+        // La trame fusionnée stocke ces tables en bf16 : exact seulement si
+        // chaque valeur l'est déjà (16 bits de poids faible nuls).
+        let code_predictor_embeddings_bf16_exact = code_predictor_embeddings
+            .iter()
+            .all(|table| table.data().iter().all(|v| v.to_bits() & 0xffff == 0));
+        super::memory::checkpoint(
+            "embeddings",
+            &[("text_cpu", text_embedding.capacity_bytes())],
+        );
 
         tensors.insert(
             "embed_tokens.weight".to_string(),
-            DecoderTensor::Dense(text_embedding.clone()),
+            // Le talker reçoit exclusivement des embeddings déjà projetés par
+            // `text_embed` : cette table n'est jamais consultée. L'arène générique
+            // l'upload néanmoins ; une seule ligne évite les deux copies du
+            // vocabulaire complet, comme pour le code predictor ci-dessous.
+            DecoderTensor::Dense(
+                if crate::runtime_flags::tts_compact_talker_embedding_enabled() {
+                    Tensor::zeros(vec![1, text_embedding.as_matrix()?.1])?
+                } else {
+                    text_embedding.clone()
+                },
+            ),
         );
         tensors.insert(
             "norm.weight".to_string(),
@@ -262,9 +283,11 @@ impl TtsModel {
             ..CausalDecoderConfig::default()
         };
         let mut talker = CausalDecoder::from_decoder_tensors(tensors, decoder_config)?;
+        super::memory::checkpoint("talker_cpu", &[]);
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             talker = talker.with_metal_runtime()?;
+            super::memory::checkpoint("talker_gpu", &[]);
         }
         let cp_config =
             CausalDecoderConfig {
@@ -322,9 +345,11 @@ impl TtsModel {
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
             code_predictor = code_predictor.with_metal_runtime()?;
+            super::memory::checkpoint("code_predictor_gpu", &[]);
         }
 
         let codec = TtsCodec::load(&codec_header, &assets.codec_config)?;
+        super::memory::checkpoint("loaded", &[]);
 
         let codec_read = codec_header.read_payload_summary()?;
         let codec_payload = TtsPayloadSummary {
@@ -335,7 +360,23 @@ impl TtsModel {
             codec_payload_checksum: codec_read.checksum,
         };
 
+        let generation_config = if matches!(
+            assets.model_kind(),
+            TtsModelKind::VoiceDesign | TtsModelKind::CustomVoice
+        ) {
+            load_generation_config(&assets.model_dir.join("generation_config.json"))?
+        } else {
+            None
+        };
+        let speaker_id = assets.model_config.speaker_id(None)?;
+        let voice_design_instruction = match assets.model_kind() {
+            TtsModelKind::VoiceDesign => super::DEFAULT_INSTRUCT.to_owned(),
+            _ => String::new(),
+        };
         Ok(Self {
+            speaker_id,
+            generation_config,
+            seed: None,
             assets,
             tokenizer,
             text_embedding,
@@ -347,10 +388,11 @@ impl TtsModel {
             code_predictor,
             code_predictor_heads,
             code_predictor_embeddings,
+            code_predictor_embeddings_bf16_exact,
             codec,
             codec_payload,
             clone_ctx: None,
-            voice_design_instruction: super::DEFAULT_INSTRUCT.to_owned(),
+            voice_design_instruction,
             prefill_memo: Default::default(),
         })
     }
@@ -441,5 +483,60 @@ impl TtsModel {
     #[must_use]
     pub fn payload_summary(&self) -> &TtsPayloadSummary {
         &self.codec_payload
+    }
+}
+
+/// Seule l'absence du fichier autorise le repli historique. Une erreur de
+/// lecture, un JSON mal formé ou des paramètres invalides restent des erreurs.
+fn load_generation_config(path: &Path) -> Result<Option<super::config::TtsGenerationConfig>> {
+    let config: super::config::TtsGenerationConfig = match super::read_json(path) {
+        Ok(config) => config,
+        Err(InferError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            static WARN_MISSING: std::sync::Once = std::sync::Once::new();
+            WARN_MISSING.call_once(|| {
+                eprintln!("saragossa TTS: generation_config.json absent ; repli sur la génération gloutonne historique");
+            });
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    config.validate()?;
+    Ok(Some(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_generation_config_falls_back_but_invalid_file_fails(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("generation_config.json");
+        assert!(load_generation_config(&path)?.is_none());
+        assert!(load_generation_config(&path)?.is_none());
+        std::fs::write(&path, "{")?;
+        assert!(matches!(
+            load_generation_config(&path),
+            Err(InferError::Json { .. })
+        ));
+        std::fs::write(
+            &path,
+            r#"{"do_sample":true,"temperature":0.9,"top_k":50,"top_p":1.0,"repetition_penalty":1.05,"subtalker_dosample":true,"subtalker_temperature":0.9,"subtalker_top_k":50,"subtalker_top_p":1.0,"max_new_tokens":2048}"#,
+        )?;
+        assert!(load_generation_config(&path)?.is_some());
+        let invalid = std::fs::read_to_string(&path)?.replace("0.9", "-1.0");
+        std::fs::write(&path, invalid)?;
+        assert!(matches!(
+            load_generation_config(&path),
+            Err(InferError::Config(_))
+        ));
+        std::fs::remove_file(&path)?;
+        std::fs::create_dir(&path)?;
+        assert!(
+            load_generation_config(&path).is_err(),
+            "un dossier n'est pas un fichier absent"
+        );
+        Ok(())
     }
 }

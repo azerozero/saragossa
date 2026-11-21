@@ -1,5 +1,44 @@
 //! Fréquences RoPE communes aux références CPU et aux kernels Metal.
 
+/// Sélection HF entrelacée [11, 11, 10] : la dernière paire (31) est H.
+/// L'entrelacement porte sur les axes, la rotation reste rotate-half.
+pub(crate) fn mrope_axis(pair: usize) -> usize {
+    match pair % 3 {
+        1 if pair < 33 => 1,
+        2 if pair < 30 => 2,
+        _ => 0,
+    }
+}
+
+pub(crate) fn apply_mrope(
+    input: &crate::Tensor,
+    heads: usize,
+    head_dim: usize,
+    positions: &[[usize; 3]],
+) -> crate::Result<crate::Tensor> {
+    let (rows, width) = input.as_matrix()?;
+    if head_dim != 256 || heads.checked_mul(head_dim) != Some(width) || rows != positions.len() {
+        return Err(crate::InferError::Dimension(
+            "M-RoPE: géométrie Qwen incompatible".into(),
+        ));
+    }
+    let frequencies = inv_freq(64, 10_000_000.0);
+    let mut output = input.data().to_vec();
+    for (row, position) in positions.iter().enumerate() {
+        for head in 0..heads {
+            let base = row * width + head * head_dim;
+            for (pair, frequency) in frequencies.iter().enumerate() {
+                let (sin, cos) = (position[mrope_axis(pair)] as f32 * frequency).sin_cos();
+                let a = input.data()[base + pair];
+                let b = input.data()[base + pair + 32];
+                output[base + pair] = a * cos - b * sin;
+                output[base + pair + 32] = a * sin + b * cos;
+            }
+        }
+    }
+    crate::Tensor::from_vec(input.shape().to_vec(), output)
+}
+
 /// Calcule en f32 `1 / θ^(2p/frequency_dim)`, comme transformers.
 ///
 /// Le dénominateur peut dépasser la largeur rotée (Gemma global) : les
@@ -77,4 +116,30 @@ fn proportional_oracle_matches_mlx_basis_and_inactive_coordinates() {
         let expected = f64::from(input[i]) * angle.cos() - f64::from(input[i + 256]) * angle.sin();
         assert!((f64::from(out[i]) - expected).abs() < 2.0e-6);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn mrope_interleaves_axes_and_leaves_unrotated_tail_intact() -> crate::Result<()> {
+    let input = crate::Tensor::from_vec(
+        vec![1, 256],
+        (0..256).map(|i| (i as f32 + 1.0) / 256.0).collect(),
+    )?;
+    let output = apply_mrope(&input, 1, 256, &[[3, 5, 7]])?;
+    assert_eq!(&output.data()[64..], &input.data()[64..]);
+    for (pair, position) in [
+        (0, 3.0),
+        (1, 5.0),
+        (2, 7.0),
+        (28, 5.0),
+        (29, 7.0),
+        (30, 3.0),
+        (31, 5.0),
+    ] {
+        let angle = position * 10_000_000_f64.powf(-2.0 * pair as f64 / 64.0);
+        let expected = f64::from(input.data()[pair]) * angle.cos()
+            - f64::from(input.data()[pair + 32]) * angle.sin();
+        assert!((f64::from(output.data()[pair]) - expected).abs() < 2e-7);
+    }
+    Ok(())
 }

@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use saragossa::chat_template::canonical_json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -146,6 +147,8 @@ fn parse_anthropic_messages_request(body: &[u8]) -> ServeResult<AnthropicMessage
 #[derive(Clone, Debug, Deserialize)]
 struct AnthropicMessagesRequest {
     model: String,
+    #[serde(default)]
+    output_config: Option<Value>,
     max_tokens: Option<usize>,
     messages: Vec<AnthropicInputMessage>,
     #[serde(default)]
@@ -208,7 +211,11 @@ impl AnthropicMessagesRequest {
             top_p: self.top_p,
             top_k: None,
             stop,
-            response_format: None,
+            response_format: self
+                .output_config
+                .as_ref()
+                .map(super::protocol::ResponseFormat::from_anthropic)
+                .transpose()?,
             user: None,
             tools: Some(convert_tools(&self.tools)?),
             tool_choice: anthropic_tool_choice(self.tool_choice.as_ref())?,
@@ -221,6 +228,7 @@ impl AnthropicMessagesRequest {
             chat_template_kwargs: None,
             stream_options: None,
             min_p: None,
+            logit_bias: None,
             presence_penalty: None,
             frequency_penalty: None,
             repetition_penalty: None,
@@ -467,7 +475,7 @@ fn content_value_to_text(value: &Value) -> String {
         Value::Array(items) => blocks_to_text(items),
         Value::Object(_) => block_to_text(value),
         Value::Null => String::new(),
-        other => other.to_string(),
+        other => canonical_json::to_string(other),
     }
 }
 
@@ -494,8 +502,9 @@ fn assistant_message(content: Option<&AnthropicContent>) -> ServeResult<WireMess
                 .get("input")
                 .filter(|v| v.is_object())
                 .ok_or_else(|| ServeError::Http("tool_use input doit être un objet".into()))?;
-            let raw = json!({"id":id,"type":"function","function":{"name":name,"arguments":input}})
-                .to_string();
+            let raw = canonical_json::to_string(
+                &json!({"id":id,"type":"function","function":{"name":name,"arguments":input}}),
+            );
             ordered.push(AssistantBlock::ToolCall(calls.len()));
             calls.push(
                 serde_json::value::RawValue::from_string(raw)
@@ -552,11 +561,11 @@ fn block_to_text(value: &Value) -> String {
             _ => object
                 .get("text")
                 .and_then(Value::as_str)
-                .map_or_else(|| value.to_string(), ToString::to_string),
+                .map_or_else(|| canonical_json::to_string(value), ToString::to_string),
         },
         Value::Array(items) => items.iter().map(block_to_text).collect(),
         Value::Null => String::new(),
-        other => other.to_string(),
+        other => canonical_json::to_string(other),
     }
 }
 
@@ -587,7 +596,7 @@ fn convert_tools(tools: &[Value]) -> ServeResult<Vec<super::protocol::DeclaredTo
             .ok_or_else(|| ServeError::Http(format!("tools[{index}] sans name")))?;
         let parameters = tool.get("input_schema").or_else(|| tool.get("parameters")).cloned().unwrap_or_else(|| json!({"type":"object"}));
         let value = json!({"type":"function","function":{"name":name,"description":tool.get("description").and_then(Value::as_str).unwrap_or(""),"parameters":parameters}});
-        Ok(super::protocol::DeclaredTool { json: value.to_string(), value })
+        Ok(super::protocol::DeclaredTool { json: canonical_json::to_string(&value), value })
     }).collect()
 }
 
@@ -799,7 +808,7 @@ fn write_anthropic_content_block<S: Write>(
                     "index": index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": input.to_string()
+                        "partial_json": canonical_json::to_string(input)
                     }
                 }),
             )?;

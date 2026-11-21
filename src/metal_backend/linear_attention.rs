@@ -73,7 +73,7 @@ pub(crate) fn linear_tree_refusal(
     if !kernels {
         return Some("delta dk128 ou chemin linéaire batché désactivé".to_string());
     }
-    if !journal_len.is_some_and(|len| len <= shape.ssm_len) {
+    if journal_len.is_none_or(|len| len > shape.ssm_len) {
         return Some("journal arbre plus grand que l'état SSM".to_string());
     }
     None
@@ -867,13 +867,8 @@ impl MetalExecutor {
                     }
                 }
             }
-            if linear_chunked_enabled()
-                && spec.key_head_dim == 128
-                && spec.value_head_dim == 128
-                && !state.ssm_bf16
-                && self.chunk_delta_seq_layout.is_some()
-            {
-                // Port chunked-DeltaNet : forme chunkée (T/C étapes au lieu de T).
+            if linear_chunked_enabled() {
+                // Refus explicite du flag historique avant toute soumission GPU.
                 self.encode_chunk_delta_seq_layout(
                     encoder,
                     &conv_out_buffer,
@@ -1052,6 +1047,7 @@ impl MetalExecutor {
         state: &LinearAttentionMetalState,
         spec: LinearAttentionStepSpec,
         dims: LinearAttnResidentDims,
+        allow_nax: bool,
     ) -> Result<()> {
         ensure_biasless(weights.in_proj_qkv, "linear_attn.in_proj_qkv")?;
         ensure_biasless(weights.in_proj_z, "linear_attn.in_proj_z")?;
@@ -1207,24 +1203,44 @@ impl MetalExecutor {
             weights.in_proj_z.weight(),
             &z_buffer,
         )?;
-        self.encode_matmul_weight(
-            encoder,
-            owned_buffers,
-            input_buffer,
-            rows,
-            in_dim,
-            weights.in_proj_b.weight(),
-            &beta_input_buffer,
-        )?;
-        self.encode_matmul_weight(
-            encoder,
-            owned_buffers,
-            input_buffer,
-            rows,
-            in_dim,
-            weights.in_proj_a.weight(),
-            &gate_input_buffer,
-        )?;
+        let k4_dk128 = use_seq_delta_batch
+            && spec.conv_kernel_dim == 4
+            && spec.value_head_dim == 128
+            && spec.key_head_dim == 128;
+        // b/a bf16 en un GEMM `[rows, 2·heads]`, lu par le seul noyau k4 dk128
+        // via `LinearAttnBatchLayout` (beta à 0, gate à `heads`).
+        let beta_gate = if k4_dk128 {
+            self.encode_dense_bf16_pair_gemm(
+                encoder,
+                input_buffer,
+                rows,
+                in_dim,
+                [weights.in_proj_b.weight(), weights.in_proj_a.weight()],
+                "linear_attn_batch_resident_beta_gate",
+            )?
+        } else {
+            None
+        };
+        if beta_gate.is_none() {
+            self.encode_matmul_weight(
+                encoder,
+                owned_buffers,
+                input_buffer,
+                rows,
+                in_dim,
+                weights.in_proj_b.weight(),
+                &beta_input_buffer,
+            )?;
+            self.encode_matmul_weight(
+                encoder,
+                owned_buffers,
+                input_buffer,
+                rows,
+                in_dim,
+                weights.in_proj_a.weight(),
+                &gate_input_buffer,
+            )?;
+        }
         if use_seq_delta_batch {
             let conv_out_buffer = self.private_f32_buffer(
                 checked_len(rows, conv_dim, "linear-attn batch conv_out")?,
@@ -1250,12 +1266,32 @@ impl MetalExecutor {
                 checked_len(rows, value_dim, "linear-attn batch y")?,
                 super::prefill::PHASE_GATE,
             )?;
-            if spec.conv_kernel_dim == 4 && spec.value_head_dim == 128 && spec.key_head_dim == 128 {
+            if k4_dk128 {
+                let (beta_input, gate_input, layout) = match &beta_gate {
+                    Some(fused) => (
+                        fused,
+                        fused,
+                        LinearAttnBatchLayout {
+                            beta_offset: 0,
+                            gate_offset: byte_offset_f32(
+                                spec.num_value_heads,
+                                "linear-attn beta_gate offset",
+                            )?,
+                            gate_stride: 2 * spec.num_value_heads,
+                            ..LinearAttnBatchLayout::contiguous(spec)
+                        },
+                    ),
+                    None => (
+                        &beta_input_buffer,
+                        &gate_input_buffer,
+                        LinearAttnBatchLayout::contiguous(spec),
+                    ),
+                };
                 self.encode_linear_attn_conv_norm_gates_k4_dk128_batch(
                     encoder,
                     &qkv_buffer,
-                    &beta_input_buffer,
-                    &gate_input_buffer,
+                    beta_input,
+                    gate_input,
                     &conv_weight_buffer,
                     &state.conv,
                     &a_log_buffer,
@@ -1267,7 +1303,7 @@ impl MetalExecutor {
                     &decay_buffer,
                     rows,
                     spec,
-                    LinearAttnBatchLayout::contiguous(spec),
+                    layout,
                     true,
                     None,
                 )?;
@@ -1357,7 +1393,21 @@ impl MetalExecutor {
                     }
                 }
             }
-            if !state.ssm_bf16
+            if linear_chunked_enabled() {
+                self.encode_chunk_delta_seq_layout(
+                    encoder,
+                    &conv_out_buffer,
+                    &q_norm_buffer,
+                    &k_norm_buffer,
+                    &beta_buffer,
+                    &decay_buffer,
+                    &state.ssm,
+                    &y_buffer,
+                    rows,
+                    spec,
+                )?;
+            } else if allow_nax
+                && !state.ssm_bf16
                 && self.encode_gated_delta_nax(
                     encoder,
                     &conv_out_buffer,
@@ -1372,24 +1422,6 @@ impl MetalExecutor {
                 )?
             {
                 // Récurrence faite par le noyau NAX.
-            } else if linear_chunked_enabled()
-                && spec.key_head_dim == 128
-                && spec.value_head_dim == 128
-                && !state.ssm_bf16
-                && self.chunk_delta_seq_layout.is_some()
-            {
-                self.encode_chunk_delta_seq_layout(
-                    encoder,
-                    &conv_out_buffer,
-                    &q_norm_buffer,
-                    &k_norm_buffer,
-                    &beta_buffer,
-                    &decay_buffer,
-                    &state.ssm,
-                    &y_buffer,
-                    rows,
-                    spec,
-                )?;
             } else {
                 self.encode_linear_attn_gated_delta_seq_dk128(
                     encoder,
@@ -3569,7 +3601,6 @@ impl MetalExecutor {
     /// # Errors
     ///
     /// Renvoie une erreur d'allocation ou de soumission Metal.
-    #[allow(dead_code, reason = "câblé au verify spéculatif MTP à l'ÉTAPE 3")]
     pub(crate) fn snapshot_linear_attn_state(
         &self,
         state: &LinearAttentionMetalState,
@@ -3646,12 +3677,12 @@ impl MetalExecutor {
         Ok(snapshots)
     }
 
-    #[cfg(any(test, feature = "devtools"))]
     /// Compare deux états linear-attn déjà synchronisés côté GPU.
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si les formes divergent ou si un readback échoue.
+    #[cfg(feature = "devtools")]
     pub(crate) fn diff_linear_attn_states(
         &self,
         left: &LinearAttentionMetalState,
@@ -3705,7 +3736,6 @@ impl MetalExecutor {
     /// # Errors
     ///
     /// Renvoie une erreur si les longueurs diffèrent ou si le blit échoue.
-    #[allow(dead_code, reason = "câblé au verify spéculatif MTP à l'ÉTAPE 3")]
     pub(crate) fn restore_linear_attn_state(
         &self,
         state: &LinearAttentionMetalState,
@@ -3836,6 +3866,7 @@ impl MetalExecutor {
     ///
     /// Renvoie une erreur si une série n'est pas une série arbre complète, si le
     /// chemin est vide ou sort des captures, ou si l'encodage échoue.
+    #[cfg(feature = "devtools")]
     pub(crate) fn restore_linear_attn_tree(
         &self,
         layers: &[(&LinearAttentionMetalState, &[LinearAttentionMetalState])],
@@ -3931,7 +3962,7 @@ impl MetalExecutor {
     }
 }
 
-#[cfg(any(test, feature = "devtools"))]
+#[cfg(feature = "devtools")]
 fn diff_f32_slices(left: &[f32], right: &[f32]) -> Result<(f32, f32)> {
     if left.len() != right.len() {
         return Err(InferError::Dimension(format!(

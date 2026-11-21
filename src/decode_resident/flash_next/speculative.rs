@@ -26,10 +26,6 @@ use crate::{InferError, Result};
 
 /// Sortie d'une génération : jetons émis et résiduels hc (avant mixer) des
 /// positions engagées après le prompt, dans l'ordre.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "spéculation MTP : serve à venir")
-)]
 pub(crate) struct Generation {
     pub(crate) tokens: Vec<usize>,
     /// Résiduel du tronc à chaque position engagée à partir du dernier jeton
@@ -44,10 +40,6 @@ pub(crate) struct Generation {
 /// Remplacement de drafts (oracles) : `(cycle, jetons déjà émis, rang du
 /// draft, draft) → draft`. Le draft de rang `i` prédit le jeton d'indice
 /// `émis + 1 + i` de la sortie.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "spéculation MTP : serve à venir")
-)]
 pub(crate) type DraftOverride<'a> = &'a dyn Fn(usize, usize, usize, usize) -> usize;
 
 /// Oracles : mutation de l'historique MTP (puissance de l'oracle des drafts).
@@ -65,10 +57,6 @@ pub(crate) enum SpecMutation {
 
 /// Options d'une génération spéculative.
 #[derive(Default)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "spéculation MTP : serve à venir")
-)]
 pub(crate) struct SpecOptions<'a> {
     /// Remplacement de drafts (oracles, cas limites).
     pub(crate) overrides: Option<DraftOverride<'a>>,
@@ -92,10 +80,6 @@ pub(crate) struct SpecOptions<'a> {
 /// # Errors
 ///
 /// Renvoie une erreur sur prompt vide ou erreur de session.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "spéculation MTP : serve à venir")
-)]
 pub(crate) fn generate_ar(
     session: &mut FlashNextSession,
     prompt: &[usize],
@@ -150,7 +134,7 @@ pub(crate) fn generate_ar(
 /// absente ou erreur de session.
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "spéculation MTP : serve à venir")
+    expect(dead_code, reason = "spéculation MTP : serve à venir")
 )]
 pub(crate) fn generate_speculative(
     session: &mut FlashNextSession,

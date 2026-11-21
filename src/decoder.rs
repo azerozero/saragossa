@@ -38,8 +38,14 @@ mod kv_rows;
 pub(crate) mod layer_plan;
 use layer_plan::{FullPlan, LayerPlan, MixerPlan, ModelPlan};
 mod state_snapshot;
-pub(crate) use state_snapshot::SnapshotSources;
+pub(crate) use state_snapshot::persistent::enabled as persistent_prefix_enabled;
+pub use state_snapshot::persistent::{
+    configure_prefix_disk_cache, flush_prefix_disk_cache, PrefixDiskSession,
+};
+pub(crate) use state_snapshot::{ReadSource, SnapshotSources};
+#[cfg(feature = "tts")]
 mod tts_prefill;
+mod vision;
 #[cfg(test)]
 pub(crate) use attention_ops::{
     attention_probs_in_place, gemma_global_attention_prefill_oracle, GemmaGlobalAttentionOracleSpec,
@@ -50,11 +56,16 @@ mod generation;
 mod lightbatch;
 mod loading;
 mod lookup;
+mod suffix;
+pub(crate) use suffix::SuffixParams;
 mod mtp;
 mod mtp_adaptive;
 mod mtp_history;
 mod multi;
 mod resident;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(feature = "tts")]
+pub(crate) use resident::tts_codebooks::TtsCodebookWeights;
 
 use self::flags::*;
 pub(in crate::decoder) use self::loading::*;
@@ -76,6 +87,8 @@ pub(crate) fn resident_decode_steps_for_test() -> usize {
 mod layer_plan_tests;
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod mtp_moe_oracles;
+#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+mod prefix_align_tests;
 #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
 mod qwen35_oracles;
 #[cfg(test)]
@@ -123,6 +136,26 @@ fn qwen_kv_nax_x3_shape(
     let validated = |shape: &&[usize]| matches!(shape, [out_dim, in_dim] if (*in_dim, *out_dim) == QWEN_27B_KV_SHAPE);
     (dense_qwen && !kv_shapes.is_empty() && kv_shapes.iter().all(validated))
         .then_some(QWEN_27B_KV_SHAPE)
+}
+
+/// Provenance d'une tête MTP, qui fixe la convention de ses normes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MtpHeadSource {
+    /// Fichier sidecar séparé : normes telles que stockées (heuristique).
+    Sidecar,
+    /// Shard du modèle : même convention de normes que le tronc.
+    Embedded,
+}
+
+impl MtpHeadSource {
+    /// Provenance détectée par `ModelAssets` (shard du modèle ou sidecar).
+    fn of(weights: &crate::MtpWeightsInfo) -> Self {
+        if weights.embedded {
+            Self::Embedded
+        } else {
+            Self::Sidecar
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -329,8 +362,9 @@ impl CausalDecoderPromptState {
         )
     }
 
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
-    pub(crate) fn final_state_for_test(&self) -> &Tensor {
+    /// État normé de la dernière position du prompt.
+    #[must_use]
+    pub fn final_state(&self) -> &Tensor {
         &self.final_state
     }
 
@@ -503,6 +537,9 @@ pub struct SpeculativeStats {
     pub dflash_switched_at: Option<usize>,
     /// Tokens du prompt repris du cache de préfixe au lieu d'être préremplis.
     pub reused_prefix_tokens: usize,
+    /// Tours de la boucle DFlash (un draft + une vérification) ; `None` quand
+    /// la tête MTP a servi seule.
+    pub dflash_tours: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -540,6 +577,8 @@ struct MtpLayer {
 pub struct CausalDecoderCache {
     layers: Vec<LayerKvCache>,
     position: usize,
+    rope_delta: i64,
+    vision_positions: Option<crate::vision::prompt::VisionPositions>,
     // Arène du decode résident COMPLET (1c) : ping-pong hidden + buffer u32 du
     // token + pool/queue/pipelines. Liée à la session → jamais clonée (cf. infra).
     #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -554,6 +593,8 @@ impl Clone for CausalDecoderCache {
         Self {
             layers: self.layers.clone(),
             position: self.position,
+            rope_delta: self.rope_delta,
+            vision_positions: self.vision_positions.clone(),
             #[cfg(all(target_os = "macos", feature = "metal"))]
             resident: None,
         }
@@ -579,6 +620,10 @@ struct ResidentArena {
     final_norm: metal::Buffer,
     lm_head: MetalLinearWeightBuffers,
     mtp: Option<ResidentMtpArena>,
+    /// QKV concaténé par couche quand le pas embedding encode la couche TTS
+    /// fusionnée ([`CausalDecoder::enable_tts_fused_layers`]) ; `None` sinon.
+    #[cfg(feature = "tts")]
+    tts_fused_qkv: Option<Vec<Vec<MetalLinearWeightBuffers>>>,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -637,6 +682,13 @@ struct ResidentVerifyCaptures;
 /// Tête appliquée aux états finaux du verify résident.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(
+    not(feature = "devtools"),
+    allow(
+        dead_code,
+        reason = "La variante échantillonnée est utilisée par DFlash"
+    )
+)]
 enum ResidentVerifyHead {
     Skip,
     Argmax,
@@ -1037,7 +1089,12 @@ impl CausalDecoderCache {
                     .saturating_add(layer.values.capacity_bytes_unseen(seen))
                     .saturating_add(layer.linear.estimated_cpu_bytes())
             })
-            .sum()
+            .sum::<usize>()
+            .saturating_add(
+                self.vision_positions
+                    .as_ref()
+                    .map_or(0, |p| p.estimated_bytes()),
+            )
     }
 
     #[cfg(test)]
@@ -1329,7 +1386,13 @@ pub struct CausalDecoder {
     #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
     dflash: Option<crate::DFlashDraft>,
     snapshot_sources: SnapshotSources,
+    /// Le loader du tronc a appliqué l'offset `1 + weight` des normes d'un
+    /// checkpoint transformers brut (`qwen_loader::bake_qwen35_norm_offset`).
+    trunk_hf_raw_norms: bool,
     prefix_cache: Arc<Mutex<PrefixCache>>,
+    /// Alignement et queue des reprises du cache de préfixe, choisis au
+    /// chargement (`runtime_flags::prefix_align_for_model`).
+    prefix_align: Option<(usize, usize)>,
     memory_guard: Option<MemoryGuard>,
     #[cfg(all(target_os = "macos", feature = "metal"))]
     runtime: DecoderRuntime,
@@ -1347,17 +1410,14 @@ impl CausalDecoder {
             .copied()
             .filter(|&v| v > 0)
             .ok_or_else(|| InferError::Config("vocabulaire KL vide".into()))?;
-        let config = format!(
-            "{:x}",
-            Sha256::digest(format!("{:?}", self.config).as_bytes())
-        );
+        let config = crate::hex(Sha256::digest(format!("{:?}", self.config).as_bytes()));
         let mut weights = Sha256::new();
         // Le gather existant fonctionne aussi après libération des poids CPU.
         let sample = self.embed_scaled(&[0, vocab / 2, vocab - 1])?;
         for value in sample.data().iter().chain(self.final_norm.data()) {
             weights.update(value.to_le_bytes());
         }
-        Ok((vocab, config, format!("{:x}", weights.finalize())))
+        Ok((vocab, config, crate::hex(weights.finalize())))
     }
 }
 
@@ -1545,6 +1605,31 @@ impl PrefixCache {
     }
 }
 
+/// Vrai si une projection du tronc est un poids dense bf16 éligible au GEMM
+/// NA (`can_use_dense_bf16_gemm` : dimensions multiples de 64, flag actif) :
+/// sous 64 lignes, elle passe par le qmv. La tête et l'embedding, appliqués
+/// ligne à ligne, n'entrent pas en compte.
+fn uses_dense_bf16_gemm(tensors: &HashMap<String, DecoderTensor>) -> bool {
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    {
+        crate::runtime_flags::dense_bf16_gemm_enabled()
+            && tensors.iter().any(|(name, tensor)| {
+                !name.starts_with("lm_head")
+                    && !name.contains("embed_tokens")
+                    && matches!(
+                        tensor,
+                        DecoderTensor::LinearWeight(LinearWeight::DenseBf16(weight))
+                            if matches!(weight.shape(), [out, input] if out % 64 == 0 && input % 64 == 0)
+                    )
+            })
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    {
+        let _ = tensors;
+        false
+    }
+}
+
 fn usize_to_u64_saturating(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
@@ -1556,6 +1641,20 @@ impl CausalDecoder {
     }
 }
 
+fn purge_prefix_cache(cache: &Mutex<PrefixCache>) -> PurgeOutcome {
+    let mut cache = match cache.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => {
+            eprintln!("warn: saragossa: cache préfixe empoisonné, récupération pour purge");
+            poisoned.into_inner()
+        }
+    };
+    cache
+        .evict_lru_entry()
+        .map(|bytes| PurgeOutcome::Purged { bytes })
+        .unwrap_or(PurgeOutcome::Empty)
+}
+
 impl CausalDecoder {
     fn register_prefix_cache_purgeable(&self) {
         let cache = Arc::downgrade(&self.prefix_cache);
@@ -1565,14 +1664,7 @@ impl CausalDecoder {
                 let Some(cache) = cache.upgrade() else {
                     return PurgeOutcome::Empty;
                 };
-                let outcome = match cache.lock() {
-                    Ok(mut cache) => cache
-                        .evict_lru_entry()
-                        .map(|bytes| PurgeOutcome::Purged { bytes })
-                        .unwrap_or(PurgeOutcome::Empty),
-                    Err(_) => PurgeOutcome::Empty,
-                };
-                outcome
+                purge_prefix_cache(&cache)
             });
         }
     }
@@ -1914,6 +2006,8 @@ impl CausalDecoder {
         mut tensors: HashMap<String, DecoderTensor>,
         config: CausalDecoderConfig,
     ) -> Result<Self> {
+        let prefix_align =
+            crate::runtime_flags::prefix_align_for_model(uses_dense_bf16_gemm(&tensors));
         let embed_tokens = take_embedding_weight(&mut tensors, "embed_tokens.weight")?;
         if config.num_hidden_layers == 0 {
             return Err(InferError::Config(
@@ -1922,15 +2016,25 @@ impl CausalDecoder {
         }
         let plan = Arc::new(ModelPlan::build(&config));
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for layer_index in 0..config.num_hidden_layers {
+        for layer_plan in plan.layers.iter().take(config.num_hidden_layers) {
             layers.push(DecoderLayer::from_tensors(
                 &mut tensors,
                 &config,
-                &plan.layers[layer_index],
+                layer_plan,
             )?);
         }
         let final_norm = take_dense(&mut tensors, "norm.weight")?;
-        let lm_head = linear_from(&mut tensors, "lm_head")?;
+        let lm_head = if crate::runtime_flags::decision_headless() {
+            // NOTE: tête d'une ligne nulle, jamais exécutée par une décision ;
+            // une tête stockée a pu être lue (spec facultative) puis est jetée.
+            tensors.remove("lm_head.weight");
+            Linear::new(
+                Tensor::from_vec(vec![1, final_norm.len()], vec![0.0; final_norm.len()])?,
+                None,
+            )?
+        } else {
+            linear_from(&mut tensors, "lm_head")?
+        };
         // Contrat strict des modèles à sinks (flint) : un tenseur chargé mais
         // jamais assemblé (ex. `mlp.gate_proj.bias` sur une couche MoE) serait
         // ignoré en silence. Les autres familles gardent leur tolérance.
@@ -1954,11 +2058,25 @@ impl CausalDecoder {
             #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
             dflash: None,
             snapshot_sources: SnapshotSources::default(),
+            trunk_hf_raw_norms: false,
             prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
+            prefix_align,
             memory_guard: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             runtime: DecoderRuntime::default(),
         })
+    }
+
+    /// Alignement et queue minimale effective (tokens) des reprises de prefill
+    /// de ce modèle, `None` si l'alignement est coupé. La queue couvre aussi le
+    /// seuil du prolongement résident (`SARAGOSSA_RUST_PREFIX_EXTEND_RESIDENT_MIN`),
+    /// sous lequel l'extension passerait en lignes.
+    #[must_use]
+    pub fn prefix_resume_align(&self) -> Option<(usize, usize)> {
+        let (align, tail) = self.prefix_align?;
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let tail = tail.max(crate::runtime_flags::prefix_extend_resident_min_tokens());
+        Some((align, tail))
     }
 
     /// Attache une garde mémoire aux allocations résidentes de ce décodeur.
@@ -2017,6 +2135,119 @@ impl CausalDecoder {
         self.finalize_logits(&logits)
     }
 
+    /// Hidden normalisés des positions `rows` d'une décision texte jointe.
+    /// Les couches complètes voient toute la séquence, les gated-delta restent
+    /// causales. Aucun cache de préfixe ni tête de vocabulaire n'est utilisé.
+    ///
+    /// # Errors
+    /// Refuse les séquences hors contrat et les architectures non Qwen3.5.
+    #[cfg(feature = "decision")]
+    pub fn decision_hidden(&self, token_ids: &[usize], rows: &[usize]) -> Result<Tensor> {
+        self.decision_hidden_packed(&[(token_ids, rows)])?
+            .pop()
+            .ok_or_else(|| InferError::Config("décision sans séquence".into()))
+    }
+
+    /// [`Self::decision_hidden`] pour plusieurs séquences indépendantes, lues
+    /// dans un seul prefill Metal : les couches ligne à ligne (normes, MLP)
+    /// lisent leurs poids une fois, chaque séquence garde ses positions, son
+    /// état gated-delta et son attention. Résultat identique, au bruit de
+    /// tuilage GEMM près, à des appels séparés ; le repli CPU les enchaîne.
+    ///
+    /// # Errors
+    /// Comme [`Self::decision_hidden`], pour chaque séquence.
+    #[cfg(feature = "decision")]
+    pub fn decision_hidden_packed(
+        &self,
+        sequences: &[(&[usize], &[usize])],
+    ) -> Result<Vec<Tensor>> {
+        let hidden_dim = self.final_norm.len();
+        if sequences.is_empty()
+            || !self.config.is_qwen
+            || !self.config.attn_output_gate
+            || sequences.iter().any(|(tokens, rows)| {
+                tokens.is_empty()
+                    || tokens.len() > 2048
+                    || rows.iter().any(|&row| row >= tokens.len())
+            })
+        {
+            return Err(InferError::Config(
+                "décision Qwen3.5 : 1 à 2048 tokens requis".into(),
+            ));
+        }
+        // Seules les lignes lues par le readout passent par la norme finale.
+        let normed = |data: &[f32], first: usize, rows: &[usize]| -> Result<Tensor> {
+            let mut picked = Vec::with_capacity(rows.len() * hidden_dim);
+            for &row in rows {
+                let row = first + row;
+                let slice = data
+                    .get(row * hidden_dim..(row + 1) * hidden_dim)
+                    .ok_or_else(|| InferError::Config("ligne de décision hors séquence".into()))?;
+                picked.extend_from_slice(slice);
+            }
+            let picked = Tensor::from_vec(vec![rows.len(), hidden_dim], picked)?;
+            rms_norm(&picked, &self.final_norm, self.config.rms_eps)
+        };
+        crate::runtime_flags::with_decision_noncausal(|| {
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            if self.resident_metal().is_some() {
+                let tokens: Vec<usize> = sequences
+                    .iter()
+                    .flat_map(|(tokens, _)| tokens.iter().copied())
+                    .collect();
+                let lengths: Vec<usize> =
+                    sequences.iter().map(|(tokens, _)| tokens.len()).collect();
+                // Une seule séquence : chemin habituel, sans découpage.
+                let prefill = || {
+                    self.prefill_resident_cache_hidden_and_captures(
+                        &tokens,
+                        &[],
+                        usize::MAX,
+                        false,
+                        0,
+                    )
+                };
+                let (_, hidden, _) = if lengths.len() == 1 {
+                    prefill()
+                } else {
+                    crate::metal_backend::with_decision_segments(&lengths, prefill)
+                }?
+                .ok_or_else(|| {
+                    InferError::Config("prefill décision résident indisponible".into())
+                })?;
+                let data = match &hidden {
+                    crate::metal_backend::PrefillKvRows::Owned(data) => data.as_slice(),
+                    crate::metal_backend::PrefillKvRows::Shared(rows) => rows.as_slice(),
+                    _ => {
+                        return Err(InferError::Config(
+                            "hidden de décision bf16 inattendu".into(),
+                        ))
+                    }
+                };
+                let mut first = 0;
+                return sequences
+                    .iter()
+                    .map(|(tokens, rows)| {
+                        let out = normed(data, first, rows);
+                        first += tokens.len();
+                        out
+                    })
+                    .collect();
+            }
+            let runtime = self.forward_runtime();
+            sequences
+                .iter()
+                .map(|(tokens, rows)| {
+                    let mut hidden = self.embed_scaled(tokens)?;
+                    for layer in &self.layers {
+                        hidden = layer.forward(&self.config, &hidden, runtime)?;
+                    }
+                    normed(hidden.data(), 0, rows)
+                })
+                .collect()
+        })
+    }
+
     /// Pré-remplit le cache depuis des embeddings déjà préparés.
     ///
     /// Qwen3-TTS prépare ses entrées comme un overlay texte+codec ; elles ne
@@ -2041,6 +2272,12 @@ impl CausalDecoder {
                 "embeddings préfixe attendus hidden={expected_hidden}, reçu {hidden_dim}"
             )));
         }
+        // NOTE: cette entrée ne sert qu'aux décodeurs TTS. La politique TTS doit
+        // donc suivre le prefill quel que soit l'appelant : un `QmmNaDequant`
+        // bf16 ici casserait l'identité avec l'extension mono-ligne (qmv f32).
+        let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+            crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+        );
         let runtime = self.forward_runtime();
         let mut cache = self.empty_cache();
         let mut hidden = input_embeds.clone();
@@ -2089,7 +2326,7 @@ impl CausalDecoder {
                 self.layers.len()
             )));
         }
-        let position = cache.position;
+        let position = cache.current_pos()?;
         let runtime = self.forward_runtime();
         let mut hidden = input_embed.clone();
         for (layer_index, layer) in self.layers.iter().enumerate() {
@@ -2164,9 +2401,9 @@ impl CausalDecoder {
                 Some(crate::decoder::resident::ResidentEmbeddingOut::State(state)) => {
                     Ok(Some(state))
                 }
-                Some(crate::decoder::resident::ResidentEmbeddingOut::Token(_)) => Err(
-                    InferError::Metal("pas résident embedding: token inattendu".to_string()),
-                ),
+                Some(_) => Err(InferError::Metal(
+                    "pas résident embedding: token inattendu".to_string(),
+                )),
                 None => Ok(None),
             }
         }
@@ -2202,19 +2439,108 @@ impl CausalDecoder {
                 return Ok(None);
             };
             let head_buffers = metal.resolve_linear_weight_buffers(head.weight(), "tts_cp_head")?;
-            match self.next_resident_embedding_step(cache, embedding, Some(&head_buffers))? {
+            match self.next_resident_embedding_step(
+                cache,
+                embedding,
+                Some(resident::ResidentEmbeddingHead::Greedy(&head_buffers)),
+            )? {
                 Some(crate::decoder::resident::ResidentEmbeddingOut::Token(token)) => {
                     Ok(Some(token))
                 }
-                Some(crate::decoder::resident::ResidentEmbeddingOut::State(_)) => Err(
-                    InferError::Metal("pas résident tête: état inattendu".to_string()),
-                ),
+                Some(_) => Err(InferError::Metal(
+                    "pas résident tête: état inattendu".to_string(),
+                )),
                 None => Ok(None),
             }
         }
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         {
             let _ = (cache, embedding, head);
+            Ok(None)
+        }
+    }
+
+    /// Décode un embedding et projette la tête dans le même command buffer.
+    /// Seuls les logits sont relus ; le sampler CPU conserve son ordre de tirage.
+    /// Renvoie `None` si le résident est indisponible, sans avancer le cache.
+    ///
+    /// # Errors
+    /// Renvoie une erreur pour une tête avec biais ou un encodage Metal invalide.
+    pub fn decode_logits_resident_from_embedding_head(
+        &self,
+        cache: &mut CausalDecoderCache,
+        embedding: &Tensor,
+        head: &crate::Linear,
+    ) -> Result<Option<Tensor>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if head.bias().is_some() {
+                return Err(InferError::Config(
+                    "tête résidente avec biais non supportée".into(),
+                ));
+            }
+            let Some(metal) = self.forward_runtime().metal_executor() else {
+                return Ok(None);
+            };
+            let buffers = metal.resolve_linear_weight_buffers(head.weight(), "tts_cp_head")?;
+            match self.next_resident_embedding_step(
+                cache,
+                embedding,
+                Some(resident::ResidentEmbeddingHead::Logits(&buffers)),
+            )? {
+                Some(resident::ResidentEmbeddingOut::Logits(logits)) => Ok(Some(logits)),
+                Some(_) => Err(InferError::Metal(
+                    "pas résident tête: logits absents".into(),
+                )),
+                None => Ok(None),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, embedding, head);
+            Ok(None)
+        }
+    }
+
+    /// Décode un embedding avec la tête du modèle, et relit état et logits.
+    /// Le talker TTS a besoin de l'état pour amorcer son code predictor.
+    ///
+    /// # Errors
+    /// Renvoie une erreur pour une tête avec biais ou un encodage Metal invalide.
+    pub fn decode_state_logits_resident_from_embedding(
+        &self,
+        cache: &mut CausalDecoderCache,
+        embedding: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            if self.lm_head.bias().is_some() {
+                return Err(InferError::Config(
+                    "tête résidente avec biais non supportée".into(),
+                ));
+            }
+            let Some(metal) = self.forward_runtime().metal_executor() else {
+                return Ok(None);
+            };
+            let buffers =
+                metal.resolve_linear_weight_buffers(self.lm_head.weight(), "tts_talker_head")?;
+            match self.next_resident_embedding_step(
+                cache,
+                embedding,
+                Some(resident::ResidentEmbeddingHead::StateLogits(&buffers)),
+            )? {
+                Some(resident::ResidentEmbeddingOut::StateLogits(state, logits)) => {
+                    Ok(Some((state, self.finalize_logits(&logits)?)))
+                }
+                Some(_) => Err(InferError::Metal(
+                    "pas résident tête: état/logits absents".into(),
+                )),
+                None => Ok(None),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            let _ = (cache, embedding);
             Ok(None)
         }
     }
@@ -2258,6 +2584,8 @@ impl CausalDecoder {
             }
         }
         cache.position = 0;
+        cache.rope_delta = 0;
+        cache.vision_positions = None;
         Ok(())
     }
 
@@ -2282,8 +2610,18 @@ impl CausalDecoder {
         // du GEMM NA u4 ne touche aucun autre modèle. Sinks appris et expert
         // partagé sans gate signent flint ; Qwen et Gemma n'en ont aucun.
         let flint = self.config.attention_sinks && self.config.ungated_shared_expert;
-        if flint && crate::runtime_flags::flint_small_nax_gemm_enabled() {
+        // NOTE: sur un Qwen MoE, le plancher abaissé vaut pour tout l'executor,
+        // semis de la tête MTP compris (batch ≥ 32) : sans effet sur la sortie,
+        // la vérification greedy reste exacte ; seule l'acceptation peut bouger.
+        if flint {
+            if crate::runtime_flags::flint_small_nax_gemm_enabled() {
+                executor.enable_flint_small_nax_gemm();
+            }
+        } else if let Some(variant) = crate::runtime_flags::qwen_small_nax_gemm(
+            self.config.is_qwen && self.config.num_experts.is_some(),
+        ) {
             executor.enable_flint_small_nax_gemm();
+            executor.set_small_nax_gemm_x4(variant == crate::runtime_flags::SmallNaxGemm::X4);
         }
         self.enable_single_copy_weights(&executor)?;
         if self.qwen_kv_nax_x3_shape().is_some() && crate::runtime_flags::qwen_kv_nax_x3_enabled() {
@@ -2489,12 +2827,53 @@ impl CausalDecoder {
         }
     }
 
-    /// Charge une tête MTP depuis un sidecar safetensors.
+    /// Charge une tête MTP depuis un fichier sidecar séparé, normes telles que
+    /// stockées. Pour la tête détectée par `ModelAssets` (sidecar ou shard du
+    /// modèle), utiliser [`Self::with_mtp_weights`].
     ///
     /// # Errors
     ///
     /// Renvoie une erreur si le sidecar est incomplet ou incompatible.
-    pub fn with_mtp_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
+    pub fn with_mtp_sidecar(self, path: impl AsRef<Path>) -> Result<Self> {
+        self.with_mtp_head(path, MtpHeadSource::Sidecar)
+    }
+
+    /// Charge la tête MTP détectée par `ModelAssets` : chemin et provenance
+    /// (sidecar ou shard du modèle) voyagent ensemble, la convention des
+    /// normes suit donc la vraie source.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur sans tête détectée, ou si elle est incomplète ou
+    /// incompatible.
+    pub fn with_mtp_weights(self, weights: &crate::MtpWeightsInfo) -> Result<Self> {
+        let path = weights.path.as_ref().ok_or_else(|| {
+            InferError::MissingWeight("tête MTP (aucun sidecar ni shard mtp.*)".to_string())
+        })?;
+        self.with_mtp_head(path, MtpHeadSource::of(weights))
+    }
+
+    pub(crate) fn with_trunk_hf_raw_norms(mut self, hf_raw: bool) -> Self {
+        self.trunk_hf_raw_norms = hf_raw;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trunk_hf_raw_norms(&self) -> bool {
+        self.trunk_hf_raw_norms
+    }
+
+    /// Charge une tête MTP depuis `path`, fichier sidecar ou shard du modèle. Embarquée dans un tronc transformers brut,
+    /// la tête dense reçoit le même offset de normes `1 + weight` que lui
+    /// (kill-switch `SARAGOSSA_RUST_MTP_HF_NORM_OFFSET=0`).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la tête est incomplète ou incompatible.
+    fn with_mtp_head(mut self, path: impl AsRef<Path>, source: MtpHeadSource) -> Result<Self> {
+        let hf_norm_offset = source == MtpHeadSource::Embedded
+            && self.trunk_hf_raw_norms
+            && crate::runtime_flags::mtp_hf_norm_offset_enabled();
         self.ensure_metal_supported()?;
         let sources = SnapshotSources::capture([path.as_ref()]);
         #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -2509,8 +2888,13 @@ impl CausalDecoder {
             not(all(target_os = "macos", feature = "metal")),
             expect(unused_mut, reason = "single-copy Metal seulement")
         )]
-        let mut head =
-            MtpHead::from_sidecar(&path, &self.config, self.final_norm.data().len(), &context)?;
+        let mut head = MtpHead::from_sidecar(
+            &path,
+            &self.config,
+            self.final_norm.data().len(),
+            &context,
+            hf_norm_offset,
+        )?;
         // La tête arrive après `enable_single_copy_weights` du tronc : sans ce
         // passage, ses linéaires quantifiées à la charge (fc, attention, expert
         // partagé, routeur) gardaient une copie CPU à scales f32 en plus de la
@@ -2524,6 +2908,22 @@ impl CausalDecoder {
         }
         self.snapshot_sources.append(sources);
         self.mtp = Some(head);
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        // NOTE: une tête de draft en sidecar remplace ensuite celle-ci ; ne pas
+        // quantifier pour rien (0,64 Go et temps CPU au chargement).
+        if self.mtp_draft_lm_head.is_none()
+            && crate::runtime_flags::mtp_draft_lm_head_u4_enabled()
+            && crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MTP_DRAFT_LM_HEAD").is_none()
+        {
+            if let Some(mut draft) = mtp::quantize_draft_lm_head_u4(&self.lm_head)? {
+                if let Some(metal) = self.runtime.metal.as_deref() {
+                    if crate::runtime_flags::single_copy_weights_enabled() {
+                        draft.move_packed_to_metal_shared(metal)?;
+                    }
+                }
+                self.mtp_draft_lm_head = Some(draft);
+            }
+        }
         Ok(self)
     }
 
@@ -2561,7 +2961,9 @@ impl CausalDecoder {
                 ForwardRuntime::metal(metal),
             )?,
         );
-        if crate::runtime_flags::state_snapshot_dir().is_some() {
+        if crate::runtime_flags::state_snapshot_dir().is_some()
+            || state_snapshot::persistent::enabled()
+        {
             if let Some(draft) = &self.dflash {
                 self.snapshot_sources.append(draft.snapshot_sources.clone());
             }
@@ -2680,6 +3082,8 @@ impl CausalDecoder {
         CausalDecoderCache {
             layers: vec![LayerKvCache::default(); self.layers.len()],
             position: 0,
+            rope_delta: 0,
+            vision_positions: None,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             resident: None,
         }

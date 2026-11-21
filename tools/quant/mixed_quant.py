@@ -67,6 +67,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tokenizer_sidecar import check_tokenizer  # noqa: E402
 
 # Fichiers annexes recopiés tels quels depuis le modèle source (tokenizer,
 # gabarit de chat, etc.). `config.json` est réécrit par la quantification et
@@ -263,6 +264,8 @@ def validate(args: argparse.Namespace) -> None:
         raise SystemExit("--imatrix et --imatrix-blend exigent --target-bpw")
     elif args.base_bits != 4:
         raise SystemExit("--base-bits exige --target-bpw")
+    if not (args.input / "tokenizer.json").is_file():
+        raise SystemExit(f"tokenizer.json absent de {args.input}")
     if not 0.0 <= args.high_fraction <= 1.0:
         raise SystemExit(f"--high-fraction hors de [0, 1]: {args.high_fraction}")
     if args.target_bpw is None and args.low_bits >= args.high_bits:
@@ -331,6 +334,9 @@ def main(argv: list[str] | None = None) -> int:
     save_model(str(args.output), model)
     save_config(config, str(args.output / "config.json"))
     copy_sidecars(args.input, args.output)
+    # `tokenizer.json` doit rester celui de la source, jamais un rendu de
+    # transformers (regex Qwen2 imposée aux Qwen3.5).
+    check_tokenizer(args.input, args.output)
 
     print(f"modèle écrit dans {args.output}", flush=True)
     return 0
@@ -369,6 +375,7 @@ def target_template(args):
     save_model(str(args.output), model)
     save_config(config, str(args.output / "config.json"))
     copy_sidecars(args.input, args.output)
+    check_tokenizer(args.input, args.output)
     (args.output / "allocation.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"template écrit : {report['actual_bpw']:.6f} bpw langage, "
           f"cible {args.target_bpw} ; remplir avec convert_ls.py --imatrix", flush=True)

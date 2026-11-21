@@ -75,21 +75,52 @@ pub(super) fn can_use_fast_affine_qmv(
     in_dim: usize,
     weight: &AffineQuantizedTensor,
 ) -> bool {
+    can_use_fast_affine_qmv_preferred(batch, in_dim, weight, false)
+}
+
+pub(super) fn can_use_fast_affine_qmv_preferred(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+    prefer_fast_affine: bool,
+) -> bool {
     let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
         return false;
     };
-    fast_affine_qmv_enabled(out_dim) && can_use_fast_affine_qmv_shape(batch, in_dim, weight)
+    can_use_fast_affine_qmv_buffers(
+        batch,
+        in_dim,
+        out_dim,
+        weight.group_size(),
+        weight.bits(),
+        prefer_fast_affine,
+    ) && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
-pub(super) fn can_use_fast_affine_qmv_shape(
+pub(super) fn can_use_fast_affine_qmv_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+    prefer_fast_affine: bool,
+) -> bool {
+    (fast_affine_qmv_enabled(out_dim) || prefer_fast_affine)
+        && batch > 0
+        && bits == FAST_QMV_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % 512 == 0
+}
+
+pub(super) fn can_use_fast_affine_qmv_u5(
     batch: usize,
     in_dim: usize,
     weight: &AffineQuantizedTensor,
 ) -> bool {
-    batch > 0
-        && weight.bits() == FAST_QMV_BITS
-        && weight.group_size() == FAST_QMV_GROUP_SIZE
-        && in_dim % 512 == 0
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_fast_affine_qmv_u5_buffers(batch, in_dim, out_dim, weight.group_size(), weight.bits())
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
@@ -167,8 +198,8 @@ pub(super) fn can_use_fast_affine_qmm8(
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
-/// GEMM « skinny » u4 gs64 sur unités matricielles (`gemm_nax_skinny_u4_x2`,
-/// `na_gemm.metal`) pour les largeurs de `qmm_skinny_min_batch()` à
+/// GEMM « skinny » u2/u3/u4 gs64 sur unités matricielles (`gemm_nax_skinny_u4_x2`
+/// et ses variantes u2/u3 en x2, `na_gemm.metal`) pour les largeurs de `qmm_skinny_min_batch()` à
 /// `qmm_na_min_batch() - 1` (vérification spéculative large) : les poids d'une
 /// tuile sont dé-quantifiés une fois pour seize lignes au lieu d'un qmv par ligne.
 /// Mesuré le 2026-10-16 (M5 Max, `small_m_qmm_microbench`) : gate/up M=8 0,19 ms
@@ -197,7 +228,7 @@ pub(super) fn can_use_qmm_skinny_buffers(
         && fast_affine_qmv_enabled(out_dim)
         && batch >= qmm_skinny_min_batch()
         && batch < qmm_na_min_batch()
-        && bits == FAST_QMV_BITS
+        && matches!(bits, 2..=FAST_QMV_BITS)
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
         && out_dim % 32 == 0
@@ -208,8 +239,9 @@ pub(super) fn can_use_qmm_skinny_buffers(
 /// exclut le skinny et les GEMM NA et garde le qmv répliqué, exact aussi.
 pub(super) const QMVT_MAX_BATCH: usize = 16;
 
-/// qmv-T u4 gs64 exact (`affine_qmvt_*`) : en vérification greedy stricte
-/// seulement, de 3 à [`QMVT_MAX_BATCH`] lignes. Il prend la place du skinny,
+/// qmv-T u4 gs64 exact (`affine_qmvt_*`) : en vérification greedy stricte de 3
+/// à [`QMVT_MAX_BATCH`] lignes, et hors strict sous le seuil du skinny
+/// ([`qmvt_small_enabled`]). Il prend la place du skinny,
 /// du qmm8 et du qmv répliqué ; chaque ligne rend les bits du qmv mono.
 /// Mesuré le 2026-11-05 (M5 Max, formes 27B, R = 9) : gate 0,251 ms, down
 /// 0,284 ms, lm_head 3,9 ms, contre 0,19 / 0,21 / 2,1 en skinny et 0,36 /
@@ -232,7 +264,17 @@ pub(super) fn can_use_qmvt_buffers(
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
         && out_dim % 32 == 0
-        && super::verify_strict_active()
+        && (super::verify_strict_active()
+            || (qmvt_small_enabled() && batch < qmm_skinny_min_batch()))
+}
+
+/// qmv-T hors mode strict pour les largeurs sous le skinny (3-4 lignes : la
+/// vérification MTP à profondeur 2) : sans lui, ces lignes passent par le qmv
+/// répliqué, qui relit le poids une fois par ligne. Mêmes bits que le qmv mono,
+/// comme le qmv répliqué qu'il remplace. Kill-switch `SARAGOSSA_RUST_QMVT_SMALL=0`.
+pub(super) fn qmvt_small_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMVT_SMALL", true))
 }
 
 pub(super) fn can_use_qmvt(
@@ -293,8 +335,10 @@ thread_local! {
 }
 
 /// Garde RAII restaurant le choix précédent du kernel skinny à sa sortie de portée.
+#[cfg(any(feature = "devtools", test))]
 pub(crate) struct SkinnyBf16ScopeGuard(Option<SkinnyKernel>);
 
+#[cfg(any(feature = "devtools", test))]
 impl Drop for SkinnyBf16ScopeGuard {
     fn drop(&mut self) {
         SKINNY_OVERRIDE.with(|slot| slot.set(self.0));
@@ -304,6 +348,7 @@ impl Drop for SkinnyBf16ScopeGuard {
 /// Force le kernel skinny bf16 (`enabled`) ou la variante précise (`!enabled` :
 /// `x2`/`x3` de `SARAGOSSA_RUST_QMM_SKINNY_KERNEL`, sinon le défaut) pour les
 /// matmuls encodés sur ce thread tant que la garde vit.
+#[cfg(any(feature = "devtools", test))]
 pub(crate) fn install_qmm_skinny_bf16_scope(enabled: bool) -> SkinnyBf16ScopeGuard {
     let kernel = if enabled {
         SkinnyKernel::Bf16
@@ -314,6 +359,7 @@ pub(crate) fn install_qmm_skinny_bf16_scope(enabled: bool) -> SkinnyBf16ScopeGua
 }
 
 /// Force une variante skinny sur ce thread (tests de précision croisés).
+#[cfg(any(feature = "devtools", test))]
 pub(super) fn install_qmm_skinny_kernel_scope(kernel: SkinnyKernel) -> SkinnyBf16ScopeGuard {
     SKINNY_OVERRIDE.with(|slot| SkinnyBf16ScopeGuard(slot.replace(Some(kernel))))
 }
@@ -330,6 +376,7 @@ fn env_skinny_kernel() -> Option<SkinnyKernel> {
     })
 }
 
+#[cfg(any(feature = "devtools", test))]
 fn precise_skinny_kernel() -> SkinnyKernel {
     match env_skinny_kernel() {
         Some(kernel @ (SkinnyKernel::X2 | SkinnyKernel::X3)) => kernel,
@@ -500,7 +547,8 @@ pub(super) const QMM_NA_U4_FLINT_MIN_DIM: usize = 512;
 /// Variante 4-bit gs64 du GEMM NA tuilé. Le chemin reste borné aux grandes
 /// projections denses (`min_dim` = [`QMM_NA_U4_DEFAULT_MIN_DIM`]) : les petites
 /// projections shared-expert de Qwen divergent en oracle greedy avec
-/// l'accumulation bf16 tensor-core et gardent le qmv f32. Le plancher est porté
+/// l'accumulation bf16 tensor-core ; elles gardent le qmv f32, sauf sur les
+/// Qwen MoE où le bf16×4 les sert (KL corpus dans le bruit). Le plancher est porté
 /// par l'executor parce que flint partage ces formes avec Qwen : seule
 /// l'identité du modèle, validée par ses propres oracles, peut l'abaisser.
 pub(super) fn can_use_qmm_na_fused_tiled_u4_buffers(
@@ -580,17 +628,27 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_align64(
 }
 
 /// Prédicat du GEMM prefill sur Neural Accelerators (matmul2d bf16) : dé-quant
-/// u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
-/// (prefill). Opt-in (`SARAGOSSA_RUST_QMM_NA`) ; l'appelant vérifie EN PLUS que la NA est
+/// u5/u6/u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
+/// (prefill). Activé par défaut (`SARAGOSSA_RUST_QMM_NA`) ; l'appelant vérifie EN PLUS que la NA est
 /// dispo (`na_gemm_bf16.is_some()`, macOS≥26). bf16 ⇒ non bit-à-bit identique.
-pub(super) fn can_use_qmm_na_u8(
+pub(super) fn can_use_qmm_na_dequant(
     batch: usize,
     in_dim: usize,
     weight: &AffineQuantizedTensor,
 ) -> bool {
-    qmm_na_enabled()
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    crate::runtime_flags::qmm_na_dequant_allowed()
+        && qmm_na_enabled()
         && batch >= qmm_na_min_batch()
-        && weight.bits() == 8
+        && qmm_na_dequant_fits(
+            in_dim,
+            out_dim,
+            crate::runtime_flags::qmm_na_dequant_max_bytes(),
+        )
+        && matches!(weight.bits(), 5 | 6 | 8)
+        && !(weight.bits() == 6 && qmm_u6_enabled())
         && weight.group_size() == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
         && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
@@ -678,6 +736,23 @@ pub(super) fn can_use_fast_affine_qmm2_u3_buffers(
     bits: usize,
 ) -> bool {
     batch == 2 && can_use_fast_affine_qmv_u3_buffers(batch, in_dim, out_dim, group_size, bits)
+}
+
+/// Le flux MLX u5 traverse les mots u32 ; gs64 garantit dix mots par groupe.
+pub(super) fn can_use_fast_affine_qmv_u5_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> bool {
+    qmv_u5_enabled()
+        && fast_affine_qmv_enabled(out_dim)
+        && batch > 0
+        && in_dim > 0
+        && bits == FAST_QMV_U5_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % FAST_QMV_GROUP_SIZE == 0
 }
 
 /// Prédicat du qmv 6-bit gs64 pour le talker TTS : même contrat de buffers que
@@ -925,4 +1000,27 @@ pub(super) fn qmm_na_min_batch() -> usize {
             .filter(|min| *min >= 2)
             .unwrap_or(32)
     })
+}
+
+/// Borne le scratch bf16 sans allouer le poids ni laisser déborder N*K*2.
+pub(super) fn qmm_na_dequant_fits(in_dim: usize, out_dim: usize, cap: usize) -> bool {
+    in_dim > 0
+        && out_dim > 0
+        && in_dim
+            .checked_mul(out_dim)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<u16>()))
+            .is_some_and(|bytes| bytes <= cap)
+}
+
+#[test]
+fn qmm_na_dequant_budget_bounds_and_overflow() {
+    let cap = 512 * 1024 * 1024;
+    assert!(qmm_na_dequant_fits(16384, 16384, cap));
+    assert!(!qmm_na_dequant_fits(16384, 16385, cap));
+    assert!(!qmm_na_dequant_fits(5120, 248320, cap));
+    assert!(!qmm_na_dequant_fits(usize::MAX, 2, usize::MAX));
+    assert!(!qmm_na_dequant_fits(usize::MAX / 2 + 1, 1, usize::MAX));
+    assert!(!qmm_na_dequant_fits(0, 1, cap));
+    assert!(!qmm_na_dequant_fits(1, 0, cap));
+    assert!(!qmm_na_dequant_fits(1, 1, 0));
 }

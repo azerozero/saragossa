@@ -70,6 +70,339 @@ fn dense_bf16_qmv_matches_f32() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requiert Metal avec GEMM NA et SARAGOSSA_RUST_DENSE_BF16_GEMM actif (défaut) ; poids synthétiques"]
+fn dense_bf16_prefill_gemm_matches_f32() -> Result<()> {
+    // Hors portée `DenseBf16X1Scope` (tête MTP, drafter, Gemma, quantifiés) :
+    // GEMM hi + lo par défaut.
+    dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_tiled_x2")
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; poids synthétiques"]
+fn dense_bf16_prefill_x1_scope_rounds_activation_once() -> Result<()> {
+    // Couches du prefill résident Qwen dense bf16 : GEMM à un produit.
+    let _scope = crate::runtime_flags::DenseBf16X1Scope::enter(true);
+    dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_bn128")
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; poids synthétiques"]
+fn decision_dense_bf16_gemm_rounds_activation_once() -> Result<()> {
+    crate::runtime_flags::with_decision_noncausal(|| {
+        dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_bn128")
+    })
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; kill-switch isolé en sous-processus ; poids synthétiques"]
+fn dense_bf16_prefill_kill_switch_selects_qmv(
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_PREFILL_QMV_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        dense_bf16_prefill_matches_f32("dense_qmv_rhs_bf16_f32")?;
+        return Ok(());
+    }
+    // Le flag est mémorisé par OnceLock : l'isoler sans modifier l'environnement
+    // des autres tests, même si le processus parent a déjà sélectionné le GEMM.
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "metal_backend::tests::dense_bf16::dense_bf16_prefill_kill_switch_selects_qmv",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("SARAGOSSA_RUST_DENSE_BF16_GEMM", "0")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+/// Rejoue le test `name` en sous-processus avec `env` : les flags sont
+/// mémorisés par `OnceLock` et ne doivent pas fuir vers les autres tests.
+fn run_flag_child(name: &str, child: &str, env: (&str, &str)) {
+    let output = std::process::Command::new(
+        std::env::current_exe().expect("invariant: binaire de test courant"),
+    )
+    .args([
+        "--exact",
+        &format!("metal_backend::tests::dense_bf16::{name}"),
+        "--ignored",
+        "--nocapture",
+    ])
+    .env(child, "1")
+    .env(env.0, env.1)
+    .output()
+    .expect("invariant: sous-processus de test lançable");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
+fn dense_bf16_prefill_x1_kill_switch_selects_hi_lo() -> Result<()> {
+    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_X1_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        // `=0` coupe le GEMM à un produit même dans la portée.
+        let _scope = crate::runtime_flags::DenseBf16X1Scope::enter(true);
+        return dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_tiled_x2");
+    }
+    run_flag_child(
+        "dense_bf16_prefill_x1_kill_switch_selects_hi_lo",
+        CHILD,
+        ("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1", "0"),
+    );
+    Ok(())
+}
+
+/// Poids bf16 synthétiques `[out_dim, in_dim]` non dyadiques, graine `seed`.
+fn synthetic_bf16(
+    executor: &MetalExecutor,
+    out_dim: usize,
+    in_dim: usize,
+    seed: usize,
+) -> Result<(LinearWeight, Vec<f32>)> {
+    let values: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| {
+            let v = ((i * 40_503 + seed * 7919) % 997) as f32 / 997.0 - 0.5;
+            // Tronqué après l'échelle : la référence CPU lit exactement le poids bf16.
+            f32::from_bits((v * 0.4).to_bits() & 0xffff_0000)
+        })
+        .collect();
+    let bits: Vec<u8> = values
+        .iter()
+        .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+        .collect();
+    let weight = crate::DenseBf16Tensor::new(
+        &[out_dim, in_dim],
+        executor.weight_buffer_from_bf16_bytes(&bits)?,
+    )?;
+    Ok((LinearWeight::DenseBf16(weight), values))
+}
+
+fn bits_of(buffer: &Buffer, len: usize) -> Result<Vec<u32>> {
+    Ok(read_f32_buffer(buffer, len)?
+        .iter()
+        .map(|v| v.to_bits())
+        .collect())
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
+fn dense_bf16_fused_mlp_matches_x1() -> Result<()> {
+    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_FUSED_MLP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        run_flag_child(
+            "dense_bf16_fused_mlp_matches_x1",
+            CHILD,
+            ("SARAGOSSA_RUST_DENSE_BF16_FUSED_MLP", "1"),
+        );
+        return Ok(());
+    }
+    // Le MLP fusionné ne sert que dans la portée X1 du prefill résident.
+    let _scope = crate::runtime_flags::DenseBf16X1Scope::enter(true);
+    let executor = MetalExecutor::new()?;
+    let (hidden, inter) = (256_usize, 384_usize);
+    let mut resolved = Vec::new();
+    for (seed, (out_dim, in_dim)) in [(inter, hidden), (inter, hidden), (hidden, inter)]
+        .into_iter()
+        .enumerate()
+    {
+        let (weight, _) = synthetic_bf16(&executor, out_dim, in_dim, seed)?;
+        resolved.push(executor.resolve_linear_weight_buffers(&weight, "test_fused_bf16")?);
+    }
+    let [gate, up, down] = [&resolved[0], &resolved[1], &resolved[2]];
+    assert!(!executor.fused_dense_mlp_supported(63, hidden, gate, up, down, inter));
+    // Une tuile M pleine, une tuile masquée, plusieurs tuiles N.
+    for m in [64_usize, 70, 130] {
+        assert!(executor.fused_dense_mlp_supported(m, hidden, gate, up, down, inter));
+        let x: Vec<f32> = (0..m * hidden)
+            .map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * 2.3)
+            .collect();
+        let lhs = executor.upload_f32_buffer(&x, "fused_bf16_lhs")?;
+        let fused = executor.uncached_f32_buffer(m * hidden, "fused_bf16_out")?;
+        let g = executor.uncached_f32_buffer(m * inter, "fused_bf16_gate")?;
+        let u = executor.uncached_f32_buffer(m * inter, "fused_bf16_up")?;
+        let h = executor.uncached_f32_buffer(m * inter, "fused_bf16_h")?;
+        let split = executor.uncached_f32_buffer(m * hidden, "fused_bf16_split")?;
+        let cb = executor.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        executor.encode_fused_dense_mlp(enc, &lhs, m, hidden, gate, up, down, inter, &fused)?;
+        executor.encode_matmul_weight_buffers(enc, &lhs, m, hidden, gate, &g, false)?;
+        executor.encode_matmul_weight_buffers(enc, &lhs, m, hidden, up, &u, false)?;
+        executor.encode_swiglu(enc, &mut Vec::new(), &g, &u, &h, m * inter)?;
+        executor.encode_matmul_weight_buffers(enc, &h, m, inter, down, &split, false)?;
+        enc.end_encoding();
+        commit_and_wait(cb)?;
+        let expected = bits_of(&split, m * hidden)?;
+        assert!(expected.iter().any(|&b| b != 0), "M={m}");
+        assert_eq!(bits_of(&fused, m * hidden)?, expected, "M={m}");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
+fn dense_bf16_pair_gemm_matches_f32() -> Result<()> {
+    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_LA_BA_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        run_flag_child(
+            "dense_bf16_pair_gemm_matches_f32",
+            CHILD,
+            ("SARAGOSSA_RUST_DENSE_BF16_LA_BA_GEMM", "1"),
+        );
+        return Ok(());
+    }
+    let executor = MetalExecutor::new()?;
+    // N = 2·48 comme b/a du 27B : une tuile N pleine et une tuile masquée.
+    let (heads, in_dim) = (48_usize, 320_usize);
+    let (b, b_values) = synthetic_bf16(&executor, heads, in_dim, 1)?;
+    let (a, a_values) = synthetic_bf16(&executor, heads, in_dim, 2)?;
+    for rows in [63_usize, 64, 70] {
+        let x: Vec<f32> = (0..rows * in_dim)
+            .map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * 2.3)
+            .collect();
+        let lhs = executor.upload_f32_buffer(&x, "pair_bf16_lhs")?;
+        let cb = executor.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        let out =
+            executor.encode_dense_bf16_pair_gemm(enc, &lhs, rows, in_dim, [&b, &a], "pair_test")?;
+        enc.end_encoding();
+        commit_and_wait(cb)?;
+        let Some(out) = out else {
+            assert!(rows < 64, "GEMM b/a attendu à M={rows}");
+            continue;
+        };
+        assert!(rows >= 64);
+        let actual = read_f32_buffer(&out, rows * 2 * heads)?;
+        for row in 0..rows {
+            for (col, w) in b_values
+                .chunks(in_dim)
+                .chain(a_values.chunks(in_dim))
+                .enumerate()
+            {
+                let xr = &x[row * in_dim..(row + 1) * in_dim];
+                let e: f64 = xr
+                    .iter()
+                    .zip(w)
+                    .map(|(&x, &w)| f64::from(x) * f64::from(w))
+                    .sum();
+                let got = f64::from(actual[row * 2 * heads + col]);
+                // hi + lo : erreur relative d'activation vers 2⁻¹⁶.
+                assert!(
+                    (got - e).abs() <= 1e-4 * e.abs().max(1.0),
+                    "{row},{col}: {got} != {e}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requiert Metal avec GEMM NA ; flag isolé en sous-processus ; poids synthétiques"]
+fn dense_bf16_prefill_x1_forced_outside_scope() -> Result<()> {
+    const CHILD: &str = "SARAGOSSA_TEST_DENSE_BF16_X1_FORCED_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        // `=1` force le GEMM à un produit hors portée.
+        return dense_bf16_prefill_matches_f32("gemm_nax_bf16_nt_bn128");
+    }
+    run_flag_child(
+        "dense_bf16_prefill_x1_forced_outside_scope",
+        CHILD,
+        ("SARAGOSSA_RUST_DENSE_BF16_GEMM_X1", "1"),
+    );
+    Ok(())
+}
+
+fn dense_bf16_prefill_matches_f32(expected_kernel: &str) -> Result<()> {
+    let executor = MetalExecutor::new()?;
+    // Sans pipeline NA, un qmv ne prouverait pas l'effet du kill-switch.
+    assert!(
+        executor.na_gemm_bf16_nt_tiled_x2.is_some(),
+        "ce test exige le pipeline GEMM NA bf16"
+    );
+    // 70 lignes : une tuile M pleine et une tuile masquée ; deux tuiles N.
+    let (batch, out_dim, in_dim) = (70, 256, 192);
+    let values: Vec<f32> = (0..out_dim * in_dim)
+        .map(|i| ((i % 23) as f32 - 11.0) / 16.0)
+        .collect();
+    let bits: Vec<u8> = values
+        .iter()
+        .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+        .collect();
+    let weight = crate::DenseBf16Tensor::new(
+        &[out_dim, in_dim],
+        executor.weight_buffer_from_bf16_bytes(&bits)?,
+    )?;
+    let resolved = executor
+        .resolve_linear_weight_buffers(&LinearWeight::DenseBf16(weight), "test_bf16_gemm")?;
+    // Activations non représentables en bf16 : le lo de la scission compte.
+    let input = Tensor::from_vec(
+        vec![batch, in_dim],
+        (0..batch * in_dim)
+            .map(|i| ((i % 19) as f32 - 9.0) / 7.0 + (i % 5) as f32 * 1e-3)
+            .collect(),
+    )?;
+    let rounded_once = expected_kernel == "gemm_nax_bf16_nt_bn128";
+    // Le GEMM à un produit arrondit l'activation en bf16 (au plus proche, pair).
+    let reference = if rounded_once {
+        let rounded = input.data().iter().map(|&v| {
+            let bits = v.to_bits();
+            f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
+        });
+        Tensor::from_vec(vec![batch, in_dim], rounded.collect())?
+    } else {
+        input.clone()
+    };
+    let expected = reference.matmul_rhs_t(&Tensor::from_vec(vec![out_dim, in_dim], values)?)?;
+    let lhs = executor.buffer_from_f32(input.data(), "test_bf16_gemm_lhs")?;
+    let out = executor.uncached_f32_buffer(batch * out_dim, "test_bf16_gemm_out")?;
+    let cb = executor.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    super::profiling::OFFSET_TEST_DISPATCHES.with(|trace| {
+        *trace.borrow_mut() = Some(Vec::new());
+    });
+    let encoded =
+        executor.encode_matmul_weight_buffers(enc, &lhs, batch, in_dim, &resolved, &out, false);
+    let trace = super::profiling::OFFSET_TEST_DISPATCHES
+        .with(|trace| trace.borrow_mut().take())
+        .expect("invariant: capture de dispatch active");
+    enc.end_encoding();
+    encoded?;
+    commit_and_wait(cb)?;
+    let mut expected_trace = Vec::new();
+    if rounded_once {
+        expected_trace.push(format!("f32_to_bf16 M={} N=1 K=0", batch * in_dim));
+    }
+    expected_trace.push(format!(
+        "{expected_kernel} M={batch} N={out_dim} K={in_dim}"
+    ));
+    assert_eq!(
+        trace, expected_trace,
+        "le kernel attendu doit être réellement dispatché"
+    );
+    let actual = read_f32_buffer(&out, batch * out_dim)?;
+    // Tolérance f32 relative contre la référence à l'activation déjà arrondie.
+    for (index, (a, e)) in actual.iter().zip(expected.data()).enumerate() {
+        assert!(
+            (a - e).abs() <= 1e-3 * e.abs().max(1.0),
+            "{index}: {a} != {e}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
 fn dense_bf16_embedding_matches_f32() -> Result<()> {
     let executor = MetalExecutor::new()?;
@@ -108,6 +441,388 @@ fn dense_bf16_embedding_matches_f32() -> Result<()> {
             read_f32_buffer(&out, 4)?,
             expected.data().iter().map(|v| v * 3.0).collect::<Vec<_>>()
         );
+    }
+    Ok(())
+}
+
+fn stage_probe_run(
+    metal: &MetalExecutor,
+    stage: bool,
+    buffers: [&metal::Buffer; 3],
+    dims: [u32; 3],
+    reps: usize,
+) -> Result<f64> {
+    let (pipeline, rows) = if stage {
+        (&metal.dense_qmv_rhs_bf16_stage_f32, 4)
+    } else {
+        (&metal.dense_qmv_rhs_bf16_f32, 1)
+    };
+    let cb = metal.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    for (index, buffer) in buffers.iter().enumerate() {
+        enc.set_buffer(index as u64, Some(buffer), 0);
+    }
+    set_u32_bytes(enc, 3, &dims, "stage_dims")?;
+    for _ in 0..reps {
+        enc.dispatch_thread_groups(
+            MTLSize::new(u64::from(dims[1]).div_ceil(rows), u64::from(dims[0]), 1),
+            MTLSize::new(32 * rows, 1, 1),
+        );
+        post_dispatch_barrier_buffer(enc, buffers[2]);
+    }
+    enc.end_encoding();
+    let start = std::time::Instant::now();
+    commit_and_wait(cb)?;
+    Ok(start.elapsed().as_secs_f64() / reps as f64)
+}
+
+/// Compare le qmv bf16 à blocs de 256 au qmv par ligne, au bit près, puis
+/// mesure leur bande passante si `probe` (formes du 27B BF16).
+fn dense_bf16_stage_vs_row(shapes: &[(usize, usize, usize)], probe: bool) -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    for &(n, k, batch) in shapes {
+        let bits: Vec<u16> = (0..n * k)
+            .map(|i| {
+                let v = ((i.wrapping_mul(2_654_435_761) >> 7) % 4093) as f32 / 4093.0 - 0.5;
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let rhs = metal.buffer_from_slice(&bits, "stage_rhs")?;
+        drop(bits);
+        // Activations non représentables en bf16, signes mêlés.
+        let x: Vec<f32> = (0..batch * k)
+            .map(|i| ((i * 40_503 % 997) as f32 / 997.0 - 0.5) * 1.37)
+            .collect();
+        let lhs = metal.upload_f32_buffer(&x, "stage_lhs")?;
+        let dims = [batch as u32, n as u32, k as u32];
+        let row_out = metal.uncached_f32_buffer(batch * n, "stage_row_out")?;
+        let stage_out = metal.uncached_f32_buffer(batch * n, "stage_out")?;
+        stage_probe_run(&metal, false, [&lhs, &rhs, &row_out], dims, 1)?;
+        stage_probe_run(&metal, true, [&lhs, &rhs, &stage_out], dims, 1)?;
+        let bits_of = |buffer| -> Result<Vec<u32>> {
+            Ok(read_f32_buffer(buffer, batch * n)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        let expected = bits_of(&row_out)?;
+        assert!(expected.iter().all(|&b| b != 0), "N={n} K={k}");
+        assert_eq!(bits_of(&stage_out)?, expected, "N={n} K={k} M={batch}");
+        if !probe {
+            continue;
+        }
+        let reps = if n * k > 1 << 26 { 8 } else { 32 };
+        let mut samples = [Vec::new(), Vec::new()];
+        for trial in 0..9 {
+            for stage in [trial % 2 == 1, trial % 2 == 0] {
+                let t = stage_probe_run(&metal, stage, [&lhs, &rhs, &stage_out], dims, reps)?;
+                if trial >= 2 {
+                    samples[usize::from(stage)].push(t);
+                }
+            }
+        }
+        for (stage, values) in samples.iter_mut().enumerate() {
+            values.sort_by(f64::total_cmp);
+            eprintln!(
+                "N={n} K={k} stage={} median={:.3}ms {:.0}GB/s",
+                stage == 1,
+                values[3] * 1e3,
+                (n * k * 2) as f64 / values[3] / 1e9
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
+fn dense_bf16_qmv_stage_matches_row_qmv_bitwise() -> Result<()> {
+    let shapes = [(37, 512, 2), (5, 256, 1), (1024, 5120, 3), (48, 5120, 1)];
+    // L'identité vaut par construction au niveau source ; elle est vérifiée
+    // avec la compilation par défaut puis avec le fast-math coupé.
+    dense_bf16_stage_vs_row(&shapes, false)?;
+    with_metal_fast_math_override(false, || dense_bf16_stage_vs_row(&shapes, false))
+}
+
+/// Le qmv bf16 en lignes rend au bit le qmv à blocs de chaque ligne : la
+/// vérification spéculative garde l'arithmétique du decode M=1.
+fn dense_bf16_rows_vs_stage(shapes: &[(usize, usize, usize)]) -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    for &(n, k, batch) in shapes {
+        let bits: Vec<u16> = (0..n * k)
+            .map(|i| {
+                let v = ((i.wrapping_mul(2_654_435_761) >> 7) % 4093) as f32 / 4093.0 - 0.5;
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let rhs = metal.buffer_from_slice(&bits, "rows_rhs")?;
+        let x: Vec<f32> = (0..batch * k)
+            .map(|i| ((i * 40_503 % 997) as f32 / 997.0 - 0.5) * 1.37)
+            .collect();
+        let lhs = metal.upload_f32_buffer(&x, "rows_lhs")?;
+        let dims = [batch as u32, n as u32, k as u32];
+        let stage_out = metal.uncached_f32_buffer(batch * n, "rows_stage_out")?;
+        let rows_out = metal.uncached_f32_buffer(batch * n, "rows_out")?;
+        stage_probe_run(&metal, true, [&lhs, &rhs, &stage_out], dims, 1)?;
+        let cb = metal.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        metal.encode_dense_qmv_rhs_bf16(enc, &lhs, &rhs, &rows_out, batch, n, k)?;
+        enc.end_encoding();
+        commit_and_wait(cb)?;
+        let bits_of = |buffer| -> Result<Vec<u32>> {
+            Ok(read_f32_buffer(buffer, batch * n)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        let expected = bits_of(&stage_out)?;
+        assert!(expected.iter().all(|&b| b != 0), "N={n} K={k}");
+        assert_eq!(bits_of(&rows_out)?, expected, "N={n} K={k} M={batch}");
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
+fn dense_bf16_qmv_stage_rows_matches_stage_bitwise() -> Result<()> {
+    // 5 lignes = arbre DFlash B=4, 9 = B=8 ; 5-8 couvrent NR=1, 17 et 33
+    // traversent plusieurs groupes de 16.
+    let shapes = [
+        (37, 512, 2),
+        (1024, 5120, 5),
+        (1024, 5120, 6),
+        (1024, 5120, 7),
+        (1024, 5120, 8),
+        (1024, 5120, 9),
+        (48, 5120, 17),
+        (6, 17408, 33),
+        (248_320, 5120, 4),
+    ];
+    dense_bf16_rows_vs_stage(&shapes)?;
+    with_metal_fast_math_override(false, || dense_bf16_rows_vs_stage(&shapes))
+}
+
+/// Temps moyen par dispatch du qmv bf16 de production (`rows` : noyau en
+/// lignes ; sinon qmv à blocs relu par ligne, comme sans le noyau en lignes).
+fn rows_probe_run(
+    metal: &MetalExecutor,
+    rows: bool,
+    buffers: [&metal::Buffer; 3],
+    dims: [u32; 3],
+    reps: usize,
+) -> Result<f64> {
+    if !rows {
+        return stage_probe_run(metal, true, buffers, dims, reps);
+    }
+    let [batch, n, k] = dims.map(|d| d as usize);
+    let cb = metal.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    for _ in 0..reps {
+        metal.encode_dense_qmv_rhs_bf16(enc, buffers[0], buffers[1], buffers[2], batch, n, k)?;
+    }
+    enc.end_encoding();
+    let start = std::time::Instant::now();
+    commit_and_wait(cb)?;
+    Ok(start.elapsed().as_secs_f64() / reps as f64)
+}
+
+#[test]
+#[ignore = "sonde qmv bf16 en lignes (vérification spéculative), GPU au repos"]
+fn dense_bf16_qmv_rows_probe() -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    let shapes = [
+        (17408_usize, 5120_usize, 9_usize),
+        (5120, 17408, 9),
+        (248_320, 5120, 9),
+        (17408, 5120, 3),
+        (17408, 5120, 4),
+    ];
+    for (n, k, batch) in shapes {
+        let bits: Vec<u16> = (0..n * k)
+            .map(|i| {
+                let v = ((i.wrapping_mul(2_654_435_761) >> 7) % 4093) as f32 / 4093.0 - 0.5;
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let rhs = metal.buffer_from_slice(&bits, "probe_rhs")?;
+        drop(bits);
+        let x: Vec<f32> = (0..batch * k)
+            .map(|i| ((i * 40_503 % 997) as f32 / 997.0 - 0.5) * 1.37)
+            .collect();
+        let lhs = metal.upload_f32_buffer(&x, "probe_lhs")?;
+        let dims = [batch as u32, n as u32, k as u32];
+        let outs = [
+            metal.uncached_f32_buffer(batch * n, "probe_stage")?,
+            metal.uncached_f32_buffer(batch * n, "probe_rows")?,
+        ];
+        let mut samples = [Vec::new(), Vec::new()];
+        for trial in 0..9 {
+            for rows in [trial % 2 == 1, trial % 2 == 0] {
+                let t = rows_probe_run(
+                    &metal,
+                    rows,
+                    [&lhs, &rhs, &outs[usize::from(rows)]],
+                    dims,
+                    4,
+                )?;
+                if trial >= 2 {
+                    samples[usize::from(rows)].push(t);
+                }
+            }
+        }
+        let bits_of = |buffer| -> Result<Vec<u32>> {
+            Ok(read_f32_buffer(buffer, batch * n)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect())
+        };
+        assert_eq!(
+            bits_of(&outs[1])?,
+            bits_of(&outs[0])?,
+            "N={n} K={k} M={batch}"
+        );
+        for (rows, values) in samples.iter_mut().enumerate() {
+            values.sort_by(f64::total_cmp);
+            eprintln!(
+                "N={n} K={k} M={batch} rows={} median={:.3}ms {:.0}GB/s",
+                rows == 1,
+                values[3] * 1e3,
+                (n * k * 2) as f64 / values[3] / 1e9
+            );
+        }
+    }
+    Ok(())
+}
+
+// Temps commit/wait amortis sur plusieurs dispatches, ordre alterné : contrôle
+// local, pas une distribution sur GPU au repos.
+#[test]
+#[ignore = "sonde bande passante qmv bf16 par ligne contre blocs de 256, GPU au repos"]
+fn dense_bf16_qmv_stage_bandwidth_probe() -> Result<()> {
+    dense_bf16_stage_vs_row(
+        &[
+            (5120, 17408, 1),
+            (17408, 5120, 1),
+            (10240, 5120, 1),
+            (6144, 5120, 1),
+            (5120, 6144, 1),
+            (248_320, 5120, 1),
+        ],
+        true,
+    )
+}
+
+/// Temps moyen par dispatch d'une variante nommée du qmv bf16 en lignes.
+fn named_rows_probe_run(
+    metal: &MetalExecutor,
+    name: &str,
+    (r, nr): (usize, usize),
+    buffers: [&metal::Buffer; 3],
+    dims: [u32; 3],
+    reps: usize,
+) -> Result<f64> {
+    let pipeline = metal.qmvt_pipeline(name)?;
+    let cb = metal.queue.new_command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    for (index, buffer) in buffers.iter().enumerate() {
+        enc.set_buffer(index as u64, Some(buffer), 0);
+    }
+    set_u32_bytes(enc, 3, &dims, "rows_dims")?;
+    for _ in 0..reps {
+        enc.dispatch_thread_groups(
+            MTLSize::new(
+                u64::from(dims[1]).div_ceil(4 * nr as u64),
+                u64::from(dims[0]).div_ceil(r as u64),
+                1,
+            ),
+            MTLSize::new(128, 1, 1),
+        );
+        post_dispatch_barrier_buffer(enc, buffers[2]);
+    }
+    enc.end_encoding();
+    let start = std::time::Instant::now();
+    commit_and_wait(cb)?;
+    Ok(start.elapsed().as_secs_f64() / reps as f64)
+}
+
+#[test]
+#[ignore = "sonde du qmv bf16 en lignes par NR (lignes de poids par simdgroup), GPU au repos"]
+fn dense_bf16_qmv_rows_variants_probe() -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    for (n, k) in [(17408_usize, 5120_usize), (5120, 17408), (248_320, 5120)] {
+        let bits: Vec<u16> = (0..n * k)
+            .map(|i| {
+                let v = ((i.wrapping_mul(2_654_435_761) >> 7) % 4093) as f32 / 4093.0 - 0.5;
+                (v.to_bits() >> 16) as u16
+            })
+            .collect();
+        let rhs = metal.buffer_from_slice(&bits, "probe_rhs")?;
+        drop(bits);
+        for batch in [4_usize, 5, 6, 7, 8, 9] {
+            let x: Vec<f32> = (0..batch * k)
+                .map(|i| ((i * 40_503 % 997) as f32 / 997.0 - 0.5) * 1.37)
+                .collect();
+            let lhs = metal.upload_f32_buffer(&x, "probe_lhs")?;
+            let dims = [batch as u32, n as u32, k as u32];
+            let stage_out = metal.uncached_f32_buffer(batch * n, "probe_stage")?;
+            let m1 = stage_probe_run(&metal, true, [&lhs, &rhs, &stage_out], dims, 4)?;
+            let _ = m1;
+            let expected: Vec<u32> = read_f32_buffer(&stage_out, batch * n)?
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            let nrs: &[usize] = if batch == 4 { &[1] } else { &[1, 4] };
+            let mut variants = Vec::new();
+            for &nr in nrs {
+                variants.push((format!("dense_qmv_rhs_bf16_rows_f32_r{batch}_n{nr}"), nr));
+            }
+            let mut samples = vec![Vec::new(); variants.len()];
+            let out = metal.uncached_f32_buffer(batch * n, "probe_out")?;
+            for trial in 0..9 {
+                for offset in 0..variants.len() {
+                    let index = (offset + trial) % variants.len();
+                    let (name, nr) = &variants[index];
+                    let t = named_rows_probe_run(
+                        &metal,
+                        name,
+                        (batch, *nr),
+                        [&lhs, &rhs, &out],
+                        dims,
+                        4,
+                    )?;
+                    let got: Vec<u32> = read_f32_buffer(&out, batch * n)?
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect();
+                    assert_eq!(got, expected, "{name} N={n} K={k}");
+                    if trial >= 2 {
+                        samples[index].push(t);
+                    }
+                }
+            }
+            let mut m1s = Vec::new();
+            for _ in 0..7 {
+                m1s.push(stage_probe_run(
+                    &metal,
+                    true,
+                    [&lhs, &rhs, &stage_out],
+                    [1, n as u32, k as u32],
+                    4,
+                )?);
+            }
+            m1s.sort_by(f64::total_cmp);
+            eprintln!("N={n} K={k} M=1 stage median={:.3}ms", m1s[3] * 1e3);
+            for ((name, _), values) in variants.iter().zip(samples.iter_mut()) {
+                values.sort_by(f64::total_cmp);
+                eprintln!(
+                    "N={n} K={k} M={batch} {name} median={:.3}ms {:.0}GB/s",
+                    values[3] * 1e3,
+                    (n * k * 2) as f64 / values[3] / 1e9
+                );
+            }
+        }
     }
     Ok(())
 }

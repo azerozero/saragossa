@@ -1238,12 +1238,12 @@ fn n2_gate_refuses_late_nan_and_native_check_refuses_early_drift() {
 fn n2_resident_decode_matches_cpu_reference() {
     use crate::qwen4_exp::Qwen4ExpReference;
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
-    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
-        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
+    let Some(golden) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_GOLDEN") else {
+        return;
+    };
     let tokens: usize = std::env::var("SARAGOSSA_QWEN4EXP_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1522,12 +1522,12 @@ fn n2_resident_decode_matches_cpu_reference() {
 fn flash_next_step_bits_dump() {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     use std::io::Write;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
-    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
-        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
+    let Some(golden) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_GOLDEN") else {
+        return;
+    };
     let out = std::env::var_os("SARAGOSSA_FLASH_NEXT_BITS_OUT")
         .expect("invariant: SARAGOSSA_FLASH_NEXT_BITS_OUT requis");
     let (context, steps) = (2048, 8);
@@ -1569,12 +1569,12 @@ fn flash_next_step_bits_dump() {
 #[ignore = "débit : poids réels, machine libre"]
 fn bench_resident_decode_after_1k_context() {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
-    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
-        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
+    let Some(golden) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_GOLDEN") else {
+        return;
+    };
     let runs: usize = crate::runtime_flags::env_var("SARAGOSSA_FLASH_NEXT_BENCH_RUNS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
@@ -1688,12 +1688,12 @@ fn resident_config_validation_accepts_flash_next_and_refuses_variants() -> Resul
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn resident_session_recovers_after_ple_and_encode_failures() {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
-    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
-        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
+    let Some(golden) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_GOLDEN") else {
+        return;
+    };
     let ids: Vec<usize> = n2_input_ids(std::path::Path::new(&golden))[..16].to_vec();
     let open = || {
         FlashNextSession::open(
@@ -1952,12 +1952,12 @@ fn load_plan_guard_refuses_transient_peak_above_final_resident() -> Result<()> {
 #[ignore = "profil : poids réels, machine libre"]
 fn profile_resident_decode_after_1k_context() {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
-    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
-        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
+    let Some(golden) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_GOLDEN") else {
+        return;
+    };
     let (context, generated) = (1024, 128);
     let ids = n2_input_ids(std::path::Path::new(&golden));
     let mut session = FlashNextSession::open(
@@ -2829,10 +2829,9 @@ fn bench_resident_decode_after_32k_context() {
     };
     use crate::qwen_loader::qwen4_exp::{Qwen4ExpCheckpoint, Qwen4ExpLayerKind};
     use crate::rope::inv_freq;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
     let corpus = std::path::PathBuf::from(
         std::env::var_os("SARAGOSSA_FLASH_NEXT_CORPUS")
             .expect("invariant: SARAGOSSA_FLASH_NEXT_CORPUS requis"),
@@ -3014,10 +3013,9 @@ fn bench_resident_decode_after_32k_context() {
 fn mtp_failed_raw_restore_poisons_session() {
     use super::session::MtpInput;
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
     let mut session = FlashNextSession::open(
         Qwen4ExpCheckpoint::open(&dir).expect("invariant: checkpoint"),
         64,
@@ -3079,10 +3077,9 @@ fn mtp_failed_raw_restore_poisons_session() {
 fn resident_session_allocates_max_capacity() {
     use super::session::{session_state_bytes, MAX_CAPACITY};
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
     let config = Qwen4ExpCheckpoint::open(&dir)
         .expect("invariant: checkpoint")
         .config;
@@ -3288,14 +3285,12 @@ fn n2_resident_mtp_head_matches_cpu() {
     use super::session::MtpInput;
     use crate::qwen4_exp::Qwen4ExpReference;
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
-    let golden_dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis"),
-    );
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
+    let Some(golden_dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_GOLDEN") else {
+        return;
+    };
     let golden = golden_dir.join("mtp_golden.safetensors");
     let next = golden_i64(&golden, "mtp_next_ids");
     let positions = golden_i64(&golden, "mtp_positions");
@@ -3959,12 +3954,12 @@ fn n2_resident_mtp_head_matches_cpu() {
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn resident_verify_rows_and_accept_match_ar_bitwise() {
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
-    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
-        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
+    let Some(golden) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_GOLDEN") else {
+        return;
+    };
     let ids = n2_input_ids(std::path::Path::new(&golden));
     let rows = super::session::VERIFY_ROWS;
     let open = || {
@@ -4174,12 +4169,12 @@ fn speculative_greedy_matches_ar_bitwise() {
     };
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
     let none = SpecOptions::default();
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
-    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
-        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
+    let Some(golden) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_GOLDEN") else {
+        return;
+    };
     let corpus = std::path::PathBuf::from(
         std::env::var_os("SARAGOSSA_FLASH_NEXT_CORPUS")
             .expect("invariant: SARAGOSSA_FLASH_NEXT_CORPUS requis"),
@@ -4637,12 +4632,12 @@ fn speculative_greedy_matches_ar_bitwise() {
 fn measure_subvocab_draft_acceptance() {
     use super::speculative::{generate_ar, generate_speculative, Generation, SpecOptions};
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
-    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
-        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
+    let Some(golden) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_GOLDEN") else {
+        return;
+    };
     let corpus = std::path::PathBuf::from(
         std::env::var_os("SARAGOSSA_FLASH_NEXT_CORPUS")
             .expect("invariant: SARAGOSSA_FLASH_NEXT_CORPUS requis"),
@@ -4754,12 +4749,12 @@ fn measure_subvocab_draft_acceptance() {
 fn bench_speculative_mono_vs_ar() {
     use super::speculative::{generate_ar, generate_speculative};
     use crate::qwen_loader::qwen4_exp::Qwen4ExpCheckpoint;
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-            .expect("invariant: SARAGOSSA_QWEN4EXP_DIR requis"),
-    );
-    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
-        .expect("invariant: SARAGOSSA_QWEN4EXP_GOLDEN requis");
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR") else {
+        return;
+    };
+    let Some(golden) = crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_GOLDEN") else {
+        return;
+    };
     let ids = n2_input_ids(std::path::Path::new(&golden));
     let tokenizer =
         tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("invariant: tokenizer");
@@ -5071,6 +5066,14 @@ fn distinct_weights(
                 LinearWeight::Dense(t) => {
                     LinearWeight::Dense(Tensor::from_vec(t.shape().to_vec(), t.data().to_vec())?)
                 }
+                LinearWeight::MicroScaled(w) => {
+                    LinearWeight::MicroScaled(crate::MicroQuantizedTensor::new(
+                        [w.shape()[0], w.shape()[1]],
+                        w.packed().to_vec(),
+                        w.scales().to_vec(),
+                        w.mode(),
+                    )?)
+                }
                 LinearWeight::DenseBf16(t) => LinearWeight::Dense(t.to_tensor()?),
                 LinearWeight::DenseShared(t) => LinearWeight::Dense(t.to_tensor()?),
                 LinearWeight::AffineQuantized(q) => {
@@ -5094,6 +5097,7 @@ fn distinct_weights(
         MetalLinearWeightBuffers::DenseBf16 { rhs, .. }
         | MetalLinearWeightBuffers::Dense { rhs, .. } => rhs.gpu_address(),
         MetalLinearWeightBuffers::AffineQuantized { packed, .. } => packed.gpu_address(),
+        MetalLinearWeightBuffers::MicroScaled(weight) => weight.packed.gpu_address(),
     };
     let distinct: std::collections::HashSet<u64> = weights.iter().map(address).collect();
     if distinct.len() != copies {

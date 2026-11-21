@@ -354,57 +354,8 @@ impl DecodeResidentState {
         Ok(self.sink_kernels.get_or_init(|| kernels))
     }
 
-    /// Désinterleave la projection q_proj `[2·q_dim]` (gate de sortie full-attn) en
-    /// `q [q_dim]` + `gate [q_dim]` sur GPU, en UN command buffer ; renvoie `(q, gate)`.
-    /// Reproduit `split_attention_gate` (decoder.rs) sans readback au milieu. La
-    /// variante encode (encoder partagé) sera extraite en 1c.2.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si `proj.len() != 2·num_heads·head_dim` ou si une
-    /// dimension déborde / l'exécution Metal échoue.
-    pub(crate) fn split_q_gate(
-        &self,
-        proj: &[f32],
-        num_heads: usize,
-        head_dim: usize,
-    ) -> Result<(Vec<f32>, Vec<f32>)> {
-        let q_dim = num_heads
-            .checked_mul(head_dim)
-            .ok_or_else(|| InferError::Dimension("split q/gate q_dim déborde".to_string()))?;
-        if proj.len() != 2 * q_dim {
-            return Err(InferError::Dimension(format!(
-                "split q/gate: proj attendu {}, reçu {}",
-                2 * q_dim,
-                proj.len()
-            )));
-        }
-        let proj_lease = self.scratch.lease(2 * q_dim, GpuElement::F32)?;
-        write_f32_at(proj_lease.tensor(), 0, proj)?;
-        let q_lease = self.scratch.lease(q_dim, GpuElement::F32)?;
-        let gate_lease = self.scratch.lease(q_dim, GpuElement::F32)?;
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        let encoder_guard = EncoderEndGuard::new(encoder);
-        self.encode_split_q_gate(
-            encoder,
-            proj_lease.tensor().buffer(),
-            q_lease.tensor().buffer(),
-            gate_lease.tensor().buffer(),
-            num_heads,
-            head_dim,
-        )?;
-        encoder_guard.end();
-        commit_and_wait(command_buffer)?;
-        let q = read_f32_buffer(q_lease.tensor().buffer(), q_dim)?;
-        let gate = read_f32_buffer(gate_lease.tensor().buffer(), q_dim)?;
-        Ok((q, gate))
-    }
-
     /// Encode le désinterleaving q/gate dans un encoder PARTAGÉ : `proj [2·q_dim]`
     /// résident → `q_out [q_dim]` + `gate_out [q_dim]` résidents, sans commit/readback.
-    /// Cœur extrait de [`Self::split_q_gate`] (désormais wrapper), réutilisé par
-    /// l'orchestration full-attn 1c.
     ///
     /// # Errors
     ///
@@ -460,45 +411,8 @@ impl DecodeResidentState {
         Ok(())
     }
 
-    /// Applique le gate de sortie full-attn `out = ctx · σ(gate)` sur GPU, en UN
-    /// command buffer. Variante encode extraite en 1c.2.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si `ctx`/`gate` ont des longueurs différentes ou nulles,
-    /// ou si l'exécution Metal échoue.
-    pub(crate) fn apply_attn_gate(&self, ctx: &[f32], gate: &[f32]) -> Result<Vec<f32>> {
-        let n = ctx.len();
-        if n == 0 || gate.len() != n {
-            return Err(InferError::Dimension(format!(
-                "attn_gate: ctx={n}, gate={}",
-                gate.len()
-            )));
-        }
-        let ctx_lease = self.scratch.lease(n, GpuElement::F32)?;
-        write_f32_at(ctx_lease.tensor(), 0, ctx)?;
-        let gate_lease = self.scratch.lease(n, GpuElement::F32)?;
-        write_f32_at(gate_lease.tensor(), 0, gate)?;
-        let out_lease = self.scratch.lease(n, GpuElement::F32)?;
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        let encoder_guard = EncoderEndGuard::new(encoder);
-        self.encode_attn_gate(
-            encoder,
-            ctx_lease.tensor().buffer(),
-            gate_lease.tensor().buffer(),
-            out_lease.tensor().buffer(),
-            n,
-        )?;
-        encoder_guard.end();
-        commit_and_wait(command_buffer)?;
-        read_f32_buffer(out_lease.tensor().buffer(), n)
-    }
-
     /// Encode le gate de sortie `out = ctx · σ(gate)` dans un encoder PARTAGÉ
-    /// (buffers résidents `[n]`), sans commit/readback. Cœur extrait de
-    /// [`Self::apply_attn_gate`] (désormais wrapper), réutilisé par l'orchestration
-    /// full-attn 1c.
+    /// (buffers résidents `[n]`), sans commit/readback.
     ///
     /// # Errors
     ///
@@ -643,69 +557,6 @@ impl DecodeResidentState {
         crate::metal_backend::post_dispatch_barrier(encoder);
         Ok(())
     }
-
-    /// Variante standalone (un command buffer) de [`Self::encode_rms_norm_rope_decode`]
-    /// pour le test ==CPU. Renvoie le tenseur normé+roté `[num_heads·head_dim]`.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si `input`/`weight` ont des longueurs incohérentes ou si
-    /// l'exécution Metal échoue.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "mirror des paramètres rms_norm+RoPE"
-    )]
-    pub(crate) fn rms_norm_rope_decode(
-        &self,
-        input: &[f32],
-        weight: &[f32],
-        num_heads: usize,
-        head_dim: usize,
-        rope_dims: usize,
-        frequency_dim: usize,
-        position: usize,
-        eps: f32,
-        base_theta: f32,
-    ) -> Result<Vec<f32>> {
-        let dim = num_heads
-            .checked_mul(head_dim)
-            .ok_or_else(|| InferError::Dimension("rope dim déborde".to_string()))?;
-        if input.len() != dim || weight.len() != head_dim {
-            return Err(InferError::Dimension(format!(
-                "rope decode: input={} (attendu {dim}), weight={} (attendu {head_dim})",
-                input.len(),
-                weight.len()
-            )));
-        }
-        let in_lease = self.scratch.lease(dim, GpuElement::F32)?;
-        write_f32_at(in_lease.tensor(), 0, input)?;
-        let weight_lease = self.scratch.lease(head_dim, GpuElement::F32)?;
-        write_f32_at(weight_lease.tensor(), 0, weight)?;
-        let out_lease = self.scratch.lease(dim, GpuElement::F32)?;
-        let frequencies = crate::metal_backend::rope::create_rope_frequencies(
-            &self.device,
-            base_theta,
-            frequency_dim,
-        )?;
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        let encoder_guard = EncoderEndGuard::new(encoder);
-        self.encode_rms_norm_rope_decode(
-            encoder,
-            in_lease.tensor().buffer(),
-            weight_lease.tensor().buffer(),
-            out_lease.tensor().buffer(),
-            num_heads,
-            head_dim,
-            rope_dims,
-            &frequencies,
-            position,
-            eps,
-        )?;
-        encoder_guard.end();
-        commit_and_wait(command_buffer)?;
-        read_f32_buffer(out_lease.tensor().buffer(), dim)
-    }
 }
 
 /// Bloc de lignes K ou V (semis de l'arène, préfixe d'un prolongement) :
@@ -829,8 +680,9 @@ pub(crate) struct FullAttentionMetalState {
     copy_at_f32_to_bf16: ComputePipelineState,
     copy_at_bf16: ComputePipelineState,
     copy_at_bf16_to_f32: ComputePipelineState,
-    /// Rotation de K et append K/V fusionnés, KV f32 puis bf16.
-    rope_append_kv: [ComputePipelineState; 2],
+    /// Rotation de K et append K/V fusionnés, KV f32 puis bf16 ; puis la même
+    /// chose précédée de la rotation de Q (trame TTS).
+    rope_append_kv: [ComputePipelineState; 4],
     /// Sinks appris par tête (flint) et leurs kernels ; `None` = attention
     /// historique, kernels sans sink inchangés.
     sinks: Option<AttentionSinks>,
@@ -853,6 +705,11 @@ struct AttentionSinks {
 }
 
 impl FullAttentionMetalState {
+    /// Octets physiques des charges utiles K/V (hors échelles quantifiées).
+    #[cfg(feature = "tts")]
+    pub(crate) fn payload_allocated_bytes(&self) -> usize {
+        (self.keys.buffer().allocated_size() + self.values.buffer().allocated_size()) as usize
+    }
     /// Attache les sinks appris `[q_heads]` (f32) de la couche : l'attention
     /// decode passe alors par les kernels avec sink (naïf fenêtré ou 2-passes
     /// d128), jamais par le flash. Refusé sur un KV quantifié, dont le 2-passes
@@ -898,6 +755,13 @@ impl FullAttentionMetalState {
     /// Indique si la couche porte des sinks (chemins en lignes refusés).
     pub(super) fn has_sinks(&self) -> bool {
         self.sinks.is_some()
+    }
+
+    /// Indique si norm+RoPE+append K/V fusionnés acceptent ce cache (f32 ou
+    /// bf16) : sinon [`Self::encode_rope_qk_append_kv`] renvoie `false`.
+    #[cfg(feature = "tts")]
+    pub(super) fn supports_fused_rope_append(&self) -> bool {
+        !self.format.is_quantized()
     }
 
     /// Renvoie la dimension d'une ligne KV (`kv_heads * head_dim`).
@@ -1029,6 +893,7 @@ impl FullAttentionMetalState {
         unsafe_code,
         reason = "copie CPU de lignes d'un MTLBuffer StorageModeShared hors command buffer"
     )]
+    #[cfg(any(feature = "devtools", test))]
     pub(crate) fn compact_tree_rows(&mut self, first: usize, path: &[usize]) -> Result<()> {
         let valid = path.first() == Some(&0) && path.windows(2).all(|pair| pair[0] < pair[1]);
         let stored = self.stored_row(first, "compaction KV arbre")?;
@@ -1213,6 +1078,7 @@ impl FullAttentionMetalState {
     ///
     /// Renvoie une erreur si `n_rows > capacity` ou si les longueurs ne valent
     /// pas `n_rows * kv_dim`.
+    #[cfg(test)]
     pub(crate) fn seed(
         &mut self,
         keys_rows: &[f32],
@@ -1226,8 +1092,8 @@ impl FullAttentionMetalState {
         )
     }
 
-    /// Comme [`Self::seed`], depuis des segments de lignes contiguës mis bout à
-    /// bout (KV CPU segmenté) : aucun tampon intermédiaire de la taille du KV.
+    /// Réinjecte le préfixe K/V depuis des segments de lignes contiguës mis bout
+    /// à bout : aucun tampon intermédiaire de la taille du KV.
     ///
     /// # Errors
     ///
@@ -1822,6 +1688,8 @@ impl FullAttentionMetalState {
                 )));
             }
         };
+        let threads = if use_flash { 1024 } else { 256 };
+        crate::metal_backend::check_threadgroup_size(pipeline, threads, "attention decode")?;
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q_buf), 0);
         encoder.set_buffer(1, Some(self.keys.buffer()), 0);
@@ -1842,7 +1710,6 @@ impl FullAttentionMetalState {
             );
         }
         crate::metal_backend::profile_dispatch();
-        let threads = if use_flash { 1024 } else { 256 };
         encoder.dispatch_thread_groups(
             MTLSize::new(u64::from(to_u32(self.q_heads, "q_heads")?), 1, 1),
             MTLSize::new(threads, 1, 1),
@@ -2233,14 +2100,82 @@ impl FullAttentionMetalState {
         rope: &FullAttnLayerDims,
         frequencies: &BufferRef,
     ) -> Result<bool> {
-        let pipeline = match self.format {
-            KvFormat::F32 => &self.rope_append_kv[0],
-            KvFormat::Bf16 => &self.rope_append_kv[1],
-            KvFormat::Q8 | KvFormat::K8V4 | KvFormat::Q4 => return Ok(false),
-        };
         if !crate::runtime_flags::decode_resident_rope_append_kv_enabled() {
             return Ok(false);
         }
+        self.encode_rope_append_kv_inner(
+            encoder,
+            k_raw,
+            k_offset,
+            k_norm,
+            v_buf,
+            v_offset,
+            rope,
+            frequencies,
+            None,
+        )
+    }
+
+    /// Variante de [`Self::encode_rope_append_kv`] qui normalise et tourne
+    /// aussi Q (`q_heads` têtes de `q_in` vers `q_out`) dans le même dispatch :
+    /// chaque tête suit le corps de `rms_norm_rope_heads_decode_f32`, au bit
+    /// près. Renvoie `Ok(false)` sans rien encoder si le KV est quantifié.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur (overflow) si la capacité KV est atteinte.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: sources Q/K/V + offsets + paramètres rms_norm+RoPE"
+    )]
+    #[cfg(feature = "tts")]
+    pub(crate) fn encode_rope_qk_append_kv(
+        &mut self,
+        encoder: &ComputeCommandEncoderRef,
+        qkv: &BufferRef,
+        q_norm: &BufferRef,
+        q_out: &BufferRef,
+        k_offset: u64,
+        k_norm: &BufferRef,
+        v_offset: u64,
+        rope: &FullAttnLayerDims,
+        frequencies: &BufferRef,
+    ) -> Result<bool> {
+        self.encode_rope_append_kv_inner(
+            encoder,
+            qkv,
+            k_offset,
+            k_norm,
+            qkv,
+            v_offset,
+            rope,
+            frequencies,
+            Some((qkv, q_norm, q_out)),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage Metal: sources Q/K/V + offsets + paramètres rms_norm+RoPE"
+    )]
+    fn encode_rope_append_kv_inner(
+        &mut self,
+        encoder: &ComputeCommandEncoderRef,
+        k_raw: &BufferRef,
+        k_offset: u64,
+        k_norm: &BufferRef,
+        v_buf: &BufferRef,
+        v_offset: u64,
+        rope: &FullAttnLayerDims,
+        frequencies: &BufferRef,
+        query: Option<(&BufferRef, &BufferRef, &BufferRef)>,
+    ) -> Result<bool> {
+        let fused_q = usize::from(query.is_some()) * 2;
+        let pipeline = match self.format {
+            KvFormat::F32 => &self.rope_append_kv[fused_q],
+            KvFormat::Bf16 => &self.rope_append_kv[1 + fused_q],
+            KvFormat::Q8 | KvFormat::K8V4 | KvFormat::Q4 => return Ok(false),
+        };
         if self.len >= self.capacity {
             return Err(InferError::Dimension(format!(
                 "append KV résident: capacité {} atteinte (overflow)",
@@ -2267,13 +2202,24 @@ impl FullAttentionMetalState {
         encoder.set_buffer(5, Some(frequencies), 0);
         encoder.set_buffer(6, Some(v_buf), v_offset);
         encoder.set_buffer(7, Some(self.values.buffer()), offset);
+        let mut heads = to_u32(self.kv_heads, "rope append kv_heads")?;
+        if let Some((q_in, q_norm, q_out)) = query {
+            let q_heads = to_u32(self.q_heads, "rope append q_heads")?;
+            encoder.set_buffer(8, Some(q_in), 0);
+            encoder.set_buffer(9, Some(q_norm), 0);
+            encoder.set_buffer(10, Some(q_out), 0);
+            encoder.set_bytes(
+                11,
+                std::mem::size_of::<u32>() as u64,
+                std::ptr::from_ref(&q_heads).cast::<c_void>(),
+            );
+            heads = heads.checked_add(q_heads).ok_or_else(|| {
+                InferError::Dimension("rope append q+kv heads déborde".to_string())
+            })?;
+        }
         crate::metal_backend::profile_dispatch();
         encoder.dispatch_thread_groups(
-            MTLSize::new(
-                u64::from(to_u32(self.kv_heads, "rope append kv_heads")?),
-                1,
-                1,
-            ),
+            MTLSize::new(u64::from(heads), 1, 1),
             MTLSize::new(256, 1, 1),
         );
         crate::metal_backend::post_dispatch_barrier(encoder);
@@ -2394,4 +2340,33 @@ impl FullAttentionMetalState {
         crate::metal_backend::post_dispatch_barrier(encoder);
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn flash_decode_rejects_insufficient_threadgroup_limit() -> Result<()> {
+    let Some(state) = super::tests::try_state()? else {
+        return Ok(());
+    };
+    let limited = crate::metal_backend::tests::limited_threadgroup_pipeline(state.device())?;
+    for head_dim in [128, 256] {
+        for format in [KvFormat::F32, KvFormat::Bf16] {
+            let mut kv = state.full_attention_format_for_test(2, 1, 1, head_dim, format)?;
+            kv.seed(&vec![0.0; head_dim], &vec![0.0; head_dim], 1)?;
+            kv.attention_flash = limited.clone();
+            kv.attention_flash_d256 = limited.clone();
+            kv.attention_flash_bf16 = limited.clone();
+            kv.attention_flash_d256_bf16 = limited.clone();
+            let buffer = state.scratch().lease(head_dim, GpuElement::F32)?;
+            let cb = state.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            let buf = buffer.tensor().buffer();
+            let result = kv.encode_attention_decode(enc, buf, buf, buf);
+            enc.end_encoding();
+            assert!(
+                matches!(result, Err(InferError::Metal(message)) if message.contains("1024") && message.contains("512"))
+            );
+        }
+    }
+    Ok(())
 }

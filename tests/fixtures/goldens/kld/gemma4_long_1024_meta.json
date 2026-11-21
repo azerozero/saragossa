@@ -1,0 +1,58 @@
+{
+  "dtype": "utf8",
+  "shape": [
+    10595
+  ],
+  "source": {
+    "model": "gemma-4-26b-a4b-it-q4a8-ls",
+    "path": "${SARAGOSSA_GEMMA4_DIR}",
+    "snapshot": null,
+    "sha256": {
+      "config.json": "ea97be48db44206bd8c2f1cc543363ee2d381002e7bc2b5e648d6624bebee677",
+      "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+      "tokenizer_config.json": "8227f6f1d959e2ded8be6351bf863a77b781bfd93b82b01e6f65d5d91d5cecb8",
+      "chat_template.jinja": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4",
+      "generation_config.json": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"
+    },
+    "versions": {
+      "transformers": "5.22.2",
+      "tokenizers": "0.23.3",
+      "jinja2": "3.1.6",
+      "mlx": "0.32.4",
+      "mlx-lm": "0.32.2",
+      "numpy": "2.5.4"
+    },
+    "float32_control": true,
+    "weight_sha256": {
+      "model-00001-of-00003.safetensors": "17b6cea13968bc7b952d6cd5a2365329b35ff13e93646a1eb8b315435b21a078",
+      "model-00002-of-00003.safetensors": "357eda2ff33bf27008afccb7754d4ae65786efed609da9c6943c26065412580a",
+      "model-00003-of-00003.safetensors": "762a6da28e9ca8ced9b5b08f87609f52151301800af5b5a1a333436cb70c4f13"
+    },
+    "corpus_sha256": "705d9cd8d10a73a75c0a529e312cd4e841d959b2980c56d15f0ce65ae60472dd",
+    "protocol": "full-prefill, cached greedy f32, 128 positions, top64+rest, f64 softmax",
+    "f32_memory": {
+      "parameter_bytes": {
+        "mlx.core.uint32": 13813448704,
+        "mlx.core.float32": 3156856952
+      },
+      "quantized_modules": {
+        "4": 90,
+        "8": 236
+      }
+    },
+    "bf16_memory": {
+      "parameter_bytes": {
+        "mlx.core.uint32": 13813448704,
+        "mlx.core.bfloat16": 1578428476
+      },
+      "quantized_modules": {
+        "4": 90,
+        "8": 236
+      }
+    }
+  },
+  "tolerance": "KL moyen et p99 delta_p <= 1.5 x bruit bf16 local; same_top >= bf16",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-14",
+  "payload_sha256": "4dbf531b82e9482ee038b431a9b6137a35e92048bef0ba39355f097f85b3fcad"
+}

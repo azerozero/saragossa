@@ -22,7 +22,7 @@ fn prefill_kv_reserve_bounds_growth_without_trimming_hint() {
     }
 }
 
-fn test_executor() -> Result<Option<MetalExecutor>> {
+pub(super) fn test_executor() -> Result<Option<MetalExecutor>> {
     match MetalExecutor::new() {
         Ok(executor) => Ok(Some(executor)),
         Err(InferError::Metal(message)) if message.contains("aucun device") => Ok(None),
@@ -39,7 +39,12 @@ fn deterministic_value(seed: usize, index: usize, scale: f32) -> f32 {
     centered * scale / 128.0
 }
 
-fn deterministic_tensor(rows: usize, cols: usize, seed: usize, scale: f32) -> Result<Tensor> {
+pub(super) fn deterministic_tensor(
+    rows: usize,
+    cols: usize,
+    seed: usize,
+    scale: f32,
+) -> Result<Tensor> {
     Tensor::from_vec(
         vec![rows, cols],
         (0..rows * cols)
@@ -48,7 +53,7 @@ fn deterministic_tensor(rows: usize, cols: usize, seed: usize, scale: f32) -> Re
     )
 }
 
-fn deterministic_norm(dim: usize, seed: usize) -> Result<Tensor> {
+pub(super) fn deterministic_norm(dim: usize, seed: usize) -> Result<Tensor> {
     Tensor::from_vec(
         vec![dim],
         (0..dim)
@@ -197,7 +202,7 @@ fn full_cache(caches: &[PrefillResidentLayerCache]) -> Result<(Tensor, Tensor)> 
     }
 }
 
-fn assert_bit_exact(actual: &Tensor, expected: &Tensor, label: &str) {
+pub(super) fn assert_bit_exact(actual: &Tensor, expected: &Tensor, label: &str) {
     assert_eq!(
         actual.shape(),
         expected.shape(),
@@ -726,6 +731,123 @@ fn gemma_windowed_attention_prefill_full_window_is_causal_bit_exact() -> Result<
     Ok(())
 }
 
+/// Le routage et le format KV restent identiques avec une fenêtre sans effet,
+/// en un bloc ou par morceaux ; une fenêtre plus courte garde son repli.
+#[test]
+fn gemma_windowed_attention_prefill_nax_chunked_routing() -> Result<()> {
+    let Some(mut executor) = test_executor()? else {
+        return Ok(());
+    };
+    const SEQ: usize = 546;
+    const HIDDEN: usize = 8;
+    const HEAD_DIM: usize = 128;
+
+    let input = deterministic_tensor(SEQ, HIDDEN, 653, 0.25)?;
+    let input_norm = deterministic_norm(HIDDEN, 659)?;
+    let post_norm = deterministic_norm(HIDDEN, 661)?;
+    let q_norm = deterministic_norm(HEAD_DIM, 673)?;
+    let k_norm = deterministic_norm(HEAD_DIM, 677)?;
+    let q_proj = Linear::new(deterministic_tensor(HEAD_DIM, HIDDEN, 683, 0.035)?, None)?;
+    let k_proj = Linear::new(deterministic_tensor(HEAD_DIM, HIDDEN, 691, 0.032)?, None)?;
+    let v_proj = Linear::new(deterministic_tensor(HEAD_DIM, HIDDEN, 701, 0.03)?, None)?;
+    let o_proj = Linear::new(deterministic_tensor(HIDDEN, HEAD_DIM, 709, 0.02)?, None)?;
+    let dense_gate = zero_linear(4, HIDDEN)?;
+    let dense_up = zero_linear(4, HIDDEN)?;
+    let dense_down = zero_linear(HIDDEN, 4)?;
+    let causal_spec = PrefillAttentionSpec {
+        seq: SEQ,
+        hidden_dim: HIDDEN,
+        q_heads: 1,
+        kv_heads: 1,
+        head_dim: HEAD_DIM,
+        rope_dims: HEAD_DIM,
+        rope_frequency_dim: HEAD_DIM,
+        rope_theta: 10_000.0,
+        attn_scalar: 256.0,
+        window: None,
+        k_eq_v: false,
+        value_norm: true,
+        eps: 1.0e-6,
+    };
+    if executor.causal_attention_prefill_nax(causal_spec).is_none() {
+        eprintln!("NAX d128 absent : oracle résident fenêtré sauté");
+        return Ok(());
+    }
+    let run = |executor: &MetalExecutor, attention_spec: PrefillAttentionSpec, chunk, min_rows| {
+        with_prefill_kv_layout_override(chunk, min_rows, || {
+            executor.qwen_moe_prefill_resident(
+                &input,
+                &[PrefillMoeLayer {
+                    input_norm: &input_norm,
+                    attention: PrefillAttentionLayer::Full {
+                        q_proj: &q_proj,
+                        k_proj: &k_proj,
+                        v_proj: &v_proj,
+                        o_proj: &o_proj,
+                        q_norm: &q_norm,
+                        k_norm: &k_norm,
+                        gated: false,
+                        sinks: None,
+                    },
+                    attention_spec,
+                    post_norm: &post_norm,
+                    post_norm_before_residual: true,
+                    tail: PrefillMoeTail::Dense {
+                        gate_proj: &dense_gate,
+                        up_proj: &dense_up,
+                        down_proj: &dense_down,
+                    },
+                }],
+                attention_spec,
+            )
+        })
+    };
+
+    for (chunk, mirror, min_rows) in [
+        (0, false, usize::MAX),
+        (273, false, usize::MAX),
+        (273, true, usize::MAX),
+        (273, false, 0),
+    ] {
+        executor.prefill_kv_bf16_mirror = mirror;
+        let (causal, causal_caches) = run(&executor, causal_spec, chunk, min_rows)?;
+        let (causal_key, causal_value) = full_cache(&causal_caches)?;
+        for window in [SEQ, SEQ + 1] {
+            let (actual, caches) = run(
+                &executor,
+                PrefillAttentionSpec {
+                    window: Some(window),
+                    ..causal_spec
+                },
+                chunk,
+                min_rows,
+            )?;
+            let (key, value) = full_cache(&caches)?;
+            assert_bit_exact(&actual, &causal, "full-window resident output");
+            assert_bit_exact(&key, &causal_key, "full-window resident key");
+            assert_bit_exact(&value, &causal_value, "full-window resident value");
+        }
+        let truncated = PrefillAttentionSpec {
+            window: Some(SEQ - 1),
+            ..causal_spec
+        };
+        let (actual, caches) = run(&executor, truncated, chunk, min_rows)?;
+        // Une vraie fenêtre reste monobloc, même si le découpage est demandé.
+        let (expected, expected_caches) = run(&executor, truncated, 0, usize::MAX)?;
+        let (key, value) = full_cache(&caches)?;
+        let (expected_key, expected_value) = full_cache(&expected_caches)?;
+        assert_bit_exact(&actual, &expected, "truncated resident output");
+        assert_bit_exact(&key, &expected_key, "truncated resident key");
+        assert_bit_exact(&value, &expected_value, "truncated resident value");
+        assert!(actual
+            .data()
+            .iter()
+            .zip(causal.data())
+            .any(|(a, b)| a.to_bits() != b.to_bits()));
+    }
+    Ok(())
+}
+
 /// L'alias Gemma K=V ignore toute projection V distincte avant le cache.
 #[test]
 fn gemma_global_attention_aliases_raw_k_as_v() -> Result<()> {
@@ -1151,6 +1273,19 @@ fn assert_full_kv_bf16_of(
 /// bit-identiques et vaut l'arrondi du K/V f32.
 #[test]
 fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
+    check_prefill_resident_chunks::<16, 2, 256>()
+}
+
+#[test]
+fn prefill_resident_d128_chunked_matches_single_chunk() -> Result<()> {
+    check_prefill_resident_chunks::<32, 4, 128>()
+}
+
+fn check_prefill_resident_chunks<
+    const Q_HEADS: usize,
+    const KV_HEADS: usize,
+    const HEAD_DIM: usize,
+>() -> Result<()> {
     let Some(mut executor) = test_executor()? else {
         return Ok(());
     };
@@ -1161,21 +1296,34 @@ fn prefill_resident_chunked_matches_single_chunk() -> Result<()> {
     // courant, tous deux en NAX. Sans accélérateur, elles sont sautées.
     if executor.causal_attention_prefill_steel_nax_d256.is_none() {
         executor.causal_attention_prefill_steel_nax_d256 =
-            super::super::pipelines::compile_steel_causal_nax_d256_attention(
+            super::super::pipelines::compile_steel_causal_nax_attention(
                 &executor.device,
                 STEEL_ATTENTION_NAX_KERNELS,
                 super::super::attention::NAX_CAUSAL_ATTN_BQ64,
             );
     }
-    let nax = executor.causal_attention_prefill_steel_nax_d256.is_some();
+    if HEAD_DIM == 128 && executor.causal_attention_prefill_nax_d128.is_none() {
+        executor.causal_attention_prefill_nax_d128 =
+            super::super::pipelines::compile_steel_causal_nax_attention(
+                &executor.device,
+                STEEL_ATTENTION_NAX_KERNELS,
+                super::super::attention::NAX_CAUSAL_ATTN_D128,
+            );
+        if executor.causal_attention_prefill_nax_d128.is_none() {
+            eprintln!("oracle résident d128 sauté : NAX indisponible");
+            return Ok(());
+        }
+    }
+    let nax = if HEAD_DIM == 128 {
+        executor.causal_attention_prefill_nax_d128.is_some()
+    } else {
+        executor.causal_attention_prefill_steel_nax_d256.is_some()
+    };
     if !nax {
         eprintln!("assertions miroir bf16 sautées : NAX indisponible sur ce GPU");
     }
     const SEQ: usize = 1100;
     const HIDDEN: usize = 64;
-    const Q_HEADS: usize = 16;
-    const KV_HEADS: usize = 2;
-    const HEAD_DIM: usize = 256;
     const INTER: usize = 32;
     // Chemin de production 27B : dk128/dv128, noyau conv 4.
     let linear_spec = LinearAttentionStepSpec {
@@ -2001,7 +2149,7 @@ fn prefill_kv_extends_in_place_across_serve_turns() -> Result<()> {
     };
     if executor.causal_attention_prefill_steel_nax_d256.is_none() {
         executor.causal_attention_prefill_steel_nax_d256 =
-            super::super::pipelines::compile_steel_causal_nax_d256_attention(
+            super::super::pipelines::compile_steel_causal_nax_attention(
                 &executor.device,
                 STEEL_ATTENTION_NAX_KERNELS,
                 super::super::attention::NAX_CAUSAL_ATTN_BQ64,
@@ -2900,8 +3048,9 @@ fn check_mixed_phase_aliases() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
-    const SEQ: usize = 513;
-    const CHUNK: usize = 257;
+    // Morceaux alignés (`runtime_flags::prefix_align`) : 320 puis 319.
+    const SEQ: usize = 639;
+    const CHUNK: usize = 320;
     const HIDDEN: usize = 64;
     const Q_HEADS: usize = 16;
     const KV_HEADS: usize = 2;
@@ -3113,8 +3262,8 @@ fn check_mixed_phase_aliases() -> Result<()> {
         );
     }
     // Chaque chunk alloue les deux couches réelles : Q/contexte/Z, RoPE/
-    // gated, gate/Y, O/down, input/postnorm. Le dernier GDN demande 256 lignes
-    // et reprend le stockage de 257 lignes de l'attention complète.
+    // gated, gate/Y, O/down, input/postnorm. Le dernier GDN demande 319 lignes
+    // et reprend le stockage de 320 lignes de l'attention complète.
     let mut shared_addresses = std::collections::HashSet::new();
     for (label, width, per_chunk) in [
         (PHASE_Q_CONTEXT, dims.value_dim, 3),
@@ -3398,4 +3547,201 @@ fn mtp_seed_bf16_streamed_bit_exact_and_adopted() -> Result<()> {
 #[ignore = "device Metal requis, données synthétiques, contexte long"]
 fn mtp_seed_bf16_streamed_32768_bit_exact() -> Result<()> {
     check_mtp_seed_streamed(&MetalExecutor::new()?, 32768, 4096, true)
+}
+
+/// Reprise d'un préfixe par le prefill résident avec le gated delta NAX du
+/// 27B (16/32 têtes, dk = dv = 128, blocs de 16 depuis le début de l'appel) :
+/// un préfixe aligné ([`crate::runtime_flags::prefix_align`]) reproduit
+/// au bit le prefill à froid, sorties et K/V ; un préfixe non aligné non. Les
+/// morceaux alignés d'un prefill à froid long donnent aussi les bits d'un seul
+/// morceau.
+#[test]
+fn prefill_resident_aligned_prefix_matches_cold_nax_linear() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    if executor.gated_delta_nax_hk16_hv32.is_none()
+        || crate::runtime_flags::prefix_align().is_none()
+    {
+        eprintln!("gated delta NAX ou alignement indisponible : test sauté");
+        return Ok(());
+    }
+    const SEQ: usize = 1100;
+    const HIDDEN: usize = 64;
+    const INTER: usize = 32;
+    let linear_spec = LinearAttentionStepSpec {
+        num_key_heads: 16,
+        num_value_heads: 32,
+        key_head_dim: 128,
+        value_head_dim: 128,
+        conv_kernel_dim: 4,
+        rms_eps: 1.0e-6,
+        l2_qk_sigmoid_gate: false,
+    };
+    let dims = LinearAttnResidentDims {
+        in_dim: HIDDEN,
+        conv_dim: 8192,
+        value_dim: 4096,
+        key_dim: 2048,
+    };
+    let input = deterministic_tensor(SEQ, HIDDEN, 811, 0.5)?;
+    let input_norm = deterministic_norm(HIDDEN, 821)?;
+    let post_norm = deterministic_norm(HIDDEN, 823)?;
+    let gate = Linear::new(deterministic_tensor(INTER, HIDDEN, 827, 0.1)?, None)?;
+    let up = Linear::new(deterministic_tensor(INTER, HIDDEN, 829, 0.1)?, None)?;
+    let down = Linear::new(deterministic_tensor(HIDDEN, INTER, 839, 0.1)?, None)?;
+    let in_proj_qkv = Linear::new(deterministic_tensor(8192, HIDDEN, 853, 0.08)?, None)?;
+    let in_proj_z = Linear::new(deterministic_tensor(4096, HIDDEN, 857, 0.08)?, None)?;
+    let in_proj_b = Linear::new(deterministic_tensor(32, HIDDEN, 859, 0.08)?, None)?;
+    let in_proj_a = Linear::new(deterministic_tensor(32, HIDDEN, 863, 0.08)?, None)?;
+    let out_proj = Linear::new(deterministic_tensor(HIDDEN, 4096, 877, 0.02)?, None)?;
+    let conv_weight = Tensor::from_vec(
+        vec![8192, 4, 1],
+        deterministic_tensor(8192, 4, 881, 0.3)?.data().to_vec(),
+    )?;
+    let a_log: Vec<f32> = (0..32).map(|i| deterministic_value(883, i, 0.3)).collect();
+    let dt_bias: Vec<f32> = (0..32).map(|i| deterministic_value(887, i, 0.2)).collect();
+    let norm_weight = deterministic_norm(128, 907)?;
+    let spec = PrefillAttentionSpec {
+        seq: SEQ,
+        hidden_dim: HIDDEN,
+        q_heads: 16,
+        kv_heads: 2,
+        head_dim: 256,
+        rope_dims: 64,
+        rope_frequency_dim: 64,
+        rope_theta: 10_000_000.0,
+        attn_scalar: 256.0,
+        window: None,
+        k_eq_v: false,
+        value_norm: false,
+        eps: 1.0e-6,
+    };
+    let tail = PrefillMoeTail::Dense {
+        gate_proj: &gate,
+        up_proj: &up,
+        down_proj: &down,
+    };
+    let make_layers = |spec: PrefillAttentionSpec| {
+        [PrefillMoeLayer {
+            input_norm: &input_norm,
+            attention: PrefillAttentionLayer::Linear {
+                weights: LinearAttnResidentWeights {
+                    in_proj_qkv: &in_proj_qkv,
+                    in_proj_z: &in_proj_z,
+                    in_proj_b: &in_proj_b,
+                    in_proj_a: &in_proj_a,
+                    out_proj: &out_proj,
+                    conv_weight: &conv_weight,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    norm_weight: norm_weight.data(),
+                },
+                spec: linear_spec,
+                dims,
+            },
+            attention_spec: spec,
+            post_norm: &post_norm,
+            post_norm_before_residual: false,
+            tail,
+        }]
+    };
+    let layers = make_layers(spec);
+    let calls_before = super::super::linear_attention_encode::linear_nax_hv32_calls();
+    let (cold, _, _) = executor.qwen_moe_prefill_resident_with_captures(
+        PrefillInput::Hidden(&input),
+        &layers,
+        spec,
+        None,
+        &[],
+        usize::MAX,
+        0,
+        false,
+    )?;
+    assert!(
+        super::super::linear_attention_encode::linear_nax_hv32_calls() > calls_before,
+        "le prefill doit passer par le gated delta NAX hv32"
+    );
+    let cold = cold.into_tensor(HIDDEN)?;
+    let rows = |tensor: &Tensor, from: usize| -> Result<Tensor> {
+        Tensor::from_vec(
+            vec![SEQ - from, HIDDEN],
+            tensor.data()[from * HIDDEN..].to_vec(),
+        )
+    };
+    // 512 → morceaux alignés (384, 384, 332) au lieu de 367/367/366.
+    let (chunked, _, _) = executor.qwen_moe_prefill_resident_with_captures(
+        PrefillInput::Hidden(&input),
+        &layers,
+        spec,
+        None,
+        &[],
+        usize::MAX,
+        512,
+        false,
+    )?;
+    assert_bit_exact(&chunked.into_tensor(HIDDEN)?, &cold, "morceaux alignés");
+    let mut unaligned_gap = 0.0_f32;
+    for prefix_rows in [640, 1024, 1000] {
+        let prefix_spec = PrefillAttentionSpec {
+            seq: prefix_rows,
+            ..spec
+        };
+        let (_, prefix_caches) = executor.qwen_moe_prefill_resident(
+            &Tensor::from_vec(
+                vec![prefix_rows, HIDDEN],
+                input.data()[..prefix_rows * HIDDEN].to_vec(),
+            )?,
+            &make_layers(prefix_spec),
+            prefix_spec,
+        )?;
+        let prefix = PrefillResidentPrefix {
+            rows: prefix_rows,
+            layers: prefix_caches
+                .iter()
+                .map(|cache| match cache {
+                    PrefillResidentLayerCache::Linear { state } => {
+                        PrefillResidentPrefixLayer::Linear { state }
+                    }
+                    PrefillResidentLayerCache::Full { .. } => {
+                        unreachable!("invariant: couche linéaire seule")
+                    }
+                })
+                .collect(),
+        };
+        let suffix = rows(&input, prefix_rows)?;
+        let (extended, _, _) = executor.qwen_moe_prefill_resident_from(
+            PrefillInput::Hidden(&suffix),
+            &layers,
+            spec,
+            None,
+            &[],
+            usize::MAX,
+            0,
+            Some(&prefix),
+            false,
+        )?;
+        let extended = extended.into_tensor(HIDDEN)?;
+        let expected = rows(&cold, prefix_rows)?;
+        if crate::runtime_flags::prefix_align().is_some_and(|(align, _)| prefix_rows % align == 0) {
+            assert_bit_exact(
+                &extended,
+                &expected,
+                &format!("préfixe aligné {prefix_rows}"),
+            );
+        } else {
+            unaligned_gap = extended
+                .data()
+                .iter()
+                .zip(expected.data())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+        }
+    }
+    // Témoin : le bloc de 16 décalé change les bits, l'alignement est requis.
+    assert!(
+        unaligned_gap > 0.0,
+        "préfixe non aligné attendu différent du prefill à froid"
+    );
+    Ok(())
 }

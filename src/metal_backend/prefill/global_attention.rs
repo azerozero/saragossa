@@ -24,6 +24,7 @@ impl MetalExecutor {
         q_dim: usize,
         layer_index: usize,
         kv_only: bool,
+        rope_positions: Option<&BufferRef>,
     ) -> Result<Buffer> {
         match (attention, attention_scratch, layer_cache) {
             (
@@ -161,7 +162,7 @@ impl MetalExecutor {
                         self.encode_rms_norm_heads_no_scale(encoder, &v_buffer, &v_buffer, spec)?;
                     }
                     if !kv_only {
-                        self.encode_rms_norm_rope_heads(
+                        self.encode_rms_norm_mrope_heads(
                             encoder,
                             &q_buffer,
                             &q_norm_buffer,
@@ -169,9 +170,10 @@ impl MetalExecutor {
                             spec,
                             spec.q_heads,
                             chunk.start,
+                            rope_positions,
                         )?;
                     }
-                    self.encode_rms_norm_rope_heads(
+                    self.encode_rms_norm_mrope_heads(
                         encoder,
                         &k_buffer,
                         &k_norm_buffer,
@@ -179,6 +181,7 @@ impl MetalExecutor {
                         spec,
                         spec.kv_heads,
                         chunk.start,
+                        rope_positions,
                     )?;
                     if *bf16_store {
                         // Même `bfloat(x)` que la conversion du NAX ou du
@@ -218,6 +221,13 @@ impl MetalExecutor {
                 if kv_only {
                     return Ok(o_buffer);
                 }
+                // Sans sinks, une fenêtre couvrant le préfixe suit exactement
+                // le même dispatch causal, y compris le NAX par morceaux.
+                let spec = if sinks_buffer.is_none() {
+                    spec.with_effective_window(chunk.start + chunk.rows)
+                } else {
+                    spec
+                };
                 self.run_resident_prefill_section(
                     context,
                     if spec.window.is_some() {
@@ -240,6 +250,23 @@ impl MetalExecutor {
                                 spec,
                                 kv_row + chunk.rows,
                                 *bf16_store,
+                            );
+                        }
+                        if rope_positions.is_some() && (chunk.rows < chunk.total || spec.seq > 256)
+                        {
+                            // Le contrat vision compare au f32 : conserver
+                            // Q/K/V en f32, sans l'arrondi BF16 du NAX.
+                            return self.encode_causal_attention_prefill_chunk(
+                                encoder,
+                                &q_rope_buffer,
+                                key_cache,
+                                value_cache,
+                                &context_buffer,
+                                spec,
+                                chunk.start + chunk.rows,
+                                chunk.total,
+                                None,
+                                false,
                             );
                         }
                         if chunk.rows < chunk.total {
@@ -280,6 +307,7 @@ impl MetalExecutor {
                                 kv_rows,
                                 chunk.total,
                                 bf16_kv,
+                                true,
                             )
                         } else if *bf16_store {
                             // Exclu par l'éligibilité : seul le NAX par
@@ -368,6 +396,10 @@ impl MetalExecutor {
                             state,
                             linear_spec,
                             dims,
+                            // Les embeddings fournis gardent la récurrence
+                            // f32 séquentielle du chemin per-op. Le NAX reste
+                            // inchangé pour les entrées texte.
+                            rope_positions.is_none(),
                         )
                     },
                 )?;

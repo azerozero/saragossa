@@ -5,11 +5,19 @@ use crate::{rms_norm, InferError, Result, Tensor};
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+mod weights;
+use weights::CodecWeights;
+
+/// Trames par lot du décodage batch au préfixe GPU : borne la mémoire des
+/// scores d'attention sans changer le PCM (invariant au découpage).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+const CODEC_GPU_PREFIX_LOT_FRAMES: usize = 64;
+
 #[derive(Debug)]
 pub(crate) struct TtsCodec {
     cfg: TtsDecoderConfig,
     sample_rate: u32,
-    weights: HashMap<String, Tensor>,
+    weights: CodecWeights,
     /// Forward GPU résident de la section chaude (`decoder.decoder.*`), construit
     /// au chargement quand Metal est dispo et `SARAGOSSA_TTS_CODEC_GPU` actif (défaut).
     /// Repli CPU (octet-identique) si absent.
@@ -19,6 +27,8 @@ pub(crate) struct TtsCodec {
 
 #[derive(Debug, Default)]
 pub(crate) struct TtsCodecStreamState {
+    /// Préfixe GPU demandé ; `false` : préfixe CPU exact (glouton, oracles).
+    gpu_prefix: bool,
     generated_frames: usize,
     hidden_time: usize,
     emitted_samples: usize,
@@ -89,8 +99,14 @@ impl TtsCodec {
         let mut weights = HashMap::new();
         let mut cluster = HashMap::new();
         let mut embsum = HashMap::new();
+        let decoder_only = crate::runtime_flags::tts_codec_decoder_only_enabled();
 
         for name in payload.names() {
+            // L'encodeur Mimi de clonage possède son propre chargeur. La synthèse
+            // ne lit aucun poids `encoder.*` de ce checkpoint partagé.
+            if decoder_only && name.starts_with("encoder.") {
+                continue;
+            }
             if let Some(base) = name.strip_suffix("._codebook.cluster_usage") {
                 cluster.insert(
                     format!("{base}.codebook"),
@@ -126,6 +142,15 @@ impl TtsCodec {
         }
 
         // Forward GPU résident de la section chaude : best-effort au chargement.
+        if crate::tts::memory::enabled() {
+            crate::tts::memory::checkpoint(
+                "codec_cpu",
+                &[(
+                    "codec_cpu",
+                    weights.values().map(Tensor::capacity_bytes).sum(),
+                )],
+            );
+        }
         // Échec (pas de Metal, kernel KO, poids absent) ⇒ repli CPU silencieux.
         #[cfg(all(target_os = "macos", feature = "metal"))]
         let gpu = if crate::runtime_flags::env_flag("SARAGOSSA_TTS_CODEC_GPU", true) {
@@ -139,6 +164,31 @@ impl TtsCodec {
         } else {
             None
         };
+        crate::tts::memory::checkpoint("codec_gpu", &[]);
+
+        let lazy_cpu = crate::runtime_flags::tts_codec_lazy_cpu_enabled();
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let discard = |name: &str| {
+            lazy_cpu
+                && gpu.as_ref().is_some_and(|gpu| {
+                    name.starts_with("decoder.decoder.")
+                        || (gpu.has_prefix()
+                            && name.starts_with("decoder.")
+                            && !name.starts_with("decoder.quantizer."))
+                })
+        };
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let discard = |_name: &str| {
+            let _ = lazy_cpu;
+            false
+        };
+        let weights = CodecWeights::new(weights, payload, discard);
+        if crate::tts::memory::enabled() {
+            crate::tts::memory::checkpoint(
+                "codec_retained",
+                &[("codec_cpu", weights.retained_bytes())],
+            );
+        }
 
         Ok(Self {
             cfg,
@@ -167,9 +217,28 @@ impl TtsCodec {
     }
 
     pub(crate) fn decode_codes(&self, generated: &[Vec<i32>]) -> Result<Vec<f32>> {
+        self.decode_codes_with(generated, true)
+    }
+
+    /// Décode avec le préfixe CPU : PCM historique au bit près, pour le
+    /// glouton et ses goldens.
+    pub(crate) fn decode_codes_exact(&self, generated: &[Vec<i32>]) -> Result<Vec<f32>> {
+        self.decode_codes_with(generated, false)
+    }
+
+    fn decode_codes_with(&self, generated: &[Vec<i32>], gpu_prefix: bool) -> Result<Vec<f32>> {
         if generated.is_empty() {
             return Ok(Vec::new());
         }
+        // Préfixe GPU : le batch passe par des lots streaming fixes, PCM
+        // identique au bit quel que soit le découpage. Les lots bornent les
+        // scores d'attention à `lot × têtes × clés` au lieu de `T² × têtes`.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if gpu_prefix && self.gpu_prefix_active() {
+            return self.decode_codes_in_lots(generated, CODEC_GPU_PREFIX_LOT_FRAMES);
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = gpu_prefix;
         let hidden = self.decode_prefix(generated)?;
         // Section chaude (`decoder.decoder.*`, ~94 % du coût) : forward GPU résident
         // si disponible, sinon repli CPU octet-identique (l'oracle de parité).
@@ -181,11 +250,39 @@ impl TtsCodec {
         self.decode_tail_cpu(&hidden)
     }
 
+    /// Décode `generated` en lots streaming de `lot` trames (préfixe GPU si
+    /// actif) et concatène le PCM.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(crate) fn decode_codes_in_lots(
+        &self,
+        generated: &[Vec<i32>],
+        lot: usize,
+    ) -> Result<Vec<f32>> {
+        let lot = lot.max(1);
+        let mut state = self.new_stream_state();
+        let mut pcm = Vec::new();
+        let mut end = 0;
+        while end < generated.len() {
+            end = end.saturating_add(lot).min(generated.len());
+            pcm.extend(self.decode_codes_streaming(&mut state, &generated[..end])?);
+        }
+        Ok(pcm)
+    }
+
     pub(crate) fn new_stream_state(&self) -> TtsCodecStreamState {
         TtsCodecStreamState {
+            gpu_prefix: true,
             #[cfg(all(target_os = "macos", feature = "metal"))]
             gpu: self.gpu.as_ref().map(|gpu| gpu.new_stream()),
             ..TtsCodecStreamState::default()
+        }
+    }
+
+    /// État streaming au préfixe CPU (voir [`Self::decode_codes_exact`]).
+    pub(crate) fn new_stream_state_exact(&self) -> TtsCodecStreamState {
+        TtsCodecStreamState {
+            gpu_prefix: false,
+            ..self.new_stream_state()
         }
     }
 
@@ -202,6 +299,29 @@ impl TtsCodec {
         state: &mut TtsCodecStreamState,
         generated: &[Vec<i32>],
     ) -> Result<Vec<f32>> {
+        let gpu_prefix = state.gpu_prefix && self.gpu_prefix_active();
+        self.decode_codes_streaming_with(state, generated, gpu_prefix)
+    }
+    /// Préfixe GPU actif : forward GPU présent avec son préfixe, RVQ en deux
+    /// groupes (sémantique puis acoustique).
+    fn gpu_prefix_active(&self) -> bool {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        {
+            self.gpu.as_ref().is_some_and(|gpu| gpu.has_prefix())
+                && self.cfg.num_quantizers > self.cfg.num_semantic_quantizers
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        {
+            false
+        }
+    }
+
+    fn decode_codes_streaming_with(
+        &self,
+        state: &mut TtsCodecStreamState,
+        generated: &[Vec<i32>],
+        gpu_prefix: bool,
+    ) -> Result<Vec<f32>> {
         if generated.len() < state.generated_frames {
             return Err(InferError::Dimension(format!(
                 "codec streaming préfixe régressif: {} < {}",
@@ -213,6 +333,26 @@ impl TtsCodec {
             return Ok(Vec::new());
         }
 
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let (true, Some(gpu), Some(gpu_state)) =
+            (gpu_prefix, self.gpu.as_ref(), state.gpu.as_mut())
+        {
+            let new_codes = &generated[state.generated_frames..];
+            let semantic =
+                usize_from_i32(self.cfg.num_semantic_quantizers, "num_semantic_quantizers")?;
+            let total = usize_from_i32(self.cfg.num_quantizers, "num_quantizers")?;
+            let first = self.rvq_sum(new_codes, 0, semantic, "decoder.quantizer.rvq_first")?;
+            let rest = self.rvq_sum(
+                new_codes,
+                semantic,
+                total - semantic,
+                "decoder.quantizer.rvq_rest",
+            )?;
+            let pcm = gpu.decode_rvq_streaming(gpu_state, first.time, &first.data, &rest.data)?;
+            state.generated_frames = generated.len();
+            state.emitted_samples = state.emitted_samples.saturating_add(pcm.len());
+            return Ok(pcm.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect());
+        }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if let Some(gpu_state) = state.gpu.as_mut() {
             let hidden = self
@@ -230,7 +370,8 @@ impl TtsCodec {
             return Ok(pcm.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect());
         }
 
-        let pcm = self.decode_codes(generated)?;
+        // Même préfixe que l'état : un état exact ne retombe jamais sur le GPU.
+        let pcm = self.decode_codes_with(generated, gpu_prefix)?;
         if pcm.len() < state.emitted_samples {
             return Err(InferError::Dimension(format!(
                 "codec streaming PCM régressif: {} < {}",
@@ -321,6 +462,46 @@ impl TtsCodec {
         Ok(hidden)
     }
 
+    /// Bascule les convolutions GPU en tuiles (oracles).
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn set_gpu_conv_tiled(&mut self, enabled: bool) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_conv_tiled(enabled);
+        }
+    }
+
+    /// Profil par kernel de la section GPU streaming : préfixe CPU, lots de
+    /// `lot` trames, le premier lot (contextes vides) écarté. Renvoie aussi la
+    /// durée GPU d'un command buffer unique par lot, sur un second état.
+    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    pub(crate) fn profile_gpu_tail(
+        &self,
+        codes: &[Vec<i32>],
+        lot: usize,
+    ) -> Result<(Vec<crate::tts_codec_gpu::KernelTime>, f64, usize)> {
+        let gpu = self
+            .gpu
+            .as_ref()
+            .ok_or_else(|| InferError::Metal("profil: codec GPU absent".to_string()))?;
+        let hidden = self.decode_prefix(codes)?;
+        let rows = hidden.time / codes.len().max(1);
+        let chunk = lot * rows * hidden.channels;
+        let mut split = gpu.new_stream();
+        let mut whole = gpu.new_stream();
+        let (mut kernels, mut single_ns, mut frames) = (Vec::new(), 0.0, 0);
+        for (index, part) in hidden.data.chunks(chunk).enumerate() {
+            let time = part.len() / hidden.channels;
+            let rec = gpu.profile_tail_stream(&mut split, time, hidden.channels, part)?;
+            let ns = gpu.time_tail_stream(&mut whole, time, hidden.channels, part)?;
+            if index > 0 {
+                kernels.extend(rec);
+                single_ns += ns;
+                frames += time / rows;
+            }
+        }
+        Ok((kernels, single_ns, frames))
+    }
+
     /// Décode entièrement sur CPU (oracle de parité, contourne le forward GPU).
     #[cfg(test)]
     pub(crate) fn decode_codes_cpu(&self, generated: &[Vec<i32>]) -> Result<Vec<f32>> {
@@ -403,6 +584,18 @@ impl TtsCodec {
         n_q: usize,
         prefix: &str,
     ) -> Result<Nlc> {
+        let acc = self.rvq_sum(generated, group_offset, n_q, prefix)?;
+        self.conv1x1(&acc, &format!("{prefix}.output_proj.weight"))
+    }
+
+    /// Somme des embeddings des `n_q` codebooks d'un groupe RVQ, `[time, dim]`.
+    fn rvq_sum(
+        &self,
+        generated: &[Vec<i32>],
+        group_offset: usize,
+        n_q: usize,
+        prefix: &str,
+    ) -> Result<Nlc> {
         let emb0 = self.weight(&format!("{prefix}.vq.layers.0.codebook.embed.weight"))?;
         let inner = matrix_shape(emb0)?.1;
         let mut acc = Nlc::zeros(generated.len(), inner);
@@ -416,7 +609,7 @@ impl TtsCodec {
                 acc.add_row_in_place(time, row)?;
             }
         }
-        self.conv1x1(&acc, &format!("{prefix}.output_proj.weight"))
+        Ok(acc)
     }
 
     fn pre_transformer(&self, x: &Nlc) -> Result<Nlc> {
@@ -466,7 +659,7 @@ impl TtsCodec {
                 .layers
                 .resize_with(layers, CodecAttentionStreamState::default);
         }
-        for layer in 0..layers {
+        for (layer, layer_state) in state.layers.iter_mut().enumerate().take(layers) {
             let prefix = format!("decoder.pre_transformer.layers.{layer}");
             let residual = h.clone();
             let hn = self.rms_norm_nlc(
@@ -474,11 +667,8 @@ impl TtsCodec {
                 &format!("{prefix}.input_layernorm.weight"),
                 self.cfg.rms_norm_eps,
             )?;
-            let attn = self.codec_attention_stream(
-                &mut state.layers[layer],
-                &hn,
-                &format!("{prefix}.self_attn"),
-            )?;
+            let attn =
+                self.codec_attention_stream(layer_state, &hn, &format!("{prefix}.self_attn"))?;
             let attn = self.mul_channel(&attn, &format!("{prefix}.self_attn_layer_scale.scale"))?;
             h = residual.add(&attn)?;
 
@@ -696,7 +886,7 @@ impl TtsCodec {
                 x.channels
             )));
         }
-        let bias = match self.opt(&format!("{prefix}.bias")) {
+        let bias = match self.opt(&format!("{prefix}.bias"))? {
             Some(b) => Some(channel_slice(b)?),
             None => None,
         };
@@ -768,7 +958,7 @@ impl TtsCodec {
                 weight.shape()
             )));
         }
-        let bias = match self.opt(bias_key) {
+        let bias = match self.opt(bias_key)? {
             Some(b) => Some(channel_slice(b)?),
             None => None,
         };
@@ -860,7 +1050,7 @@ impl TtsCodec {
             )));
         }
         let out_time = x.time - kernel + 1;
-        let bias = match self.opt(bias_key) {
+        let bias = match self.opt(bias_key)? {
             Some(b) => Some(channel_slice(b)?),
             None => None,
         };
@@ -922,7 +1112,7 @@ impl TtsCodec {
         let out_time = raw_time.checked_sub(trim).ok_or_else(|| {
             InferError::Dimension(format!("trim conv transpose invalide {weight_key}"))
         })?;
-        let bias = match self.opt(bias_key) {
+        let bias = match self.opt(bias_key)? {
             Some(b) => Some(channel_slice(b)?),
             None => None,
         };
@@ -1083,11 +1273,11 @@ impl TtsCodec {
 
     fn weight(&self, key: &str) -> Result<&Tensor> {
         self.weights
-            .get(key)
+            .get(key)?
             .ok_or_else(|| InferError::MissingWeight(key.to_string()))
     }
 
-    fn opt(&self, key: &str) -> Option<&Tensor> {
+    fn opt(&self, key: &str) -> Result<Option<&Tensor>> {
         self.weights.get(key)
     }
 }

@@ -38,7 +38,7 @@ pub fn read(name: &str) -> TestResult<(Header, Vec<u8>)> {
         .try_fold(width, |n: usize, d| n.checked_mul(*d));
     assert_eq!(count, Some(bytes.len()), "{name}: taille/shape");
     assert_eq!(
-        format!("{:x}", Sha256::digest(&bytes)),
+        hex(Sha256::digest(&bytes)),
         header.payload_sha256,
         "{name}: SHA256"
     );
@@ -74,12 +74,35 @@ pub fn json<T: DeserializeOwned>(name: &str) -> TestResult<T> {
 pub fn check_model(name: &str, path: &Path) -> TestResult {
     let (header, _) = read(name)?;
     for (file, expected) in header.source["sha256"].as_object().ok_or("SHA absents")? {
-        let digest = format!("{:x}", Sha256::digest(std::fs::read(path.join(file))?));
+        let digest = hex(Sha256::digest(std::fs::read(path.join(file))?));
         assert_eq!(
             Some(digest.as_str()),
             expected.as_str(),
             "{name}/{file}: provenance différente"
         );
+    }
+    // Les captures longues authentifient aussi les poids quantifiés. Lire en
+    // flux évite une allocation de la taille de chaque shard safetensors.
+    if let Some(weights) = header.source["weight_sha256"].as_object() {
+        use std::io::Read;
+        assert!(!weights.is_empty(), "{name}: empreintes des poids absentes");
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        for (file, expected) in weights {
+            let mut input = std::fs::File::open(path.join(file))?;
+            let mut hash = Sha256::new();
+            loop {
+                let size = input.read(&mut buffer)?;
+                if size == 0 {
+                    break;
+                }
+                hash.update(&buffer[..size]);
+            }
+            assert_eq!(
+                Some(hex(hash.finalize()).as_str()),
+                expected.as_str(),
+                "{name}/{file}: poids différents"
+            );
+        }
     }
     Ok(())
 }
@@ -197,4 +220,14 @@ pub fn difference(label: &str, actual: &str, expected: &str) -> Option<String> {
     Some(format!(
         "{label}: premier octet divergent={offset}, Rust={actual:?}, référence={expected:?}"
     ))
+}
+
+/// Hexadécimal minuscule local : ce fichier est aussi inclus par le binaire
+/// `serve`, où `crate::hex` de la bibliothèque n'existe pas.
+fn hex(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

@@ -1,4 +1,26 @@
 #[test]
+fn decision_noncausal_gqa_d256_reads_suffix() -> Result<()> {
+    if test_executor()?.is_none() { return Ok(()); }
+    crate::runtime_flags::with_decision_noncausal(|| {
+        let executor = MetalExecutor::new()?;
+        let unsupported = Tensor::from_vec(vec![1, 512], vec![0.0; 512])?;
+        assert!(executor.noncausal_attention_prefill(&unsupported, &unsupported, &unsupported, 1, 1).is_err());
+        // Non-multiple des tuiles NAX, GQA 4:1 comme THX-02. Q=K=0 rend
+        // le softmax uniforme ; seule la dernière clé contient une valeur.
+        for seq in [128, 513] {
+            let q = Tensor::from_vec(vec![seq, 1024], vec![0.0;seq*1024])?;
+            let k = Tensor::from_vec(vec![seq, 256], vec![0.0;seq*256])?;
+            let mut values = vec![0.0;seq*256];
+            values[(seq-1)*256..].fill(2.0);
+            let v = Tensor::from_vec(vec![seq,256], values)?;
+            let got = executor.noncausal_attention_prefill(&q,&k,&v,4,1)?;
+            for &x in got.data() { assert!((x - 2.0/seq as f32).abs() < 1e-5); }
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn noncausal_attention_prefill_matches_cpu() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
@@ -618,6 +640,31 @@ fn causal_attention_prefill_mid_is_bit_identical_to_short_at_256() -> Result<()>
     Ok(())
 }
 
+/// Le long conserve les bits du mid et écrit aussi la moitié haute de d512.
+#[test]
+fn causal_attention_prefill_long_d512_matches_mid_and_cpu() -> Result<()> {
+    let executor = MetalExecutor::new()?;
+    for seq in [256, 257] {
+        let (q, k, v) = causal_attention_inputs(seq, 2, 1, 512)?;
+        let mid = causal_attention_prefill_with_pipeline(
+            &executor, &q, &k, &v, 2, 1, &executor.causal_attention_prefill_mid_f32, 256,
+        )?;
+        let long = causal_attention_prefill_with_pipeline(
+            &executor, &q, &k, &v, 2, 1, &executor.causal_attention_prefill_long_d512_f32, 256,
+        )?;
+        assert_bits_equal(mid.data(), long.data(), "prefill mid vs long");
+    }
+    // Frontière du sélecteur puis longueur de la régression mesurée.
+    for seq in [2048, 2049, 4109] {
+        let (q, k, v) = causal_attention_inputs(seq, 2, 1, 512)?;
+        let got = executor.causal_attention_prefill(&q, &k, &v, 2, 1)?;
+        let rows = [0, 255, 256, 2047, seq - 1];
+        let expected = cpu_causal_attention_selected_rows_gqa(&q, &k, &v, 2, 1, &rows)?;
+        assert_causal_rows_close(&got, &expected, 5.0e-4)?;
+    }
+    Ok(())
+}
+
 #[test]
 fn causal_attention_prefill_batch_long_is_scoped_to_27b_30b_35b() {
     let base = PrefillAttentionSpec {
@@ -696,7 +743,7 @@ fn causal_attention_prefill_batch_long_is_scoped_to_27b_30b_35b() {
             ..base
         }
     ));
-    assert!(attention::prefill_attn_steel_d256_supported(
+    assert!(attention::prefill_attn_steel_supported(
         PrefillAttentionSpec {
             q_heads: 16,
             kv_heads: 2,
@@ -705,7 +752,7 @@ fn causal_attention_prefill_batch_long_is_scoped_to_27b_30b_35b() {
             ..base
         }
     ));
-    assert!(!attention::prefill_attn_steel_d256_supported(
+    assert!(!attention::prefill_attn_steel_supported(
         PrefillAttentionSpec {
             seq: 256,
             q_heads: 16,
@@ -716,13 +763,13 @@ fn causal_attention_prefill_batch_long_is_scoped_to_27b_30b_35b() {
         }
     ));
     // 27B (24/4/256) : Steel depuis le 2026-10-21, au-delà de 256 tokens seulement.
-    assert!(attention::prefill_attn_steel_d256_supported(
+    assert!(attention::prefill_attn_steel_supported(
         PrefillAttentionSpec { ..base }
     ));
-    assert!(!attention::prefill_attn_steel_d256_supported(
+    assert!(!attention::prefill_attn_steel_supported(
         PrefillAttentionSpec { seq: 256, ..base }
     ));
-    assert!(!attention::prefill_attn_steel_d256_supported(
+    assert!(attention::prefill_attn_steel_supported(
         PrefillAttentionSpec {
             q_heads: 32,
             kv_heads: 4,
@@ -881,20 +928,11 @@ fn causal_attention_prefill_steel_d256_matches_cpu_selected_rows() -> Result<()>
     Ok(())
 }
 
-/// Oracle CPU direct du kernel chunké-GQA `chunk_delta_seq_layout` (celui que
-/// dispatche `encode_chunk_delta_seq_layout`, opt-in `SARAGOSSA_RUST_LINEAR_CHUNKED`) :
-/// compare y ET l'état SSM final contre `naive_gdn_reference` (récurrence GDN
-/// séquentielle token-par-token, zéro chunking — voir la doc de module de
-/// `linear_attention`). Longueurs aux frontières du chunk C=16 (1, 15, 16, 17,
-/// 3×16+7) × deux découpages GQA (repeat 2 et 4), état initial non nul inclus.
-///
-/// Tolérance 5e-4 ABSOLUE, justifiée : entrées d'échelle réaliste O(1) (q/k
-/// post-norm ~d_k^(−1)/d_k^(−1/2), v ∈ [−1,1]) ; le chunking ré-associe des
-/// sommes f32 de 128 (dots sur d_k) + 16 (corrections intra-chunk) termes et
-/// introduit des ratios γ_i/γ_j bornés ≤ 0,9⁻¹⁶ ≈ 5,4 (decay ∈ [0,9, 0,999)) →
-/// bruit attendu ~1e-5, marge ×50, alignée sur le test batch résident dk128.
+/// Oracle CPU du scan GQA conservé après le retrait des kernels chunkés.
+/// Les longueurs 1,15,16,17,55 et l'état initial non nul restent couverts,
+/// avec la même tolérance absolue de 5e-4.
 #[test]
-fn chunk_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
+fn gated_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
     use crate::linear_attention::tests::{
         naive_gdn_reference, synthetic_gdn_inputs, DeterministicF32, CHUNK_BOUNDARY_LENGTHS,
     };
@@ -968,7 +1006,7 @@ fn chunk_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
 
             let cb = executor.queue.new_command_buffer();
             let encoder = cb.new_compute_command_encoder();
-            let encoded = executor.encode_chunk_delta_seq_layout(
+            let encoded = executor.encode_linear_attn_gated_delta_seq_dk128(
                 encoder,
                 &conv_out_buf,
                 &q_buf,
@@ -976,6 +1014,7 @@ fn chunk_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
                 &beta_buf,
                 &decay_buf,
                 &state_buf,
+                false,
                 &y_buf,
                 steps,
                 LinearAttentionStepSpec {
@@ -989,12 +1028,7 @@ fn chunk_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
                 },
             );
             encoder.end_encoding();
-            match encoded {
-                Ok(()) => {}
-                // Pipeline chunké non compilé sur cette machine → test sans objet.
-                Err(InferError::Config(_)) => return Ok(()),
-                Err(error) => return Err(error),
-            }
+            encoded?;
             commit_and_wait(cb)?;
 
             let gpu_y = read_f32_buffer(&y_buf, steps * value_dim)?;
@@ -1006,18 +1040,9 @@ fn chunk_delta_seq_layout_gqa_matches_naive_oracle() -> Result<()> {
     Ok(())
 }
 
-// Verrouille la CLASSE caractérisée dans `docs/reviews/35b-prefill-drift-dossier.md` :
-// AU-DELÀ de 256 tokens, la forme CHUNKÉE de l'attention linéaire (kernel
-// `chunk_delta_seq_layout`, empruntée par les chemins prefill résident ET batché du
-// 35B) reste dans la tolérance 5e-4 du SCAN séquentiel token-par-token (la référence
-// per-op). Les cas de frontière de chunk existants plafonnent à seq=55 ; ce cas
-// traverse 256 (seq=300 = 18 chunks pleins + 12), soit le régime où la ré-association
-// f32 inter-chunk était soupçonnée de dériver. Il prouve que l'écart observé au niveau
-// modèle (dossier) est un near-tie (flip d'argmax sur clusters serrés), PAS une
-// divergence numérique du kernel : le prefill résident du 35B reste byte-identique au
-// scan per-op sur texte réel à 608/1329/6007 tokens.
+// Conserver le cas long (300 pas) et sa tolérance de 5e-4 sur le scan sûr.
 #[test]
-fn chunk_delta_seq_layout_matches_scan_beyond_256() -> Result<()> {
+fn gated_delta_seq_layout_matches_scan_beyond_256() -> Result<()> {
     use crate::linear_attention::tests::{
         naive_gdn_reference, synthetic_gdn_inputs, DeterministicF32,
     };
@@ -1084,7 +1109,7 @@ fn chunk_delta_seq_layout_matches_scan_beyond_256() -> Result<()> {
 
     let cb = executor.queue.new_command_buffer();
     let encoder = cb.new_compute_command_encoder();
-    let encoded = executor.encode_chunk_delta_seq_layout(
+    let encoded = executor.encode_linear_attn_gated_delta_seq_dk128(
         encoder,
         &conv_out_buf,
         &q_buf,
@@ -1092,6 +1117,7 @@ fn chunk_delta_seq_layout_matches_scan_beyond_256() -> Result<()> {
         &beta_buf,
         &decay_buf,
         &state_buf,
+        false,
         &y_buf,
         steps,
         LinearAttentionStepSpec {
@@ -1105,12 +1131,7 @@ fn chunk_delta_seq_layout_matches_scan_beyond_256() -> Result<()> {
         },
     );
     encoder.end_encoding();
-    match encoded {
-        Ok(()) => {}
-        // Pipeline chunké non compilé sur cette machine → test sans objet.
-        Err(InferError::Config(_)) => return Ok(()),
-        Err(error) => return Err(error),
-    }
+    encoded?;
     commit_and_wait(cb)?;
 
     let gpu_y = read_f32_buffer(&y_buf, steps * value_dim)?;
@@ -1305,7 +1326,7 @@ fn causal_attention_prefill_nax_d256_matches_cpu_selected_rows() -> Result<()> {
         return Ok(());
     };
     executor.causal_attention_prefill_steel_nax_d256 =
-        pipelines::compile_steel_causal_nax_d256_attention(
+        pipelines::compile_steel_causal_nax_attention(
             &executor.device,
             STEEL_ATTENTION_NAX_KERNELS,
             attention::NAX_CAUSAL_ATTN_BQ64,
@@ -1407,6 +1428,7 @@ fn nax_chunk_attention(
         kv_rows,
         kv_rows,
         None,
+        true,
     );
     encoder.end_encoding();
     encoded?;
@@ -1481,7 +1503,7 @@ fn nax_d256_variants_match_cpu_oracle() -> Result<()> {
             let mut grids = Vec::new();
             for head_major in [false, true] {
                 executor.causal_attention_prefill_steel_nax_d256 =
-                    pipelines::compile_steel_causal_nax_d256_attention(
+                    pipelines::compile_steel_causal_nax_attention(
                         &executor.device,
                         STEEL_ATTENTION_NAX_KERNELS,
                         attention::NaxCausalAttnShape {
@@ -1573,7 +1595,7 @@ fn nax_d256_head_major_grid_is_bit_identical() -> Result<()> {
     let mut outputs = Vec::new();
     for head_major in [false, true] {
         executor.causal_attention_prefill_steel_nax_d256 =
-            pipelines::compile_steel_causal_nax_d256_attention(
+            pipelines::compile_steel_causal_nax_attention(
                 &executor.device,
                 STEEL_ATTENTION_NAX_KERNELS,
                 attention::NaxCausalAttnShape {
@@ -1603,7 +1625,7 @@ fn nax_d256_head_major_grid_is_bit_identical() -> Result<()> {
     Ok(())
 }
 
-/// Le gated delta NAX de MLX (forme 27B, 16/48 têtes) suit la récurrence
+/// Le gated delta NAX de MLX (16/32 et 16/48 têtes) suit la récurrence
 /// séquentielle `naive_gdn_reference`, y et état final, aux frontières de
 /// morceau et au-delà de 256 tokens, avec un état initial non nul.
 #[test]
@@ -1616,73 +1638,93 @@ fn gated_delta_nax_matches_naive_oracle() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
-    if executor.gated_delta_nax_hk16_hv48.is_none() {
-        return Ok(());
-    }
-    let config = LinearAttentionConfig {
-        num_key_heads: 16,
-        num_value_heads: 48,
-        key_head_dim: 128,
-        value_head_dim: 128,
-        conv_kernel_dim: 4,
-        rms_eps: 1.0e-6,
-    };
-    let key_dim = config.key_dim()?;
-    let value_dim = config.value_dim()?;
-    let conv_dim = 2 * key_dim + value_dim;
-    let state_len = config.num_value_heads * config.value_head_dim * config.key_head_dim;
-    let mut max_err = 0.0_f32;
-    for (length_index, &steps) in CHUNK_BOUNDARY_LENGTHS.iter().chain(&[300]).enumerate() {
-        let seed = 0x6e41_0000 + length_index as u64;
-        let inputs = synthetic_gdn_inputs(config, steps, seed);
-        let mut rng = DeterministicF32::new(seed ^ 0xc0de);
-        let mut conv_out = rng.fill(steps * conv_dim, -1.0, 1.0);
-        for t in 0..steps {
-            conv_out[t * conv_dim + 2 * key_dim..(t * conv_dim) + 2 * key_dim + value_dim]
-                .copy_from_slice(&inputs.v[t * value_dim..(t + 1) * value_dim]);
-        }
-        let initial_state = rng.fill(state_len, -0.1, 0.1);
-        let mut oracle_state = initial_state.clone();
-        let oracle_y = naive_gdn_reference(
-            &inputs.q,
-            &inputs.k,
-            &inputs.v,
-            &inputs.g,
-            &inputs.beta,
-            steps,
-            config,
-            &mut oracle_state,
-        );
-        let shared_f32 = |data: &[f32]| {
-            executor.device.new_buffer_with_data(
-                data.as_ptr().cast::<std::ffi::c_void>(),
-                (data.len() * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
+    for hv in [32, 48] {
+        let enabled = if hv == 32 {
+            crate::runtime_flags::gated_delta_nax_hv32_enabled()
+        } else {
+            crate::runtime_flags::prefill_linear_nax_enabled()
         };
-        let conv_out_buf = shared_f32(&conv_out);
-        let q_buf = shared_f32(&inputs.q);
-        let k_buf = shared_f32(&inputs.k);
-        let beta_buf = shared_f32(&inputs.beta);
-        let decay_buf = shared_f32(&inputs.g);
-        let state_buf = shared_f32(&initial_state);
-        let y_buf = executor.device.new_buffer(
-            (steps * value_dim * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let cb = executor.queue.new_command_buffer();
-        let encoder = cb.new_compute_command_encoder();
-        let encoded = executor.encode_gated_delta_nax(
-            encoder,
-            &conv_out_buf,
-            &q_buf,
-            &k_buf,
-            &beta_buf,
-            &decay_buf,
-            &state_buf,
-            &y_buf,
-            steps,
-            LinearAttentionStepSpec {
+        let available = if hv == 32 {
+            executor.gated_delta_nax_hk16_hv32.is_some()
+        } else {
+            executor.gated_delta_nax_hk16_hv48.is_some()
+        };
+        if !enabled {
+            assert!(!available, "NAX hv{hv} compilé malgré le flag désactivé");
+            eprintln!("oracle NAX hv{hv} désactivé par flag");
+            continue;
+        }
+        if !available {
+            assert!(
+                !executor.na_library_available_for_test(),
+                "NAX hv{hv} absent sur GPU compatible"
+            );
+            continue;
+        }
+        let config = LinearAttentionConfig {
+            num_key_heads: 16,
+            num_value_heads: hv,
+            key_head_dim: 128,
+            value_head_dim: 128,
+            conv_kernel_dim: 4,
+            rms_eps: 1.0e-6,
+        };
+        let key_dim = config.key_dim()?;
+        let value_dim = config.value_dim()?;
+        let conv_dim = 2 * key_dim + value_dim;
+        let state_len = config.num_value_heads * config.value_head_dim * config.key_head_dim;
+        let mut max_err = 0.0_f32;
+        let extra: &[usize] = if hv == 32 { &[512] } else { &[] };
+        for (length_index, &steps) in CHUNK_BOUNDARY_LENGTHS
+            .iter()
+            .chain(&[300])
+            .chain(extra)
+            .enumerate()
+        {
+            let seed = if steps == 512 {
+                0x6b62 + steps as u64
+            } else {
+                0x6e41_0000 + length_index as u64
+            };
+            let inputs = synthetic_gdn_inputs(config, steps, seed);
+            let mut rng = DeterministicF32::new(seed ^ 0xc0de);
+            let mut conv_out = rng.fill(steps * conv_dim, -1.0, 1.0);
+            for t in 0..steps {
+                conv_out[t * conv_dim + 2 * key_dim..(t * conv_dim) + 2 * key_dim + value_dim]
+                    .copy_from_slice(&inputs.v[t * value_dim..(t + 1) * value_dim]);
+            }
+            let initial_state = rng.fill(state_len, -0.1, 0.1);
+            let mut oracle_state = initial_state.clone();
+            let oracle_y = naive_gdn_reference(
+                &inputs.q,
+                &inputs.k,
+                &inputs.v,
+                &inputs.g,
+                &inputs.beta,
+                steps,
+                config,
+                &mut oracle_state,
+            );
+            let shared_f32 = |data: &[f32]| {
+                executor.device.new_buffer_with_data(
+                    data.as_ptr().cast::<std::ffi::c_void>(),
+                    (data.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            };
+            let conv_out_buf = shared_f32(&conv_out);
+            let q_buf = shared_f32(&inputs.q);
+            let k_buf = shared_f32(&inputs.k);
+            let beta_buf = shared_f32(&inputs.beta);
+            let decay_buf = shared_f32(&inputs.g);
+            let state_buf = shared_f32(&initial_state);
+            let y_buf = executor.device.new_buffer(
+                (steps * value_dim * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let cb = executor.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            let spec = LinearAttentionStepSpec {
                 num_key_heads: config.num_key_heads,
                 num_value_heads: config.num_value_heads,
                 key_head_dim: config.key_head_dim,
@@ -1690,20 +1732,61 @@ fn gated_delta_nax_matches_naive_oracle() -> Result<()> {
                 conv_kernel_dim: config.conv_kernel_dim,
                 rms_eps: config.rms_eps,
                 l2_qk_sigmoid_gate: false,
-            },
-        );
-        encoder.end_encoding();
-        assert!(encoded?, "gated delta NAX hors périmètre");
-        commit_and_wait(cb)?;
-        let gpu_y = read_f32_buffer(&y_buf, steps * value_dim)?;
-        let gpu_state = read_f32_buffer(&state_buf, state_len)?;
-        for (a, b) in gpu_y.iter().zip(&oracle_y).chain(gpu_state.iter().zip(&oracle_state)) {
-            max_err = max_err.max((a - b).abs());
+            };
+            let encoded = executor.encode_gated_delta_nax(
+                encoder,
+                &conv_out_buf,
+                &q_buf,
+                &k_buf,
+                &beta_buf,
+                &decay_buf,
+                &state_buf,
+                &y_buf,
+                steps,
+                spec,
+            );
+            encoder.end_encoding();
+            assert!(encoded?, "gated delta NAX hors périmètre");
+            commit_and_wait(cb)?;
+            let gpu_y = read_f32_buffer(&y_buf, steps * value_dim)?;
+            let gpu_state = read_f32_buffer(&state_buf, state_len)?;
+            for (a, b) in gpu_y
+                .iter()
+                .zip(&oracle_y)
+                .chain(gpu_state.iter().zip(&oracle_state))
+            {
+                max_err = max_err.max((a - b).abs());
+            }
+            assert_close_eps(&gpu_y, &oracle_y, 5.0e-4);
+            assert_close_eps(&gpu_state, &oracle_state, 5.0e-4);
+            let seq_state_buf = shared_f32(&initial_state);
+            let cb = executor.queue.new_command_buffer();
+            let encoder = cb.new_compute_command_encoder();
+            let guard = EncoderEndGuard::new(encoder);
+            executor.encode_linear_attn_gated_delta_seq_dk128(
+                encoder,
+                &conv_out_buf,
+                &q_buf,
+                &k_buf,
+                &beta_buf,
+                &decay_buf,
+                &seq_state_buf,
+                false,
+                &y_buf,
+                steps,
+                spec,
+            )?;
+            guard.end();
+            commit_and_wait(cb)?;
+            let seq_y = read_f32_buffer(&y_buf, steps * value_dim)?;
+            let seq_state = read_f32_buffer(&seq_state_buf, state_len)?;
+            assert_close_eps(&seq_y, &oracle_y, 5.0e-4);
+            assert_close_eps(&seq_state, &oracle_state, 5.0e-4);
+            assert_close_eps(&gpu_y, &seq_y, 5.0e-4);
+            assert_close_eps(&gpu_state, &seq_state, 5.0e-4);
         }
-        assert_close_eps(&gpu_y, &oracle_y, 5.0e-4);
-        assert_close_eps(&gpu_state, &oracle_state, 5.0e-4);
+        eprintln!("gated delta NAX hv{hv}: écart max {max_err:e}");
     }
-    eprintln!("gated delta NAX: écart max {max_err:e}");
     Ok(())
 }
 
@@ -1773,7 +1856,7 @@ fn nax_d256_chunk_microbench() -> Result<()> {
                 let cb = executor.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
                 executor.encode_causal_attention_prefill_chunk(
-                    enc, &q_buf, &k_buf, &v_buf, &out, spec, kv_rows, kv_rows, bf16_kv,
+                    enc, &q_buf, &k_buf, &v_buf, &out, spec, kv_rows, kv_rows, bf16_kv, true,
                 )?;
                 enc.end_encoding();
                 let t = std::time::Instant::now();

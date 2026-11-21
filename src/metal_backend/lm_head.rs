@@ -1,4 +1,9 @@
-//! Projection lm_head et argmax Metal.
+//! Projection lm_head, argmax et échantillonnage Metal.
+//!
+//! Les samplers reçoivent le softcap final du modèle : il est appliqué aux
+//! logits bruts dans leur premier kernel, avant température et filtrage.
+//! `None` ou un cap non positif le désactive, comme `finalize_logits` CPU.
+//! Les chemins argmax et les readbacks de logits bruts restent inchangés.
 
 use super::*;
 
@@ -22,6 +27,7 @@ impl MetalExecutor {
         top_p: f32,
         top_k: usize,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<usize> {
         ensure_biasless(linear, "sample")?;
         let (batch, in_dim) = input.as_matrix()?;
@@ -67,6 +73,7 @@ impl MetalExecutor {
             temperature,
             top_p,
             rng_state,
+            softcap,
         )?;
         encoder_guard.end();
         commit_and_wait(command_buffer)?;
@@ -90,6 +97,7 @@ impl MetalExecutor {
         linear: &Linear,
         temperature: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<usize> {
         ensure_biasless(linear, "sample_gumbel")?;
         let (batch, in_dim) = input.as_matrix()?;
@@ -128,6 +136,7 @@ impl MetalExecutor {
             out_dim,
             temperature,
             rng_state,
+            softcap,
         )?;
         encoder_guard.end();
         commit_and_wait(command_buffer)?;
@@ -449,6 +458,7 @@ impl MetalExecutor {
         top_p: f32,
         top_k: usize,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         let out_dim = self.linear_weight_out_dim(lm_head);
         let logits_buffer = self.private_f32_buffer(out_dim, "sample_logits")?;
@@ -475,6 +485,7 @@ impl MetalExecutor {
             temperature,
             top_p,
             rng_state,
+            softcap,
         )
     }
 
@@ -492,6 +503,7 @@ impl MetalExecutor {
         in_dim: usize,
         temperature: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         let out_dim = self.linear_weight_out_dim(lm_head);
         let logits_buffer = self.private_f32_buffer(out_dim, "sample_gumbel_logits")?;
@@ -516,10 +528,12 @@ impl MetalExecutor {
             out_dim,
             temperature,
             rng_state,
+            softcap,
         )
     }
 
-    /// Encode le `lm_head` dans un buffer partagé pour sampling CPU exact.
+    /// Encode le `lm_head` dans le buffer partagé fourni pour sampling CPU exact.
+    /// L'appelant garde son bail jusqu'à la fin du command buffer et du readback.
     ///
     /// # Errors
     ///
@@ -530,16 +544,19 @@ impl MetalExecutor {
         input_buffer: &BufferRef,
         lm_head: &MetalLinearWeightBuffers,
         in_dim: usize,
-    ) -> Result<(metal::Buffer, usize)> {
+        logits_buffer: &BufferRef,
+    ) -> Result<usize> {
         let out_dim = self.linear_weight_out_dim(lm_head);
-        let logits_buffer = self.uncached_f32_buffer(out_dim, "sample_logits_readback")?;
+        if logits_buffer.length() < byte_len::<f32>(out_dim)? {
+            return Err(InferError::Dimension("buffer readback trop petit".into()));
+        }
         let projected_dim = self.encode_matmul_weight_buffers(
             encoder,
             input_buffer,
             1,
             in_dim,
             lm_head,
-            &logits_buffer,
+            logits_buffer,
             false,
         )?;
         if projected_dim != out_dim {
@@ -547,7 +564,7 @@ impl MetalExecutor {
                 "sample readback projection sort {projected_dim}, attendu {out_dim}"
             )));
         }
-        Ok((logits_buffer, out_dim))
+        Ok(out_dim)
     }
 
     /// Variante en lignes de [`Self::encode_lm_head_logits_readback_buffers`] :
@@ -813,6 +830,7 @@ impl MetalExecutor {
         index_offset: u64,
         (temperature, top_p, top_k): (f32, f32, usize),
         rng_states: &[u64],
+        softcap: Option<f32>,
     ) -> Result<()> {
         if rng_states.is_empty() {
             return Err(InferError::Dimension(
@@ -842,6 +860,7 @@ impl MetalExecutor {
                 temperature,
                 top_p,
                 rng_state,
+                softcap,
             )?;
         }
         Ok(())
@@ -863,6 +882,7 @@ impl MetalExecutor {
         in_dim: usize,
         params: (f32, f32, usize),
         rng_states: &[u64],
+        softcap: Option<f32>,
     ) -> Result<()> {
         let rows = rng_states.len();
         let out_dim = self.linear_weight_out_dim(lm_head);
@@ -895,6 +915,7 @@ impl MetalExecutor {
             0,
             params,
             rng_states,
+            softcap,
         )
     }
 
@@ -1279,6 +1300,7 @@ impl MetalExecutor {
         count: usize,
         temperature: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         let count_u32 = checked_u32(count, "sample Gumbel count")?;
         let partial_count = count.div_ceil(256);
@@ -1292,6 +1314,7 @@ impl MetalExecutor {
         set_u32_bytes(encoder, 3, &[count_u32], "gumbel_count")?;
         set_f32_bytes(encoder, 4, &[temperature], "gumbel_temperature")?;
         set_u64_bytes(encoder, 5, &[rng_state], "gumbel_rng")?;
+        set_f32_bytes(encoder, 6, &[softcap.unwrap_or(0.0)], "gumbel_softcap")?;
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(checked_nsuint(partial_count, "gumbel partial_count")?, 1, 1),
@@ -1317,6 +1340,7 @@ impl MetalExecutor {
         count: usize,
         temperature: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         self.encode_sample_gumbel_with_offsets(
             encoder,
@@ -1327,6 +1351,7 @@ impl MetalExecutor {
             count,
             temperature,
             rng_state,
+            softcap,
         )
     }
 
@@ -1344,6 +1369,7 @@ impl MetalExecutor {
         temperature: f32,
         top_p: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         self.encode_sample_topk_topp_with_offsets(
             encoder,
@@ -1356,6 +1382,7 @@ impl MetalExecutor {
             temperature,
             top_p,
             rng_state,
+            softcap,
         )
     }
 
@@ -1378,6 +1405,7 @@ impl MetalExecutor {
         temperature: f32,
         top_p: f32,
         rng_state: u64,
+        softcap: Option<f32>,
     ) -> Result<()> {
         if top_k == 0 && top_p >= 1.0 {
             return self.encode_sample_gumbel_with_offsets(
@@ -1389,6 +1417,7 @@ impl MetalExecutor {
                 count,
                 temperature,
                 rng_state,
+                softcap,
             );
         }
         if top_k == 0 || top_k > MAX_SAMPLER_TOP_K || top_k > count {
@@ -1402,6 +1431,30 @@ impl MetalExecutor {
         ];
         let params = [temperature, top_p];
         let partial_count = count.div_ceil(256);
+        let scan_groups = count.div_ceil(SAMPLER_SCAN_GROUP);
+        // Le dernier bloc de 256 doit garder au moins `top_k` logits : sinon le
+        // chemin historique répète des indices, que le balayage ne reproduit pas.
+        let scan = crate::runtime_flags::sampler_topk_scan_enabled()
+            && (count % 256 == 0 || count % 256 >= top_k)
+            && scan_groups <= SAMPLER_SCAN_MAX_GROUPS
+            && self
+                .sample_topk_scan_blocks_f32
+                .max_total_threads_per_threadgroup()
+                >= 1024;
+        let fallback = if scan {
+            Some(self.encode_sample_topk_scan(
+                encoder,
+                (logits_buffer, logits_offset),
+                (output_index, index_offset),
+                dims,
+                scan_groups,
+                params,
+                rng_state,
+                softcap,
+            )?)
+        } else {
+            None
+        };
         let partial_len = partial_count
             .checked_mul(top_k)
             .ok_or_else(|| InferError::Metal("sample partial top-k déborde".to_string()))?;
@@ -1413,6 +1466,8 @@ impl MetalExecutor {
         encoder.set_buffer(1, Some(&partial_values), 0);
         encoder.set_buffer(2, Some(&partial_indices), 0);
         set_u32_bytes(encoder, 3, &dims, "sample_block_dims")?;
+        set_f32_bytes(encoder, 4, &[softcap.unwrap_or(0.0)], "sample_softcap")?;
+        bind_sampler_run(encoder, 5, fallback.as_ref())?;
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(checked_nsuint(partial_count, "sample partial_count")?, 1, 1),
@@ -1431,9 +1486,103 @@ impl MetalExecutor {
         set_u32_bytes(encoder, 3, &finalize_dims, "sample_finalize_dims")?;
         set_f32_bytes(encoder, 4, &params, "sample_params")?;
         set_u64_bytes(encoder, 5, &[rng_state], "sample_rng")?;
+        bind_sampler_run(encoder, 6, fallback.as_ref())?;
         profile_dispatch();
         encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(128, 1, 1));
         post_dispatch_barrier(encoder);
         Ok(())
+    }
+
+    /// Balayage top-k (`sample_topk_scan_*`) : écrit le token quand chaque
+    /// logit est régulier et rend le drapeau qui relance, sinon, les kernels
+    /// historiques encodés à la suite.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "encodage sampler: buffers + offsets + paramètres sampling explicites"
+    )]
+    fn encode_sample_topk_scan(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        (logits_buffer, logits_offset): (&BufferRef, u64),
+        (output_index, index_offset): (&BufferRef, u64),
+        dims: [u32; 2],
+        groups: usize,
+        params: [f32; 2],
+        rng_state: u64,
+        softcap: Option<f32>,
+    ) -> Result<metal::Buffer> {
+        let top_k = dims[1] as usize;
+        let list_len = groups
+            .checked_mul(top_k)
+            .ok_or_else(|| InferError::Metal("sample scan top-k déborde".to_string()))?;
+        let values = self.private_f32_buffer(list_len, "sample_scan_values")?;
+        let indices = self.private_u32_buffer(list_len, "sample_scan_indices")?;
+        let flags = self.private_u32_buffer(groups * 32, "sample_scan_flags")?;
+        let run = self.private_u32_buffer(1, "sample_scan_run")?;
+
+        encoder.set_compute_pipeline_state(&self.sample_topk_scan_blocks_f32);
+        encoder.set_buffer(0, Some(logits_buffer), logits_offset);
+        encoder.set_buffer(1, Some(&values), 0);
+        encoder.set_buffer(2, Some(&indices), 0);
+        encoder.set_buffer(3, Some(&flags), 0);
+        set_u32_bytes(encoder, 4, &dims, "sample_scan_dims")?;
+        set_f32_bytes(encoder, 5, &[softcap.unwrap_or(0.0)], "sample_scan_softcap")?;
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(checked_nsuint(groups, "sample scan groups")?, 1, 1),
+            MTLSize::new(1024, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+
+        let finalize_dims = [checked_u32(groups, "sample scan groups")?, dims[1]];
+        encoder.set_compute_pipeline_state(&self.sample_topk_scan_finalize_f32);
+        encoder.set_buffer(0, Some(&values), 0);
+        encoder.set_buffer(1, Some(&indices), 0);
+        encoder.set_buffer(2, Some(&flags), 0);
+        encoder.set_buffer(3, Some(output_index), index_offset);
+        encoder.set_buffer(4, Some(&run), 0);
+        set_u32_bytes(encoder, 5, &finalize_dims, "sample_scan_finalize_dims")?;
+        set_f32_bytes(encoder, 6, &params, "sample_scan_params")?;
+        set_u64_bytes(encoder, 7, &[rng_state], "sample_scan_rng")?;
+        profile_dispatch();
+        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 1, 1));
+        post_dispatch_barrier(encoder);
+        #[cfg(test)]
+        SAMPLER_SCAN_RUNS.with(|runs| runs.borrow_mut().push(run.clone()));
+        Ok(run)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Drapeaux `run` des balayages encodés, pour que les oracles vérifient le
+    /// chemin réellement pris (0 : balayage, 1 : repli historique).
+    static SAMPLER_SCAN_RUNS: std::cell::RefCell<Vec<metal::Buffer>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Vide et rend les drapeaux `run` des balayages encodés sur ce thread.
+#[cfg(test)]
+pub(super) fn take_sampler_scan_runs() -> Vec<metal::Buffer> {
+    SAMPLER_SCAN_RUNS.with(|runs| std::mem::take(&mut *runs.borrow_mut()))
+}
+
+/// Logits par threadgroup du balayage top-k (1024 threads × 8).
+const SAMPLER_SCAN_GROUP: usize = 8192;
+/// Listes fusionnées par `sample_topk_scan_finalize_f32` (`heads[1024]`).
+const SAMPLER_SCAN_MAX_GROUPS: usize = 1024;
+
+/// Garde des kernels historiques : le drapeau GPU du balayage, sinon 1.
+fn bind_sampler_run(
+    encoder: &ComputeCommandEncoderRef,
+    index: NSUInteger,
+    run: Option<&metal::Buffer>,
+) -> Result<()> {
+    match run {
+        Some(buffer) => {
+            encoder.set_buffer(index, Some(buffer), 0);
+            Ok(())
+        }
+        None => set_u32_bytes(encoder, index, &[1], "sample_run"),
     }
 }

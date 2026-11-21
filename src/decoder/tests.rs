@@ -4,6 +4,9 @@ use super::attention_ops::{
     rms_norm_heads, rms_norm_rope_heads_at, AttentionLayout, RopeParams,
 };
 use super::*;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[path = "gemma4_oracles.rs"]
+mod gemma4_oracles;
 use crate::oracle::assert_close_abs as assert_close;
 use safetensors::{serialize, Dtype, View};
 use std::borrow::Cow;
@@ -937,6 +940,24 @@ fn prefix_captures_stitch_rejects_shifted_from_cpu() -> Result<()> {
     Ok(())
 }
 
+/// Un recollage impossible à l'extension MTP ou AR n'échoue pas la requête :
+/// l'entrée est écrite sans captures.
+#[test]
+#[cfg(feature = "devtools")]
+fn carry_captures_drops_unstitchable_captures_cpu() -> Result<()> {
+    let prefix = PrefixCaptures::new(&[0], 2, Tensor::zeros(vec![3, 1])?);
+    let suffix = PrefixCaptures::new(&[0], 6, Tensor::zeros(vec![2, 1])?);
+    assert!(
+        generation::carry_captures(Some(prefix), Some(suffix), Some((vec![0], 4)), 6, 8).is_none()
+    );
+    let prefix = PrefixCaptures::new(&[0], 3, Tensor::zeros(vec![3, 1])?);
+    let suffix = PrefixCaptures::new(&[0], 6, Tensor::zeros(vec![2, 1])?);
+    assert!(
+        generation::carry_captures(Some(prefix), Some(suffix), Some((vec![0], 4)), 6, 8).is_some()
+    );
+    Ok(())
+}
+
 #[test]
 #[cfg(feature = "devtools")]
 fn prefix_cache_dflash_exact_hit_bounds_unlimited_captures_cpu() -> Result<()> {
@@ -1479,6 +1500,33 @@ fn causal_attention_sliding_window_matches_truncated_context() {
             1.0e-6,
         );
     }
+}
+
+#[test]
+fn decision_noncausal_mask_reads_future_and_restores_causal() -> Result<()> {
+    let layout = AttentionLayout {
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        head_dim: 2,
+        rope_dims: 2,
+        attn_scalar: 2.0,
+        sliding_window: None,
+    };
+    let q = Tensor::from_vec(vec![2, 2], vec![0.0; 4])?;
+    let k = q.clone();
+    let v = Tensor::from_vec(vec![2, 2], vec![2.0, 4.0, 10.0, 20.0])?;
+    let before = causal_attention(&q, &k, &v, &layout, None)?;
+    let joint = crate::runtime_flags::with_decision_noncausal(|| {
+        causal_attention(&q, &k, &v, &layout, None)
+    })?;
+    assert_eq!(before.row_slice(0)?, &[2.0, 4.0]);
+    assert_eq!(joint.row_slice(0)?, &[6.0, 12.0]);
+    assert_eq!(joint.row_slice(1)?, &[6.0, 12.0]);
+    assert_eq!(
+        causal_attention(&q, &k, &v, &layout, None)?.data(),
+        before.data()
+    );
+    Ok(())
 }
 
 #[test]
@@ -2367,6 +2415,70 @@ fn resident_test_model() -> Option<CausalDecoder> {
     }
 }
 
+/// Le cap du modèle doit atteindre le sampler non résident partagé avec MTP.
+/// Le greedy conserve son argmax et n'avance pas le RNG.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn softcap_sampling_decoder_routes_and_greedy() -> Result<()> {
+    let Some(mut model) = resident_test_model() else {
+        return Ok(());
+    };
+    model.config.final_logit_softcapping = Some(30.0);
+    model.lm_head = Linear::new(
+        Tensor::from_vec(
+            vec![3, 4],
+            vec![
+                45.0, 0.0, 0.0, 0.0, 38.0, 0.0, 0.0, 0.0, 31.0, 0.0, 0.0, 0.0,
+            ],
+        )?,
+        None,
+    )?;
+    let state = Tensor::row(vec![1.0, 0.0, 0.0, 0.0])?;
+    let logits = model.logits_from_final_state(&state)?;
+    let options = GenerationOptions {
+        temperature: 2.5,
+        top_k: 2,
+        top_p: 0.9,
+        ..GenerationOptions::default()
+    };
+    let mut differences = 0;
+    for seed in 0..128 {
+        let mut cpu_rng = DeterministicSampler::new(seed);
+        let expected = sample_token_top_k_top_p(
+            logits.as_row()?,
+            options.temperature,
+            options.top_p,
+            options.top_k,
+            &mut cpu_rng,
+        )?;
+        let raw = sample_token_top_k_top_p(
+            &[45.0, 38.0, 31.0],
+            options.temperature,
+            options.top_p,
+            options.top_k,
+            &mut DeterministicSampler::new(seed),
+        )?;
+        differences += usize::from(raw != expected);
+        let mut rng = DeterministicSampler::new(seed);
+        assert_eq!(
+            model.sample_token_from_state(&state, &options, &mut rng)?,
+            expected
+        );
+        assert_eq!(rng.state(), cpu_rng.state());
+    }
+    assert!(differences > 10, "l'oracle doit détecter l'absence de cap");
+    for cap in [None, Some(30.0)] {
+        model.config.final_logit_softcapping = cap;
+        let mut rng = DeterministicSampler::new(123);
+        assert_eq!(
+            model.sample_token_from_state(&state, &GenerationOptions::default(), &mut rng)?,
+            0
+        );
+        assert_eq!(rng.state(), 123);
+    }
+    Ok(())
+}
+
 /// Décode `n` tokens en greedy T=0, chemin résident forcé (`resident`) ou CPU.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn greedy_resident_ab(
@@ -2745,7 +2857,7 @@ fn mtp_committed_two_row_verifier_edges_match_ar() -> Result<()> {
         "MTP verifier integration requires an MTP sidecar in {}",
         model_dir.display()
     );
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         return Err(InferError::MissingArtifact {
             path: model_dir,
             what: "MTP sidecar",
@@ -2753,7 +2865,7 @@ fn mtp_committed_two_row_verifier_edges_match_ar() -> Result<()> {
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     assert!(
         model.mtp.is_some(),
         "MTP verifier integration must load the MTP head"
@@ -2976,7 +3088,7 @@ fn d1_strict_model() -> Result<(crate::ModelAssets, CausalDecoder)> {
             "test D1 strict : flags MTP/résident absents".to_string(),
         ));
     }
-    if super::flags::mtp_adaptive_depth_enabled() {
+    if super::flags::mtp_adaptive_depth_override() == Some(true) {
         return Err(InferError::Config(
             "test D1 strict : ADAPTIVE_DEPTH off requis".to_string(),
         ));
@@ -2985,7 +3097,7 @@ fn d1_strict_model() -> Result<(crate::ModelAssets, CausalDecoder)> {
         InferError::Config("test D1 strict : SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL".to_string())
     })?;
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let mtp_path = assets
+    let _mtp_path = assets
         .mtp
         .path
         .clone()
@@ -2995,7 +3107,7 @@ fn d1_strict_model() -> Result<(crate::ModelAssets, CausalDecoder)> {
         })?;
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(&mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     if model.mtp.is_none() || !model.supports_resident_full_decode() {
         return Err(InferError::Config(
             "test D1 strict : MTP résident non supporté".to_string(),
@@ -3317,13 +3429,13 @@ fn mtp_sampled_matches_ar_at_low_temperature_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip MTP échantillonné : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let prompt = mtp_verifier_prompt_ids(
         &assets,
         "Write a Rust function that parses a semantic version string and returns its three components.",
@@ -3386,13 +3498,13 @@ fn mtp_stop_sequences_match_ar_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip stop sequences MTP : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let prompt = mtp_verifier_prompt_ids(
         &assets,
         "Write a Rust function that parses a semantic version string and returns its three components.",
@@ -3587,13 +3699,13 @@ fn mtp_early_first_token_streams_once_and_stops_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip premier token MTP : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let prompt = mtp_verifier_prompt_ids(
         &assets,
         "Explain in two sentences why the borrow checker rejects aliasing mutable references.",
@@ -3808,6 +3920,61 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
     Ok(())
 }
 
+/// Défaut greedy sur cible dense BF16 : l'entrée publique (sans
+/// `SARAGOSSA_RUST_DFLASH_TREE`) vérifie un arbre B = 4 et sort exactement les
+/// tokens de l'AR. Requiert une cible BF16 (`SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`)
+/// et `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`.
+#[test]
+#[ignore = "modèle réel BF16 + draft DFlash requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn dflash_default_tree_b4_bf16_matches_ar_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none()
+        || crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_TREE").is_some()
+    {
+        eprintln!("skip DFlash B=4 : drafter absent ou SARAGOSSA_RUST_DFLASH_TREE posée");
+        return Ok(());
+    }
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    // Chargement de `serve` : poids créés directement en Metal (MLP bf16 gardés).
+    let executor = crate::MetalExecutor::new_with_kernel_profile(
+        crate::KernelProfile::for_model_dir(&assets.model_dir),
+    )?;
+    let model = crate::load_causal_decoder_for_metal(&assets, &executor)?
+        .with_metal_executor(executor)?
+        .with_dflash_draft_from_env(&assets.config)?;
+    let draft = model
+        .dflash_draft()
+        .ok_or_else(|| InferError::Config("drafter DFlash non chargé".to_string()))?
+        .clone();
+    assert!(model.dense_bf16_mlp(), "le test exige une cible dense BF16");
+    assert_eq!(
+        crate::runtime_flags::dflash_tree_default_budget(true, true),
+        4,
+        "défaut greedy BF16 : B = 4 (hors mode strict)"
+    );
+    let options = mtp_verifier_options(Vec::new());
+    for text in [
+        "Write a Rust function that parses a semantic version string and returns its three components.",
+        "Raconte en quelques phrases l'histoire d'un phare isolé sur une côte bretonne.",
+    ] {
+        let prompt = mtp_verifier_prompt_ids(&assets, text)?;
+        let ar = model.generate_greedy_cached_with_options(&prompt, 64, &options)?;
+        let spec = model.generate_greedy_dflash_resident_with_options(
+            &prompt,
+            64,
+            &options,
+            &draft,
+            draft.info.block_size,
+        )?;
+        assert!(spec.stats.verifications > 0 && spec.stats.accepted > 0);
+        assert_eq!(spec.tokens, ar, "DFlash arbre B=4 diverge de l'AR");
+    }
+    Ok(())
+}
+
 // --- DFlash : boucle résidente contre boucle CPU (GPU + modèle réel + draft) ---
 
 /// Oracle de la boucle DFlash résidente : mêmes tokens que la boucle CPU et que
@@ -3839,8 +4006,8 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         .with_metal_runtime()?
         .with_dflash_draft_from_env(&assets.config)?;
     // Sidecar MTP pour le repli après bascule (section ignorée sans sidecar).
-    if let Some(mtp_path) = assets.mtp.path.as_ref() {
-        model = model.with_mtp_sidecar(mtp_path)?;
+    if assets.mtp.path.is_some() {
+        model = model.with_mtp_weights(&assets.mtp)?;
     }
     let draft = model
         .dflash_draft()
@@ -4182,6 +4349,20 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
         routed.stats.proposed_by_position.len(),
         draft.info.block_size
     );
+    // Routage par classe de prompt : sans DFlash, la tête MTP (2 positions)
+    // sert la requête et rend la même suite.
+    if model.mtp.is_some() {
+        let prose = model.generate_greedy_mtp_routed(
+            &prompt,
+            max_new_tokens,
+            &options,
+            2,
+            false,
+            |_| true,
+        )?;
+        assert_eq!(prose.tokens, ar, "greedy routé vers MTP divergent de l'AR");
+        assert!(prose.stats.proposed_by_position.len() <= 2);
+    }
     Ok(())
 }
 
@@ -4198,13 +4379,13 @@ fn mtp_seed_metal_matches_cpu_oracle_real_model() -> Result<()> {
         return Ok(());
     };
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let Some(mtp_path) = assets.mtp.path.as_ref() else {
+    let Some(_) = assets.mtp.path.as_ref() else {
         eprintln!("skip semis MTP : sidecar MTP absent");
         return Ok(());
     };
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(mtp_path)?;
+        .with_mtp_weights(&assets.mtp)?;
     let head = model
         .mtp
         .as_ref()
@@ -4476,11 +4657,16 @@ fn resident_bf16_qwen_weights(
 
 /// Parcours multi-tours par le vrai cache de préfixe du décodeur
 /// (`prefill_cache_state` → `prefix_cache_get`/`prefix_cache_put`,
-/// `PrefillKvPlacement` raccordé à `replace_prefill`) :
-/// - tour 2 prolongé en place dans l'allocation du tour 1, K/V identique au
-///   prefill à froid, snapshot du tour 1 conservé ;
-/// - entrée ancienne prolongée sur une autre branche sous une vue plus
-///   longue : copie, lignes publiées intactes, entrées remplacées libérées ;
+/// `PrefillKvPlacement` raccordé à `replace_prefill`), alignement de 64 actif
+/// et longueurs multiples de 64 :
+/// - tour 1 : ancre (1024) et prompt complet (1088) au cache, queue
+///   prolongée en place ;
+/// - tour 2 : hit sur le tour 1 (1088, aligné), nouvelle ancre (1152) puis queue,
+///   prolongés en place dans l'allocation du tour 1, K/V identique au prefill
+///   à froid, ancre du tour 1 conservée et intacte (1216, aligné, entre
+///   aussi au cache) ;
+/// - autre branche depuis l'ancre du tour 1 sous une vue plus longue (tour 2) :
+///   copie, lignes publiées intactes, entrées remplacées libérées ;
 /// - rollback (troncature du cache) puis prolongement : de nouveau en place.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]
@@ -4501,23 +4687,27 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
         rope_theta: Some(10_000_000.0),
         ..CausalDecoderConfig::default()
     };
-    let model = match CausalDecoder::from_tensors(
-        resident_bf16_qwen_weights(VOCAB, HIDDEN, false)?,
-        config,
-    )?
+    // Alignement de 64 fixé au chargement : ancres et queues sur 64 lignes.
+    let model = match crate::runtime_flags::with_prefix_align_for_test(Some(64), || {
+        CausalDecoder::from_tensors(resident_bf16_qwen_weights(VOCAB, HIDDEN, false)?, config)
+    })?
     .with_metal_runtime()
     {
         Ok(model) => model,
         Err(InferError::Metal(message)) if message.contains("aucun device") => return Ok(()),
         Err(error) => return Err(error),
     };
+    if model.prefix_resume_align().map(|(align, _)| align) != Some(64) {
+        eprintln!("prolongement en place sauté : alignement de 64 indisponible");
+        return Ok(());
+    }
     let ids = |len: usize, step: usize, offset: usize| -> Vec<usize> {
         (0..len).map(|i| (i * step + offset) % VOCAB).collect()
     };
-    let tokens = ids(1200, 31, 7);
-    let (p1, p2) = (&tokens[..1100], &tokens[..1200]);
-    let branch = [p1, &ids(100, 17, 3)].concat();
-    let p3 = [&tokens[..1150], &ids(60, 13, 5)].concat();
+    let tokens = ids(1216, 31, 7);
+    let (p1, p2) = (&tokens[..1088], &tokens[..1216]);
+    let branch = [&tokens[..1024], &ids(128, 17, 3)].concat();
+    let p3 = [&tokens[..1152], &ids(64, 13, 5)].concat();
     // Vue bf16 unique de K et de V : (allocations K/V, éléments). K et V
     // doivent suivre le même placement (même allocation propre, même longueur).
     let sole_view = |cache: &CausalDecoderCache| {
@@ -4539,7 +4729,7 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
     let cold = |prompt: &[usize]| -> Result<_> {
         Ok(kv(&model.prefill_prompt_state_uncached(prompt)?.cache))
     };
-    let cached = || -> Result<Vec<Vec<usize>>> {
+    let cached = || -> Result<Vec<usize>> {
         let cache = model
             .prefix_cache
             .lock()
@@ -4547,8 +4737,19 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
         Ok(cache
             .entries
             .iter()
-            .map(|entry| entry.tokens.clone())
+            .map(|entry| entry.tokens.len())
             .collect())
+    };
+    let anchor_kv = || -> Result<_> {
+        let cache = model
+            .prefix_cache
+            .lock()
+            .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?;
+        Ok(cache
+            .entries
+            .iter()
+            .find(|entry| entry.tokens.len() == 1024)
+            .map(|entry| kv(&entry.cache)))
     };
 
     // Morceaux de 512 et stockage bf16 dès la première ligne : le chemin de
@@ -4559,25 +4760,28 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
             eprintln!("prolongement en place du décodeur sauté : K/V bf16 indisponible (NAX)");
             return Ok(());
         };
-        assert_eq!(len, 1100 * KV_DIM);
-        let turn1_kv = kv(&turn1);
+        assert_eq!(len, 1088 * KV_DIM);
+        assert_eq!(
+            cached()?,
+            vec![1088, 1024],
+            "tour 1 : prompt complet et ancre"
+        );
+        let anchor1 = anchor_kv()?;
+        // Fin de la requête : plus aucune vue au-delà de l'ancre.
+        drop(turn1);
 
-        // Tour 2 : hit sur l'entrée du tour 1, prolongée en place.
+        // Tour 2 : hit sur le prompt du tour 1 (aligné), prolongé en place.
         let (turn2, _) = model.prefill_cache_state(p2)?;
         assert_eq!(
             sole_view(&turn2),
-            Some((home, 1200 * KV_DIM)),
+            Some((home, 1216 * KV_DIM)),
             "tour 2 en place"
         );
         assert_eq!(kv(&turn2), cold(p2)?, "tour 2 : K/V vs froid");
-        assert_eq!(
-            cached()?,
-            vec![p2.to_vec(), p1.to_vec()],
-            "snapshot du tour 1 gardé"
-        );
-        assert_eq!(kv(&turn1), turn1_kv, "état du tour 1 intact");
+        assert_eq!(cached()?, vec![1216, 1152, 1088, 1024], "tours et ancres");
+        assert_eq!(anchor_kv()?, anchor1, "ancre du tour 1 intacte");
 
-        // Autre branche depuis l'entrée du tour 1 : une vue plus longue vit
+        // Autre branche depuis l'ancre du tour 1 : une vue plus longue vit
         // (tour 2), le prolongement recopie sans toucher aux lignes publiées.
         let turn2_kv = kv(&turn2);
         let (branched, _) = model.prefill_cache_state(&branch)?;
@@ -4586,27 +4790,170 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
         assert_eq!(kv(&branched), cold(&branch)?, "branche : K/V vs froid");
         assert_eq!(kv(&turn2), turn2_kv, "lignes publiées intactes");
         // Les entrées de l'allocation remplacée sont libérées.
-        assert_eq!(cached()?, vec![branch.clone()]);
-        drop((turn1, branched));
+        assert_eq!(
+            cached()?,
+            vec![1152, 1088],
+            "seules les entrées de la branche restent"
+        );
+        drop(branched);
 
-        // Rollback du tour 2 à 1150 positions, mémorisé, puis prolongé :
+        // Rollback du tour 2 à 1152 positions, mémorisé, puis prolongé :
         // plus aucune vue ne couvre au-delà, le prolongement reste en place.
         let mut rolled = turn2;
         for layer in &mut rolled.layers {
-            layer.truncate(1150)?;
+            layer.truncate(1152)?;
         }
-        rolled.position = 1150;
+        rolled.position = 1152;
         let final_state = Tensor::row(vec![0.0; HIDDEN])?;
-        model.prefix_cache_put(&p3[..1150], &(rolled, final_state), None, None)?;
+        model.prefix_cache_put(&p3[..1152], &(rolled, final_state), None, None)?;
         let (turn3, _) = model.prefill_cache_state(&p3)?;
         assert_eq!(
             sole_view(&turn3),
-            Some((home, 1210 * KV_DIM)),
+            Some((home, 1216 * KV_DIM)),
             "rollback puis prolongement en place"
         );
         assert_eq!(kv(&turn3), cold(&p3)?, "rollback : K/V vs froid");
         Ok(())
     })
+}
+
+/// Hits du cache de préfixe (ancre alignée, extension résidente) contre le
+/// prefill à froid d'un seul tenant : K/V et état final identiques au bit, y
+/// compris pour des préfixes non alignés et des suffixes de moins de 32 tokens
+/// qui prenaient avant l’extension en lignes. Seules les ancres alignées et les
+/// prompts complets entrent au cache.
+/// Projections f32 : alignement automatique de 16 (queue de 32).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn prefix_cache_aligned_hits_match_cold_prefill() -> Result<()> {
+    check_prefix_cache_aligned_hits(false)
+}
+
+/// Comme [`prefix_cache_aligned_hits_match_cold_prefill`] avec q/o en dense
+/// bf16 (GEMM NA dès 64 lignes, qmv en dessous) : alignement automatique de 64.
+/// Témoin : une queue de 40 lignes après un préfixe aligné sur 16 diffère.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn prefix_cache_aligned_hits_match_cold_prefill_dense_bf16() -> Result<()> {
+    check_prefix_cache_aligned_hits(true)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn check_prefix_cache_aligned_hits(dense_bf16: bool) -> Result<()> {
+    if !prefix_cache_enabled() || prefix_cache_capacity() < 2 {
+        return Ok(());
+    }
+    const VOCAB: usize = 97;
+    let config = CausalDecoderConfig {
+        num_attention_heads: 16,
+        num_key_value_heads: 2,
+        head_dim: Some(256),
+        rope_theta: Some(10_000_000.0),
+        ..CausalDecoderConfig::default()
+    };
+    let Some(device) = metal::Device::system_default() else {
+        return Ok(());
+    };
+    let mut tensors: HashMap<String, DecoderTensor> = resident_bf16_qwen_weights(VOCAB, 64, false)?
+        .into_iter()
+        .map(|(name, tensor)| (name, DecoderTensor::Dense(tensor)))
+        .collect();
+    if dense_bf16 {
+        for name in [
+            "layers.0.self_attn.q_proj.weight",
+            "layers.0.self_attn.o_proj.weight",
+        ] {
+            let Some(DecoderTensor::Dense(tensor)) = tensors.remove(name) else {
+                return Err(InferError::Config(format!("{name} absent")));
+            };
+            let bits: Vec<u16> = tensor
+                .data()
+                .iter()
+                .map(|value| (value.to_bits().wrapping_add(0x8000) >> 16) as u16)
+                .collect();
+            let buffer = device.new_buffer_with_data(
+                bits.as_ptr().cast(),
+                (bits.len() * 2) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            tensors.insert(
+                name.to_string(),
+                DecoderTensor::LinearWeight(crate::LinearWeight::DenseBf16(
+                    crate::DenseBf16Tensor::new(tensor.shape(), buffer)?,
+                )),
+            );
+        }
+    }
+    let model = match CausalDecoder::from_decoder_tensors(tensors, config)?.with_metal_runtime() {
+        Ok(model) => model,
+        Err(InferError::Metal(message)) if message.contains("aucun device") => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let Some((align, tail)) = model.prefix_resume_align() else {
+        return Ok(());
+    };
+    if crate::runtime_flags::env_var("SARAGOSSA_RUST_PREFIX_ALIGN").is_none() {
+        let expected = if dense_bf16 { (64, 64) } else { (16, 32) };
+        assert_eq!((align, tail), expected, "alignement automatique");
+    }
+    let tokens: Vec<usize> = (0..1300).map(|i| (i * 31 + 7) % VOCAB).collect();
+    if !model.prefix_extend_as_cheap_as_cold(tokens.len()) {
+        eprintln!("extension résidente indisponible : test sauté");
+        return Ok(());
+    }
+    if dense_bf16 {
+        let cold = model.prefill_prompt_state_uncached(&tokens[..1072])?;
+        let mut warm = model.prefill_prompt_state_uncached(&tokens[..1032])?;
+        model.extend_prompt_state(&mut warm, &tokens[1032..1072])?;
+        // NOTE: témoin informatif seulement : selon le GPU, le GEMM d'une queue
+        // de 40 lignes peut coïncider avec le froid, ce qui ne prouve rien.
+        if warm.final_state.data() == cold.final_state.data() {
+            eprintln!("queue de 40 lignes identique au froid sur ce GPU : témoin muet");
+        }
+    }
+    for (prefix, len) in [
+        (1100, 1120),
+        (1037, 1200),
+        (1000, 1031),
+        (1024, 1300),
+        (1040, 1080),
+    ] {
+        model.clear_prefix_cache();
+        let cold = model.prefill_prompt_state_uncached(&tokens[..len])?;
+        model.prefill_cache_state(&tokens[..prefix])?;
+        let (warm, final_state) = model.prefill_cache_state(&tokens[..len])?;
+        let entries = model
+            .prefix_cache
+            .lock()
+            .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?
+            .entries
+            .iter()
+            .map(|entry| entry.tokens.len())
+            .collect::<Vec<_>>();
+        // Ancres alignées pour les extensions, prompts complets pour les
+        // hits exacts.
+        assert!(
+            entries.iter().any(|len| len % align == 0)
+                && entries
+                    .iter()
+                    .all(|entry| entry % align == 0 || *entry == prefix || *entry == len),
+            "{prefix}→{len} : entrées {entries:?}"
+        );
+        for layer in 0..model.layers.len() {
+            assert_eq!(
+                warm.layer_kv_for_test(layer),
+                cold.cache.layer_kv_for_test(layer),
+                "{prefix}→{len} : K/V couche {layer}"
+            );
+        }
+        assert_eq!(
+            final_state.data(),
+            cold.final_state.data(),
+            "{prefix}→{len} : état final"
+        );
+    }
+    model.clear_prefix_cache();
+    Ok(())
 }
 
 /// Seul un Qwen dense à k/v 5120→1024 (Qwen3.8 27B) ouvre ses k/v au
@@ -5600,10 +5947,14 @@ fn greedy_identity_states_real_model() -> Result<()> {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(128);
     let assets = crate::ModelAssets::load_local(&model_dir)?;
-    let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
+    // Chargement de production : un modèle bf16 garde ses poids en bf16 (le
+    // chargement CPU les doublerait en f32).
+    let executor = crate::MetalExecutor::new()?;
+    let mut model =
+        crate::load_causal_decoder_for_metal(&assets, &executor)?.with_metal_executor(executor)?;
     let has_mtp = match assets.mtp.path.as_ref() {
-        Some(path) => {
-            model = model.with_mtp_sidecar(path)?;
+        Some(_) => {
+            model = model.with_mtp_weights(&assets.mtp)?;
             true
         }
         None => false,
@@ -5878,7 +6229,7 @@ fn greedy_identity_states_real_model() -> Result<()> {
     }
     eprintln!("identité : largeur d'arbre max {tree_widths:?}, vérifications Skip ≥ 5 lignes {skip_coverage:?}");
     // `dflash-défaut` : la largeur observée est celle du budget par défaut
-    // (B = 3 en greedy strict, B = 8 sinon), pas une autre.
+    // (B = 4 sur cible bf16 dense, B = 3 sinon en greedy), pas une autre.
     for mode in &selected {
         if !coverage.contains_key(mode) {
             failures.push(format!(
@@ -5888,7 +6239,16 @@ fn greedy_identity_states_real_model() -> Result<()> {
     }
     if selected.contains("dflash-défaut") {
         let width = tree_widths.get("dflash-défaut").copied().unwrap_or(0);
-        let expected = crate::runtime_flags::dflash_tree_default_budget(true) + 1;
+        // Lignes littérales (budget + ancre) : ne pas recalculer par la fonction
+        // de production, sinon un changement de défaut passerait inaperçu.
+        let expected = match (
+            crate::runtime_flags::verify_strict_enabled(),
+            model.dense_bf16_mlp(),
+        ) {
+            (true, _) => 4,
+            (false, true) => 5,
+            (false, false) => 4,
+        };
         if width != expected {
             failures.push(format!(
                 "dflash-défaut : arbre de {width} lignes au plus, {expected} attendu"
@@ -5960,8 +6320,8 @@ fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
     let assets = crate::ModelAssets::load_local(&model_dir)?;
     let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
     let has_mtp = match assets.mtp.path.as_ref() {
-        Some(path) => {
-            model = model.with_mtp_sidecar(path)?;
+        Some(_) => {
+            model = model.with_mtp_weights(&assets.mtp)?;
             true
         }
         None => false,
@@ -6250,8 +6610,132 @@ fn mtp_seed_shared_prefix_keeps_allocations() -> Result<()> {
     Ok(())
 }
 
+/// Profondeurs MTP fixes 1 à 4 (cycle fusionné en D2, chemin général sinon) :
+/// la sortie greedy reste celle de l'AR, avec acceptations à chaque position et
+/// rejets, donc retour arrière du KV MTP exercé à chaque profondeur.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_fixed_depths_match_ar_synthetic() -> Result<()> {
+    assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
+    let (model, prompt) = mtp_sign_synthetic_model()?;
+    let options = GenerationOptions::default();
+    crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || -> Result<()> {
+        model.clear_prefix_cache();
+        let ar = model.generate_greedy_cached_with_options(&prompt, 48, &options)?;
+        assert_eq!(ar.len(), 48);
+        for depth in 1..=4 {
+            model.clear_prefix_cache();
+            let output = crate::runtime_flags::with_mtp_fixed_depth_override(|| {
+                model.generate_greedy_mtp_batched_with_options(&prompt, 48, &options, depth)
+            })?;
+            let accepted = &output.stats.accepted_by_position;
+            eprintln!(
+                "D{depth}: proposés={:?} acceptés={accepted:?}",
+                output.stats.proposed_by_position
+            );
+            assert_eq!(output.tokens, ar, "D{depth} diverge de l'AR");
+            assert!(
+                accepted.iter().take(depth).all(|&count| count > 0),
+                "D{depth} : une position de draft jamais acceptée ({accepted:?})"
+            );
+            assert!(output.stats.rejected > 0, "D{depth} : aucun rejet");
+        }
+        Ok(())
+    })
+}
+
+/// Profondeur fixe 2 avec tête de draft u4 tirée du lm_head bf16 du tronc
+/// (`quantize_draft_lm_head_u4`, défaut des cibles bf16) : la vérification reste
+/// faite par le lm_head bf16, la sortie greedy est donc celle de l'AR.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn mtp_d2_u4_draft_head_matches_ar_synthetic() -> Result<()> {
+    assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
+    let (mut model, prompt) = mtp_sign_synthetic_model()?;
+    let device = metal::Device::system_default()
+        .ok_or_else(|| InferError::Config("device Metal absent".into()))?;
+    // Tête bf16 du tronc : même motif de signes que la fixture, plus un bruit
+    // hors des colonnes vues par la norme, pour que la quantification u4 arrondisse.
+    let (hidden, vocab) = (model.final_norm.len(), 97);
+    let mut head = vec![0.0_f32; vocab * hidden];
+    for (i, value) in head.iter_mut().enumerate().skip(3 * hidden) {
+        *value = ((i * 7919) % 1009) as f32 / 1009.0 - 0.5;
+    }
+    head[0] = 1.0;
+    head[hidden] = -1.0;
+    head[2 * hidden + 1] = -1.0;
+    let bits: Vec<u16> = head.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+    let buffer = device.new_buffer_with_data(
+        bits.as_ptr().cast(),
+        (bits.len() * 2) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    model.lm_head = Linear::from_weight(
+        crate::LinearWeight::DenseBf16(crate::DenseBf16Tensor::new(&[vocab, hidden], buffer)?),
+        None,
+    )?;
+    model.mtp_draft_lm_head = Some(
+        mtp::quantize_draft_lm_head_u4(&model.lm_head)?
+            .ok_or_else(|| InferError::Config("tête u4 refusée".into()))?,
+    );
+    let options = GenerationOptions::default();
+    crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || -> Result<()> {
+        model.clear_prefix_cache();
+        let ar = model.generate_greedy_cached_with_options(&prompt, 48, &options)?;
+        assert_eq!(ar.len(), 48);
+        model.clear_prefix_cache();
+        let output = crate::runtime_flags::with_mtp_fixed_depth_override(|| {
+            model.generate_greedy_mtp_batched_with_options(&prompt, 48, &options, 2)
+        })?;
+        eprintln!(
+            "D2 u4 : proposés={:?} acceptés={:?}",
+            output.stats.proposed_by_position, output.stats.accepted_by_position
+        );
+        assert_eq!(output.tokens, ar, "D2 + tête u4 diverge de l'AR");
+        assert!(output.stats.accepted > 0, "aucun draft accepté");
+        Ok(())
+    })
+}
+
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
+    mtp_synthetic_model_with(|_| Ok(()))
+}
+
+/// Comme [`mtp_seed_synthetic_model`], logits restreints aux tokens 0 à 2 : la
+/// norme finale ne laisse passer que h₀ et h₁, et le lm_head donne `+h₀` au
+/// token 0, `−h₀` au token 1 et `−h₁` au token 2. Tronc et tête MTP partagent
+/// norme et lm_head mais pas leurs états cachés : le token 2 sort de façon
+/// irrégulière chez l'un ou l'autre. Avec ce poids `−1` (mesuré : `−0,5` et
+/// `−2` ne laissent que des acceptations ou que des rejets), chaque profondeur
+/// 1 à 4 voit des acceptations à toutes les positions et des rejets.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn mtp_sign_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
+    mtp_synthetic_model_with(|weights| {
+        let hidden = weights["norm.weight"].data().len();
+        let vocab = weights["lm_head.weight"].data().len() / hidden;
+        let mut norm = vec![0.0; hidden];
+        norm[0] = 1.0;
+        norm[1] = 1.0;
+        let mut head = vec![0.0; vocab * hidden];
+        head[0] = 1.0;
+        head[hidden] = -1.0;
+        head[2 * hidden + 1] = -1.0;
+        weights.insert("norm.weight".into(), Tensor::from_vec(vec![hidden], norm)?);
+        weights.insert(
+            "lm_head.weight".into(),
+            Tensor::from_vec(vec![vocab, hidden], head)?,
+        );
+        Ok(())
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn mtp_synthetic_model_with(
+    tweak: impl FnOnce(&mut HashMap<String, Tensor>) -> Result<()>,
+) -> Result<(CausalDecoder, Vec<usize>)> {
     const VOCAB: usize = 97;
     const HIDDEN: usize = 64;
     let config = CausalDecoderConfig {
@@ -6264,7 +6748,8 @@ fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
         attn_output_gate: true,
         ..CausalDecoderConfig::default()
     };
-    let weights = resident_bf16_qwen_weights(VOCAB, HIDDEN, config.attn_output_gate)?;
+    let mut weights = resident_bf16_qwen_weights(VOCAB, HIDDEN, config.attn_output_gate)?;
+    tweak(&mut weights)?;
     let mut model = CausalDecoder::from_tensors(weights, config)?;
     let layer = &model.layers[0];
     let AttentionBlock::Full(attention) = &layer.attention else {
@@ -6311,7 +6796,11 @@ fn mtp_bf16_history_generation_adoption_and_f32_fallback() -> Result<()> {
     assert!(decode_resident_full_enabled());
     assert_eq!(mtp_history_policy(), MtpHistoryPolicy::Committed);
     assert!(prefix_cache_enabled());
-    let (model, prompt) = mtp_seed_synthetic_model()?;
+    // POURQUOI : depuis bbe5b4f, un prompt à froid est calculé en deux temps
+    // (ancre alignée puis queue), donc l'historique MTP compte deux segments.
+    // Ce test vérifie le semis d'un seul tenant : reprises à la longueur exacte.
+    let (model, prompt) =
+        crate::runtime_flags::with_prefix_align_for_test(None, mtp_seed_synthetic_model)?;
     let capacity = prompt.len() + 16;
     crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || -> Result<()> {
         with_kv_format_override(KvFormat::Bf16, || -> Result<()> {
@@ -6808,14 +7297,14 @@ fn mtp_bf16_real_greedy_ids_and_memory() -> Result<()> {
     let dir = mtp_verifier_model_dir()
         .ok_or_else(|| InferError::Config("modèle local MTP requis".into()))?;
     let assets = crate::ModelAssets::load_local(&dir)?;
-    let sidecar = assets
+    let _sidecar = assets
         .mtp
         .path
         .as_ref()
         .ok_or_else(|| InferError::Config("sidecar MTP local requis".into()))?;
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(sidecar)?;
+        .with_mtp_weights(&assets.mtp)?;
     let number = |name: &str, default| -> Result<usize> {
         std::env::var(name).ok().map_or(Ok(default), |s| {
             s.parse()
@@ -6970,5 +7459,195 @@ fn gemma4_explicit_rope_parameters_reach_decoder() -> Result<()> {
     assert_eq!(sliding.rope_dims(256), 256);
     assert_eq!(sliding.rope_frequency_dim(256), 256);
     assert_eq!(sliding.rope_theta_override, Some(20_000.0));
+    Ok(())
+}
+
+#[test]
+fn prefix_cache_purge_recovers_poisoned_mutex() -> Result<()> {
+    let model = CausalDecoder::from_tensors(test_weights(), CausalDecoderConfig::default())?;
+    let entry = |token| PrefixCacheEntry {
+        tokens: vec![token],
+        cache: model.empty_cache(),
+        final_state: Tensor::row(vec![0.0]).expect("invariant: ligne non vide"),
+        mtp_history: None,
+        captures: None,
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        linear_metal: Vec::new(),
+    };
+    for poisoned in [false, true] {
+        let cache = Mutex::new(PrefixCache {
+            entries: vec![entry(2), entry(1)],
+        });
+        if poisoned {
+            let result = std::panic::catch_unwind(|| {
+                let _guard = cache.lock().expect("invariant: mutex neuf");
+                panic!("empoisonnement volontaire du cache");
+            });
+            assert!(result.is_err());
+            assert!(cache.is_poisoned());
+        }
+        assert!(matches!(purge_prefix_cache(&cache), PurgeOutcome::Purged { bytes } if bytes > 0));
+        {
+            let guard = cache.lock().unwrap_or_else(|error| error.into_inner());
+            assert_eq!(guard.entries.len(), 1);
+            assert_eq!(guard.entries[0].tokens, vec![2]);
+        }
+        assert!(matches!(
+            purge_prefix_cache(&cache),
+            PurgeOutcome::Purged { .. }
+        ));
+        assert!(matches!(purge_prefix_cache(&cache), PurgeOutcome::Empty));
+    }
+    Ok(())
+}
+
+/// Alternance du routage par classe de prompt sur un même décodeur, cache de
+/// préfixe actif : DFlash (tour 1), MTP sur l'entrée DFlash (tour 2), DFlash
+/// sur l'entrée MTP (tour 3), sous 16k et au-delà. Chaque tour égale l'AR non
+/// caché ; l'historique MTP semé sur GPU par le prefill DFlash (captures et
+/// semis fusionnés) égale, à la tolérance du semis, celui de la référence
+/// semée depuis les états normés de toutes les positions ; le tour MTP reprend
+/// tout le tour 1 avec cet historique et le tour DFlash trouve une entrée avec
+/// captures, donc aucun prefill complet. Requiert
+/// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` (sidecar MTP) et
+/// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`, routage et cache de préfixe actifs.
+#[test]
+#[ignore = "modèle réel + sidecar MTP + draft DFlash requis"]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+fn spec_route_alternation_reuses_prefix_real_model() -> Result<()> {
+    let Some(model_dir) = mtp_verifier_model_dir() else {
+        return Ok(());
+    };
+    if crate::runtime_flags::env_var_os("SARAGOSSA_RUST_DFLASH_DRAFT_DIR").is_none()
+        || !crate::runtime_flags::spec_route_enabled()
+        || !prefix_cache_enabled()
+    {
+        eprintln!("skip alternance : drafter absent, routage ou cache de préfixe coupé");
+        return Ok(());
+    }
+    let assets = crate::ModelAssets::load_local(&model_dir)?;
+    let _mtp_path = assets
+        .mtp
+        .path
+        .clone()
+        .ok_or_else(|| InferError::Config("sidecar MTP requis".to_string()))?;
+    let model = crate::load_causal_decoder(&assets)?
+        .with_metal_runtime()?
+        .with_mtp_weights(&assets.mtp)?
+        .with_dflash_draft_from_env(&assets.config)?;
+    let draft = model
+        .dflash_draft()
+        .ok_or_else(|| InferError::Config("drafter non chargé".to_string()))?
+        .clone();
+    let layer_ids = draft.info.target_layer_ids.clone();
+    let keep_rows =
+        super::resident::dflash::drafter_window(&draft.info.layer_types, draft.info.sliding_window)
+            .unwrap_or(usize::MAX);
+    let options = mtp_verifier_options(Vec::new());
+    let encode = |text: &str| -> Result<Vec<usize>> {
+        assets
+            .encode_prompt(text)?
+            .into_iter()
+            .map(|id| {
+                usize::try_from(id)
+                    .map_err(|_| InferError::Dimension(format!("token id hors plage: {id}")))
+            })
+            .collect()
+    };
+    let ar = |prompt: &[usize]| -> Result<Vec<usize>> {
+        Ok(model
+            .generate_greedy_timed_from_prompt_state_with_options(
+                model.prefill_prompt_state_uncached(prompt)?,
+                Duration::ZERO,
+                24,
+                &options,
+            )?
+            .tokens)
+    };
+    let filler =
+        "Le journal du port consigne chaque livraison, chaque incident et la relève du soir. ";
+    for (repeats, min_len, max_len) in [(8usize, 1, 16_383), (1_000, 16_384, usize::MAX)] {
+        model.clear_prefix_cache();
+        let p1 = mtp_verifier_prompt_ids(
+            &assets,
+            &format!(
+                "{}Écris une fonction Rust qui valide ce journal.",
+                filler.repeat(repeats)
+            ),
+        )?;
+        assert!(
+            (min_len..=max_len).contains(&p1.len()),
+            "longueur {}",
+            p1.len()
+        );
+        let turn1 = model.generate_greedy_mtp_routed(&p1, 24, &options, 2, true, |_| true)?;
+        assert_eq!(turn1.tokens, ar(&p1)?, "tour DFlash {}", p1.len());
+        let seeded = model
+            .prefix_cache
+            .lock()
+            .map_err(|_| InferError::Config("cache préfixe empoisonné".to_string()))?
+            .entries
+            .iter()
+            .find(|entry| entry.tokens == p1)
+            .and_then(|entry| entry.mtp_history.clone())
+            .ok_or_else(|| InferError::Config("entrée DFlash sans historique MTP".to_string()))?;
+        let (_, final_states, _) =
+            model.prefill_cache_state_with_layer_capture_all(&p1, &layer_ids, keep_rows, true)?;
+        let reference = model.dflash_switch_mtp_history(&p1, &final_states)?;
+        assert_eq!(seeded.len(), p1.len() - 1, "historique semé incomplet");
+        assert_eq!(seeded.len(), reference.len());
+        for (label, gpu, cpu) in [
+            ("K", seeded.keys.to_vec(), reference.keys.to_vec()),
+            ("V", seeded.values.to_vec(), reference.values.to_vec()),
+        ] {
+            assert_eq!(gpu.len(), cpu.len(), "longueur {label}");
+            let scale = cpu.iter().fold(0.0f32, |acc, x| acc.max(x.abs()));
+            let max_err = cpu
+                .iter()
+                .zip(&gpu)
+                .fold(0.0f32, |acc, (a, b)| acc.max((a - b).abs()));
+            eprintln!(
+                "historique semé {label} prompt={} : max_abs={scale:e} max_err={max_err:e}",
+                p1.len()
+            );
+            assert!(
+                gpu.iter().all(|value| value.is_finite()) && max_err <= 5e-3 * scale,
+                "historique {label} : dérive {max_err:e} / {scale:e}"
+            );
+        }
+        let mut p2 = p1.clone();
+        p2.extend_from_slice(&turn1.tokens);
+        p2.extend(encode(
+            "<|im_end|>\n<|im_start|>user\nRaconte la journée en prose.<|im_end|>\n<|im_start|>assistant\n",
+        )?);
+        let turn2 = model.generate_greedy_mtp_routed(&p2, 24, &options, 2, false, |_| true)?;
+        assert_eq!(turn2.tokens, ar(&p2)?, "tour MTP {}", p2.len());
+        assert!(
+            turn2.stats.reused_prefix_tokens >= p1.len(),
+            "tour MTP sans reprise de l'entrée DFlash : {} sur {}",
+            turn2.stats.reused_prefix_tokens,
+            p1.len()
+        );
+        let mut p3 = p2.clone();
+        p3.extend_from_slice(&turn2.tokens);
+        p3.extend(encode(
+            "<|im_end|>\n<|im_start|>user\nÉcris maintenant le code complet.<|im_end|>\n<|im_start|>assistant\n",
+        )?);
+        // Le hit avec captures est ce que le tour DFlash lit en premier : s'il
+        // échoue, le tour 3 refait un prefill complet.
+        let hit = model.prefix_cache_get_with_captures(&p3, &layer_ids, keep_rows)?;
+        assert!(
+            hit.is_some(),
+            "tour DFlash sans entrée à captures : prefill complet ({})",
+            p3.len()
+        );
+        let turn3 = model.generate_greedy_mtp_routed(&p3, 24, &options, 2, true, |_| true)?;
+        assert_eq!(turn3.tokens, ar(&p3)?, "tour DFlash après MTP {}", p3.len());
+        eprintln!(
+            "alternance prompt={} : MTP reprend {} tokens, DFlash reprend l'entrée MTP",
+            p1.len(),
+            turn2.stats.reused_prefix_tokens
+        );
+    }
     Ok(())
 }

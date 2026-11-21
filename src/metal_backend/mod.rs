@@ -30,24 +30,28 @@ const STEEL_SINK_ATTN_D128_KV_BF16: &str =
 #[cfg(all(target_os = "macos", feature = "metal"))]
 const STEEL_ATTENTION_NAX_KERNELS: &str = include_str!("../../assets/steel_attention_nax.metal");
 const GATED_DELTA_NAX_KERNELS: &str = include_str!("../../assets/gated_delta_nax.metal");
+const GATED_DELTA_NAX_HK16_HV32: &str = "gated_delta_fused_nax_f32_dk128_dv128_hk16_hv32_c16";
 const GATED_DELTA_NAX_HK16_HV48: &str = "gated_delta_fused_nax_f32_dk128_dv128_hk16_hv48_c16";
 const MAX_MOE_TOP_K: usize = 16;
 pub(crate) const MAX_SAMPLER_TOP_K: usize = 32;
 const FAST_QMV_GROUP_SIZE: usize = 64;
 const QMM_NA_GS128_GROUP_SIZE: usize = 128;
 const FAST_QMV_BITS: usize = 4;
-/// Lignes par tuile (un seul expert) des kernels MoE groupés tuilés de flint.
+/// Lignes par tuile (un seul expert) des kernels MoE groupés tuilés.
 const MOE_COOP_TILED_BM: usize = 32;
 /// Lignes par tuile des kernels MoE groupés 16 × 32.
 const MOE_COOP_TILE_M: usize = 16;
 const FAST_QMV_U2_BITS: usize = 2;
 const FAST_QMV_U3_BITS: usize = 3;
+const FAST_QMV_U5_BITS: usize = 5;
 const FAST_QMV_U6_BITS: usize = 6;
 /// Synchronisé avec `U6_QMM_MAX_BATCH` pour découper les lots sans dépassement.
 const U6_QMM_BATCH_TILE: usize = 8;
 
 mod attention;
 mod attention_checks;
+mod micro;
+pub(crate) use attention_checks::check_threadgroup_size;
 mod barriers;
 mod buffers;
 mod byte_helpers;
@@ -58,12 +62,15 @@ mod kernel_timing;
 mod lightbatch_duo;
 mod lightbatch_multi;
 mod linear_attention;
+mod memory;
 mod state_snapshot;
 pub(crate) use state_snapshot::LinearSnapshotLayout;
 mod linear_attention_encode;
 pub(super) use linear_attention_encode::LinearAttnBatchLayout;
 mod lm_head;
 mod matmul;
+#[cfg(feature = "decision")]
+pub(crate) use matmul::DENSE_BF16_GEMM_MIN_BATCH;
 mod matmul_align64;
 mod matmul_encode;
 mod matmul_resident;
@@ -99,13 +106,19 @@ pub(crate) use self::flags::with_flint_moe_coop_override;
 #[cfg(test)]
 pub(crate) use self::flags::with_flint_moe_coop_tiled_override;
 #[cfg(test)]
+pub(crate) use self::flags::with_moe_coop_override;
+#[cfg(test)]
 pub(crate) use self::flags::with_qmm_na_u4_min_dim_override;
+#[cfg(test)]
+pub(crate) use self::flags::MMAP_WEIGHT_VIEWS;
 #[cfg(test)]
 pub(crate) use self::matmul::with_concat_vram_fraction_override;
 #[cfg(test)]
 pub(crate) use self::moe_na::moe_coop_tiled_trace_for_test;
 #[cfg(test)]
 pub(crate) use self::prefill::routed_coop_trace_for_test;
+#[cfg(feature = "decision")]
+pub(crate) use self::prefill::with_decision_segments;
 #[cfg(test)]
 pub(crate) use self::prefill::with_prefill_kv_layout_override;
 pub(crate) use self::prefill::with_prefill_kv_reserve;
@@ -115,6 +128,7 @@ mod profiling;
 pub(crate) mod rope;
 mod scratch;
 // Fondation du K/V sparse : seuls ses tests l'utilisent avant A2.
+mod bf16_encode;
 #[cfg_attr(not(test), expect(dead_code, reason = "branché en A2"))]
 mod sparse;
 #[cfg(test)]
@@ -123,12 +137,16 @@ pub(crate) mod tests;
 mod transfer;
 // Arbre de vérification DFlash : construit par la boucle DFlash (devtools).
 #[cfg_attr(
-    not(feature = "devtools"),
+    not(any(feature = "devtools", test)),
     expect(dead_code, reason = "arbre construit par la boucle DFlash (devtools)")
 )]
 mod verify_tree;
+#[cfg(any(feature = "stt", feature = "diar"))]
+#[cfg_attr(not(feature = "stt"), allow(dead_code))]
 mod whisper_encode;
 
+#[cfg(all(test, any(feature = "tts", feature = "denoise")))]
+pub(crate) use self::barriers::command_buffer_gpu_ns;
 #[doc(hidden)]
 pub use self::barriers::dump_commit_components;
 pub(crate) use self::barriers::{
@@ -136,9 +154,10 @@ pub(crate) use self::barriers::{
     post_dispatch_barrier, wait_for_completion, EncoderEndGuard,
 };
 pub(crate) use self::byte_helpers::read_u16_buffer;
-pub(crate) use self::byte_helpers::{read_f32_buffer, read_u32_buffer};
+pub(crate) use self::byte_helpers::{read_f32_buffer, read_f32_buffer_at, read_u32_buffer};
 pub(crate) use self::byte_helpers::{write_f32_buffer, write_u16_buffer_at, write_u8_buffer};
 use self::core::*;
+#[cfg(any(feature = "devtools", test))]
 pub(crate) use self::eligibility::install_qmm_skinny_bf16_scope;
 pub(crate) use self::flags::resident_concurrent_enabled;
 pub(crate) use self::lightbatch_duo::{
@@ -146,18 +165,22 @@ pub(crate) use self::lightbatch_duo::{
 };
 #[cfg(feature = "devtools")]
 pub(crate) use self::linear_attention::linear_tree_journal_refusal;
-#[cfg(test)]
+#[cfg(all(test, feature = "devtools"))]
 pub(crate) use self::linear_attention::{linear_tree_refusal, LinearTreeShape};
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub(crate) use self::matmul::take_concat_profile;
-pub(crate) use self::matmul::{whisper_bf16_gemm_enabled, whisper_decode_bf16_qmv_enabled};
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(crate) use self::matmul::whisper_bf16_gemm_enabled;
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(crate) use self::matmul::whisper_decode_attn_bf16_enabled;
+pub(crate) use self::matmul::whisper_decode_bf16_qmv_enabled;
 use self::na_gemm::NA_GEMM_SRC;
 #[cfg(test)]
 use self::pipelines::KernelSources;
 #[doc(hidden)]
 pub use self::profiling::{
     decode_profile_dispatch_shapes_snapshot, decode_profile_dispatch_sites_snapshot,
-    decode_profile_snapshot, DispatchProfileShape, DispatchProfileSite,
+    decode_profile_gpu_ns, decode_profile_snapshot, DispatchProfileShape, DispatchProfileSite,
 };
 pub(crate) use self::profiling::{profile_dispatch, profile_dispatch_shape, trace_dispatch_path};
 pub(crate) use self::scratch::install_scratch_namespace;
@@ -173,8 +196,13 @@ pub(crate) use self::verify_tree::{
 pub(crate) fn qmvt_dispatches_for_test() -> usize {
     matmul_encode::QMVT_DISPATCHES.with(std::cell::Cell::get)
 }
+#[cfg(feature = "stt")]
 pub(crate) use self::whisper_encode::{
     WhisperConvWeights, WhisperDecodeKv, WhisperDecodeLayer, WhisperResidentDecoder,
+    WhisperResidentMatrix, WhisperStepEmit, WhisperStepOutput,
+};
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(crate) use self::whisper_encode::{
     WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
 };
 
@@ -210,6 +238,13 @@ fn affine_biases_offset(weight: &AffineQuantizedTensor) -> Result<NSUInteger> {
 
 /// Exécute les premiers kernels Metal du backend Rust expérimental.
 #[derive(Debug)]
+#[cfg_attr(
+    not(all(feature = "stt", feature = "tts")),
+    allow(
+        dead_code,
+        reason = "Les pipelines partagés gardent une initialisation uniforme entre builds"
+    )
+)]
 pub struct MetalExecutor {
     kernel_profile: crate::KernelProfile,
     rope_frequencies: rope::RopeFrequencyCache,
@@ -217,6 +252,7 @@ pub struct MetalExecutor {
     queue: CommandQueue,
     dense_matmul_rhs_t_f32: ComputePipelineState,
     dense_qmv_rhs_bf16_f32: ComputePipelineState,
+    dense_qmv_rhs_bf16_stage_f32: ComputePipelineState,
     dense_qmv_fast_f32: ComputePipelineState,
     dense_gemm_rhs_t_f32: ComputePipelineState,
     affine_matmul_rhs_t_u32_f32: ComputePipelineState,
@@ -226,14 +262,20 @@ pub struct MetalExecutor {
     affine_qmv_fast_aligned_u4_gs64_residual_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u3_gs64_f32: ComputePipelineState,
     affine_qmv_fast_u4_gs64_align64_f32: ComputePipelineState,
+    affine_qmv_fast_u5_gs64_f32: ComputePipelineState,
+    affine_qmv_fast_aligned_u5_gs64_f32: ComputePipelineState,
     affine_qmv_fast_u6_gs64_f32: ComputePipelineState,
     affine_qmv_fast_aligned_u6_gs64_f32: ComputePipelineState,
+    affine_gate_up_swiglu_aligned_u6_gs64_f32: ComputePipelineState,
+    affine_qmv_residual_aligned_u6_gs64_f32: ComputePipelineState,
     affine_qmm_batched_u6_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u4_gs64_f32: ComputePipelineState,
     affine_qmm8_fast_aligned_u4_gs64_f32: ComputePipelineState,
     na_gemm_skinny_u4: Option<ComputePipelineState>,
     na_gemm_skinny_u4_x3: Option<ComputePipelineState>,
     na_gemm_skinny_u4_x2: Option<ComputePipelineState>,
+    na_gemm_skinny_u3_x2: Option<ComputePipelineState>,
+    na_gemm_skinny_u2_x2: Option<ComputePipelineState>,
     affine_qmm2_fast_aligned_u3_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs64_f32: ComputePipelineState,
     affine_qmm2_fast_aligned_u8_gs128_f32: ComputePipelineState,
@@ -343,10 +385,16 @@ pub struct MetalExecutor {
     whisper_attn_decode_vec64_f32: ComputePipelineState,
     im2col_f32: ComputePipelineState,
     rms_norm_rope_heads_f32: ComputePipelineState,
+    #[cfg(feature = "diar")]
+    rope_heads_inplace_f32: ComputePipelineState,
+    #[cfg(feature = "diar")]
+    split_qkv_rows_f32: ComputePipelineState,
+    rms_norm_mrope_heads_f32: ComputePipelineState,
     rms_norm_heads_no_scale_f32: ComputePipelineState,
     causal_attention_prefill_f32: ComputePipelineState,
     causal_attention_prefill_mid_f32: ComputePipelineState,
     causal_attention_prefill_long_f32: ComputePipelineState,
+    causal_attention_prefill_long_d512_f32: ComputePipelineState,
     windowed_attention_prefill_f32: ComputePipelineState,
     windowed_attention_prefill_mid_f32: ComputePipelineState,
     windowed_attention_prefill_long_f32: ComputePipelineState,
@@ -369,8 +417,11 @@ pub struct MetalExecutor {
     /// Choix du Steel avec sinks (lu du flag, forcé en test).
     prefill_sink_steel: bool,
     /// Plancher de `in_dim`/`out_dim` du GEMM NA u4 gs64 : 2048 par défaut,
-    /// abaissé pour flint seul par [`Self::enable_flint_small_nax_gemm`].
+    /// abaissé pour flint et les Qwen MoE par [`Self::enable_flint_small_nax_gemm`].
     qmm_na_u4_min_dim: usize,
+    /// Sous le plancher, bf16×4 au lieu du bf16×3 : Qwen MoE par défaut
+    /// ([`Self::set_small_nax_gemm_x4`]), jamais flint ni les k/v du 27B.
+    qmm_na_u4_x4: bool,
     /// `weight_id` des poids ouverts au GEMM NA u4 sous le plancher : les k/v
     /// des couches full du modèle cible
     /// ([`Self::allow_qmm_na_u4_x3_weight`]). Vide par défaut.
@@ -378,6 +429,8 @@ pub struct MetalExecutor {
     /// K/V des couches glissantes à sinks borné à la fenêtre (lu du flag,
     /// forcé en test).
     prefill_window_kv: bool,
+    /// NAX d128 sans sinks ; repli naïf si absent.
+    causal_attention_prefill_nax_d128: Option<attention::NaxCausalAttention>,
     causal_attention_prefill_steel_nax_d256: Option<attention::NaxCausalAttention>,
     /// NAX d128 avec sinks (couches pleines flint, K/V bf16) ; `None` hors
     /// flag ou s'il ne compile pas, le Steel d128 bf16 prend alors le relais.
@@ -393,6 +446,7 @@ pub struct MetalExecutor {
     prefill_kv_bf16_store_min_rows: Option<usize>,
     noncausal_attention_prefill_f32: ComputePipelineState,
     steel_attention_f32_bq32_bk32_bd64: Option<ComputePipelineState>,
+    decision_attention_nax: Option<attention::NaxCausalAttention>,
     add_rms_norm_row_f32: ComputePipelineState,
     topk_softmax_f32: ComputePipelineState,
     /// Top-k softmax 256 < experts ≤ 1024, un thread par logit.
@@ -409,18 +463,22 @@ pub struct MetalExecutor {
     sample_gumbel_blocks_f32: ComputePipelineState,
     sample_topk_blocks_f32: ComputePipelineState,
     sample_topk_finalize_f32: ComputePipelineState,
+    sample_topk_scan_blocks_f32: ComputePipelineState,
+    sample_topk_scan_finalize_f32: ComputePipelineState,
     argmax_blocks_f32: ComputePipelineState,
     argmax_finalize_f32: ComputePipelineState,
     talker_greedy_argmax_f32: ComputePipelineState,
     f32_to_bf16: ComputePipelineState,
+    dequant_u5_to_bf16_t_gs64: ComputePipelineState,
+    dequant_u6_to_bf16_t_gs64: ComputePipelineState,
     dequant_u8_to_bf16_t_gs64: ComputePipelineState,
     /// GEMM Neural Accelerators (`matmul2d`, bf16-in/f32-out) ; `None` si la
     /// MetalPerformancePrimitives n'est pas dispo (macOS < 26).
     na_gemm_bf16: Option<ComputePipelineState>,
     /// Variante encodeur Whisper plus proche du tiling MLX Steel NAX (BN=128).
     na_gemm_bf16_bn128: Option<ComputePipelineState>,
-    pub(super) chunk_delta_seq_layout: Option<ComputePipelineState>,
-    pub(super) chunk_delta_seq_layout_tc: Option<ComputePipelineState>,
+    /// Gated delta NAX de MLX (MoE : 16/32 têtes, dk = dv = 128).
+    pub(super) gated_delta_nax_hk16_hv32: Option<ComputePipelineState>,
     /// Gated delta NAX de MLX (27B : 16/48 têtes, dk = dv = 128).
     pub(super) gated_delta_nax_hk16_hv48: Option<ComputePipelineState>,
     na_gemm_coop_qb: Option<ComputePipelineState>,
@@ -429,10 +487,24 @@ pub struct MetalExecutor {
     na_gemm_coop_qb_tiled_gs128: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4: Option<ComputePipelineState>,
     /// GEMM tuilé u4 bf16×3 à lhs f32, réservé aux projections sous le
-    /// plancher par défaut (petites formes de flint).
+    /// plancher par défaut (petites formes de flint, `=x3` sur les Qwen MoE).
     na_gemm_coop_qb_tiled_u4_x3: Option<ComputePipelineState>,
+    /// Variante bf16×4 (lo·lo en plus), défaut des Qwen MoE
+    /// (`SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM=0` la coupe).
+    na_gemm_coop_qb_tiled_u4_x4: Option<ComputePipelineState>,
+    /// GEMM tuilé à poids bf16 denses `[N,K]` et lhs f32 scindé hi + lo,
+    /// pour le prefill des modèles BF16.
+    na_gemm_bf16_nt_tiled_x2: Option<ComputePipelineState>,
+    /// Même GEMM hi + lo, N quelconque (projections b/a, opt-in).
+    na_gemm_bf16_nt_tiled_x2_maskn: Option<ComputePipelineState>,
+    /// matmul2d MPP A et B bf16, B `[N,K]` : réservé aux décisions THX-02.
+    na_gemm_bf16_nt_bn128: Option<ComputePipelineState>,
+    /// Même matmul2d que `na_gemm_bf16_nt_bn128` sur gate et up, SwiGLU en
+    /// épilogue et H bf16 (MLP dense bf16 fusionné du prefill, opt-in).
+    na_gemm_bf16_nt_gate_up_swiglu: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_align64: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4_gate_up_swiglu: Option<ComputePipelineState>,
+    #[cfg(test)]
     na_gemm_coop_qb_grouped: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_gather: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_gate_up_swiglu: Option<ComputePipelineState>,
@@ -443,8 +515,6 @@ pub struct MetalExecutor {
     /// [`MOE_COOP_TILED_BM`] lignes × 64 colonnes.
     na_gemm_coop_qb_grouped_gate_up_swiglu_u4_tiled: Option<ComputePipelineState>,
     na_gemm_coop_qb_grouped_scatter_u4_tiled: Option<ComputePipelineState>,
-    moe_coop_gather_padded: Option<ComputePipelineState>,
-    moe_coop_scatter_padded: Option<ComputePipelineState>,
     moe_g_fill_u32: Option<ComputePipelineState>,
     moe_g_histogram: Option<ComputePipelineState>,
     moe_g_offsets: Option<ComputePipelineState>,
@@ -462,6 +532,9 @@ pub struct MetalExecutor {
     /// Bibliothèque `kernels.metal` compilée, gardée pour les pipelines créés à la
     /// demande (qmv-T du mode strict, une instance par largeur de lot).
     library: metal::Library,
+    micro_library: Mutex<Option<metal::Library>>,
+    /// Bibliothèque micro compilée en fast-math, réservée au MLP fusionné.
+    micro_fast_library: Mutex<Option<metal::Library>>,
     /// Pipelines qmv-T déjà créés, par nom de kernel.
     qmvt_pipelines: Mutex<HashMap<String, ComputePipelineState>>,
     /// Force la rétention des dérivés de poids avant de libérer leurs payloads CPU.
@@ -529,6 +602,7 @@ pub(crate) struct StackedAffineBuffers {
 
 #[derive(Clone, Debug)]
 pub(crate) enum MetalLinearWeightBuffers {
+    MicroScaled(micro::MicroWeightBuffers),
     DenseBf16 {
         rhs: Buffer,
         out_dim: usize,
@@ -558,6 +632,7 @@ pub(crate) enum MetalLinearWeightBuffers {
 
 #[derive(Clone, Debug)]
 pub(crate) enum MetalEmbeddingWeightBuffers {
+    MicroScaled(micro::MicroWeightBuffers),
     DenseBf16 {
         table: Buffer,
         vocab: usize,
@@ -616,7 +691,7 @@ pub(crate) struct MetalLinearAttnResidentDenseWeights {
     pub norm_weight: Buffer,
 }
 
-#[cfg(any(test, feature = "devtools"))]
+#[cfg(feature = "devtools")]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LinearAttentionStateDiff {
     pub conv_max_abs: f32,
@@ -643,11 +718,7 @@ impl MetalMoeSharedWeights {
     /// retomber sur le chemin générique quand c'est faux. Le shared passe déjà par
     /// le matmul générique (toute quantification), donc seuls les experts comptent.
     pub(crate) fn coop_compatible(&self) -> bool {
-        let bits = self.stacked.gate.bits;
-        let ok = |b: &StackedAffineBuffers| b.bits == bits && b.group_size == 64;
-        let quant_ok = bits == 8
-            || (bits == FAST_QMV_BITS && moe_coop_u4_enabled() && moe_coop_fused_swiglu_enabled());
-        ok(&self.stacked.gate) && ok(&self.stacked.up) && ok(&self.stacked.down) && quant_ok
+        MetalMoeRoutedWeights::stacked_coop_compatible(&self.stacked)
     }
 }
 
@@ -667,7 +738,15 @@ impl MetalMoeRoutedWeights {
     pub(crate) fn stacked_coop_compatible(stacked: &StackedMoeBuffers) -> bool {
         let bits = stacked.gate.bits;
         let ok = |b: &StackedAffineBuffers| {
-            b.bits == bits && b.group_size == 64 && b.in_dim % b.group_size == 0
+            // Les chargeurs ne masquent ni les groupes quantifiés (64), ni
+            // les fragments K (16), ni les colonnes de sortie N (32).
+            b.bits == bits
+                && b.group_size == 64
+                && b.in_dim > 0
+                && b.out_dim > 0
+                && b.in_dim % 64 == 0
+                && b.in_dim % 16 == 0
+                && b.out_dim % 32 == 0
         };
         let dims_ok = stacked.gate.experts == stacked.up.experts
             && stacked.gate.experts == stacked.down.experts
@@ -907,6 +986,8 @@ pub(crate) struct PrefillCaptures {
 pub(crate) enum PrefillInput<'a> {
     /// Flux résiduel déjà plongé `[rows, hidden]`.
     Hidden(&'a Tensor),
+    /// Embeddings fournis et positions par ligne, sans encodeur vision.
+    PositionedHidden(&'a Tensor, &'a [[usize; 3]]),
     /// Jetons plongés sur le GPU morceau par morceau : ni `[rows, hidden]` CPU
     /// ni sa copie GPU (2 × 5,4 Go à 256k sur le 27B). Réservé à un embedding
     /// dont le gather Metal est l'octet près celui du CPU.
@@ -991,6 +1072,10 @@ struct MetalBufferKey {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum MetalBufferSource {
+    Micro {
+        weight_id: u64,
+        scales: bool,
+    },
     Pointer(usize),
     Affine {
         weight_id: u64,
@@ -1037,6 +1122,7 @@ impl ScratchBufferCache {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum MetalBufferElement {
+    U8,
     F32,
     U32,
     Bf16,
@@ -1044,3 +1130,6 @@ enum MetalBufferElement {
 
 #[cfg(test)]
 pub(crate) mod weight_file_tests;
+
+#[cfg(test)]
+pub(crate) use linear_attention_encode::{linear_nax_hv32_calls, with_linear_nax_disabled};

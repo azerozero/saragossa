@@ -13,7 +13,7 @@ use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,11 +37,18 @@ use super::state::ServeState;
 pub(super) struct Front {
     pub(super) api_key: Option<String>,
     pub(super) model_ids: Vec<String>,
+    #[cfg(feature = "denoise")]
+    pub(super) enhance: super::enhance::EnhanceService,
 }
 
 impl Front {
     pub(super) fn new(api_key: Option<String>, model_ids: Vec<String>) -> Self {
-        Self { api_key, model_ids }
+        Self {
+            api_key,
+            model_ids,
+            #[cfg(feature = "denoise")]
+            enhance: super::enhance::EnhanceService::new(None),
+        }
     }
 }
 
@@ -108,7 +115,8 @@ impl<S: ServeStream> Dispatcher<S> {
 
     /// Ne bloque jamais l'accept : au-delà du plafond, 503 immédiat.
     fn dispatch(&self, mut stream: S) {
-        if let Err(error) = stream.configure(self.limits.read_timeout) {
+        if let Err(error) = stream.configure(super::reload::read_timeout(self.limits.read_timeout))
+        {
             eprintln!("saragossa serve request error: {error}");
             return;
         }
@@ -156,6 +164,11 @@ where
     S: ServeStream,
     A: FnOnce(Dispatcher<S>) -> ServeResult<()> + Send + 'static,
 {
+    #[cfg(feature = "denoise")]
+    let front = Front {
+        enhance: super::enhance::EnhanceService::new(state.audio_mut().enhance_path()),
+        ..front
+    };
     let queue_depth = serve_queue_depth();
     let (jobs, queue) = sync_channel(queue_depth);
     let dispatcher = Dispatcher {
@@ -171,6 +184,11 @@ where
             read_timeout,
         }),
     };
+    #[cfg(any(feature = "h2", feature = "webtransport"))]
+    let _transports = super::enhance::async_io::start(
+        Arc::clone(&dispatcher.front),
+        Arc::clone(&dispatcher.connections),
+    )?;
     // NOTE: thread détaché plutôt que scope : une panique moteur doit tuer le
     // process comme avant, pas attendre un accept qui ne finit jamais.
     let acceptor = thread::Builder::new()
@@ -184,6 +202,14 @@ where
     } else {
         1
     };
+    #[cfg(unix)]
+    if super::relay::await_predecessor() {
+        if let Err(error) = state.preload() {
+            // NOTE: le parent est parti ; refuser de servir couperait le
+            // service, les requêtes rechargent alors à la demande.
+            eprintln!("saragossa serve relais: préchargement différé échoué: {error}");
+        }
+    }
     run_engine(&queue, state, max_streams);
     acceptor
         .join()
@@ -226,17 +252,20 @@ fn run_engine<S: ServeStream>(
     max_streams: usize,
 ) {
     // Plafond `max_tokens` pour la validation d'admission, `None` sans lots.
-    let batching = (max_streams > 1).then(|| state.max_tokens_cap());
+    // NOTE: relu à chaque admission : un rechargement SIGHUP du plafond joue
+    // aussi sur l'éligibilité ; un job déjà en file est validé au plafond courant.
+    let batching = |state: &ServeState| (max_streams > 1).then(|| state.max_tokens_cap());
     // NOTE: les jobs de `pending` gardent leur place d'attente : canal et
     // file locale restent ensemble sous `SARAGOSSA_SERVE_QUEUE`.
     let pending_cap = serve_queue_depth();
     let mut pending: VecDeque<Queued<S>> = VecDeque::new();
     loop {
+        apply_pending_models(state);
         let leader = match pending.pop_front() {
             Some(queued) => queued,
-            None => match queue.recv() {
-                Ok(job) => Queued::new(job, batching, state),
-                Err(_) => break,
+            None => match next_job(queue, state) {
+                Some(job) => Queued::new(job, batching(state), state),
+                None => break,
             },
         };
         let Some(model) = leader
@@ -248,7 +277,7 @@ fn run_engine<S: ServeStream>(
             continue;
         };
         drain_queue(queue, &mut pending, pending_cap, |job| {
-            Queued::new(job, batching, state)
+            Queued::new(job, batching(state), state)
         });
         let others = take_batch(
             &mut pending,
@@ -263,6 +292,25 @@ fn run_engine<S: ServeStream>(
         let mut batch = vec![leader];
         batch.extend(others);
         run_batch(batch, state);
+    }
+}
+
+/// Applique la liste de modèles d'un SIGHUP ; entre deux jobs seulement.
+fn apply_pending_models(state: &mut ServeState) {
+    if let Some(models) = super::reload::take_pending_models() {
+        state.set_models(&models);
+    }
+}
+
+/// Attend le prochain job en regardant toutes les 250 ms si un SIGHUP a changé
+/// les modèles ; `None` quand tous les émetteurs ont lâché.
+fn next_job<S>(queue: &Receiver<Job<S>>, state: &mut ServeState) -> Option<Job<S>> {
+    loop {
+        match queue.recv_timeout(Duration::from_millis(250)) {
+            Ok(job) => return Some(job),
+            Err(RecvTimeoutError::Timeout) => apply_pending_models(state),
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
     }
 }
 
@@ -317,11 +365,73 @@ fn run_batch<S: ServeStream>(batch: Vec<Queued<S>>, state: &mut ServeState) {
             (stream, request, _bytes)
         })
         .collect();
-    let mut sockets: Vec<(&mut S, &HttpRequest)> = jobs
+    let mut tracked: Vec<(Sent<'_, S>, &HttpRequest)> = jobs
         .iter_mut()
-        .map(|(stream, request, _)| (stream, &*request))
+        .map(|(stream, request, _)| (Sent::new(stream), &*request))
         .collect();
-    handle_batch(state, &mut sockets);
+    let mut wrapped: Vec<(&mut Sent<'_, S>, &HttpRequest)> = tracked
+        .iter_mut()
+        .map(|(sent, request)| (sent, *request))
+        .collect();
+    if !guarded(state, |state| handle_batch(state, &mut wrapped)) {
+        drop(wrapped);
+        for (sent, _) in &mut tracked {
+            sent.reply_500();
+        }
+    }
+}
+
+/// Socket qui note si des octets de réponse sont déjà partis : après une
+/// panique, un 500 ne peut plus s'ajouter à une réponse commencée (SSE comprise).
+struct Sent<'a, S> {
+    inner: &'a mut S,
+    started: bool,
+}
+
+impl<'a, S: Write> Sent<'a, S> {
+    fn new(inner: &'a mut S) -> Self {
+        Self {
+            inner,
+            started: false,
+        }
+    }
+
+    /// Répond 500 si rien n'est parti ; sinon laisse la connexion se fermer au
+    /// drop de la socket, le client voyant un flux interrompu.
+    fn reply_500(&mut self) {
+        if !self.started {
+            let _ = send_error(self.inner, 500, PANIC_MESSAGE);
+        }
+    }
+}
+
+impl<S: Write> Write for Sent<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.started |= !buf.is_empty();
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+const PANIC_MESSAGE: &str = "erreur interne du moteur, modèles rechargés à la prochaine requête";
+
+/// Exécute `work` sur le thread moteur en contenant une panique : `false` si
+/// elle a eu lieu. Les poids chargés sont alors abandonnés (rechargement
+/// paresseux) car l'état GPU et décodeur est incertain ; le serveur reste vivant.
+fn guarded(state: &mut ServeState, work: impl FnOnce(&mut ServeState)) -> bool {
+    // NOTE: AssertUnwindSafe est sûr ici car l'état possiblement
+    // incohérent est invalidé avant toute réutilisation.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut *state)));
+    if outcome.is_ok() {
+        return true;
+    }
+    eprintln!("saragossa serve panique du moteur contenue, modèles invalidés");
+    // Un Drop qui paniquerait à son tour ne doit pas tuer le moteur.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.invalidate_models()));
+    false
 }
 
 /// Exécute un job sur le thread moteur.
@@ -339,8 +449,14 @@ fn run_job<S: ServeStream>(job: Job<S>, state: &mut ServeState) {
         waiting,
     } = job;
     drop(waiting);
-    if let Err(error) = handle_job(&mut stream, state, &request) {
-        eprintln!("saragossa serve request error: {error}");
+    let mut sent = Sent::new(&mut stream);
+    let ok = guarded(state, |state| {
+        if let Err(error) = handle_job(&mut sent, state, &request) {
+            eprintln!("saragossa serve request error: {error}");
+        }
+    });
+    if !ok {
+        sent.reply_500();
     }
 }
 
@@ -357,7 +473,7 @@ impl<S: ServeStream> Connection<S> {
     /// Lit les headers, sert les routes statiques et le refus bearer avant de
     /// lire le corps, puis met en file sans bloquer.
     fn handle(&self, mut stream: S) -> ServeResult<()> {
-        let deadline = Instant::now() + self.limits.read_timeout;
+        let deadline = Instant::now() + super::reload::read_timeout(self.limits.read_timeout);
         let Some((mut request, content_length)) =
             read_or_reject(&mut stream, |s| read_head(s, deadline))?
         else {
@@ -365,6 +481,23 @@ impl<S: ServeStream> Connection<S> {
         };
         if let Some(result) = route_front(&mut stream, &self.front, &request) {
             return reply_on_error(&mut stream, result);
+        }
+        #[cfg(feature = "ws")]
+        if request.route() == "/v1/audio/enhance/ws" {
+            return self.front.enhance.handle_ws(&mut stream, &mut request);
+        }
+        if request.is_enhance() {
+            #[cfg(not(feature = "denoise"))]
+            return send_error(
+                &mut stream,
+                501,
+                "modalité débruitage absente : recompiler avec --features denoise",
+            );
+            #[cfg(feature = "denoise")]
+            return self
+                .front
+                .enhance
+                .handle(&mut stream, &mut request, content_length);
         }
         let Some(bytes) = Reservation::acquire(
             &self.inflight_bytes,
@@ -414,13 +547,13 @@ impl<S: ServeStream> Connection<S> {
 }
 
 /// Part réservée d'un compteur plafonné (connexions, octets), rendue au drop.
-struct Reservation {
+pub(super) struct Reservation {
     counter: Arc<AtomicUsize>,
     amount: usize,
 }
 
 impl Reservation {
-    fn acquire(counter: &Arc<AtomicUsize>, amount: usize, max: usize) -> Option<Self> {
+    pub(super) fn acquire(counter: &Arc<AtomicUsize>, amount: usize, max: usize) -> Option<Self> {
         // NOTE: boucle compare-exchange plutôt que `fetch_update`, déprécié au
         // profit de `try_update` absent de la MSRV 1.85.
         let mut count = counter.load(Ordering::Acquire);
@@ -543,6 +676,50 @@ mod tests {
         response
     }
 
+    #[test]
+    fn engine_panic_is_contained_and_engine_stays_usable() {
+        let args = ServeArgs::parse(["--model", "a=/x/a", "--backend", "cpu"].map(String::from))
+            .expect("invariant: arguments valides");
+        let mut state = ServeState::new(&args);
+        assert!(!guarded(&mut state, |_| panic!("panique injectée")));
+        assert!(guarded(&mut state, |_| {}));
+    }
+
+    #[test]
+    fn no_second_response_after_a_started_one() {
+        let mut out = Vec::new();
+        let mut sent = Sent::new(&mut out);
+        sent.reply_500();
+        assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 500"));
+        let mut out = Vec::new();
+        let mut sent = Sent::new(&mut out);
+        sent.write_all(b"HTTP/1.1 200 OK\r\n")
+            .expect("invariant: Vec");
+        sent.reply_500();
+        assert_eq!(out, b"HTTP/1.1 200 OK\r\n");
+    }
+
+    #[test]
+    #[cfg(not(feature = "denoise"))]
+    fn enhance_without_feature_rejects_before_upload_or_queueing() {
+        let (dispatcher, queue) = dispatcher_with(Some("secret"), 2, 0, 0);
+        for framing in ["Content-Length: 99999999999", "Transfer-Encoding: chunked"] {
+            for (authorization, status) in [("", 401), ("Authorization: Bearer secret\r\n", 501)] {
+                let raw = format!(
+                    "POST /v1/audio/enhance?stream=true HTTP/1.1\r\n{authorization}{framing}\r\n\r\n"
+                );
+                let reply = response(connect(&dispatcher, raw.as_bytes()));
+                assert!(reply.starts_with(&format!("HTTP/1.1 {status}")), "{reply}");
+                if status == 501 {
+                    assert!(reply.contains("--features denoise"), "{reply}");
+                }
+                settle(&dispatcher);
+                assert!(queue.try_recv().is_err());
+                assert_eq!(dispatcher.inflight_bytes.load(Ordering::Acquire), 0);
+            }
+        }
+    }
+
     /// Le lot prend les éléments du même modèle dans l'ordre, sous le
     /// plafond ; les autres restent en file locale dans leur ordre.
     #[test]
@@ -660,6 +837,7 @@ mod tests {
         ] {
             let raw = format!("POST {route} HTTP/1.1\r\nContent-Length: 16777217\r\n\r\n");
             let reply = response(connect(&dispatcher, raw.as_bytes()));
+            settle(&dispatcher);
             assert!(reply.starts_with("HTTP/1.1 400 Bad Request"));
             let body = json_body(&reply);
             assert_eq!(body["error"]["type"], "invalid_request_error");
@@ -681,6 +859,9 @@ mod tests {
 
     #[test]
     fn model_lookup_uses_registry_and_auth_without_engine() {
+        let _serial = super::super::reload::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (dispatcher, rx) = dispatcher_with(Some("test-key"), 2, usize::MAX, 1);
         for (path, authorized, status) in [
             ("/v1/models/alpha", false, 401),
@@ -698,6 +879,9 @@ mod tests {
             };
             let raw = format!("GET {path} HTTP/1.1\r\n{auth}\r\n");
             let reply = response(connect(&dispatcher, raw.as_bytes()));
+            // La socket se ferme avant que le thread rende son slot : sans
+            // attente, la requête suivante peut dépasser max_connections.
+            settle(&dispatcher);
             assert!(reply.starts_with(&format!("HTTP/1.1 {status} ")), "{reply}");
             let body = json_body(&reply);
             if status == 200 {

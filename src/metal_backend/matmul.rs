@@ -31,6 +31,7 @@ pub(crate) fn take_concat_profile() -> (u64, u64) {
 fn linear_weight_id(weight: &LinearWeight) -> LinearWeightId {
     match weight {
         LinearWeight::Dense(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
+        LinearWeight::MicroScaled(tensor) => LinearWeightId::Affine(tensor.weight_id()),
         LinearWeight::DenseShared(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
         LinearWeight::DenseBf16(tensor) => LinearWeightId::Dense(tensor.data().as_ptr().addr()),
         LinearWeight::AffineQuantized(weight) => LinearWeightId::Affine(weight.weight_id()),
@@ -44,6 +45,11 @@ fn concat_copy_bytes(weights: &[&LinearWeight]) -> Option<u64> {
     weights.iter().try_fold(0_u64, |total, weight| {
         let bytes = match weight {
             LinearWeight::Dense(weight) => weight.len().checked_mul(4)?,
+            LinearWeight::MicroScaled(weight) => weight
+                .packed()
+                .len()
+                .checked_mul(4)?
+                .checked_add(weight.scales().len())?,
             LinearWeight::DenseShared(weight) => weight.data().len().checked_mul(4)?,
             LinearWeight::DenseBf16(weight) => weight.data().len().checked_mul(2)?,
             LinearWeight::AffineQuantized(weight) => {
@@ -106,6 +112,7 @@ fn concat_weight_key(weights: &[&LinearWeight]) -> Option<ConcatWeightKey> {
 /// par défaut si disponible. `SARAGOSSA_STT_F32=1` force l'ancien chemin f32 ;
 /// `SARAGOSSA_STT_BF16=0` garde aussi un kill-switch compatible avec les anciens benches.
 /// bf16-input / accumulation f32.
+#[cfg(any(feature = "stt", feature = "diar"))]
 pub(crate) fn whisper_bf16_gemm_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
@@ -116,6 +123,17 @@ pub(crate) fn whisper_bf16_gemm_enabled() -> bool {
             crate::runtime_flags::env_var("SARAGOSSA_STT_BF16").as_deref(),
             Some("0" | "false" | "off" | "no")
         )
+    })
+}
+
+/// Projections d'attention du decode Whisper (q, k, v, o, cross q et o) sur les
+/// poids bf16 du QMV decode. Opt-in `SARAGOSSA_STT_DEC_ATTN_BF16=1` : l'arrondi
+/// bf16 des poids change les logits ; défaut OFF (f32, inchangé).
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(crate) fn whisper_decode_attn_bf16_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        whisper_decode_bf16_qmv_enabled() && crate::runtime_flags::stt_dec_attn_bf16()
     })
 }
 
@@ -327,8 +345,156 @@ impl MetalExecutor {
                 "matmul bf16 x=[{batch},{in_dim}] rhs=[{out_dim},{rhs_in_dim}]"
             )));
         }
-        self.encode_dense_qmv_rhs_bf16(encoder, lhs, rhs, out, batch, out_dim, in_dim)?;
+        // NOTE: GEMM bf16 à un produit (activation arrondie une fois en bf16)
+        // pour les modèles de décision et, par défaut, les couches du prefill
+        // résident d'un LLM Qwen dense bf16 (`DenseBf16X1Scope`) ; ailleurs
+        // (decode, vérification, tête MTP, drafter, Gemma, modèles quantifiés)
+        // hi + lo. KL du 27B BF16 dans docs/perf/prefill-bf16.md.
+        if let Some(pso) = self
+            .na_gemm_bf16_nt_bn128
+            .as_ref()
+            .filter(|_| uses_dense_bf16_gemm_x1(batch, in_dim, out_dim))
+        {
+            // NOTE: scratch bf16 M×K mis en cache par longueur : un tampon par
+            // K distinct (5120, 6144, 17408 sur le 27B), soit 2·M·K octets,
+            // 142 Mo pour le down_proj à 4096 lignes et 285 Mo à 8192.
+            let len = checked_len(batch, in_dim, "GEMM bf16 un produit A bf16")?;
+            let lhs_bf16 = self.private_bf16_buffer(len, "dense_bf16_gemm_lhs_bf16")?;
+            self.encode_f32_to_bf16(encoder, lhs, &lhs_bf16, len)?;
+            self.dispatch_dense_bf16_gemm_x1(
+                encoder, pso, &lhs_bf16, rhs, out, batch, out_dim, in_dim,
+            )?;
+            return Ok(out_dim);
+        }
+        if let Some(pso) = self
+            .na_gemm_bf16_nt_tiled_x2
+            .as_ref()
+            .filter(|_| can_use_dense_bf16_gemm(batch, in_dim, out_dim))
+        {
+            self.encode_dense_bf16_gemm(encoder, pso, lhs, rhs, out, batch, out_dim, in_dim)?;
+        } else {
+            self.encode_dense_qmv_rhs_bf16(encoder, lhs, rhs, out, batch, out_dim, in_dim)?;
+        }
         Ok(out_dim)
+    }
+
+    /// matmul2d bf16 `C[M,N] = A[M,K]·B[N,K]^T`, A déjà en bf16, N%128=0.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "dispatch Metal: pipeline, buffers et dimensions restent explicites"
+    )]
+    pub(super) fn dispatch_dense_bf16_gemm_x1(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pso: &ComputePipelineState,
+        lhs_bf16: &BufferRef,
+        rhs: &BufferRef,
+        out: &BufferRef,
+        batch: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
+        let mnk = [
+            checked_u32(batch, "bf16 gemm batch")?,
+            checked_u32(out_dim, "bf16 gemm out_dim")?,
+            checked_u32(in_dim, "bf16 gemm in_dim")?,
+            0,
+        ];
+        encoder.set_compute_pipeline_state(pso);
+        encoder.set_buffer(0, Some(lhs_bf16), 0);
+        encoder.set_buffer(1, Some(rhs), 0);
+        encoder.set_buffer(2, Some(out), 0);
+        encoder.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
+        trace_dispatch_path("gemm_nax_bf16_nt_bn128", batch, out_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(out_dim / 128, "bf16 gemm out tiles")?,
+                checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?,
+                1,
+            ),
+            MTLSize::new(pso.thread_execution_width().max(1) * 8, 1, 1),
+        );
+        // Barrière complète : le scratch A est réécrit par le GEMM suivant.
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// Projections b/a bf16 denses de la linear attention au prefill : un GEMM
+    /// hi + lo (`gemm_nax_bf16_nt_tiled_x2_maskn`) sur la concaténation
+    /// `[first; second]`, sortie `[rows, 2·heads]`. `None` hors flag ou hors
+    /// forme : l'appelant garde ses deux qmv.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si la concaténation ou une dimension échoue.
+    pub(crate) fn encode_dense_bf16_pair_gemm(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input: &BufferRef,
+        rows: usize,
+        in_dim: usize,
+        [first, second]: [&LinearWeight; 2],
+        label: &'static str,
+    ) -> Result<Option<Buffer>> {
+        let (LinearWeight::DenseBf16(_), LinearWeight::DenseBf16(_)) = (first, second) else {
+            return Ok(None);
+        };
+        let Some(pso) = self.na_gemm_bf16_nt_tiled_x2_maskn.as_ref().filter(|_| {
+            crate::runtime_flags::dense_bf16_la_ba_gemm_enabled()
+                && crate::runtime_flags::dense_bf16_gemm_enabled()
+                && rows >= dense_bf16_gemm_min_batch()
+                && in_dim % 64 == 0
+        }) else {
+            return Ok(None);
+        };
+        let MetalLinearWeightBuffers::DenseBf16 { rhs, out_dim, .. } =
+            self.resolve_concat_linear_weight_buffers(&[first, second], label)?
+        else {
+            return Err(InferError::Dimension(format!(
+                "{label}: concat bf16 attendue"
+            )));
+        };
+        let out = self.private_f32_buffer(checked_len(rows, out_dim, label)?, label)?;
+        self.encode_dense_bf16_gemm(encoder, pso, input, &rhs, &out, rows, out_dim, in_dim)?;
+        Ok(Some(out))
+    }
+
+    /// GEMM NA tuilé `C[M,N] = A[M,K]·B[N,K]^T`, A f32 scindé hi + lo, B bf16.
+    fn encode_dense_bf16_gemm(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pso: &ComputePipelineState,
+        lhs: &BufferRef,
+        rhs_bf16: &BufferRef,
+        out: &BufferRef,
+        batch: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
+        let mnk = [
+            checked_u32(batch, "bf16 gemm batch")?,
+            checked_u32(out_dim, "bf16 gemm out_dim")?,
+            checked_u32(in_dim, "bf16 gemm in_dim")?,
+            0,
+        ];
+        encoder.set_compute_pipeline_state(pso);
+        encoder.set_buffer(0, Some(lhs), 0);
+        encoder.set_buffer(1, Some(rhs_bf16), 0);
+        encoder.set_buffer(2, Some(out), 0);
+        encoder.set_bytes(3, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
+        trace_dispatch_path("gemm_nax_bf16_nt_tiled_x2", batch, out_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(batch.div_ceil(64), "bf16 gemm batch tiles")?,
+                checked_nsuint(out_dim.div_ceil(64), "bf16 gemm out tiles")?,
+                1,
+            ),
+            MTLSize::new(128, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, out);
+        Ok(())
     }
 
     /// QMV dense batch>=1 avec poids bf16 row-major `[out_dim,in_dim]`.
@@ -346,26 +512,91 @@ impl MetalExecutor {
         out_dim: usize,
         in_dim: usize,
     ) -> Result<()> {
+        self.encode_dense_qmv_rhs_bf16_at(encoder, lhs, rhs_bf16, out, 0, batch, out_dim, in_dim)
+    }
+
+    /// [`Self::encode_dense_qmv_rhs_bf16`] avec un décalage d'écriture (append KV).
+    #[expect(clippy::too_many_arguments, reason = "qmv bas niveau (dims + buffers)")]
+    pub(crate) fn encode_dense_qmv_rhs_bf16_at(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs: &BufferRef,
+        rhs_bf16: &BufferRef,
+        out: &BufferRef,
+        out_offset_bytes: u64,
+        batch: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
         let dims = [
             checked_u32(batch, "bf16 qmv batch")?,
             checked_u32(out_dim, "bf16 qmv out_dim")?,
             checked_u32(in_dim, "bf16 qmv in_dim")?,
         ];
-        encoder.set_compute_pipeline_state(&self.dense_qmv_rhs_bf16_f32);
+        // Le noyau à blocs de 256 garde l'ordre d'accumulation du qmv par ligne.
+        let stage = in_dim % 256 == 0 && crate::runtime_flags::dense_bf16_qmv_stage_enabled();
+        // Plusieurs lignes (vérification MTP/DFlash) : le bloc de poids est lu une
+        // fois pour R ≤ 16 lignes au lieu d'une, même arithmétique par ligne.
+        let rows = (stage && batch > 1 && crate::runtime_flags::dense_bf16_qmv_rows_enabled())
+            .then(|| batch.min(16));
+        // Lignes de poids par simdgroup : 1 jusqu'à 8 lignes d'activation, 4 au-delà
+        // pour réutiliser chaque activation chargée. Sonde
+        // `dense_bf16_qmv_rows_variants_probe` (27B, ms, NR = 1 contre NR = 4) :
+        // gate 17408×5120 R = 5 0,36/0,53, R = 6 0,36/0,58, R = 8 0,47/0,76,
+        // R = 9 0,93/0,70 ; down 5120×17408 R = 6 0,49/0,67 ; lm_head R = 6
+        // 4,7/7,5, R = 9 12,1/6,6. M = 1 : gate 0,35, down 0,38, lm_head 4,4.
+        let per_simdgroup = if batch <= 8 { 1 } else { 4 };
+        let rows_pipeline = rows
+            .map(|r| {
+                self.qmvt_pipeline(&format!(
+                    "dense_qmv_rhs_bf16_rows_f32_r{r}_n{per_simdgroup}"
+                ))
+            })
+            .transpose()?;
+        let (pipeline, name, rows_per_group, batch_groups) = match (&rows_pipeline, rows) {
+            (Some(pipeline), Some(r)) => (
+                pipeline,
+                "dense_qmv_rhs_bf16_rows_f32",
+                4 * per_simdgroup,
+                batch.div_ceil(r),
+            ),
+            _ if stage => (
+                &self.dense_qmv_rhs_bf16_stage_f32,
+                "dense_qmv_rhs_bf16_stage_f32",
+                4,
+                batch,
+            ),
+            _ => (
+                &self.dense_qmv_rhs_bf16_f32,
+                "dense_qmv_rhs_bf16_f32",
+                1,
+                batch,
+            ),
+        };
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(lhs), 0);
         encoder.set_buffer(1, Some(rhs_bf16), 0);
-        encoder.set_buffer(2, Some(out), 0);
+        encoder.set_buffer(2, Some(out), out_offset_bytes);
         encoder.set_bytes(
             3,
             std::mem::size_of::<[u32; 3]>() as u64,
             dims.as_ptr().cast::<std::ffi::c_void>(),
         );
-        let threads_per_group = self.qmv_thread_group_size(&self.dense_qmv_rhs_bf16_f32);
+        // Noyau à blocs : un simdgroup par ligne de poids, 4 par threadgroup ;
+        // noyau en lignes : 4 simdgroups de 4 lignes de poids chacun.
+        let threads_per_group = if rows.is_some() {
+            128
+        } else if stage {
+            32 * rows_per_group as NSUInteger
+        } else {
+            self.qmv_thread_group_size(pipeline)
+        };
+        trace_dispatch_path(name, batch, out_dim, in_dim);
         profile_dispatch();
         encoder.dispatch_thread_groups(
             MTLSize::new(
-                checked_nsuint(out_dim, "bf16 qmv out_dim")?,
-                checked_nsuint(batch, "bf16 qmv batch")?,
+                checked_nsuint(out_dim.div_ceil(rows_per_group), "bf16 qmv out_dim")?,
+                checked_nsuint(batch_groups, "bf16 qmv batch")?,
                 1,
             ),
             MTLSize::new(threads_per_group, 1, 1),
@@ -657,6 +888,23 @@ impl MetalExecutor {
                 *packed_cols,
                 groups,
             )?;
+        } else if aligned_weights && can_use_fast_affine_qmv_u5(batch, in_dim, weight) {
+            self.encode_affine_qmv_u5_buffers(
+                encoder,
+                &lhs_buffer,
+                &packed_buffer,
+                packed_offset,
+                &scales_buffer,
+                scales_offset,
+                &biases_buffer,
+                biases_offset,
+                &output_buffer,
+                batch,
+                in_dim,
+                *out_dim,
+                *packed_cols,
+                groups,
+            )?;
         } else if aligned_weights && can_use_fast_affine_qmv_u6(batch, in_dim, weight) {
             let encode = if matches!(
                 select_u6_matmul_kernel(batch, qmm_u6_enabled()),
@@ -845,6 +1093,9 @@ impl MetalExecutor {
         label: &'static str,
     ) -> Result<MetalLinearWeightBuffers> {
         match weight {
+            LinearWeight::MicroScaled(weight) => Ok(MetalLinearWeightBuffers::MicroScaled(
+                self.resolve_micro(weight)?,
+            )),
             LinearWeight::DenseShared(weight) => Ok(MetalLinearWeightBuffers::Dense {
                 rhs: weight.buffer().clone(),
                 rhs_bf16: None,
@@ -1191,6 +1442,37 @@ impl MetalExecutor {
             )));
         };
         match first {
+            LinearWeight::MicroScaled(first_weight) => {
+                let mode = first_weight.mode();
+                let in_dim = first_weight.shape()[1];
+                let mut rows = 0usize;
+                let mut packed = Vec::new();
+                let mut scales = Vec::new();
+                for weight in weights {
+                    let LinearWeight::MicroScaled(weight) = weight else {
+                        return Err(InferError::Dimension(
+                            "concat micro avec stockage différent".into(),
+                        ));
+                    };
+                    if weight.mode() != mode || weight.shape()[1] != in_dim {
+                        return Err(InferError::Dimension("concat micro incompatible".into()));
+                    }
+                    rows = rows
+                        .checked_add(weight.shape()[0])
+                        .ok_or_else(|| InferError::Shape("concat micro trop grande".into()))?;
+                    packed.extend_from_slice(weight.packed());
+                    scales.extend_from_slice(weight.scales());
+                }
+                Ok(MetalLinearWeightBuffers::MicroScaled(
+                    micro::MicroWeightBuffers {
+                        packed: self.buffer_from_u32(&packed, label)?,
+                        scales: self.buffer_from_slice(&scales, label)?,
+                        out_dim: rows,
+                        in_dim,
+                        mode,
+                    },
+                ))
+            }
             LinearWeight::DenseBf16(first_weight) => {
                 // Certains sites exigent encore une concat : la copie reste bf16
                 // et le vecteur temporaire disparaît après l'upload partagé.
@@ -1355,6 +1637,42 @@ impl MetalExecutor {
             }
         }
     }
+}
+
+/// Plancher de lignes du GEMM NA bf16. En dessous (decode, vérification
+/// spéculative), le qmv garde son résultat par ligne indépendant du batch, ce
+/// qui préserve l'identité vérification/AR ; au-dessus (prefill), relire le
+/// poids par ligne bornait le débit à ~20 tok/s sur un 27B BF16.
+/// `SARAGOSSA_RUST_DENSE_BF16_GEMM_MIN_BATCH` (diagnostic seulement, de 1 à
+/// 64) abaisse le plancher pour mesurer le GEMM sur peu de lignes ; hors de
+/// cette plage, le plancher reste 64. L'alignement automatique des reprises
+/// (`runtime_flags::prefix_align_for_model`) suppose le plancher de 64.
+pub(crate) const DENSE_BF16_GEMM_MIN_BATCH: usize = 64;
+
+fn dense_bf16_gemm_min_batch() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        crate::runtime_flags::env_var("SARAGOSSA_RUST_DENSE_BF16_GEMM_MIN_BATCH")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|min| (1..=DENSE_BF16_GEMM_MIN_BATCH).contains(min))
+            .unwrap_or(DENSE_BF16_GEMM_MIN_BATCH)
+    })
+}
+
+/// Prédicat du GEMM bf16 à un produit (`gemm_nax_bf16_nt_bn128`), hors
+/// disponibilité du pipeline ; partagé avec le MLP bf16 fusionné.
+pub(super) fn uses_dense_bf16_gemm_x1(batch: usize, in_dim: usize, out_dim: usize) -> bool {
+    (crate::runtime_flags::decision_gemm_bf16_enabled()
+        || crate::runtime_flags::dense_bf16_gemm_x1_enabled())
+        && out_dim % 128 == 0
+        && can_use_dense_bf16_gemm(batch, in_dim, out_dim)
+}
+
+fn can_use_dense_bf16_gemm(batch: usize, in_dim: usize, out_dim: usize) -> bool {
+    batch >= dense_bf16_gemm_min_batch()
+        && in_dim % 64 == 0
+        && out_dim % 64 == 0
+        && crate::runtime_flags::dense_bf16_gemm_enabled()
 }
 
 #[cfg(test)]

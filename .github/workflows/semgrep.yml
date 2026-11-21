@@ -28,9 +28,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
-      image: semgrep/semgrep:1.144.0
+      image: semgrep/semgrep:1.184.0
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Scan Rust sources
         run: semgrep scan --config auto --sarif --output semgrep-results.sarif src/
         env:
@@ -40,7 +40,7 @@ jobs:
             p/owasp-top-ten
       - name: Upload SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: semgrep-results.sarif
           category: semgrep

@@ -1,0 +1,35 @@
+name: Auto-merge release PRs
+
+# Publication continue, comme grob : toute PR release-plz fusionne dès que la CI est verte.
+on:
+  pull_request:
+    types: [opened, labeled, unlabeled, synchronize, ready_for_review]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  auto-merge:
+    if: >-
+      startsWith(github.head_ref, 'release-plz-')
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Enable auto-merge
+        if: >-
+          contains(github.event.pull_request.labels.*.name, 'release')
+          && github.event.pull_request.draft == false
+        run: gh pr merge --auto --merge --match-head-commit "$HEAD_SHA" "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Disable auto-merge when the release label is removed
+        if: >-
+          github.event.action == 'unlabeled'
+          && github.event.label.name == 'release'
+        run: gh pr merge --disable-auto "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

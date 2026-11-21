@@ -11,7 +11,7 @@ use proptest::prelude::*;
 /// formulation indépendante du chemin prod (`gated_delta`) : l'état décayé
 /// `g_t·S_{t−1}` est matérialisé avant lecture, puis `S_t = g_t·S_{t−1} + Δ·k_tᵀ`
 /// et `y_t = S_t·q_t` sont recalculés terme à terme. Sert de référence directe
-/// aux chemins chunkés (kernel Metal `chunk_delta_seq_layout`) et au chemin CPU.
+/// au scan Metal et au chemin CPU, y compris les anciennes frontières de chunks.
 ///
 /// Layouts plats : `q`/`k` `[seq, H_k·d_k]`, `v` `[seq, H_v·d_v]`, `g`/`beta`
 /// `[seq, H_v]` ; `state` `[H_v·d_v·d_k]` (identique à `cache.ssm`), mis à jour

@@ -1,0 +1,9 @@
+# Propriétaire par défaut, puis chemins du backend Metal.
+* @azerozero
+
+/src/metal_backend/ @azerozero
+/src/decode_resident/ @azerozero
+/src/decode_resident.rs @azerozero
+/src/kernels.metal @azerozero
+/assets/*.metal @azerozero
+/build.rs @azerozero

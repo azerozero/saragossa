@@ -92,6 +92,39 @@ impl Source {
     }
 }
 
+impl Source {
+    /// Identité d'octets déjà lus en mémoire : `before` est la métadonnée prise
+    /// avant la lecture. Le fichier doit être inchangé après la lecture, et
+    /// l'empreinte porte sur `bytes` eux-mêmes, jamais sur une relecture.
+    pub(super) fn from_read(path: &Path, before: &Metadata, bytes: &[u8]) -> Result<Self> {
+        let stamp = Stamp::read(path, before)?;
+        if stamp.bytes != bytes.len() as u64 {
+            return Err(invalid("source lue de taille différente de sa métadonnée"));
+        }
+        stamp.verify(path, &io(path, fs::metadata(path))?)?;
+        let hashes = bytes
+            .chunks(BLOCK_BYTES)
+            .map(|block| Sha256::digest(block).into());
+        Ok(Self {
+            path: path.to_owned(),
+            content_sha256: digest_blocks(stamp.bytes, hashes),
+            stamp,
+        })
+    }
+}
+
+/// Empreinte finale : format, taille, découpage, puis SHA-256 des blocs dans l'ordre.
+fn digest_blocks(bytes: u64, blocks: impl IntoIterator<Item = [u8; 32]>) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"saragossa-state-source-blocks-v1\0");
+    hash.update(bytes.to_le_bytes());
+    hash.update((BLOCK_BYTES as u64).to_le_bytes());
+    for block in blocks {
+        hash.update(block);
+    }
+    crate::hex(hash.finalize())
+}
+
 /// Un buffer de 4 Mio par thread (au plus huit), plus 32 octets par bloc.
 /// Le nombre de threads et leur ordonnancement ne changent jamais l'empreinte.
 fn hash_blocks(path: &Path, stamp: &Stamp, workers: usize) -> Result<String> {
@@ -148,14 +181,7 @@ fn hash_blocks(path: &Path, stamp: &Stamp, workers: usize) -> Result<String> {
         result
     })?;
     stamp.verify(path, &io(path, fs::metadata(path))?)?;
-    let mut hash = Sha256::new();
-    hash.update(b"saragossa-state-source-blocks-v1\0");
-    hash.update(stamp.bytes.to_le_bytes());
-    hash.update((BLOCK_BYTES as u64).to_le_bytes());
-    for block in hashes {
-        hash.update(block);
-    }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(digest_blocks(stamp.bytes, hashes))
 }
 
 #[cfg(test)]
@@ -181,13 +207,38 @@ mod tests {
             expected.update(Sha256::digest(vec![byte; BLOCK_BYTES]));
         }
         expected.update(Sha256::digest(b"partial block"));
-        let expected = format!("{:x}", expected.finalize());
+        let expected = crate::hex(expected.finalize());
         for workers in [1, 2, 3, 8] {
             assert_eq!(hash_blocks(&path, &stamp, workers)?, expected);
         }
         file.seek(SeekFrom::Start(BLOCK_BYTES as u64)).unwrap();
         file.write_all(&[9]).unwrap();
         assert_ne!(Source::read(&path)?.content_sha256, expected);
+        Ok(())
+    }
+
+    /// Régression LoRA : l'identité d'une source lue en mémoire vient de ces
+    /// octets. Un fichier réécrit ensuite ne lui prête pas son empreinte, et
+    /// la vérification de fin de chargement refuse l'instantané.
+    #[test]
+    fn read_source_hashes_consumed_bytes_not_a_reread() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adapter_model.safetensors");
+        fs::write(&path, vec![7_u8; BLOCK_BYTES + 3]).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let read = Source::from_read(&path, &before, &bytes)?;
+        assert_eq!(read.content_sha256, Source::read(&path)?.content_sha256);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&path, vec![8_u8; BLOCK_BYTES + 3]).unwrap();
+        assert_ne!(read.content_sha256, Source::read(&path)?.content_sha256);
+        assert!(read.verify().is_err(), "fichier réécrit après lecture");
+        // Métadonnée prise avant une réécriture : la lecture est refusée.
+        let stale = fs::metadata(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&path, vec![9_u8; BLOCK_BYTES + 3]).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert!(Source::from_read(&path, &stale, &bytes).is_err());
         Ok(())
     }
 

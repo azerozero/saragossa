@@ -288,7 +288,7 @@ fn resident_capture_range(
     (kept, copy)
 }
 
-fn f32_byte_offset(len: usize) -> Result<u64> {
+pub(super) fn f32_byte_offset(len: usize) -> Result<u64> {
     len.checked_mul(std::mem::size_of::<f32>())
         .and_then(|bytes| u64::try_from(bytes).ok())
         .ok_or_else(|| InferError::Shape(format!("offset f32 {len} déborde")))
@@ -430,7 +430,9 @@ impl MetalExecutor {
         }
         let start = prefix.map_or(0, |prefix| prefix.rows);
         let (rows, hidden_dim) = match input {
-            PrefillInput::Hidden(hidden) => hidden.as_matrix()?,
+            PrefillInput::Hidden(hidden) | PrefillInput::PositionedHidden(hidden, _) => {
+                hidden.as_matrix()?
+            }
             PrefillInput::Tokens { ids, embedding, .. } => {
                 (ids.len(), embedding.shape().get(1).copied().unwrap_or(0))
             }
@@ -459,6 +461,28 @@ impl MetalExecutor {
         let chunk_tokens = layout_override.map_or(chunk_tokens, |(chunk, _)| chunk);
         let chunk_rows = self.resident_prefill_chunk_rows(layers, rows, chunk_tokens);
         let chunk_count = rows.div_ceil(chunk_rows);
+        if crate::runtime_flags::decision_noncausal()
+            && (chunk_count != 1 || start != 0 || last_row_only || mtp_seed.is_some())
+        {
+            return Err(InferError::Config(
+                "décision non causale : prefill entier sans cache requis".into(),
+            ));
+        }
+        // Séquences de décision empaquetées : un seul morceau, sans préfixe ni
+        // capture, chaque séquence avec son propre état (cf. `segments`).
+        let segments = super::segments::decision_segments();
+        if !segments.is_empty()
+            && (!crate::runtime_flags::decision_noncausal()
+                || segments.contains(&0)
+                || segments.iter().sum::<usize>() != rows
+                || chunk_count != 1
+                || prefix.is_some()
+                || !capture_layer_ids.is_empty())
+        {
+            return Err(InferError::Config(
+                "décision empaquetée : séquences non vides couvrant un prefill entier".into(),
+            ));
+        }
         // Sans sortie partagée dans l'ancien chemin, la norme finale était
         // CPU. Garder ce repli évite de changer ses bits sur un prefill monobloc.
         if mtp_seed.is_some() && chunk_count == 1 && !private_scratch_enabled() {
@@ -478,10 +502,32 @@ impl MetalExecutor {
         let hidden_len = checked_len(rows, hidden_dim, "prefill résident hidden")?;
         let chunk_hidden_capacity =
             checked_len(chunk_rows, hidden_dim, "prefill résident hidden morceau")?;
+        let rope_positions = match input {
+            PrefillInput::PositionedHidden(_, positions) => {
+                if positions.len() != spec.seq
+                    || start != 0
+                    || mtp_seed.is_some()
+                    || crate::runtime_flags::decision_noncausal()
+                {
+                    return Err(InferError::Config(
+                        "positions M-RoPE incompatibles avec ce prefill".into(),
+                    ));
+                }
+                let ids = positions
+                    .iter()
+                    .flatten()
+                    .map(|&p| checked_u32(p, "M-RoPE position"))
+                    .collect::<Result<Vec<_>>>()?;
+                Some(self.upload_u32_buffer(&ids, "mrope_positions")?)
+            }
+            _ => None,
+        };
         let source = match input {
-            PrefillInput::Hidden(hidden) => ResidentPrefillSource::Hidden(
-                self.upload_f32_buffer(hidden.data(), "resident_input")?,
-            ),
+            PrefillInput::Hidden(hidden) | PrefillInput::PositionedHidden(hidden, _) => {
+                ResidentPrefillSource::Hidden(
+                    self.upload_f32_buffer(hidden.data(), "resident_input")?,
+                )
+            }
             PrefillInput::Tokens {
                 ids,
                 embedding,
@@ -552,15 +598,23 @@ impl MetalExecutor {
                 PrefillAttentionLayer::Full { sinks: Some(_), .. }
             )
         });
-        // Le miroir ne sert qu'au NAX d256 sans sinks : les couches à sinks
+        // Le miroir ne sert qu'au NAX d128/d256 sans sinks : les couches à sinks
         // (flint) lisent leur K/V dans son format de stockage, le NAX d128
         // avec sinks seulement sur un stockage bf16.
         let bf16_mirror = self.prefill_kv_bf16_mirror
+            && rope_positions.is_none()
             && chunked
             && !has_sinks
-            && self.causal_attention_prefill_steel_nax_d256.is_some();
+            && layers.iter().all(|layer| match layer.attention {
+                PrefillAttentionLayer::Full { .. } => self
+                    .causal_attention_prefill_nax(
+                        layer.attention_spec.with_effective_window(spec.seq),
+                    )
+                    .is_some(),
+                PrefillAttentionLayer::Linear { .. } => true,
+            });
         // Le stockage bf16 vaut pour toutes les couches : il faut un lecteur
-        // bf16 à chacune, le NAX d256 sans sinks ; avec sinks, le flag flint (actif par défaut)
+        // bf16 à chacune, le NAX d128/d256 sans sinks ; avec sinks, le flag flint (actif par défaut)
         // puis le Steel d128 bf16 pour une couche pleine, le naïf bf16
         // (toujours compilé) suffisant à une fenêtrée. L'arène d'un prompt de
         // cette longueur sera bf16 : sans sinks, le NAX lisait déjà ces
@@ -574,17 +628,23 @@ impl MetalExecutor {
                         || self.attention_prefill_steel_sink_d128_kv_bf16.is_some()
                         || self.attention_prefill_nax_sink_d128.is_some())
             }
-            PrefillAttentionLayer::Full { .. } => {
-                self.causal_attention_prefill_steel_nax_d256.is_some()
-            }
+            PrefillAttentionLayer::Full { .. } => self
+                .causal_attention_prefill_nax(layer.attention_spec.with_effective_window(spec.seq))
+                .is_some(),
             PrefillAttentionLayer::Linear { .. } => true,
         });
         let bf16_min_rows = self.prefill_kv_bf16_store_min_rows;
         #[cfg(test)]
         let bf16_min_rows = layout_override.map_or(bf16_min_rows, |(_, min_rows)| Some(min_rows));
         let bf16_store = chunked
+            && rope_positions.is_none()
             && kv_bf16_readable
             && bf16_min_rows.is_some_and(|min_rows| spec.seq >= min_rows);
+        if trace_prefill_enabled() {
+            eprintln!(
+                "prefill layout rows={rows} chunk_rows={chunk_rows} chunks={chunk_count} kv_bf16_store={bf16_store}"
+            );
+        }
         // Réserve d'un K/V écrit dans un buffer neuf (prefill à froid, préfixe
         // recopié) : la demande de l'appelant pour un K/V bf16, adoptable par
         // l'arène, plus un huitième du prompt dans la limite du contexte.
@@ -835,6 +895,20 @@ impl MetalExecutor {
             }
             layer_cache_buffers.push(cache);
         }
+        // États neufs des séquences empaquetées suivant la première, qui
+        // garde `layer_cache_buffers` (rendu à l'appelant, inutilisé).
+        let mut segment_caches = Vec::with_capacity(segments.len().saturating_sub(1));
+        for &len in segments.iter().skip(1) {
+            let mut caches = Vec::with_capacity(layers.len());
+            for (layer_index, layer) in layers.iter().enumerate() {
+                let (_, kv_dim, shape) =
+                    self.resident_prefill_layer_shape(layer, layer_index, spec, hidden_dim)?;
+                caches.push(self.allocate_prefill_resident_layer_cache(
+                    &shape, len, kv_dim, false, false, None,
+                )?);
+            }
+            segment_caches.push(caches);
+        }
         let mut owned_buffers = Vec::new();
         // Queue publiée de chaque couche bornée : buffers K/V et première
         // ligne absolue.
@@ -985,6 +1059,11 @@ impl MetalExecutor {
                     )?;
                     current_buffer = chunk_input.clone();
                 }
+                // Portée par défaut du GEMM bf16 à un produit : couches d'un LLM
+                // Qwen dense entièrement bf16, hors tête MTP (encodée après).
+                let x1_scope = crate::runtime_flags::DenseBf16X1Scope::enter(
+                    all_dense_bf16_qwen_tails(layers),
+                );
                 for (layer_index, layer) in layers.iter().enumerate() {
                     let layer_spec = PrefillAttentionSpec {
                         seq: chunk.rows,
@@ -1035,19 +1114,38 @@ impl MetalExecutor {
                         layer_spec,
                         hidden_dim,
                     )?;
-                    let attention_output_buffer = self.encode_resident_attention_phase(
-                        &mut encode_context,
-                        layer.attention,
-                        attention_scratch,
-                        &normed_buffer,
-                        &layer_cache_buffers[layer_index],
-                        chunk,
-                        layer_spec,
-                        hidden_dim,
-                        q_dim,
-                        layer_index,
-                        kv_only,
-                    )?;
+                    let attention_output_buffer = if segments.is_empty() {
+                        self.encode_resident_attention_phase(
+                            &mut encode_context,
+                            layer.attention,
+                            attention_scratch,
+                            &normed_buffer,
+                            &layer_cache_buffers[layer_index],
+                            chunk,
+                            layer_spec,
+                            hidden_dim,
+                            q_dim,
+                            layer_index,
+                            kv_only,
+                            rope_positions.as_deref(),
+                        )?
+                    } else {
+                        let caches: Vec<_> = std::iter::once(&layer_cache_buffers[layer_index])
+                            .chain(segment_caches.iter().map(|caches| &caches[layer_index]))
+                            .collect();
+                        self.encode_decision_segment_attention(
+                            &mut encode_context,
+                            layer.attention,
+                            &attention_scratch,
+                            &normed_buffer,
+                            &caches,
+                            &segments,
+                            layer_spec,
+                            hidden_dim,
+                            q_dim,
+                            layer_index,
+                        )?
+                    };
                     if kv_only {
                         continue;
                     }
@@ -1112,6 +1210,7 @@ impl MetalExecutor {
                         }
                     }
                 }
+                drop(x1_scope);
                 if let Some(seed) = mtp_seed.as_deref_mut() {
                     self.run_resident_prefill_section(
                         &mut encode_context,
@@ -1463,7 +1562,27 @@ impl MetalExecutor {
         {
             return rows;
         }
-        rows.div_ceil(rows.div_ceil(target))
+        let balanced = rows.div_ceil(rows.div_ceil(target));
+        // Un découpage imposé par un test garde ses morceaux tels quels.
+        #[cfg(test)]
+        if PREFILL_KV_LAYOUT_OVERRIDE.with(Cell::get).is_some() {
+            return balanced;
+        }
+        // Des morceaux plus petits que l'alignement (tests de découpage) restent
+        // équilibrés : la production en vise au moins 512.
+        let Some((align, tail)) =
+            crate::runtime_flags::prefix_align().filter(|&(align, _)| target >= align)
+        else {
+            return balanced;
+        };
+        // Morceaux multiples de l'alignement et dernier morceau d'au moins
+        // `tail` lignes : un préfixe aligné repris du cache retrouve les
+        // frontières et les noyaux du prefill à froid.
+        let mut chunk = balanced.next_multiple_of(align);
+        while chunk < rows && rows % chunk != 0 && rows % chunk < tail {
+            chunk += align;
+        }
+        chunk.min(rows)
     }
 
     fn resident_prefill_layer_shape<'a>(
@@ -2201,6 +2320,21 @@ fn shared_kv_rows(
             )
         })
     }
+}
+
+/// Vrai si chaque couche porte la queue dense Qwen à poids bf16 : un modèle
+/// quantifié (tenseurs bf16 résiduels), Gemma ou MoE garde le GEMM hi + lo.
+fn all_dense_bf16_qwen_tails(layers: &[PrefillMoeLayer<'_>]) -> bool {
+    !layers.is_empty()
+        && layers.iter().all(|layer| {
+            matches!(
+                layer.tail,
+                PrefillMoeTail::Dense { gate_proj, up_proj, down_proj }
+                    if [gate_proj, up_proj, down_proj]
+                        .iter()
+                        .all(|linear| matches!(linear.weight(), crate::LinearWeight::DenseBf16(_)))
+            )
+        })
 }
 
 #[cfg(test)]

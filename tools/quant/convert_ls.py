@@ -3,7 +3,8 @@
   VENV_PY -I -B convert_ls.py --src BF16 --template U4 --dst NOUVEAU_DOSSIER
 
 Recalcule les tenseurs quantifiés language_model du modèle de base ; recopie
-les autres tenseurs et fichiers du checkpoint MLX u4 fourni comme template.
+les autres tenseurs et fichiers du checkpoint MLX u4 fourni comme template, sauf
+tokenizer.json, recopié à l'identique depuis BF16.
 La largeur (3, 4, 5, 6 ou 8 bits) de chaque tenseur suit le template ; les experts
 fusionnés gate_up_proj (Gemma 4) sont découpés comme mlx-lm.
 L'échelle peut être négative. Le meilleur groupe entre min-max et ajustement
@@ -25,6 +26,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import opt_quant  # noqa: E402
 import tensor_stream  # noqa: E402
 from imatrix import importance_for  # noqa: E402
+from tokenizer_sidecar import copy_tokenizer  # noqa: E402
 
 
 def bf16_key(base):
@@ -63,6 +65,8 @@ def validate(src, template, dst):
         raise ValueError("src et template doivent contenir des shards model*.safetensors")
     if not (template / "config.json").is_file():
         raise ValueError("template : config.json absent")
+    if not (src / "tokenizer.json").is_file():
+        raise ValueError("src : tokenizer.json absent")
     return sources, shards
 
 
@@ -181,9 +185,12 @@ def convert(src, template, dst, imatrix=None, imatrix_blend=False,
         outputs[path].rename(dst / path.name)
         print("écrit", path.name, flush=True)
     for path in template.iterdir():
-        if path.is_file() and path not in shards and path.name != "README.md":
+        if path.is_file() and path not in shards and path.name not in ("README.md", "tokenizer.json"):
             tensor_stream.check_space(dst, min_free_gib + path.stat().st_size / 2**30)
             shutil.copy2(path, dst / path.name)
+    # Le tokenizer vient de la source BF16 : celui d'un template mlx-lm peut
+    # avoir été réécrit par transformers avec la regex Qwen2.
+    copy_tokenizer(src, dst)
     tensor_stream.check_space(dst, min_free_gib + 4096 / 2**30)
     (dst / "README.md").write_text(
         "Checkpoint MLX affine gs64 : échelles et biais ajustés aux moindres carrés "
@@ -206,8 +213,8 @@ def _self_check():
         for name in ("src", "template", "existing"):
             (root / name).mkdir()
         src, template, dst = (root / name for name in ("src", "template", "new"))
-        for path in (src / "model-1.safetensors", template / "model-1.safetensors",
-                     template / "config.json"):
+        for path in (src / "model-1.safetensors", src / "tokenizer.json",
+                     template / "model-1.safetensors", template / "config.json"):
             path.write_bytes(b"")
         (template / "config.json").write_text(json.dumps({"quantization": {"bits": 4, "group_size": 64}}))
         assert validate(src, template, dst) == ([src / "model-1.safetensors"],

@@ -11,6 +11,8 @@ on:
 permissions:
   contents: read
   issues: write
+  # audit-check publie aussi un check run.
+  checks: write
 
 concurrency:
   group: audit-cron-${{ github.ref }}
@@ -22,7 +24,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+      # L'action signale les CVE ; cette commande impose aussi l'échec du job.
+      - name: Reject vulnerable or yanked dependencies
+        run: cargo audit --deny yanked

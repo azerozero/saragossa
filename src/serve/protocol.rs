@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use saragossa::ChatTemplateMessage;
+use saragossa::{chat_template::canonical_json, ChatTemplateMessage};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -72,6 +72,9 @@ pub(super) struct ChatCompletionRequest {
     /// Filtre min-p : non implémenté, seule la valeur neutre 0 est admise.
     #[serde(default)]
     pub(super) min_p: Option<f32>,
+    /// Biais de logits non implémenté : seul un objet vide ou null est admis.
+    #[serde(default)]
+    pub(super) logit_bias: Option<Value>,
     /// Pénalité de présence OpenAI : non implémentée, neutre 0 seulement.
     #[serde(default)]
     pub(super) presence_penalty: Option<f32>,
@@ -112,6 +115,18 @@ const MAX_STOP_SEQUENCES: usize = 16;
 const MAX_STOP_BYTES: usize = 1024;
 
 impl ChatCompletionRequest {
+    /// Le routage spéculatif laisse-t-il DFlash servir la requête ? Lit toute
+    /// la conversation et les outils (`saragossa::spec_route::allows_dflash`),
+    /// rien quand le routage est coupé.
+    pub(super) fn allows_dflash(&self) -> bool {
+        saragossa::spec_route::allows_dflash(
+            self.messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.content_text())),
+            self.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+        )
+    }
+
     /// Désérialise sans exposer le diagnostic serde, qui peut citer une valeur.
     /// Le JSON brut reste utilisé sur le chemin valide (ordre des outils).
     pub(super) fn parse(body: &[u8]) -> ServeResult<Self> {
@@ -166,6 +181,30 @@ impl ChatCompletionRequest {
     /// budget plafonné, format de sortie et stop sequences bornées. Rend le
     /// budget effectif.
     pub(super) fn validate(&self, max_tokens_cap: usize) -> ServeResult<usize> {
+        for message in &self.messages {
+            if message.content.as_ref().is_some_and(contains_vision_media) {
+                #[cfg(not(feature = "vision"))]
+                return Err(ServeError::NotImplementedParameter {
+                    param: "messages.content".to_string(),
+                    message: "modalité vision absente : recompiler avec --features vision",
+                });
+                #[cfg(feature = "vision")]
+                return Err(ServeError::InvalidParameter {
+                    param: "messages.content",
+                    message: "vision non implémentée : les images et vidéos sont refusées",
+                });
+            }
+        }
+        if self
+            .logit_bias
+            .as_ref()
+            .is_some_and(|bias| !bias.as_object().is_some_and(|object| object.is_empty()))
+        {
+            return Err(ServeError::InvalidParameter {
+                param: "logit_bias",
+                message: "le biais de logits n'est pas implémenté",
+            });
+        }
         if self.n.is_some_and(|n| n != 1) {
             return Err(ServeError::InvalidParameter {
                 param: "n",
@@ -327,10 +366,13 @@ impl ChatCompletionRequest {
             "text" => Ok(ResponseFormatMode::Text),
             "json_object" => Ok(ResponseFormatMode::JsonObject),
             "json_lines" => Ok(ResponseFormatMode::JsonLines),
-            "json_schema" => Err(ServeError::not_implemented(
-                "response_format json_schema n'est pas encore supporté (v1: json_object, extension saragossa json_lines)",
+            "json_schema" => {
+                format.compiled_schema()?;
+                Ok(ResponseFormatMode::JsonSchema)
+            }
+            _ => Err(ServeError::Http(
+                "response_format.type: type JSON string invalide".into(),
             )),
-            _ => Err(ServeError::Http("response_format.type: type JSON string invalide".into())),
         }
     }
 
@@ -402,6 +444,8 @@ pub(super) enum ResponseFormatMode {
     Text,
     /// Objet JSON racine contraint par le sampler.
     JsonObject,
+    /// Objet racine contraint par un schéma JSON.
+    JsonSchema,
     /// Suite NDJSON saragossa, un objet JSON racine complet par ligne.
     JsonLines,
 }
@@ -412,6 +456,79 @@ pub(super) struct ResponseFormat {
     /// Type demandé (`text`, `json_object`, `json_lines`, `json_schema`).
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
+    json_schema: Option<SchemaFormat>,
+    #[serde(skip)]
+    compiled: std::sync::OnceLock<std::sync::Arc<saragossa::guided::JsonSchema>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SchemaFormat {
+    name: String,
+    schema: Value,
+    #[serde(default)]
+    strict: Option<bool>,
+}
+
+impl ResponseFormat {
+    pub(super) fn compiled_schema(
+        &self,
+    ) -> ServeResult<std::sync::Arc<saragossa::guided::JsonSchema>> {
+        if let Some(schema) = self.compiled.get() {
+            return Ok(std::sync::Arc::clone(schema));
+        }
+        let format = self
+            .json_schema
+            .as_ref()
+            .ok_or_else(|| ServeError::Http("response_format.json_schema requis".into()))?;
+        if format.name.is_empty()
+            || format.name.len() > 64
+            || !format
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(ServeError::Http(
+                "json_schema.name: 1 à 64 caractères alphanumériques, _ ou - requis".into(),
+            ));
+        }
+        // false/absent retain the same guarantee; unsupported schemas never degrade to text.
+        let _strict = format.strict;
+        let schema = std::sync::Arc::new(
+            saragossa::guided::JsonSchema::compile(&format.schema)
+                .map_err(|error| ServeError::Http(error.to_string()))?,
+        );
+        let _ = self.compiled.set(std::sync::Arc::clone(&schema));
+        Ok(self.compiled.get().map_or(schema, std::sync::Arc::clone))
+    }
+
+    pub(super) fn from_anthropic(config: &Value) -> ServeResult<Self> {
+        let object = config
+            .as_object()
+            .ok_or_else(|| ServeError::Http("output_config: objet requis".into()))?;
+        let format = &config["format"];
+        if object.keys().any(|key| key != "format")
+            || format["type"] != "json_schema"
+            || format
+                .as_object()
+                .is_none_or(|o| o.keys().any(|key| key != "type" && key != "schema"))
+        {
+            return Err(ServeError::Http(
+                "output_config.format: seuls type=json_schema et schema sont supportés".into(),
+            ));
+        }
+        let response = Self {
+            kind: "json_schema".into(),
+            json_schema: Some(SchemaFormat {
+                name: "response".into(),
+                schema: format["schema"].clone(),
+                strict: Some(true),
+            }),
+            compiled: std::sync::OnceLock::new(),
+        };
+        response.compiled_schema()?;
+        Ok(response)
+    }
 }
 
 /// Message OpenAI minimal.
@@ -449,7 +566,7 @@ impl WireMessage {
                 .collect::<Vec<_>>()
                 .join(""),
             Some(Value::Null) | None => String::new(),
-            Some(other) => other.to_string(),
+            Some(other) => canonical_json::to_string(other),
         }
     }
 }
@@ -465,6 +582,23 @@ fn text_part(value: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .map(ToString::to_string),
         _ => None,
+    }
+}
+
+fn contains_vision_media(value: &Value) -> bool {
+    match value {
+        Value::Array(parts) => parts.iter().any(contains_vision_media),
+        Value::Object(part) => {
+            matches!(
+                part.get("type").and_then(Value::as_str),
+                Some("image" | "image_url" | "input_image" | "video" | "video_url" | "input_video")
+            ) || ["image_url", "video_url"]
+                .iter()
+                .any(|key| part.contains_key(*key))
+                || part.get("text").is_some_and(contains_vision_media)
+        }
+        Value::String(text) => text.contains("<|image_pad|>") || text.contains("<|video_pad|>"),
+        _ => false,
     }
 }
 
@@ -872,6 +1006,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_media_before_loading_or_flattening_content() {
+        for kind in [
+            "image",
+            "image_url",
+            "input_image",
+            "video",
+            "video_url",
+            "input_video",
+        ] {
+            let value = serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "décris"}, {"type": kind}
+                ]}]
+            });
+            let request: ChatCompletionRequest =
+                serde_json::from_value(value).expect("invariant: requête synthétique valide");
+            let error = request.validate(512).expect_err("média non pris en charge");
+            #[cfg(feature = "vision")]
+            assert!(matches!(error, ServeError::InvalidParameter { .. }));
+            #[cfg(not(feature = "vision"))]
+            assert!(matches!(error, ServeError::NotImplementedParameter { .. }));
+        }
+    }
+
+    #[test]
+    fn refuses_media_markers_in_text_content() {
+        for content in [
+            serde_json::json!("<|image_pad|>"),
+            serde_json::json!([
+                {"type": "text", "text": "<|video_pad|>"}
+            ]),
+        ] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": content}]
+            }))
+            .expect("invariant: requête synthétique valide");
+            assert!(request.validate(512).is_err());
+        }
+    }
+
+    #[test]
     fn stream_ids_are_unique_across_threads() {
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -1050,6 +1225,23 @@ mod tests {
     }
 
     #[test]
+    fn json_content_fallback_keeps_main_sorted_bytes() {
+        for content in [
+            r#"{"z":[{"z":2,"a":1}],"a":0}"#,
+            r#"{"a":0,"z":[{"a":1,"z":2}]}"#,
+        ] {
+            let body =
+                format!(r#"{{"model":"m","messages":[{{"role":"user","content":{content}}}]}}"#);
+            let request =
+                ChatCompletionRequest::parse(body.as_bytes()).expect("invariant: requête valide");
+            assert_eq!(
+                request.template_messages()[0].content.as_deref(),
+                Some(r#"{"a":0,"z":[{"a":1,"z":2}]}"#)
+            );
+        }
+    }
+
+    #[test]
     fn request_extracts_segmented_text() {
         let req: ChatCompletionRequest = serde_json::from_str(
             r#"{"model":"reti-35b","messages":[{"role":"user","content":[{"type":"text","text":"bon"},{"type":"text","text":"jour"}]}]}"#,
@@ -1193,5 +1385,81 @@ mod tests {
         assert!(value["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("max_tokens")));
+    }
+}
+
+#[cfg(test)]
+mod logit_bias_tests {
+    use super::*;
+
+    #[test]
+    fn neutral_logit_bias_preserves_validation() {
+        for suffix in ["", ", \"logit_bias\":null", ", \"logit_bias\":{}"] {
+            let body = format!(r#"{{"model":"m", "messages":[], "max_tokens":1{suffix}}}"#);
+            let request =
+                ChatCompletionRequest::parse(body.as_bytes()).expect("invariant: JSON valide");
+            assert_eq!(request.validate(1).expect("invariant: sans biais"), 1);
+        }
+    }
+
+    #[test]
+    fn nonempty_or_invalid_logit_bias_is_rejected() {
+        for bias in [r#"{"42":-100}"#, r#"{"42":0}"#, "false", "[]", "0", r#""""#] {
+            let body =
+                format!(r#"{{"model":"m", "messages":[], "max_tokens":1, "logit_bias":{bias}}}"#);
+            let request =
+                ChatCompletionRequest::parse(body.as_bytes()).expect("invariant: JSON valide");
+            assert!(matches!(
+                request.validate(1),
+                Err(ServeError::InvalidParameter {
+                    param: "logit_bias",
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn schema_cache_and_strict_modes() {
+        for strict in [Value::Null, json!(true), json!(false)] {
+            let request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"test", "messages":[], "response_format":{"type":"json_schema", "json_schema":{
+                    "name":"weather", "strict":strict, "schema":{"type":"object"}
+                }}
+            })).expect("request");
+            assert_eq!(
+                request.response_format_mode().expect("mode"),
+                ResponseFormatMode::JsonSchema
+            );
+            let format = request.response_format.as_ref().expect("format");
+            assert!(std::sync::Arc::ptr_eq(
+                &format.compiled_schema().expect("schema"),
+                &format.compiled_schema().expect("cached")
+            ));
+            assert!(!request.batchable(256));
+        }
+    }
+
+    #[test]
+    fn anthropic_schema_conversion_and_invalid_config() {
+        let format = ResponseFormat::from_anthropic(
+            &json!({"format":{"type":"json_schema", "schema":{"type":"object"}}}),
+        )
+        .expect("format");
+        assert!(format.compiled_schema().is_ok());
+        for config in [
+            json!({}),
+            json!({"format":{"type":"text"}}),
+            json!({"format":{"type":"json_schema", "schema":{"type":"object", "pattern":".*"}}}),
+            json!({"format":{"type":"json_schema", "schema":{"type":"object"}}, "effort":"high"}),
+        ] {
+            assert!(ResponseFormat::from_anthropic(&config).is_err());
+        }
     }
 }

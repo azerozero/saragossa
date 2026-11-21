@@ -52,10 +52,6 @@ struct MtpBuffers {
 
 /// Résiduel d'entrée d'un pas MTP : copié depuis l'hôte, ou depuis un buffer
 /// résident (sortie d'un pas MTP précédent, sans aller-retour hôte).
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
-)]
 pub(crate) enum MtpInput<'a> {
     Host(&'a [f32]),
     Resident(&'a metal::BufferRef),
@@ -64,7 +60,7 @@ pub(crate) enum MtpInput<'a> {
 /// Sortie d'un pas MTP.
 #[cfg_attr(
     not(test),
-    allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
+    expect(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
 )]
 pub(crate) struct MtpOutput {
     /// Draft : argmax du lm_head partagé sur le mixer de tête.
@@ -88,10 +84,6 @@ pub(crate) const VERIFY_ROWS: usize = 4;
 /// Tampons préalloués d'une vérification : entrées et sorties propres à chaque
 /// ligne (aucune réécriture hôte d'un tampon encodé), et captures de l'état du
 /// tronc après chaque ligne `r < VERIFY_ROWS − 1`, pour le retour arrière.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
-)]
 struct VerifyBuffers {
     /// `[ligne]` : embedding répété sur les flux (`[hc·hidden]`).
     embed: Vec<Buffer>,
@@ -150,10 +142,6 @@ pub(crate) struct DeltaNetAndMoe<'a> {
 }
 
 /// Vérification soumise, en attente de [`FlashNextSession::accept`].
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
-)]
 struct PendingVerify {
     position: usize,
     ple_step: usize,
@@ -163,10 +151,6 @@ struct PendingVerify {
 }
 
 /// Sortie d'une ligne de vérification.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
-)]
 pub(crate) struct VerifyRow {
     pub(crate) argmax: u32,
     /// Résiduel hc avant le mixer final (`h` de la MTP pour le cycle suivant).
@@ -208,7 +192,7 @@ pub(crate) struct IndexerProbe {
 /// Sorties d'un pas.
 #[cfg_attr(
     not(test),
-    allow(
+    expect(
         dead_code,
         reason = "pas encore d'entrée de production (serve, étape 9) : exercé par les oracles"
     )
@@ -234,13 +218,6 @@ pub(crate) struct StepOutput {
 }
 
 /// Decode résident Flash-Next d'une séquence (≤ 2051 tokens).
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "pas encore d'entrée de production (serve, étape 9) : exercé par les oracles"
-    )
-)]
 pub(crate) struct FlashNextSession {
     ckpt: Qwen4ExpCheckpoint,
     executor: MetalExecutor,
@@ -493,7 +470,7 @@ pub(crate) fn validate_resident_config(c: &Qwen4ExpConfig) -> Result<usize> {
 
 #[cfg_attr(
     not(test),
-    allow(
+    expect(
         dead_code,
         reason = "pas encore d'entrée de production (serve, étape 9) : exercé par les oracles"
     )
@@ -827,10 +804,6 @@ impl FlashNextSession {
     /// lignes, token ou capacité invalides, lecture n-gram, ou encodage et
     /// exécution Metal (rien n'est engagé si l'encodage échoue ; une erreur GPU
     /// invalide la session).
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
-    )]
     pub(crate) fn verify(&mut self, tokens: &[usize]) -> Result<Vec<VerifyRow>> {
         self.refuse_poisoned()?;
         self.refuse_pending()?;
@@ -888,10 +861,6 @@ impl FlashNextSession {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
-    )]
     fn verify_with(&mut self, buffers: &VerifyBuffers, tokens: &[usize]) -> Result<PendingVerify> {
         let c = &self.ckpt.config;
         let rows = tokens.len();
@@ -973,10 +942,6 @@ impl FlashNextSession {
     /// Ligne `r` d'une vérification : embedding de la ligne vers `h[0]`, pas du
     /// tronc (PLE, couches, mixer, argmax), copie du résiduel, puis captures de
     /// l'état si une ligne suit.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
-    )]
     fn encode_verify_row(
         &mut self,
         encoders: &mut Encoders<'_>,
@@ -1068,10 +1033,6 @@ impl FlashNextSession {
     ///
     /// Renvoie une erreur sans vérification en attente, si `k` sort des lignes
     /// vérifiées, ou sur exécution Metal (session invalidée).
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
-    )]
     pub(crate) fn accept(&mut self, k: usize) -> Result<()> {
         let rows = self
             .pending
@@ -1461,10 +1422,6 @@ impl FlashNextSession {
     }
 
     /// Position du prochain token.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
-    )]
     pub(crate) fn position(&self) -> usize {
         self.position
     }
@@ -1513,10 +1470,6 @@ impl FlashNextSession {
     }
 
     /// Capacité de la session (tokens).
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
-    )]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }
@@ -1910,10 +1863,6 @@ impl FlashNextSession {
     /// dépasse l'historique, ou si le bloc en cours n'est pas vide sans
     /// instantané pris à `rows` lignes. Un échec de la copie de restauration
     /// invalide la session.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "spéculation MTP : boucle à l'étape 6 C")
-    )]
     pub(crate) fn mtp_truncate(&mut self, rows: usize) -> Result<()> {
         self.refuse_poisoned()?;
         self.refuse_pending()?;
@@ -1995,10 +1944,6 @@ impl FlashNextSession {
     }
 
     /// Résiduel de sortie du dernier pas MTP, résident (entrée du draft suivant).
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
-    )]
     pub(crate) fn mtp_hidden_buffer(&self) -> Option<&Buffer> {
         self.mtp.as_ref().map(|m| &m.out)
     }
@@ -2011,10 +1956,6 @@ impl FlashNextSession {
     }
 
     /// Lignes de l'historique MTP (longueur du KV de la tête) ; `None` sans tête.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
-    )]
     pub(crate) fn mtp_rows(&self) -> Option<usize> {
         self.mtp.as_ref()?;
         match self.states.last() {
@@ -2033,10 +1974,6 @@ impl FlashNextSession {
     /// Renvoie une erreur sans tête MTP, sur forme ou token invalides, capacité
     /// atteinte, ou sur encodage et exécution Metal (session invalidée dans ce
     /// dernier cas, comme [`Self::step`]).
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
-    )]
     pub(crate) fn mtp_step(
         &mut self,
         h: MtpInput<'_>,
@@ -2122,10 +2059,6 @@ impl FlashNextSession {
     }
 
     /// Relectures d'un pas MTP soumis et terminé.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
-    )]
     fn mtp_post_commit(&self, rows: usize, logits: bool, hidden: bool) -> Result<MtpOutput> {
         // `rows` ne sert qu'aux captures d'oracles.
         #[cfg(not(test))]
@@ -2177,10 +2110,6 @@ impl FlashNextSession {
     /// Encode un pas MTP à la ligne `rows` : entrée fc par flux, couche QSA +
     /// MoE ([`LayerEncoder::encode`]), copie du résiduel de sortie, mixer de
     /// tête et lm_head (argmax, logits sur demande). Ne soumet rien.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "tête MTP : spéculation à l'étape 6 C")
-    )]
     fn encode_mtp(&mut self, encoders: &mut Encoders<'_>, rows: usize, logits: bool) -> Result<()> {
         let c = &self.ckpt.config;
         let width = self.hc_dims.width();

@@ -17,6 +17,7 @@ fabriquer des poids, pas à les exécuter.
 | `imatrix.py` | Capture BF16 de E[x²] par canal d'entrée, corpus indépendant |
 | `sensitivity.py` | Allocation calibrée 3/4/5/6/8 bits sous budget réel, appelée par `mixed_quant.py` |
 | `test_quant.py` | Auto-tests stdlib et contrôle facultatif MLX CPU sur de petits tenseurs |
+| `tokenizer_sidecar.py` | Recopie `tokenizer.json` de la source à l'identique et refuse une regex de pré-tokenizer réécrite par transformers (`test_tokenizer_sidecar.py`) |
 | `chat_kl.py` | KL en régime chat contre les poids officiels bf16 (référence transformers, candidat mlx-lm) ; `--prompts`, `--json` par prompt, `--full-vocab`, `--reverse` |
 | `prompt_sets.py` | Ensembles figés `sets/selection.json` et `sets/validation.json` (aveugle), disjonction et SHA-256 |
 | `paired.py` | Différences appariées par prompt, IC 95 % bootstrap, plan factoriel 2×2 |

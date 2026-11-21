@@ -55,6 +55,7 @@ def stdlib_checks():
         for directory in (src, template):
             directory.mkdir()
             (directory / "model.safetensors").touch()
+            (directory / "tokenizer.json").write_text('{"fixture": true}')
         (template / "config.json").write_text("{}")
         corpus = root / "corpus.txt"
         corpus.write_text(imatrix.PROMPTS[0])
@@ -216,6 +217,7 @@ def checkpoint_checks(mx, nn, tree_flatten, SwitchGLU):
         original = dict(tree_flatten(model.parameters()))
         mx.save_safetensors(str(src / "model.safetensors"), original)
         (src / "config.json").write_text("{}")
+        (src / "tokenizer.json").write_text('{"fixture": true}')
         corpus = root / "corpus.txt"
         corpus.write_text("abcdefghijklmnop")
         config = {"quantization": {"bits": 3, "group_size": 64}}

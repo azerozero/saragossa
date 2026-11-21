@@ -12,6 +12,14 @@ pub type Result<T> = std::result::Result<T, InferError>;
 #[derive(Debug, Error)]
 /// Décrit les erreurs produites par le moteur d'inférence.
 pub enum InferError {
+    /// Signale un mode de quantification inconnu, sans repli affine implicite.
+    #[error("mode de quantification non supporté: {0}")]
+    UnsupportedQuantization(String),
+    /// Signale une entrée audio invalide avant traitement.
+    #[cfg(any(feature = "stt", feature = "tts", feature = "denoise"))]
+    #[error(transparent)]
+    Audio(crate::wire_audio::AudioParseError),
+
     /// Signale une forme de tenseur invalide.
     #[error("forme tensor invalide: {0}")]
     Shape(String),
@@ -19,6 +27,11 @@ pub enum InferError {
     /// Signale des dimensions incompatibles.
     #[error("dimension incompatible: {0}")]
     Dimension(String),
+
+    /// Refuse un tampon vision avant allocation lorsque le profil est dépassé.
+    #[cfg(feature = "vision")]
+    #[error("budget vision dépassé: {pixels} pixels, maximum {max_pixels}")]
+    VisionPixelBudget { pixels: u64, max_pixels: u64 },
 
     /// Signale un poids absent du modèle.
     #[error("poids manquant: {0}")]

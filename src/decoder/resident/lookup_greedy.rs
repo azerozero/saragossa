@@ -228,7 +228,7 @@ fn trace(update: impl FnOnce(&mut LookupGreedyTrace)) {
 }
 
 /// Rend et remet à zéro les compteurs de la boucle lookup de ce thread.
-#[cfg(test)]
+#[cfg(all(test, feature = "devtools"))]
 pub(in crate::decoder) fn take_lookup_greedy_trace() -> LookupGreedyTrace {
     LOOKUP_TRACE.with(|cell| cell.replace(LookupGreedyTrace::default()))
 }

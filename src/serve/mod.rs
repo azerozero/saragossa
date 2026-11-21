@@ -1,4 +1,5 @@
 //! Sous-commande `saragossa serve`.
+//! Les modules error, mtp et streaming sont aussi partagés avec le REPL LLM.
 //!
 //! Concurrence d'E/S seulement (voir `dispatch`) : un thread d'accept et un
 //! thread par connexion lisent les requêtes, refusent un bearer invalide avant
@@ -23,34 +24,113 @@
 //! - `SARAGOSSA_SERVE_MAX_INFLIGHT_BYTES` (256 Mio) : octets de corps lus ou
 //!   en file.
 //!
-//! Le parseur HTTP accepte uniquement les corps à `Content-Length`.
-//! `Transfer-Encoding: chunked` n'est pas pris en charge.
+//! SIGHUP relit le profil (`--profile`/`--config`, `--set` compris) et n'applique
+//! que `serve.read_timeout_secs`, `serve.max_tokens_cap` et la liste `[[models]]` ;
+//! tout autre changement ou chemin de modèle illisible est refusé en bloc (voir
+//! `reload`).
+//!
+//! SIGUSR2 relaie sans coupure vers le binaire du même chemin (ou
+//! `--upgrade-binary PATH`) : l'enfant hérite de la socket d'écoute, puis
+//! l'ancien processus vide ses connexions et sort (voir `relay`).
+//!
+//! Hors débruitage duplex (`enhance`), le parseur accepte les corps à `Content-Length`.
+//! `Transfer-Encoding` seul répond 501 ; avec `Content-Length`, ou un
+//! `Content-Length` répété ou non numérique, le cadrage ambigu répond 400.
 
+#[cfg(feature = "serve")]
 mod anthropic;
+#[cfg(feature = "serve")]
 mod args;
+#[cfg(any(
+    feature = "stt",
+    feature = "tts",
+    feature = "diar",
+    feature = "denoise"
+))]
+#[cfg(feature = "serve")]
 mod audio;
+#[cfg(feature = "serve")]
 mod cache;
+#[cfg(feature = "serve")]
 mod dispatch;
+#[cfg(feature = "embed")]
+#[cfg(feature = "serve")]
 mod embeddings;
+#[cfg(all(feature = "serve", feature = "denoise"))]
+mod enhance;
+#[cfg(all(feature = "serve", feature = "denoise"))]
+mod enhance_body;
 pub(crate) mod error;
+#[cfg(feature = "serve")]
 mod flint_output;
+#[cfg(feature = "serve")]
 mod http;
+#[cfg(feature = "serve")]
 mod model_selection;
 pub(crate) mod mtp;
+#[cfg(feature = "serve")]
 mod protocol;
+#[cfg(all(feature = "serve", unix))]
+mod relay;
+#[cfg(feature = "serve")]
+mod reload;
+#[cfg(feature = "serve")]
 mod responses;
+#[cfg(feature = "serve")]
 mod state;
 pub(crate) mod streaming;
+#[cfg(feature = "stt")]
+#[cfg(feature = "serve")]
+mod stt;
+#[cfg(feature = "serve")]
 mod tool_output;
+#[cfg(feature = "serve")]
 mod warmup;
 
+#[cfg(feature = "serve")]
 use std::error::Error;
 
+#[cfg(feature = "serve")]
 use args::ServeArgs;
 
+#[cfg(feature = "serve")]
 use super::CliResult;
 
+#[cfg(feature = "serve")]
+/// Extrait `--profile`/`--config` (sinon `SARAGOSSA_CONFIG`) et les `--set` répétables.
+fn take_config_args(
+    args: Vec<String>,
+) -> error::ServeResult<(Option<String>, Vec<String>, Vec<String>)> {
+    let mut path = std::env::var("SARAGOSSA_CONFIG")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let mut sets = Vec::new();
+    let mut rest = Vec::with_capacity(args.len());
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let missing = || error::ServeError::args(format!("{arg} attend une valeur"));
+        match arg.as_str() {
+            "--config" | "--profile" => path = Some(iter.next().ok_or_else(missing)?),
+            "--set" => sets.push(iter.next().ok_or_else(missing)?),
+            // NOTE: une valeur en argv est visible par `ps` ; elle passe donc par
+            // l'environnement, que le relais SIGUSR2 transmet à l'enfant.
+            "--api-key" | "--bearer-token" => {
+                let key = iter.next().ok_or_else(missing)?;
+                eprintln!(
+                    "saragossa serve: --api-key est déprécié (visible dans `ps`), utiliser SARAGOSSA_API_KEY"
+                );
+                // NOTE: `set_var` n'est sûr que parce que ce code s'exécute au démarrage,
+                // avant tout thread ; la clé passe ensuite à tous les sous-processus.
+                std::env::set_var("SARAGOSSA_API_KEY", key);
+            }
+            _ => rest.push(arg),
+        }
+    }
+    Ok((path, sets, rest))
+}
+
 /// Lance le serveur OpenAI-compatible local.
+#[cfg(feature = "serve")]
 pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     let raw_args = args.into_iter().collect::<Vec<_>>();
     if raw_args
@@ -60,12 +140,35 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         println!("{}", args::help_text());
         return Ok(());
     }
-    let mut args = ServeArgs::parse(raw_args).map_err(boxed_error)?;
+    let (config_path, sets, mut raw_args) = take_config_args(raw_args).map_err(boxed_error)?;
+    let resolved = saragossa::runtime_flags::Resolved::resolve(config_path.as_deref(), &sets)?;
+    resolved.install();
+    let profile = resolved.profile.clone();
+    #[cfg(unix)]
+    relay::configure(&mut raw_args, &profile.serve).map_err(boxed_error)?;
+    let mut args = ServeArgs::parse_with(&profile, raw_args.clone()).map_err(boxed_error)?;
+    // Sans profil, SIGHUP garde son effet par défaut (arrêt du processus).
+    if config_path.is_some() {
+        reload::watch(config_path, sets, raw_args, profile);
+    }
+    if let Some(root) = &args.prefix_ssd.directory {
+        saragossa::decoder::configure_prefix_disk_cache(
+            root,
+            args.prefix_ssd.bytes()?,
+            args.prefix_ssd.priority_tokens,
+        )?;
+    }
     model_selection::select_if_missing(&mut args).map_err(boxed_error)?;
     model_selection::resolve_models(&mut args).map_err(boxed_error)?;
+    reload::set_launch_models(&args.models);
     saragossa::force_resident_full_linear_decode();
     let mut state = state::ServeState::new(&args);
-    if args.preload {
+    // NOTE: en relais séquentiel, le moteur précharge après la sortie du parent.
+    #[cfg(unix)]
+    let deferred = relay::defer_preload(args.preload);
+    #[cfg(not(unix))]
+    let deferred = false;
+    if args.preload && !deferred {
         state.preload().map_err(boxed_error)?;
     }
     if let Some(addr) = args.tcp_addr() {
@@ -80,6 +183,7 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     }
 }
 
+#[cfg(feature = "serve")]
 fn boxed_error<E>(error: E) -> Box<dyn Error>
 where
     E: Error + 'static,

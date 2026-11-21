@@ -303,6 +303,9 @@ pub(in crate::decoder) fn take_embedding_weight(
         .ok_or_else(|| InferError::MissingWeight(key.to_string()))?
     {
         DecoderTensor::Dense(tensor) => Ok(EmbeddingWeight::Dense(tensor)),
+        DecoderTensor::LinearWeight(LinearWeight::MicroScaled(tensor)) => {
+            Ok(EmbeddingWeight::MicroScaled(tensor))
+        }
         DecoderTensor::LinearWeight(LinearWeight::Dense(tensor)) => {
             Ok(EmbeddingWeight::Dense(tensor))
         }

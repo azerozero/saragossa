@@ -12,6 +12,7 @@ fn fixture(root: &Path) -> (CausalDecoder, Option<Request>) {
         root: root.to_owned(),
         key: Key {
             version: FORMAT_VERSION,
+            position_sha256: None,
             prompt_sha256: "test".into(),
             tokens: 2,
             sources: Vec::new(),
@@ -204,12 +205,12 @@ fn identity_with_weights(mtp: bool) -> Result<()> {
     let mut model = crate::load_causal_decoder(&assets)?.with_metal_runtime()?;
     HITS.set(0);
     let tokens = if mtp {
-        let path = assets
+        let _path = assets
             .mtp
             .path
             .as_ref()
             .ok_or_else(|| invalid("tête MTP absente"))?;
-        model = model.with_mtp_sidecar(path)?;
+        model = model.with_mtp_weights(&assets.mtp)?;
         model
             .generate_greedy_mtp_core(&prompt, 24, &GenerationOptions::default(), 2, |_| true)?
             .tokens
@@ -539,7 +540,7 @@ fn snapshot_key_uses_effective_chunk_after_environment_change() {
                     hash.update(field);
                 }
             }
-            let environment = format!("{:x}", hash.finalize());
+            let environment = crate::hex(hash.finalize());
             assert_eq!(crate::runtime_flags::prefill_resident_chunk_tokens(), 4096);
             // Aucune demande de clé avant la mutation : c'est le premier flag
             // qui doit avoir capturé l'environnement initial entier.
@@ -789,6 +790,9 @@ fn content_identity_covers_shards_auxiliaries_and_sidecars() {
                 root.join("mtp.safetensors"),
                 draft.join("model.safetensors"),
                 draft.join("config.json"),
+                root.join("tokenizer.json"),
+                root.join("tokenizer_config.json"),
+                root.join("special_tokens_map.json"),
             ];
             for path in &paths {
                 std::fs::write(path, b"synthetic A").unwrap();
@@ -1066,4 +1070,171 @@ fn unwritable_snapshot_keeps_generation_without_manifest() {
     if std::env::var_os("SARAGOSSA_SNAPSHOT_TEST_CHILD").is_none() {
         assert_eq!(log.matches("; sans écriture").count(), 2, "{log}");
     }
+}
+
+#[test]
+fn staging_estimate_counts_aliased_history_and_captures_without_copy() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let (model, _) = fixture(dir.path());
+    let (cache, final_state) = model.prefill_cache_state(&[0, 1])?;
+    let history = &cache.layers[0];
+    let captures = PrefixCaptures::new(&[0], 1, final_state.clone());
+    let (plain_disk, plain_ram) = staging_estimate(&cache, &final_state, None, None);
+    let (disk, ram) = staging_estimate(&cache, &final_state, Some(history), Some(&captures));
+    let history_bytes = history.keys.snapshot_bytes() + history.values.snapshot_bytes();
+    let capture_bytes = (captures.hidden.data().len() * 4) as u64;
+    assert_eq!(disk - plain_disk, history_bytes + capture_bytes);
+    assert_eq!(ram - plain_ram, history_bytes + capture_bytes);
+    assert_eq!(
+        history.keys.snapshot_bytes(),
+        history
+            .keys
+            .snapshot_segments()
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>()
+    );
+    Ok(())
+}
+
+#[test]
+fn vision_snapshot_v5_preserves_delta_and_rejects_stale_or_tampered_context() -> Result<()> {
+    use crate::vision::prompt::{MediaSpan, VisionPositions};
+    let dir = tempfile::tempdir().unwrap();
+    let (model, mut request) = fixture(dir.path());
+    let (mut cache, final_state) = model.prefill_cache_state(&[0, 1])?;
+    cache.rope_delta = -1;
+    cache.vision_positions = Some(VisionPositions {
+        rows: vec![[0; 3], [0; 3]],
+        media: vec![MediaSpan {
+            start: 0,
+            end: 2,
+            hash: [42; 32],
+        }],
+    });
+    request.as_mut().unwrap().key.position_sha256 =
+        position_digest(cache.vision_positions.as_ref(), cache.position)?;
+    model.snapshot_save(&request, &cache, &final_state, None, None);
+    let request = request.unwrap();
+    let loaded = model.snapshot_read(&request)?;
+    assert_eq!(loaded.cache.position(), 2);
+    assert_eq!(loaded.cache.current_pos()?, 1);
+    assert_eq!(loaded.cache.clone().rope_delta, -1);
+    let path = dir.path().join("manifest.json");
+    let original = std::fs::read(&path).unwrap();
+    for change in ["delta", "version", "missing", "media"] {
+        let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        match change {
+            "delta" => value["rope_delta"] = 0.into(),
+            "version" => value["key"]["version"] = 4.into(),
+            "missing" => {
+                value.as_object_mut().unwrap().remove("rope_delta");
+            }
+            "media" => value["vision_positions"]["media"][0]["hash"][0] = 0.into(),
+            _ => unreachable!(),
+        }
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(model.snapshot_read(&request).is_err(), "{change}");
+    }
+    Ok(())
+}
+
+#[test]
+fn vision_snapshot_rejects_position_context_forged_into_text_key() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let (model, request) = fixture(dir.path());
+    let (cache, state) = model.prefill_cache_state(&[0, 1])?;
+    model.snapshot_save(&request, &cache, &state, None, None);
+    let path = dir.path().join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // Sans média terminé, la clé reste celle du texte. Un contexte ajouté
+    // ne doit pas permettre d'y faire passer un delta pourtant cohérent.
+    manifest["vision_positions"] = serde_json::json!({
+        "rows": [[5, 5, 5], [6, 6, 6]], "media": []
+    });
+    manifest["rope_delta"] = 5.into();
+    std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(model.snapshot_read(request.as_ref().unwrap()).is_err());
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "vision")]
+fn vision_snapshot_resume_before_and_after_image_keeps_decode_logits() -> Result<()> {
+    use crate::vision::prompt::SuppliedImage;
+    let model = crate::decoder::vision::tests::model()?;
+    let tokens = [0, 7, 7, 7, 7, 1];
+    let embeddings = Tensor::from_vec(
+        vec![4, 256],
+        (0..1024).map(|i| (i as f32 * 0.03).cos()).collect(),
+    )?;
+    for boundary in [1, 5, 6] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mut request) = fixture(dir.path());
+        let (mut expected, state) = if boundary == 1 {
+            model.prefill_cache_state(&tokens[..boundary])?
+        } else {
+            model.prefill_supplied_vision_state(
+                &tokens[..boundary],
+                7,
+                &[SuppliedImage {
+                    start: 1,
+                    grid: [1, 4, 4],
+                    embeddings: &embeddings,
+                    content_hash: [42; 32],
+                    parameters: b"snapshot-oracle",
+                }],
+                2,
+                false,
+            )?
+        };
+        let key = &mut request.as_mut().unwrap().key;
+        key.tokens = boundary;
+        key.position_sha256 = position_digest(expected.vision_positions.as_ref(), boundary)?;
+        model.snapshot_save(&request, &expected, &state, None, None);
+        let mut restored = model.snapshot_read(request.as_ref().unwrap())?.cache;
+        for token in [2, 3, 4, 5, 6, 1, 2, 0, 4, 3, 1, 5, 6, 1, 0, 2] {
+            let left = model.next_logits_cached(&mut expected, token)?;
+            let right = model.next_logits_cached(&mut restored, token)?;
+            assert_eq!(left.data(), right.data(), "frontière {boundary}");
+            assert_eq!(expected.current_pos()?, restored.current_pos()?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn vision_snapshot_before_first_image_resets_delta_and_resumes_text() -> Result<()> {
+    use crate::vision::prompt::{MediaSpan, VisionPositions};
+
+    let dir = tempfile::tempdir().expect("invariant: répertoire temporaire");
+    let (model, request) = fixture(dir.path());
+    let (mut cache, state) = model.prefill_cache_state(&[0, 1])?;
+    let mut expected = cache.clone();
+    // Le KV ne contient que le préfixe texte ; le contexte et son delta
+    // décrivent encore le prompt complet, dont l'image commence après lui.
+    cache.vision_positions = Some(VisionPositions {
+        rows: vec![[0; 3], [1; 3], [2; 3], [2, 2, 3], [2, 3, 2], [2, 3, 3]],
+        media: vec![MediaSpan {
+            start: 2,
+            end: 6,
+            hash: [42; 32],
+        }],
+    });
+    cache.rope_delta = -2;
+    model.snapshot_save(&request, &cache, &state, None, None);
+    let mut restored = model
+        .snapshot_read(request.as_ref().expect("invariant: requête"))?
+        .cache;
+    assert_eq!(restored.position(), 2);
+    assert_eq!(restored.rope_delta, 0);
+    assert!(restored.vision_positions.is_none());
+    assert_eq!(restored.current_pos()?, 2);
+    for token in [0, 1, 0] {
+        let left = model.next_logits_cached(&mut expected, token)?;
+        let right = model.next_logits_cached(&mut restored, token)?;
+        assert_eq!(left.data(), right.data());
+    }
+    Ok(())
 }

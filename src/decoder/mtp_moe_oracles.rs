@@ -49,6 +49,7 @@ fn dense_of(weight: &LinearWeight) -> Result<Tensor> {
         LinearWeight::DenseBf16(tensor) => tensor.to_tensor(),
         LinearWeight::DenseShared(tensor) => tensor.to_tensor(),
         LinearWeight::AffineQuantized(tensor) => tensor.dequantize(),
+        LinearWeight::MicroScaled(tensor) => tensor.dequantize(),
     }
 }
 
@@ -455,10 +456,10 @@ fn mtp_moe_resident_block_matches_cpu_oracle() -> Result<()> {
         eprintln!("skip : SARAGOSSA_RUST_MTP_ORACLE_PROMPTS absent");
         return Ok(());
     };
-    let sidecar = sidecar_path(&assets)?;
+    sidecar_path(&assets)?;
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(&sidecar)?;
+        .with_mtp_weights(&assets.mtp)?;
     let head = model
         .mtp
         .as_ref()
@@ -587,10 +588,10 @@ fn mtp_moe_sampled_bench_vs_ar() -> Result<()> {
     let depth = crate::runtime_flags::env_var("SARAGOSSA_RUST_MTP_ORACLE_DEPTH")
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(2);
-    let sidecar = sidecar_path(&assets)?;
+    sidecar_path(&assets)?;
     let model = crate::load_causal_decoder(&assets)?
         .with_metal_runtime()?
-        .with_mtp_sidecar(&sidecar)?;
+        .with_mtp_weights(&assets.mtp)?;
     let options = GenerationOptions {
         stop_token_ids: Vec::new(),
         stop_sequences: Vec::new(),

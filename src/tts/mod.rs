@@ -12,9 +12,11 @@ mod generation;
 mod helpers;
 mod inputs;
 mod load;
+pub(crate) mod memory;
 mod model;
 mod payload;
 mod prefill;
+mod profile;
 mod sampling;
 mod synth;
 #[cfg(test)]
@@ -30,7 +32,7 @@ pub use config::{
 };
 pub use constants::CLONE_GENERATION_HARD_CAP as TTS_GENERATION_HARD_CAP;
 pub use constants::DEFAULT_INSTRUCT;
-pub use model::{TtsForwardOutput, TtsModel, TtsPayloadSummary, TtsSynthesisOutput};
+pub use model::{TtsForwardOutput, TtsModel, TtsPayloadSummary, TtsStopReason, TtsSynthesisOutput};
 pub(crate) use payload::SafetensorPayload;
 
 use config::{read_json, require_file};

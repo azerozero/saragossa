@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use super::error::{ServeError, ServeResult};
 use crate::{hf_resolve, RuntimeKind};
+use saragossa::runtime_flags::{ModelEntry, Profile};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8081;
@@ -29,10 +30,14 @@ pub(super) struct ServeArgs {
     pub(super) models: Vec<ServeModelConfig>,
     /// Répertoire du modèle STT Whisper exposé sur `/v1/audio/transcriptions`.
     pub(super) stt_model: Option<PathBuf>,
+    /// Répertoire du modèle de diarisation exposé sur `/v1/audio/diarization`.
+    pub(super) diar_model: Option<PathBuf>,
     /// Répertoire du modèle TTS Qwen3 exposé sur `/v1/audio/speech`.
     pub(super) tts_model: Option<PathBuf>,
     /// Répertoire du modèle d'embeddings e5-small exposé sur `/v1/embeddings`.
     pub(super) embed_model: Option<PathBuf>,
+    /// Poids DeepFilterNet3 (`dfn3.safetensors`) exposés sur `/v1/audio/enhance`.
+    pub(super) enhance_model: Option<PathBuf>,
     /// Backend d'inférence.
     pub(super) backend: RuntimeKind,
     /// Charge tous les modèles au démarrage.
@@ -41,6 +46,8 @@ pub(super) struct ServeArgs {
     pub(super) read_timeout: Duration,
     /// Plafond dur du budget de génération par requête.
     pub(super) max_tokens_cap: usize,
+    /// Cache persistant opt-in.
+    pub(super) prefix_ssd: saragossa::runtime_flags::ServePrefixSsdOptions,
 }
 
 /// Modèle exposé par `saragossa serve`.
@@ -55,8 +62,17 @@ pub(super) struct ServeModelConfig {
 }
 
 impl ServeArgs {
-    /// Parse les options de la sous-commande.
+    /// Parse les options sans profil.
+    #[cfg(test)]
     pub(super) fn parse(args: impl IntoIterator<Item = String>) -> ServeResult<Self> {
+        Self::parse_with(&Profile::default(), args)
+    }
+
+    /// Parse les options ; `profile` fournit les défauts, la CLI gagne.
+    pub(super) fn parse_with(
+        profile: &Profile,
+        args: impl IntoIterator<Item = String>,
+    ) -> ServeResult<Self> {
         let mut host = DEFAULT_HOST.to_string();
         let mut port = None;
         let mut socket = PathBuf::from(DEFAULT_SOCKET);
@@ -64,11 +80,26 @@ impl ServeArgs {
         let mut models = Vec::new();
         let mut stt_model = None;
         let mut tts_model = None;
+        let mut diar_model = None;
         let mut embed_model = None;
-        let mut backend = RuntimeKind::default_backend();
-        let mut preload = false;
-        let mut read_timeout = Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS);
-        let mut max_tokens_cap = DEFAULT_MAX_TOKENS_CAP;
+        let mut enhance_model = None;
+        let mut backend = match &profile.engine.backend {
+            Some(name) => RuntimeKind::parse(name).map_err(|e| ServeError::args(e.to_string()))?,
+            None => RuntimeKind::default_backend(),
+        };
+        let mut preload = profile.engine.preload.unwrap_or(false);
+        let mut read_timeout = Duration::from_secs(
+            profile
+                .serve
+                .read_timeout_secs
+                .unwrap_or(DEFAULT_READ_TIMEOUT_SECS),
+        );
+        let mut max_tokens_cap = match profile.serve.max_tokens_cap {
+            Some(cap) => usize::try_from(cap)
+                .map_err(|_| ServeError::args("serve.max_tokens_cap hors plage"))?,
+            None => DEFAULT_MAX_TOKENS_CAP,
+        };
+        let mut prefix_ssd = saragossa::runtime_flags::ServePrefixSsdOptions::from_env()?;
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -110,17 +141,41 @@ impl ServeArgs {
                     )?;
                 }
                 "--stt-model" => {
+                    require_feature("--stt-model", "stt", cfg!(feature = "stt"))?;
                     stt_model = Some(next_value(&mut iter, "--stt-model")?.into());
                 }
+                "--diar-model" => {
+                    require_feature("--diar-model", "diar", cfg!(feature = "diar"))?;
+                    diar_model = Some(next_value(&mut iter, "--diar-model")?.into());
+                }
                 "--tts-model" => {
+                    require_feature("--tts-model", "tts", cfg!(feature = "tts"))?;
                     tts_model = Some(next_value(&mut iter, "--tts-model")?.into());
                 }
                 "--embed-model" => {
+                    require_feature("--embed-model", "embed", cfg!(feature = "embed"))?;
                     embed_model = Some(next_value(&mut iter, "--embed-model")?.into());
+                }
+                "--enhance-model" => {
+                    require_feature("--enhance-model", "denoise", cfg!(feature = "denoise"))?;
+                    enhance_model = Some(next_value(&mut iter, "--enhance-model")?.into());
                 }
                 "--backend" | "--runtime" => {
                     backend = RuntimeKind::parse(&next_value(&mut iter, "--backend")?)
                         .map_err(|e| ServeError::args(e.to_string()))?;
+                }
+                "--prefix-cache-ssd-dir" => {
+                    prefix_ssd.directory =
+                        Some(next_value(&mut iter, "--prefix-cache-ssd-dir")?.into())
+                }
+                "--prefix-cache-ssd-gib" => {
+                    prefix_ssd.gib = parse_positive_u64("--prefix-cache-ssd-gib", &mut iter)?
+                }
+                "--prefix-cache-ssd-priority-tokens" => {
+                    prefix_ssd.priority_tokens =
+                        next_value(&mut iter, "--prefix-cache-ssd-priority-tokens")?
+                            .parse()
+                            .map_err(|_| ServeError::args("priorité SSD invalide"))?;
                 }
                 "--preload" => preload = true,
                 "--read-timeout-secs" => {
@@ -134,6 +189,13 @@ impl ServeArgs {
                 other => return Err(ServeError::args(format!("argument serve inconnu: {other}"))),
             }
         }
+        // La CLI gagne : une entrée TOML de même id est ignorée.
+        for entry in &profile.models {
+            if !models.iter().any(|model| model.id == entry.id) {
+                models.push(config_from_entry(entry)?);
+            }
+        }
+        prefix_ssd.bytes()?;
         validate_tcp_args(&host, port, api_key.as_deref())?;
         Ok(Self {
             host,
@@ -142,12 +204,15 @@ impl ServeArgs {
             api_key,
             models,
             stt_model,
+            diar_model,
             tts_model,
             embed_model,
+            enhance_model,
             backend,
             preload,
             read_timeout,
             max_tokens_cap,
+            prefix_ssd,
         })
     }
 
@@ -164,29 +229,80 @@ impl ServeArgs {
 
 /// Renvoie l'aide concise de `serve`.
 pub(super) fn help_text() -> String {
+    let mut modality_options = String::new();
+    let mut modality_help = String::new();
+    for (enabled, flag, description) in [
+        (
+            cfg!(feature = "diar"),
+            "--diar-model",
+            "Nemotron-3-Diarization on /v1/audio/diarization",
+        ),
+        (
+            cfg!(feature = "stt"),
+            "--stt-model",
+            "Whisper STT on /v1/audio/transcriptions",
+        ),
+        (
+            cfg!(feature = "tts"),
+            "--tts-model",
+            "Qwen3 TTS on /v1/audio/speech",
+        ),
+        (
+            cfg!(feature = "embed"),
+            "--embed-model",
+            "e5-small on /v1/embeddings",
+        ),
+        (
+            cfg!(feature = "denoise"),
+            "--enhance-model",
+            "DeepFilterNet3 denoising on /v1/audio/enhance",
+        ),
+    ] {
+        if enabled {
+            let value = if flag == "--enhance-model" {
+                "FILE"
+            } else {
+                "DIR"
+            };
+            modality_options.push_str(&format!("[{flag} {value}] "));
+            modality_help.push_str(&format!(
+                "{flag} enables {description} (opt-in, lazy-loaded).\n"
+            ));
+        }
+    }
     format!(
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
-         [--api-key TOKEN] [--model ID=DIR|DIR|ORG/REPO]... \\
+         [--api-key TOKEN (deprecated, use SARAGOSSA_API_KEY)] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
-         [--stt-model DIR] [--tts-model DIR] [--embed-model DIR] \\
-         [--backend cpu|metal] [--preload]\n\
+         {modality_options}[--backend cpu|metal] [--preload] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
+         Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap and the [[models]] list (id, path) only. See `saragossa config print`.\n\
+         Upgrade (Unix): SIGUSR2 starts the same binary path (or --upgrade-binary PATH) with the same arguments on the inherited listening socket, then the old process drains for at most serve.drain_timeout_secs (30) and exits; enhance h2/WebTransport listeners follow. serve.relay_mode=auto|parallel|sequential (auto: sequential only if the memory guard refuses two resident processes).\n\
+         SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
+         --prefix-cache-ssd-priority-tokens 4096 (0 disables priority).\n\
          Models: repeat --model to expose any supported checkpoint. A bare path \\
          gets its directory name as alias; ORG/REPO is resolved through the local \\
          Hugging Face cache and downloaded when incomplete. Without --model, a TTY \\
          opens a local-model picker. \\
          Backward-compatible aliases: --model-27b registers reti-27b, \\
          --model-35b registers reti-35b.\n\
-         Audio/embeddings (opt-in, lazy-loaded): --stt-model enables Whisper STT \\
-         on /v1/audio/transcriptions, --tts-model enables Qwen3 TTS on \\
-         /v1/audio/speech, --embed-model enables e5-small on /v1/embeddings.\n\
-         Safety defaults: --read-timeout-secs {DEFAULT_READ_TIMEOUT_SECS}, \\
+         {modality_help}Safety defaults: --read-timeout-secs {DEFAULT_READ_TIMEOUT_SECS}, \\
          --max-tokens-cap {DEFAULT_MAX_TOKENS_CAP}.\n\
          Default transport: Unix socket {DEFAULT_SOCKET} (0600). \\
          --port enables TCP on 127.0.0.1 for grob and requires --api-key \\
          or {API_KEY_ENV}.\n\
          Endpoints: GET /v1/models, POST /v1/chat/completions, \\
-         POST /v1/audio/transcriptions, POST /v1/audio/speech, POST /v1/embeddings"
+         POST /v1/audio/transcriptions, POST /v1/audio/transcriptions/stream, \
+         POST /v1/audio/diarization, POST /v1/audio/speech, POST /v1/audio/enhance, POST /v1/embeddings"
     )
+}
+
+fn require_feature(flag: &str, feature: &str, enabled: bool) -> ServeResult<()> {
+    if !enabled {
+        return Err(ServeError::args(format!(
+            "{flag} indisponible: compilé sans la feature {feature}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_tcp_args(host: &str, port: Option<u16>, api_key: Option<&str>) -> ServeResult<()> {
@@ -232,6 +348,20 @@ pub(super) fn parse_model_registration(value: &str) -> ServeResult<ServeModelCon
     Ok(ServeModelConfig {
         id,
         path: PathBuf::from(value),
+        hf_repo,
+    })
+}
+
+/// Convertit une entrée `[[models]]` ; une référence HF nue est résolue au lancement.
+pub(super) fn config_from_entry(entry: &ModelEntry) -> ServeResult<ServeModelConfig> {
+    if entry.id.trim().is_empty() || entry.path.trim().is_empty() {
+        return Err(ServeError::args("[[models]]: id et path requis"));
+    }
+    let hf_repo = (!Path::new(&entry.path).exists() && hf_resolve::is_hf_model_id(&entry.path))
+        .then(|| entry.path.clone());
+    Ok(ServeModelConfig {
+        id: entry.id.trim().to_string(),
+        path: PathBuf::from(entry.path.trim()),
         hf_repo,
     })
 }
@@ -293,6 +423,66 @@ fn parse_positive_usize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_sets_defaults_and_cli_wins() {
+        let profile = Profile::parse(
+            "[engine]\nbackend = \"cpu\"\npreload = true\n\
+             [serve]\nread_timeout_secs = 9\nmax_tokens_cap = 100\n",
+        )
+        .expect("profil valide");
+        let from_file = ServeArgs::parse_with(&profile, Vec::new()).expect("args");
+        assert_eq!(from_file.backend, RuntimeKind::Cpu);
+        assert!(from_file.preload);
+        assert_eq!(from_file.read_timeout, Duration::from_secs(9));
+        assert_eq!(from_file.max_tokens_cap, 100);
+        let cli = ServeArgs::parse_with(
+            &profile,
+            ["--read-timeout-secs", "5", "--max-tokens-cap", "7"].map(String::from),
+        )
+        .expect("args");
+        assert_eq!(cli.read_timeout, Duration::from_secs(5));
+        assert_eq!(cli.max_tokens_cap, 7);
+    }
+
+    #[test]
+    fn modality_options_follow_compiled_features() {
+        let help = help_text();
+        for (enabled, flag, feature) in [
+            (cfg!(feature = "diar"), "--diar-model", "diar"),
+            (cfg!(feature = "stt"), "--stt-model", "stt"),
+            (cfg!(feature = "tts"), "--tts-model", "tts"),
+            (cfg!(feature = "embed"), "--embed-model", "embed"),
+            (cfg!(feature = "denoise"), "--enhance-model", "denoise"),
+        ] {
+            assert_eq!(help.contains(flag), enabled, "{flag}");
+            let parsed = ServeArgs::parse([flag.to_string(), "/m/modality".to_string()]);
+            if enabled {
+                let args = parsed.expect("invariant: modalité compilée acceptée");
+                let path = match feature {
+                    "diar" => args.diar_model,
+                    "stt" => args.stt_model,
+                    "tts" => args.tts_model,
+                    "denoise" => args.enhance_model,
+                    _ => args.embed_model,
+                };
+                assert_eq!(path, Some(PathBuf::from("/m/modality")));
+            } else {
+                let expected = format!("compilé sans la feature {feature}");
+                let error = parsed.expect_err("invariant: modalité absente refusée");
+                assert!(error.to_string().contains(&expected));
+                for values in [
+                    vec![flag],
+                    vec!["--model", "llm=/m/llm", flag, "/m/modality"],
+                    vec![flag, "/m/modality", "--model", "llm=/m/llm"],
+                ] {
+                    let error = ServeArgs::parse(values.into_iter().map(str::to_string))
+                        .expect_err("invariant: option absente refusée avant la sélection LLM");
+                    assert!(error.to_string().contains(&expected));
+                }
+            }
+        }
+    }
 
     #[test]
     fn parse_defaults_to_unix_socket_without_implicit_models() {
@@ -470,5 +660,33 @@ mod tests {
         let cap = ServeArgs::parse(["--max-tokens-cap".to_string(), "0".to_string()])
             .expect_err("invariant: cap nul refusé");
         assert!(cap.to_string().contains("> 0"));
+    }
+}
+
+#[cfg(test)]
+mod ssd_tests {
+    use super::*;
+    #[test]
+    fn explicit_ssd_options_and_invalid_budgets() {
+        let args = ServeArgs::parse(
+            [
+                "--prefix-cache-ssd-dir",
+                "/cache",
+                "--prefix-cache-ssd-gib",
+                "8",
+                "--prefix-cache-ssd-priority-tokens",
+                "0",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+        assert_eq!(args.prefix_ssd.directory, Some(PathBuf::from("/cache")));
+        assert_eq!(args.prefix_ssd.bytes().unwrap(), 8 << 30);
+        assert_eq!(args.prefix_ssd.priority_tokens, 0);
+        for value in ["0", "18446744073709551615", "wrong"] {
+            assert!(
+                ServeArgs::parse(["--prefix-cache-ssd-gib", value].map(str::to_owned)).is_err()
+            );
+        }
     }
 }

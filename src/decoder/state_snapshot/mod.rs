@@ -1,5 +1,6 @@
 //! Instantané diagnostic post-prefill. Le decode reprend le format du cache de
 //! préfixe ; seules les données persistantes traversent la frontière disque.
+pub(crate) mod persistent;
 mod sources;
 mod storage;
 #[cfg(test)]
@@ -12,7 +13,7 @@ use sources::Source;
 use std::path::{Path, PathBuf};
 use storage::{invalid, io, Blob, Writer};
 
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,7 +60,7 @@ pub(crate) struct SnapshotSources(Option<std::result::Result<Vec<Source>, String
 
 impl SnapshotSources {
     pub(crate) fn capture<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Self {
-        if crate::runtime_flags::state_snapshot_dir().is_none() {
+        if crate::runtime_flags::state_snapshot_dir().is_none() && !persistent::enabled() {
             return Self::default();
         }
         Self(Some(
@@ -71,7 +72,13 @@ impl SnapshotSources {
                         sources.push(Source::read(path)?);
                     }
                     if let Some(parent) = path.parent() {
-                        for name in ["model.safetensors.index.json", "config.json"] {
+                        for name in [
+                            "model.safetensors.index.json",
+                            "config.json",
+                            "tokenizer.json",
+                            "tokenizer_config.json",
+                            "special_tokens_map.json",
+                        ] {
                             let auxiliary = parent.join(name);
                             if auxiliary.is_file()
                                 && !sources.iter().any(|source| source.path() == auxiliary)
@@ -85,6 +92,31 @@ impl SnapshotSources {
             })()
             .map_err(|e| e.to_string()),
         ))
+    }
+
+    /// Comme [`Self::capture`], suivi des sources déjà lues en mémoire
+    /// (`read`), dont l'empreinte vient des octets effectivement consommés.
+    pub(crate) fn capture_with_read<'a>(
+        paths: impl IntoIterator<Item = &'a Path>,
+        read: &[ReadSource],
+    ) -> Self {
+        let mut sources = Self::capture(paths);
+        if let Some(Ok(list)) = &mut sources.0 {
+            for source in read {
+                match &source.0 {
+                    Some(Ok(source)) => list.push(source.clone()),
+                    Some(Err(error)) => {
+                        sources.0 = Some(Err(error.clone()));
+                        break;
+                    }
+                    None => {
+                        sources.0 = Some(Err("identité d'une source lue absente".into()));
+                        break;
+                    }
+                }
+            }
+        }
+        sources
     }
 
     fn verified(&self) -> Result<&[Source]> {
@@ -124,6 +156,23 @@ impl SnapshotSources {
     }
 }
 
+/// Identité d'un fichier lu entièrement en mémoire, prise au moment de la
+/// lecture. Vide quand aucun instantané n'est actif : rien n'est haché.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReadSource(Option<std::result::Result<Source, String>>);
+
+impl ReadSource {
+    /// `before` est la métadonnée prise avant de lire `bytes` depuis `path`.
+    pub(crate) fn new(path: &Path, before: &std::fs::Metadata, bytes: &[u8]) -> Self {
+        if crate::runtime_flags::state_snapshot_dir().is_none() && !persistent::enabled() {
+            return Self::default();
+        }
+        Self(Some(
+            Source::from_read(path, before, bytes).map_err(|e| e.to_string()),
+        ))
+    }
+}
+
 /// Les ablations ne doivent ni relire un calcul complet ni publier un calcul tronqué.
 fn snapshot_calculations_complete() -> Result<()> {
     if let Some(flag) = crate::runtime_flags::state_snapshot_ablation() {
@@ -141,6 +190,7 @@ thread_local! { static HITS: std::cell::Cell<usize> = const { std::cell::Cell::n
 struct Key {
     version: u32,
     prompt_sha256: String,
+    position_sha256: Option<String>,
     tokens: usize,
     sources: Vec<Source>,
     binary_sha256: String,
@@ -151,6 +201,7 @@ struct Key {
     little_endian: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct Request {
     root: PathBuf,
     key: Key,
@@ -160,6 +211,13 @@ pub(super) struct State {
     pub(super) cache: CausalDecoderCache,
     pub(super) final_state: Tensor,
     pub(super) history: Option<LayerKvCache>,
+    #[cfg_attr(
+        not(feature = "devtools"),
+        allow(
+            dead_code,
+            reason = "Format commun des snapshots avec ou sans capture DFlash"
+        )
+    )]
     pub(super) captures: Option<PrefixCaptures>,
 }
 
@@ -344,10 +402,53 @@ struct Captures {
 struct Manifest {
     key: Key,
     position: usize,
+    rope_delta: i64,
+    vision_positions: Option<crate::vision::prompt::VisionPositions>,
     layers: Vec<Layer>,
     final_state: Dense,
     history: Option<Layer>,
     captures: Option<Captures>,
+}
+
+/// Majorant sans copie des blobs et du pic de préparation. Seules les tailles
+/// KV sont lues ; chaque occurrence sérialisée compte, même aliasée.
+fn staging_estimate(
+    cache: &CausalDecoderCache,
+    final_state: &Tensor,
+    history: Option<&LayerKvCache>,
+    captures: Option<&PrefixCaptures>,
+) -> (u64, u64) {
+    let mut blobs = (final_state.data().len() as u64).saturating_mul(4);
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    let mut scratch = 0u64;
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let scratch = 0u64;
+    for layer in cache.layers.iter().chain(history) {
+        for rows in [&layer.keys, &layer.values] {
+            blobs = blobs.saturating_add(rows.snapshot_bytes());
+        }
+        blobs = blobs.saturating_add(
+            (layer.linear.conv.len() as u64)
+                .saturating_add(layer.linear.ssm.len() as u64)
+                .saturating_mul(4),
+        );
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(state) = layer.linear.metal_state() {
+            let bytes = state.estimated_bytes() as u64;
+            blobs = blobs.saturating_add(bytes);
+            // disk_parts : blit GPU, lecture CPU et conversion temporaire.
+            scratch = scratch.max(bytes.saturating_mul(3));
+        }
+    }
+    if let Some(captures) = captures {
+        blobs = blobs.saturating_add((captures.hidden.data().len() as u64).saturating_mul(4));
+    }
+    let disk = blobs.saturating_add(MAX_MANIFEST_BYTES).saturating_add(64);
+    // Manifeste, métadonnées et réécriture JSON du worker : marge conservatrice.
+    let ram = blobs
+        .saturating_add(scratch)
+        .saturating_add(MAX_MANIFEST_BYTES * 8);
+    (disk, ram)
 }
 
 impl CausalDecoder {
@@ -361,10 +462,25 @@ impl CausalDecoder {
         prompt: &[usize],
         mode: SnapshotMode,
     ) -> Result<Option<Request>> {
+        self.snapshot_request_positioned(prompt, mode, None)
+    }
+
+    pub(super) fn snapshot_request_positioned(
+        &self,
+        prompt: &[usize],
+        mode: SnapshotMode,
+        positions: Option<&crate::vision::prompt::VisionPositions>,
+    ) -> Result<Option<Request>> {
+        if let Some(positions) = positions {
+            positions.delta_at(prompt.len())?;
+        }
         if crate::runtime_flags::state_snapshot_warmup() {
             return Ok(None);
         }
-        let Some(root) = crate::runtime_flags::state_snapshot_dir() else {
+        let Some(root) = persistent::store()
+            .map(|store| store.root.as_path())
+            .or_else(crate::runtime_flags::state_snapshot_dir)
+        else {
             return Ok(None);
         };
         let sources = match self.snapshot_sources.verified() {
@@ -397,15 +513,20 @@ impl CausalDecoder {
             .map(|metal| metal.snapshot_kernel_profile());
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let kernel_profile: Option<String> = None;
-        let prompt_sha256 = format!("{:x}", hash.finalize());
+        let position_sha256 = position_digest(positions, prompt.len())?;
+        if let Some(identity) = &position_sha256 {
+            hash.update(identity.as_bytes());
+        }
+        let prompt_sha256 = crate::hex(hash.finalize());
         // Une bascule DFlash vers MTP préremplit un autre prompt : son écriture
         // ne doit pas remplacer l'instantané du prompt initial à accélérer.
         let entry = storage::digest(format!("{prompt_sha256}:{mode}").as_bytes());
-        Ok(Some(Request {
+        let mut request = Request {
             root: root.join(format!("entry-{entry}")),
             key: Key {
                 version: FORMAT_VERSION,
                 prompt_sha256,
+                position_sha256,
                 tokens: prompt.len(),
                 sources: sources.to_vec(),
                 binary_sha256: storage::binary_sha256()?.to_owned(),
@@ -421,7 +542,15 @@ impl CausalDecoder {
                 ),
                 little_endian: cfg!(target_endian = "little"),
             },
-        }))
+        };
+        if persistent::enabled() {
+            let key =
+                serde_json::to_vec(&request.key).map_err(|error| invalid(error.to_string()))?;
+            let identity = storage::digest(&key);
+            let name = storage::digest(format!("{identity}:{}", persistent::session()).as_bytes());
+            request.root = root.join(format!("entry-{name}"));
+        }
+        Ok(Some(request))
     }
 
     fn snapshot_has_metal(&self) -> bool {
@@ -458,6 +587,14 @@ impl CausalDecoder {
                 }
             }
         }
+        if let (Some(request), Some(store)) = (&mut request, persistent::store()) {
+            let key =
+                serde_json::to_vec(&request.key).map_err(|error| invalid(error.to_string()))?;
+            let name = storage::digest(
+                format!("{}:{}", storage::digest(&key), persistent::session()).as_bytes(),
+            );
+            request.root = store.root.join(format!("entry-{name}"));
+        }
         Ok(request)
     }
 
@@ -466,6 +603,16 @@ impl CausalDecoder {
             return None;
         }
         let request = request.as_ref()?;
+        if let Some(store) =
+            persistent::store().filter(|store| request.root.starts_with(&store.root))
+        {
+            let state = store.read(self, request);
+            #[cfg(test)]
+            if state.is_some() {
+                HITS.set(HITS.get() + 1);
+            }
+            return state;
+        }
         match self.snapshot_read(request) {
             Ok(state) => {
                 #[cfg(test)]
@@ -517,6 +664,11 @@ impl CausalDecoder {
         if manifest.position != request.key.tokens || manifest.layers.len() != self.layers.len() {
             return Err(invalid("position ou nombre de couches incorrect"));
         }
+        if position_digest(manifest.vision_positions.as_ref(), request.key.tokens)?
+            != request.key.position_sha256
+        {
+            return Err(invalid("contexte positionnel différent de la clé"));
+        }
         manifest.validate(self, request.key.tokens)?;
         let root = &request.root;
         let mut cache = self.empty_cache();
@@ -526,6 +678,9 @@ impl CausalDecoder {
             .map(|layer| layer.read(root))
             .collect::<Result<_>>()?;
         cache.position = manifest.position;
+        cache.rope_delta = manifest.rope_delta;
+        cache.vision_positions = manifest.vision_positions;
+        cache.current_pos()?;
         let final_state = manifest.final_state.read(root)?;
         if final_state.shape() != [1, self.final_norm.data().len()] {
             return Err(invalid("dernière ligne invalide"));
@@ -596,10 +751,45 @@ impl CausalDecoder {
         let Some(request) = request else {
             return;
         };
+        if position_digest(cache.vision_positions.as_ref(), cache.position)
+            .ok()
+            .as_ref()
+            != Some(&request.key.position_sha256)
+        {
+            eprintln!("state_snapshot refusé : contexte positionnel différent de la clé");
+            return;
+        }
+        let store = persistent::store().filter(|store| request.root.starts_with(&store.root));
+        let mut reservation = None;
+        let permit = if let Some(store) = store {
+            if store.skip_save(request) {
+                return;
+            }
+            let Some(permit) = store.reserve() else {
+                eprintln!("prefix_ssd skipped reason=writer_busy");
+                return;
+            };
+            let (disk_bytes, ram_bytes) = staging_estimate(cache, final_state, history, captures);
+            match store.admit_staging(request, disk_bytes, ram_bytes) {
+                Ok(memory) => reservation = Some(memory),
+                Err(error) => {
+                    store.refuse(request, &error.to_string());
+                    eprintln!("prefix_ssd skipped before_copy: {error}");
+                    return;
+                }
+            }
+            Some(permit)
+        } else {
+            None
+        };
         let result = (|| -> Result<()> {
             snapshot_calculations_complete()?;
             request.key.sources.iter().try_for_each(Source::verify)?;
-            let mut writer = Writer::new(&request.root)?;
+            let mut writer = if let Some(store) = store {
+                Writer::buffered(&request.root, store.budget)
+            } else {
+                Writer::new(&request.root)?
+            };
             let layers = cache
                 .layers
                 .iter()
@@ -621,6 +811,16 @@ impl CausalDecoder {
             let manifest = Manifest {
                 key,
                 position: cache.position,
+                rope_delta: cache
+                    .vision_positions
+                    .as_ref()
+                    .map_or(Ok(cache.rope_delta), |p| p.delta_at(cache.position))?,
+                vision_positions: cache
+                    .vision_positions
+                    .as_ref()
+                    .map(|p| p.prefix(cache.position))
+                    .transpose()?
+                    .flatten(),
                 layers,
                 final_state: Dense::write(final_state, &mut writer)?,
                 history,
@@ -628,6 +828,14 @@ impl CausalDecoder {
             };
             snapshot_calculations_complete()?;
             request.key.sources.iter().try_for_each(Source::verify)?;
+            if let (Some(store), Some(permit)) = (store, permit) {
+                return store.submit_reserved(
+                    request,
+                    writer.finish_buffered(&manifest)?,
+                    permit,
+                    reservation,
+                );
+            }
             writer.publish(&manifest)?;
             eprintln!(
                 "state_snapshot écrit mode={} tokens={}",
@@ -636,7 +844,84 @@ impl CausalDecoder {
             Ok(())
         })();
         if let Err(error) = result {
+            if let Some(store) = store {
+                store.refuse(request, &error.to_string());
+            }
             eprintln!("state_snapshot refusé : {error}; sans écriture");
         }
     }
+}
+
+impl CausalDecoder {
+    /// Recherche une frontière AR sur SSD sans déclencher de prefill.
+    /// Les tokens doivent être le préfixe exact, sous la portée de session serve.
+    ///
+    /// # Errors
+    /// Renvoie une erreur si l'identité du modèle ne peut pas être établie.
+    pub fn load_persistent_prompt(
+        &self,
+        tokens: &[usize],
+    ) -> Result<Option<CausalDecoderPromptState>> {
+        if !persistent::enabled() {
+            return Ok(None);
+        }
+        let request = self.snapshot_request(tokens, SnapshotMode::Ar)?;
+        Ok(self
+            .snapshot_load(&request)
+            .map(|state| CausalDecoderPromptState::new(state.cache, state.final_state)))
+    }
+
+    /// Recherche la frontière persistante la plus longue au-delà de `minimum`.
+    /// Seules les longueurs présentes dans l'index disque sont hachées.
+    ///
+    /// # Errors
+    /// Renvoie une erreur si l'identité du modèle ne peut pas être établie.
+    pub fn load_persistent_prefix(
+        &self,
+        tokens: &[usize],
+        block: usize,
+        minimum: usize,
+    ) -> Result<Option<CausalDecoderPromptState>> {
+        let Some(store) = persistent::store() else {
+            return Ok(None);
+        };
+        for length in store.boundaries(tokens.len(), block, minimum) {
+            if let Some(state) = self.load_persistent_prompt(&tokens[..length])? {
+                return Ok(Some(state));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Programme la persistance d'une frontière AR nouvellement étendue.
+    ///
+    /// # Errors
+    /// Renvoie une erreur si l'identité du modèle ne peut pas être établie.
+    pub fn persist_prompt(&self, tokens: &[usize], state: &CausalDecoderPromptState) -> Result<()> {
+        if !persistent::enabled() {
+            return Ok(());
+        }
+        if tokens.len() != state.position() {
+            return Err(invalid("frontière SSD incohérente"));
+        }
+        let request = self.snapshot_request(tokens, SnapshotMode::Ar)?;
+        self.snapshot_save(&request, &state.cache, &state.final_state, None, None);
+        Ok(())
+    }
+}
+
+fn position_digest(
+    positions: Option<&crate::vision::prompt::VisionPositions>,
+    tokens: usize,
+) -> Result<Option<String>> {
+    positions
+        .map(|p| p.prefix(tokens))
+        .transpose()?
+        .flatten()
+        .map(|positions| {
+            serde_json::to_vec(&positions)
+                .map(|bytes| storage::digest(&bytes))
+                .map_err(|e| invalid(e.to_string()))
+        })
+        .transpose()
 }

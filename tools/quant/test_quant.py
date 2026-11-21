@@ -30,6 +30,7 @@ def stdlib_checks():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "config.json").write_text("{}")
+        (root / "tokenizer.json").write_text('{"fixture": true}')
         args = mixed_quant.parse_args(["--input", str(root), "--output", str(root / "out"),
                                        "--imatrix-blend"])
         try:
@@ -174,6 +175,7 @@ def mlx_checks():
         source.mkdir()
         mx.save_safetensors(str(source / "model.safetensors"), original)
         (source / "config.json").write_text("{}")
+        (source / "tokenizer.json").write_text('{"fixture": true}')
         for base_bits, target, forced, blend in (
                 (4, 6.0, "lm_head", False), (4, 6.0, "lm_head", True),
                 (3, 4.2, "", False), (3, 4.2, "", True), (3, 5.0, "lm_head", False)):

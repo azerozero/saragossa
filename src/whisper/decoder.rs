@@ -1,5 +1,9 @@
 //! Décodeur Whisper CPU, avec cross-attention sur les features audio.
 
+use super::streaming::TextDeltas;
+use super::timestamps::{
+    parse_segments, RulesMode, TimestampRules, WhisperSegment, WhisperTranscript,
+};
 use super::{
     take, take_layer_norm, take_linear, validate_vector, whisper_weights_path, WhisperConfig,
     WhisperEncoder, WhisperLayerNorm, WhisperSelfAttention,
@@ -14,6 +18,16 @@ const SOT_TOKEN: &str = "<|startoftranscript|>";
 const EOT_TOKEN: &str = "<|endoftext|>";
 const TRANSCRIBE_TOKEN: &str = "<|transcribe|>";
 const NO_TIMESTAMPS_TOKEN: &str = "<|notimestamps|>";
+const TRANSLATE_TOKEN: &str = "<|translate|>";
+const FIRST_TIMESTAMP_TOKEN: &str = "<|0.00|>";
+/// `<|nospeech|>` depuis large-v3, `<|nocaptions|>` avant.
+/// Seuils par défaut d'openai-whisper (`no_speech_threshold`, `logprob_threshold`).
+const NO_SPEECH_THRESHOLD: f32 = 0.6;
+const LOGPROB_THRESHOLD: f64 = -1.0;
+const NO_SPEECH_TOKENS: [&str; 2] = ["<|nospeech|>", "<|nocaptions|>"];
+
+/// Reçoit chaque morceau de texte décodé.
+type DeltaSink<'a> = dyn FnMut(&str) -> Result<()> + 'a;
 
 #[cfg(test)]
 #[path = "reference_goldens.rs"]
@@ -50,6 +64,16 @@ pub struct WhisperModel {
     transcribe_token: u32,
     eot_token: u32,
     no_timestamps_token: u32,
+    /// `<|0.00|>` : absent, `verbose_json` est refusé.
+    timestamp_begin: Option<u32>,
+    no_speech_token: Option<u32>,
+    /// Tokens de langue, de SOT exclu à `<|translate|>` exclu.
+    language_tokens: std::ops::Range<u32>,
+}
+
+/// Verdict openai : sans parole si `no_speech_prob > 0,6` et logprob moyen <= -1,0.
+fn silence_verdict(no_speech_prob: f32, avg_logprob: f64) -> bool {
+    no_speech_prob > NO_SPEECH_THRESHOLD && avg_logprob <= LOGPROB_THRESHOLD
 }
 
 /// État du decode RÉSIDENT (poids GPU + KV résident) lié à une génération.
@@ -58,6 +82,15 @@ struct ResidentDecode<'a> {
     metal: &'a crate::MetalExecutor,
     dec: crate::metal_backend::WhisperResidentDecoder,
     kv: crate::metal_backend::WhisperDecodeKv,
+}
+
+/// Features encodeur : tenseur hôte, ou buffer resté sur le GPU depuis
+/// l'encodeur résident ([`super::WhisperEncoder::encode_samples_resident`]).
+#[derive(Clone, Copy)]
+enum AudioFeatures<'a> {
+    Host(&'a Tensor),
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    Resident(&'a crate::metal_backend::WhisperResidentMatrix),
 }
 
 enum DecodeStep {
@@ -149,6 +182,32 @@ impl WhisperDecoder {
         eot_token: u32,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Vec<u32>> {
+        self.generate(
+            AudioFeatures::Host(audio_features),
+            prompt_tokens,
+            (max_new_tokens, eot_token),
+            runtime,
+            None,
+            &mut |_| Ok(()),
+        )
+    }
+
+    /// Boucle greedy commune. Avec `rules`, les logits complets sont relus à
+    /// chaque pas (y compris après SOT) pour les timestamps et les logprobs ;
+    /// sans règles, le chemin résident garde l'argmax GPU. `on_token` reçoit
+    /// les tokens générés après chaque ajout.
+    fn generate(
+        &self,
+        features: AudioFeatures<'_>,
+        prompt_tokens: &[u32],
+        (max_new_tokens, eot_token): (usize, u32),
+        runtime: ForwardRuntime<'_>,
+        mut rules: Option<&mut TimestampRules>,
+        on_token: &mut dyn FnMut(&[u32]) -> Result<()>,
+    ) -> Result<Vec<u32>> {
+        let want_sot = rules.is_some();
+        // Le mode `Probe` ne relit que les logits du SOT : l'argmax GPU continue.
+        let want_logits = rules.as_deref().is_some_and(|r| r.mode != RulesMode::Probe);
         if prompt_tokens.is_empty() {
             return Err(InferError::Config("préfixe Whisper vide".to_string()));
         }
@@ -159,12 +218,20 @@ impl WhisperDecoder {
             Some(metal)
                 if crate::runtime_flags::env_var_os("SARAGOSSA_STT_DECODER_PEROP").is_none() =>
             {
+                let t_kv = std::time::Instant::now();
                 let dec = self.build_resident_decoder(metal)?;
-                let kv = metal.build_whisper_decode_kv_resident(
-                    audio_features,
-                    &dec,
-                    self.config.max_target_positions,
-                )?;
+                let capacity = self.config.max_target_positions;
+                let kv = match features {
+                    AudioFeatures::Host(audio_features) => {
+                        metal.build_whisper_decode_kv_resident(audio_features, &dec, capacity)?
+                    }
+                    AudioFeatures::Resident(matrix) => {
+                        metal.build_whisper_decode_kv_from_resident(matrix, &dec, capacity)?
+                    }
+                };
+                if crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some() {
+                    eprintln!("[dec] kv cross: {} us", t_kv.elapsed().as_micros());
+                }
                 Some(ResidentDecode { metal, dec, kv })
             }
             _ => None,
@@ -172,10 +239,17 @@ impl WhisperDecoder {
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         let mut resident: Option<()> = None;
 
-        let cross = if resident.is_none() {
-            self.precompute_cross_kv(audio_features, runtime)?
-        } else {
-            Vec::new()
+        let cross = match (resident.is_none(), features) {
+            (true, AudioFeatures::Host(audio_features)) => {
+                self.precompute_cross_kv(audio_features, runtime)?
+            }
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            (true, AudioFeatures::Resident(_)) => {
+                return Err(InferError::Config(
+                    "features Whisper résidentes sans décodeur résident".to_string(),
+                ));
+            }
+            (false, _) => Vec::new(),
         };
         let mut self_kv: Vec<LayerSelfKv> = (0..self.layers.len())
             .map(|_| LayerSelfKv::new(self.config.d_model))
@@ -185,18 +259,30 @@ impl WhisperDecoder {
         let mut step = |token: u32,
                         position: usize,
                         emit_next: bool,
+                        want_logits: bool,
                         self_kv: &mut [LayerSelfKv]|
          -> Result<DecodeStep> {
             #[cfg(all(target_os = "macos", feature = "metal"))]
             if let Some(rd) = resident.as_mut() {
+                use crate::metal_backend::{WhisperStepEmit, WhisperStepOutput};
                 let h = self.embed_tokens_at(&[token], position)?;
-                let token = rd
-                    .metal
-                    .encode_whisper_decode_step(&h, &rd.dec, &mut rd.kv, emit_next)?;
-                return Ok(match token {
-                    Some(token) => DecodeStep::Token(token),
-                    None => DecodeStep::Advanced,
-                });
+                let emit = match (emit_next, want_logits) {
+                    (false, _) => WhisperStepEmit::Nothing,
+                    (true, false) => WhisperStepEmit::Argmax,
+                    (true, true) => WhisperStepEmit::Hidden,
+                };
+                return Ok(
+                    match rd
+                        .metal
+                        .encode_whisper_decode_step(&h, &rd.dec, &mut rd.kv, emit)?
+                    {
+                        WhisperStepOutput::Advanced => DecodeStep::Advanced,
+                        WhisperStepOutput::Token(token) => DecodeStep::Token(token),
+                        WhisperStepOutput::Hidden(hidden) => {
+                            DecodeStep::Logits(self.decoder_head(&Tensor::row(hidden)?, runtime)?)
+                        }
+                    },
+                );
             }
             let logits = self.forward_step(token, position, cross_ref, self_kv, runtime)?;
             if emit_next {
@@ -211,17 +297,32 @@ impl WhisperDecoder {
         let mut next_from_resident = None;
         let mut logits = None;
         for (position, &token) in prompt_tokens.iter().enumerate() {
-            let emit_next = position + 1 == prompt_tokens.len();
-            match step(token, position, emit_next, &mut self_kv)? {
+            let last = position + 1 == prompt_tokens.len();
+            let emit_next = last || (want_sot && position == 0);
+            let wants = want_logits || (want_sot && position == 0);
+            match step(token, position, emit_next, wants, &mut self_kv)? {
                 DecodeStep::Advanced => {}
                 DecodeStep::Token(token) => next_from_resident = Some(token),
-                DecodeStep::Logits(value) => logits = Some(value),
+                DecodeStep::Logits(value) => {
+                    if position == 0 {
+                        if let Some(rules) = rules.as_deref_mut() {
+                            rules.observe_sot(value.data());
+                        }
+                    }
+                    if last {
+                        logits = Some(value);
+                    }
+                }
             }
         }
         if next_from_resident.is_none() && logits.is_none() {
             return Err(InferError::Config("préfixe Whisper vide".to_string()));
         }
 
+        // Mode `Probe` : seuls les logits du SOT comptaient.
+        if rules.as_deref().is_some_and(|r| r.mode == RulesMode::Probe) {
+            return Ok(Vec::new());
+        }
         let mut generated = Vec::new();
         let budget = max_new_tokens.min(self.config.max_target_positions);
         let mut ctx_len = prompt_tokens.len();
@@ -232,21 +333,25 @@ impl WhisperDecoder {
                     let logits = logits.take().ok_or_else(|| {
                         InferError::Config("decode Whisper sans logits".to_string())
                     })?;
-                    u32::try_from(argmax(logits.data())?).map_err(|_| {
-                        InferError::Dimension("token argmax hors plage u32".to_string())
-                    })?
+                    match rules.as_deref_mut().filter(|r| r.mode != RulesMode::Probe) {
+                        Some(rules) => rules.select(logits.into_data(), &generated),
+                        None => u32::try_from(argmax(logits.data())?).map_err(|_| {
+                            InferError::Dimension("token argmax hors plage u32".to_string())
+                        })?,
+                    }
                 }
             };
             if next == eot_token {
                 return Ok(generated);
             }
             generated.push(next);
+            on_token(&generated)?;
             let position = ctx_len;
             ctx_len += 1;
             if ctx_len >= self.config.max_target_positions {
                 break;
             }
-            match step(next, position, true, &mut self_kv)? {
+            match step(next, position, true, want_logits, &mut self_kv)? {
                 DecodeStep::Advanced => {}
                 DecodeStep::Token(token) => next_from_resident = Some(token),
                 DecodeStep::Logits(value) => logits = Some(value),
@@ -300,7 +405,8 @@ impl WhisperDecoder {
         let proj = |linear: &Linear| -> Result<WhisperResidentProj> {
             let tensor = match linear.weight() {
                 crate::LinearWeight::Dense(tensor) => tensor,
-                crate::LinearWeight::AffineQuantized(_)
+                crate::LinearWeight::MicroScaled(_)
+                | crate::LinearWeight::AffineQuantized(_)
                 | crate::LinearWeight::DenseBf16(_)
                 | crate::LinearWeight::DenseShared(_) => {
                     return Err(InferError::Config(
@@ -542,6 +648,13 @@ impl WhisperModel {
         let transcribe_token = token_id(&tokenizer, TRANSCRIBE_TOKEN)?;
         let eot_token = token_id(&tokenizer, EOT_TOKEN)?;
         let no_timestamps_token = token_id(&tokenizer, NO_TIMESTAMPS_TOKEN)?;
+        let timestamp_begin = tokenizer.token_to_id(FIRST_TIMESTAMP_TOKEN);
+        let no_speech_token = NO_SPEECH_TOKENS
+            .iter()
+            .find_map(|token| tokenizer.token_to_id(token));
+        let language_end = tokenizer
+            .token_to_id(TRANSLATE_TOKEN)
+            .unwrap_or(sot_token + 1);
         Ok(Self {
             encoder,
             decoder,
@@ -550,6 +663,9 @@ impl WhisperModel {
             transcribe_token,
             eot_token,
             no_timestamps_token,
+            timestamp_begin,
+            no_speech_token,
+            language_tokens: sot_token + 1..language_end.max(sot_token + 1),
         })
     }
 
@@ -566,12 +682,45 @@ impl WhisperModel {
         lang: &str,
         runtime: ForwardRuntime<'_>,
     ) -> Result<(String, String)> {
+        self.transcribe_inner(samples, lang, runtime, None)
+    }
+
+    /// Comme [`Self::transcribe`], en appelant `on_delta` dès qu'un morceau de
+    /// texte est décodé. La concaténation des deltas égale le texte renvoyé.
+    ///
+    /// # Errors
+    ///
+    /// Mêmes erreurs que [`Self::transcribe`], plus celles de `on_delta`.
+    pub fn transcribe_with_deltas(
+        &self,
+        samples: &[f32],
+        lang: &str,
+        runtime: ForwardRuntime<'_>,
+        on_delta: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<(String, String)> {
+        self.transcribe_inner(samples, lang, runtime, Some(on_delta))
+    }
+
+    fn transcribe_inner(
+        &self,
+        samples: &[f32],
+        lang: &str,
+        runtime: ForwardRuntime<'_>,
+        mut on_delta: Option<&mut DeltaSink<'_>>,
+    ) -> Result<(String, String)> {
         if samples.len() <= super::N_SAMPLES {
-            return self.transcribe_segment(samples, lang, runtime);
+            return self.decode_segment(samples, lang, runtime, on_delta, false);
         }
-        let mut texts = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
         for range in super::segments::audio_segments(samples) {
-            let (text, _) = self.transcribe_segment(&samples[range], lang, runtime)?;
+            let separator = !texts.is_empty();
+            let (text, _) = self.decode_segment(
+                &samples[range],
+                lang,
+                runtime,
+                on_delta.as_deref_mut(),
+                separator,
+            )?;
             if !text.is_empty() {
                 texts.push(text);
             }
@@ -579,19 +728,61 @@ impl WhisperModel {
         Ok((texts.join(" "), lang.to_string()))
     }
 
+    #[cfg(test)]
     fn transcribe_segment(
         &self,
         samples: &[f32],
         lang: &str,
         runtime: ForwardRuntime<'_>,
     ) -> Result<(String, String)> {
+        self.decode_segment(samples, lang, runtime, None, false)
+    }
+
+    fn decode_segment(
+        &self,
+        samples: &[f32],
+        lang: &str,
+        runtime: ForwardRuntime<'_>,
+        on_delta: Option<&mut DeltaSink<'_>>,
+        separator: bool,
+    ) -> Result<(String, String)> {
+        // Features gardées sur le GPU jusqu'au KV cross (identiques au bit :
+        // seules des copies f32 disparaissent). `SARAGOSSA_STT_FEATURES_HOST=1`
+        // rétablit le readback ; les replis per-op le rétablissent aussi.
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(metal) = runtime.metal_executor() {
+            if !crate::runtime_flags::stt_features_host()
+                && crate::runtime_flags::env_var_os("SARAGOSSA_STT_DECODER_PEROP").is_none()
+            {
+                if let Some(features) = self.encoder.encode_samples_resident(samples, metal)? {
+                    return self.decode_text(
+                        AudioFeatures::Resident(&features),
+                        lang,
+                        runtime,
+                        on_delta,
+                        separator,
+                    );
+                }
+            }
+        }
+        let features = self.encode_segment(samples, runtime)?;
+        self.decode_text(
+            AudioFeatures::Host(&features),
+            lang,
+            runtime,
+            on_delta,
+            separator,
+        )
+    }
+
+    fn encode_segment(&self, samples: &[f32], runtime: ForwardRuntime<'_>) -> Result<Tensor> {
         let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
         let t_enc = std::time::Instant::now();
         let audio_features = self.encoder.encode_samples(samples, runtime)?;
         if timing {
             eprintln!("[stt] encode: {} ms", t_enc.elapsed().as_millis());
         }
-        self.transcribe_with_features(&audio_features, lang, runtime)
+        Ok(audio_features)
     }
 
     /// Transcrit depuis des features audio Whisper déjà encodées.
@@ -608,24 +799,130 @@ impl WhisperModel {
         lang: &str,
         runtime: ForwardRuntime<'_>,
     ) -> Result<(String, String)> {
-        let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
+        self.decode_text(
+            AudioFeatures::Host(audio_features),
+            lang,
+            runtime,
+            None,
+            false,
+        )
+    }
+
+    fn prompt(&self, lang: &str, timestamps: bool) -> Vec<u32> {
         let mut prompt = Vec::with_capacity(4);
         prompt.push(self.sot_token);
         if let Some(language_token) = self.language_token(lang) {
             prompt.push(language_token);
         }
         prompt.push(self.transcribe_token);
-        prompt.push(self.no_timestamps_token);
+        if !timestamps {
+            prompt.push(self.no_timestamps_token);
+        }
+        prompt
+    }
 
-        let t_dec = std::time::Instant::now();
+    fn token_budget(&self) -> usize {
+        self.decoder.config.max_target_positions.min(448)
+    }
 
-        let generated = self.decoder.generate_greedy(
-            audio_features,
-            &prompt,
-            self.decoder.config.max_target_positions.min(448),
-            self.eot_token,
+    /// Règle d'openai-whisper : fenêtre sans parole si `no_speech_prob` (logits du
+    /// SOT) dépasse 0,6 ET que le logprob moyen du décodage greedy ne dépasse pas
+    /// -1,0. Sans cela, whisper-tiny hallucine « ... » sur du silence. Le sondage
+    /// du SOT est peu coûteux ; le décodage complet n'a lieu que si la fenêtre
+    /// est suspecte, donc la parole garde le chemin résident inchangé.
+    ///
+    /// NOTE: le logprob est calculé sans `suppress_tokens` ni `suppress_blank`,
+    /// donc avec un petit écart par rapport à openai près du seuil. Le token de
+    /// langue n'est jamais compté : il fait partie du préfixe, même en mode auto.
+    fn is_silence(
+        &self,
+        features: AudioFeatures<'_>,
+        prompt: &[u32],
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<bool> {
+        if self.no_speech_token.is_none() {
+            return Ok(false);
+        }
+        let budget = (self.token_budget(), self.eot_token);
+        let mut probe =
+            TimestampRules::scoring(self.eot_token, self.no_speech_token, RulesMode::Probe);
+        self.decoder.generate(
+            features,
+            prompt,
+            budget,
             runtime,
+            Some(&mut probe),
+            &mut |_| Ok(()),
         )?;
+        if probe.no_speech_prob <= NO_SPEECH_THRESHOLD {
+            return Ok(false);
+        }
+        let mut plain = TimestampRules::scoring(self.eot_token, None, RulesMode::Plain);
+        let generated = self.decoder.generate(
+            features,
+            prompt,
+            budget,
+            runtime,
+            Some(&mut plain),
+            &mut |_| Ok(()),
+        )?;
+        // `generated` exclut l'EOT mais `select` en a cumulé le logprob : +1.
+        Ok(silence_verdict(
+            probe.no_speech_prob,
+            plain.sum_logprob / (generated.len() + 1) as f64,
+        ))
+    }
+
+    fn decode_text(
+        &self,
+        features: AudioFeatures<'_>,
+        lang: &str,
+        runtime: ForwardRuntime<'_>,
+        on_delta: Option<&mut DeltaSink<'_>>,
+        separator: bool,
+    ) -> Result<(String, String)> {
+        let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
+        let prompt = self.prompt(lang, false);
+        let effective_lang = if lang == "auto" { "auto" } else { lang }.to_string();
+        if self.is_silence(features, &prompt, runtime)? {
+            return Ok((String::new(), effective_lang));
+        }
+        let t_dec = std::time::Instant::now();
+        let generated = match on_delta {
+            None => self.decoder.generate(
+                features,
+                &prompt,
+                (self.token_budget(), self.eot_token),
+                runtime,
+                None,
+                &mut |_| Ok(()),
+            )?,
+            Some(on_delta) => {
+                // Redécoder le préfixe à chaque token (≤ 448) reste négligeable
+                // devant un pas GPU et suit exactement le décodage final.
+                let mut deltas = TextDeltas::new(separator);
+                let generated = self.decoder.generate(
+                    features,
+                    &prompt,
+                    (self.token_budget(), self.eot_token),
+                    runtime,
+                    None,
+                    &mut |tokens| {
+                        let decoded = decode_generated_tokens(&self.tokenizer, tokens)?;
+                        match deltas.update(&decoded) {
+                            Some(delta) => on_delta(&delta),
+                            None => Ok(()),
+                        }
+                    },
+                )?;
+                let text = decode_generated_tokens(&self.tokenizer, &generated)?;
+                // Le reste retenu (blancs, `U+FFFD` final) part avec le dernier token.
+                if let Some(delta) = deltas.finish(&text) {
+                    on_delta(&delta)?;
+                }
+                generated
+            }
+        };
         if timing {
             eprintln!(
                 "[stt] decode: {} ms ({} tokens)",
@@ -634,8 +931,96 @@ impl WhisperModel {
             );
         }
         let text = decode_generated_tokens(&self.tokenizer, &generated)?;
-        let effective_lang = if lang == "auto" { "auto" } else { lang }.to_string();
         Ok((text.trim().to_string(), effective_lang))
+    }
+
+    /// Transcription horodatée (`verbose_json`) : mêmes fenêtres de 30 s que
+    /// [`Self::transcribe`], décodées avec les tokens `<|t.tt|>`.
+    ///
+    /// Le décodage horodaté diffère du mode `notimestamps` : son texte peut
+    /// s'écarter légèrement de [`Self::transcribe`].
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le tokenizer n'a pas de timestamps, ou si
+    /// l'encodage, le décodage ou le tokenizer échoue.
+    pub fn transcribe_verbose(
+        &self,
+        samples: &[f32],
+        lang: &str,
+        runtime: ForwardRuntime<'_>,
+    ) -> Result<WhisperTranscript> {
+        let ts_begin = self.timestamp_begin.ok_or_else(|| {
+            InferError::Config(format!("tokenizer Whisper sans {FIRST_TIMESTAMP_TOKEN}"))
+        })?;
+        let prompt = self.prompt(lang, true);
+        let mut segments: Vec<WhisperSegment> = Vec::new();
+        let mut language = None;
+        for range in super::segments::audio_segments(samples) {
+            if range.is_empty() {
+                continue;
+            }
+            let offset = range.start as f32 / super::SAMPLE_RATE as f32;
+            let window_seconds = range.len() as f32 / super::SAMPLE_RATE as f32;
+            let seek = range.start / super::HOP;
+            let features = self.encode_segment(&samples[range], runtime)?;
+            let mut rules = TimestampRules::new(
+                self.eot_token,
+                ts_begin,
+                self.no_speech_token,
+                self.language_tokens.clone(),
+            );
+            let generated = self.decoder.generate(
+                AudioFeatures::Host(&features),
+                &prompt,
+                (self.token_budget(), self.eot_token),
+                runtime,
+                Some(&mut rules),
+                &mut |_| Ok(()),
+            )?;
+            language = language.or(rules.language);
+            let avg_logprob = (rules.sum_logprob / (generated.len() + 1) as f64) as f32;
+            let compression_ratio = super::timestamps::compression_ratio(
+                decode_generated_tokens(&self.tokenizer, &generated)?.trim(),
+            );
+            for (start, end, tokens) in
+                parse_segments(&generated, self.eot_token, ts_begin, window_seconds)
+            {
+                segments.push(WhisperSegment {
+                    id: segments.len(),
+                    seek,
+                    start: round_centis(offset + start),
+                    end: round_centis(offset + end),
+                    text: decode_generated_tokens(&self.tokenizer, &tokens)?,
+                    tokens,
+                    temperature: 0.0,
+                    avg_logprob,
+                    compression_ratio,
+                    no_speech_prob: rules.no_speech_prob,
+                });
+            }
+        }
+        let text = segments
+            .iter()
+            .map(|segment| segment.text.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let language = match (lang, language) {
+            ("auto", Some(token)) => self
+                .tokenizer
+                .decode(&[token], false)?
+                .trim_start_matches("<|")
+                .trim_end_matches("|>")
+                .to_string(),
+            _ => lang.to_string(),
+        };
+        Ok(WhisperTranscript {
+            text,
+            language,
+            duration: samples.len() as f32 / super::SAMPLE_RATE as f32,
+            segments,
+        })
     }
 
     fn language_token(&self, lang: &str) -> Option<u32> {
@@ -758,6 +1143,10 @@ fn feed_forward(
     fc2.forward_with_runtime(&crate::gelu(&h), runtime)
 }
 
+fn round_centis(seconds: f32) -> f32 {
+    (seconds * 100.0).round() / 100.0
+}
+
 // Keep Whisper's special-token policy shared with the CPU tokenizer golden.
 fn decode_generated_tokens(tokenizer: &RustTokenizer, generated: &[u32]) -> Result<String> {
     tokenizer.decode(generated, true)
@@ -797,6 +1186,8 @@ mod golden_tests {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    mod quality;
 
     #[test]
     fn embed_tokens_adds_positional_offset() {
@@ -919,6 +1310,14 @@ mod tests {
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     fn live_runtime() -> ForwardRuntime<'static> {
         ForwardRuntime::cpu()
+    }
+
+    #[test]
+    fn silence_verdict_needs_both_thresholds() {
+        assert!(silence_verdict(0.9, -1.5));
+        assert!(silence_verdict(0.61, -1.0));
+        assert!(!silence_verdict(0.6, -2.0));
+        assert!(!silence_verdict(0.9, -0.5));
     }
 
     fn tiny_decoder_without_layers() -> WhisperDecoder {

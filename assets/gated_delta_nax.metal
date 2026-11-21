@@ -2643,6 +2643,40 @@ METAL_FUNC void row_sum(thread float* dst, const thread T& tile) {
 
 namespace mlx {
 namespace steel {
+// Les fragments ci-dessous exigent le layout MPP à précision relâchée.
+// Pour hv32, les trois produits hi*hi + hi*lo + lo*hi récupèrent les bits
+// perdus sans changer ce layout. hv48 garde exactement le produit historique.
+template <mpp::tensor_ops::matmul2d_descriptor Desc, bool Compensated,
+          typename A, typename B, typename C>
+METAL_FUNC void gdn_mma(thread A& a, thread B& b, thread C& c) {
+  mpp::tensor_ops::matmul2d<Desc, metal::execution_simdgroup> op;
+  if constexpr (!Compensated) {
+    op.run(a, b, c);
+  } else {
+    auto a_hi = op.template get_left_input_cooperative_tensor<float, float, float>();
+    auto a_lo = op.template get_left_input_cooperative_tensor<float, float, float>();
+    auto b_hi = op.template get_right_input_cooperative_tensor<float, float, float>();
+    auto b_lo = op.template get_right_input_cooperative_tensor<float, float, float>();
+    STEEL_PRAGMA_UNROLL
+    for (ushort i = 0; i < a.get_capacity(); ++i) {
+      a_hi[i] = float(bfloat(a[i]));
+      a_lo[i] = float(bfloat(a[i] - a_hi[i]));
+    }
+    STEEL_PRAGMA_UNROLL
+    for (ushort i = 0; i < b.get_capacity(); ++i) {
+      b_hi[i] = float(bfloat(b[i]));
+      b_lo[i] = float(bfloat(b[i] - b_hi[i]));
+    }
+    op.run(a_hi, b_hi, c);
+    constexpr auto accumulate = mpp::tensor_ops::matmul2d_descriptor(
+        Desc.m, Desc.n, Desc.k, Desc.transpose_left, Desc.transpose_right, true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<accumulate, metal::execution_simdgroup> add;
+    add.run(a_hi, b_lo, c);
+    add.run(a_lo, b_hi, c);
+  }
+}
+
 template <
     typename CType,
     typename AType,
@@ -2650,7 +2684,8 @@ template <
     bool transpose_a = false,
     bool transpose_b = false,
     mpp::tensor_ops::matmul2d_descriptor::mode Mode =
-        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate>
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate,
+    bool Compensated = false>
 METAL_FUNC static constexpr void mma(
     thread BaseNAXFrag::dtype_frag_t<CType>& C,
     const thread BaseNAXFrag::dtype_frag_t<AType>& A0,
@@ -2692,7 +2727,7 @@ METAL_FUNC static constexpr void mma(
     ct_c[i] = C[i];
   }
 
-  gemm_op.run(ct_a, ct_b, ct_c);
+  gdn_mma<desc, Compensated>(ct_a, ct_b, ct_c);
 
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < BaseNAXFrag::kElemsPerFrag; i++) {
@@ -2707,7 +2742,8 @@ template <
     bool transpose_a,
     bool transpose_b,
     mpp::tensor_ops::matmul2d_descriptor::mode Mode =
-        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate>
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate,
+    bool Compensated = false>
 METAL_FUNC static constexpr void mma(
     thread BaseNAXFrag::dtype_frag_t<CType>& C,
     const thread BaseNAXFrag::dtype_frag_t<AType>& A,
@@ -2746,7 +2782,7 @@ METAL_FUNC static constexpr void mma(
     ct_c[BaseNAXFrag::kElemsPerFrag + i] = 0.0;
   }
 
-  gemm_op.run(ct_a, ct_b, ct_c);
+  gdn_mma<desc, Compensated>(ct_a, ct_b, ct_c);
 
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < BaseNAXFrag::kElemsPerFrag; i++) {
@@ -2761,7 +2797,8 @@ template <
     bool transpose_a = false,
     bool transpose_b = false,
     mpp::tensor_ops::matmul2d_descriptor::mode Mode =
-        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate>
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate,
+    bool Compensated = false>
 METAL_FUNC static constexpr void mman(
     thread BaseNAXFrag::dtype_frag_t<CType>& Cn0,
     thread BaseNAXFrag::dtype_frag_t<CType>& Cn1,
@@ -2809,7 +2846,7 @@ METAL_FUNC static constexpr void mman(
   }
 
   // Do matmul
-  gemm_op.run(ct_a, ct_b, ct_c);
+  gdn_mma<desc, Compensated>(ct_a, ct_b, ct_c);
 
   // Copy out results
   STEEL_PRAGMA_UNROLL
@@ -2829,7 +2866,7 @@ METAL_FUNC static constexpr void mman(
       typename decltype(B)::elem_type,                       \
       TA,                                                    \
       TB,                                                    \
-      mpp::tensor_ops::matmul2d_descriptor::mode::multiply>( \
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply, Compensated>( \
       C.frag_at(0, (CO)),                                    \
       A.frag_at(0, (AO)),                                    \
       metal::bool_constant<TA>{},                            \
@@ -2843,7 +2880,7 @@ METAL_FUNC static constexpr void mman(
       typename decltype(B)::elem_type,                                  \
       TA,                                                               \
       TB,                                                               \
-      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate>( \
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate, Compensated>( \
       C.frag_at(0, (CO)),                                               \
       A.frag_at(0, (AO)),                                               \
       metal::bool_constant<TA>{},                                       \
@@ -2857,7 +2894,7 @@ METAL_FUNC static constexpr void mman(
       typename decltype(B)::elem_type,                                  \
       TA,                                                               \
       TB,                                                               \
-      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate>( \
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate, Compensated>( \
       C.frag_at(0, (CO)),                                               \
       A.frag_at(0, (AO)),                                               \
       A.frag_at(0, (AO) + 1),                                           \
@@ -2873,7 +2910,7 @@ METAL_FUNC static constexpr void mman(
       typename decltype(B)::elem_type,                       \
       TA,                                                    \
       TB,                                                    \
-      mpp::tensor_ops::matmul2d_descriptor::mode::multiply>( \
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply, Compensated>( \
       C.frag_at(0, (CO)),                                    \
       C.frag_at(0, (CO) + 1),                                \
       A.frag_at(0, (AO)),                                    \
@@ -2889,7 +2926,7 @@ METAL_FUNC static constexpr void mman(
       typename decltype(B)::elem_type,                                  \
       TA,                                                               \
       TB,                                                               \
-      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate>( \
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate, Compensated>( \
       C.frag_at(0, (CO)),                                               \
       C.frag_at(0, (CO) + 1),                                           \
       A.frag_at(0, (AO)),                                               \
@@ -3000,7 +3037,7 @@ using namespace mpp::tensor_ops;
 
 constant bool save_state_cache [[function_constant(200)]];
 
-template <typename InT, int Dk, int Dv, int Hk, int Hv, int C, int Ckpt>
+template <typename InT, int Dk, int Dv, int Hk, int Hv, int C, int Ckpt, bool Compensated = false>
 [[kernel]] void gated_delta_fused_nax(
     const device InT* q [[buffer(0)]],
     const device InT* k [[buffer(1)]],
@@ -3245,3 +3282,9 @@ template [[host_name("gated_delta_fused_nax_f32_dk128_dv128_hk16_hv48_c16")]]
 [[kernel]] decltype(gated_delta_fused_nax<float, 128, 128, 16, 48, 16, 1>)
 gated_delta_fused_nax<float, 128, 128, 16, 48, 16, 1>;
 
+// Qwen MoE : deux têtes valeurs par tête clé, produits compensés pour
+// maintenir y et état dans la borne de l’oracle, y compris à T >= 512.
+// Comme hv48, log(max(g, 1e-6)) borne les décroissances avant le scan.
+template [[host_name("gated_delta_fused_nax_f32_dk128_dv128_hk16_hv32_c16")]]
+[[kernel]] decltype(gated_delta_fused_nax<float, 128, 128, 16, 32, 16, 1, true>)
+gated_delta_fused_nax<float, 128, 128, 16, 32, 16, 1, true>;

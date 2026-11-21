@@ -22,6 +22,7 @@ PINS = {
     "jinja2": "3.1.6",
     "mlx": "0.32.4",
     "mlx-lm": "0.32.2",
+    "numpy": "2.5.4",
     "torch": "2.15.0",
     "sentence-transformers": "6.3.0",
 }

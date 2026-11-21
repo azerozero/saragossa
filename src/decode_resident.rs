@@ -29,14 +29,6 @@
 //! Réserve **(E)** : ce module EST le jalon 1a.5 (briques minimales + test de
 //! liveness sur des couches synthétiques) à dérisquer avant 1b.
 
-// NOTE: fondation des tranches 1b/1c. Les briques publiques ne sont pour l'instant
-// exercées que par les tests ; la boucle decode résidente (1b) les câblera. Le
-// `dead_code` sera retiré à ce moment-là.
-#![allow(
-    dead_code,
-    reason = "fondation du decode résident (1b/1c) — câblée à la phase suivante"
-)]
-
 use crate::metal_backend::{
     commit_and_wait, read_f32_buffer, LinearAttentionMetalState, LinearAttentionStepSpec,
     LinearAttnResidentDims, MetalExecutor, MetalLinearAttnResidentDenseWeights,
@@ -65,6 +57,10 @@ mod layers;
 mod moe_tail;
 mod multi;
 mod rows;
+#[cfg(feature = "tts")]
+mod tts_layer;
+#[cfg(feature = "tts")]
+mod tts_sampler;
 mod types;
 mod utils;
 
@@ -90,12 +86,16 @@ pub(crate) use self::kv_quant::KvFormat;
 #[cfg(test)]
 pub(crate) use self::layers::QKV_CONCAT_NO_GATE_HITS;
 pub(crate) use self::multi::MultiFullAttnStream;
+#[cfg(feature = "tts")]
+pub(crate) use self::tts_layer::TtsCpLayerWeights;
+#[cfg(feature = "tts")]
+pub(crate) use self::tts_sampler::{TtsCodebookSample, TTS_SAMPLER_MAX_VOCAB, TTS_SAMPLER_TRACE_K};
 pub(crate) use self::types::{
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
     GemmaDenseTailWeights, GemmaMoeTailWeights, GemmaParallelMoeTailWeights, GpuSectionTimer,
     LinearAttnDenseLayerWeights, LinearAttnLayerWeights, MtpD2Segments,
 };
-#[cfg(all(test, feature = "devtools"))]
+#[cfg(test)]
 pub(crate) use self::utils::with_kv_format_override;
 pub(crate) use self::utils::{kv_bf16_dense, kv_bf16_dense_by_default, kv_element_bytes};
 
@@ -133,7 +133,7 @@ pub(crate) struct DecodeResidentState {
     copy_at_bf16_kernel: ComputePipelineState,
     copy_at_bf16_to_f32_kernel: ComputePipelineState,
     /// Rotation de K et append K/V fusionnés, KV f32 puis bf16.
-    rope_append_kv_kernels: [ComputePipelineState; 2],
+    rope_append_kv_kernels: [ComputePipelineState; 4],
     /// Kernels position GPU (bloc MTP), compilés au premier usage seulement.
     gpu_position_kernels: OnceLock<gpu_position::GpuPositionKernels>,
     /// Kernels du chemin full-attn en lignes fusionné, compilés au premier usage.
@@ -142,6 +142,9 @@ pub(crate) struct DecodeResidentState {
     kv_quant_kernels: OnceLock<kv_quant::KvQuantKernels>,
     /// Kernels d'attention avec sinks appris (flint), compilés au premier usage.
     sink_kernels: OnceLock<attention::SinkKernels>,
+    /// Tirage des codebooks TTS sur GPU, compilé au premier usage.
+    #[cfg(feature = "tts")]
+    tts_sampler_kernel: OnceLock<tts_sampler::TtsSamplerKernel>,
     /// Instrumentation per-section (tranche 3), active si `SARAGOSSA_RUST_GPU_COUNTERS`.
     timer: Option<GpuSectionTimer>,
     /// Slot de flux (light-batch) : namespace du scratch label-keyed de

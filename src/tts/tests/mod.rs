@@ -9,8 +9,12 @@ use std::time::Instant;
 
 mod assets;
 mod codec;
+#[cfg(all(target_os = "macos", feature = "metal"))]
+mod fused;
 mod golden;
 mod guards;
+mod inputs;
+mod policy;
 
 /// Charge le codec TTS réel depuis le snapshot VoiceDesign en cache HF.
 fn load_voicedesign_codec() -> Option<TtsCodec> {

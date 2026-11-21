@@ -8,7 +8,6 @@
 
 use super::*;
 use std::ffi::c_void;
-use std::sync::PoisonError;
 
 impl MetalExecutor {
     /// Encode une LayerNorm ligne par ligne : `out = (x-µ)/σ · weight + bias`.
@@ -201,36 +200,6 @@ impl MetalExecutor {
         Ok(())
     }
 
-    /// Encode l'ajout du biais ligne à ligne (in-place) `data[r,c] += bias[c]`.
-    /// `data` peut être lié à un offset (épilogue d'un append KV résident).
-    pub(crate) fn encode_add_row_bias(
-        &self,
-        encoder: &ComputeCommandEncoderRef,
-        data: &BufferRef,
-        data_offset_bytes: u64,
-        bias: &BufferRef,
-        rows: usize,
-        cols: usize,
-    ) -> Result<()> {
-        let dims = [
-            checked_u32(rows, "add_row_bias rows")?,
-            checked_u32(cols, "add_row_bias cols")?,
-        ];
-        let total = checked_len(rows, cols, "add_row_bias total")?;
-        encoder.set_compute_pipeline_state(&self.add_row_bias_f32);
-        encoder.set_buffer(0, Some(data), data_offset_bytes);
-        encoder.set_buffer(1, Some(bias), 0);
-        encoder.set_bytes(2, 8, dims.as_ptr().cast::<c_void>());
-        let width = self.add_row_bias_f32.thread_execution_width().max(1);
-        profile_dispatch();
-        encoder.dispatch_threads(
-            MTLSize::new(checked_nsuint(total, "add_row_bias total")?, 1, 1),
-            MTLSize::new(width, 1, 1),
-        );
-        post_dispatch_barrier(encoder);
-        Ok(())
-    }
-
     /// Encode l'im2col conv1d : `input [frames, in_ch]` → `output [out_frames,
     /// in_ch·kernel]` (zéro-pad), pour un GEMM tuilé conv1d résident.
     #[expect(
@@ -275,266 +244,6 @@ impl MetalExecutor {
         Ok(())
     }
 
-    /// Encode la conversion f32 → bf16 `[n]` (+ barrière).
-    pub(crate) fn encode_f32_to_bf16(
-        &self,
-        encoder: &ComputeCommandEncoderRef,
-        input: &BufferRef,
-        out_bf16: &BufferRef,
-        n: usize,
-    ) -> Result<()> {
-        self.encode_f32_to_bf16_at(encoder, input, out_bf16, 0, n)
-    }
-
-    /// Encode la conversion f32 → bf16 des `n` éléments à partir de
-    /// l'élément `start` des deux buffers (+ barrière).
-    pub(crate) fn encode_f32_to_bf16_at(
-        &self,
-        encoder: &ComputeCommandEncoderRef,
-        input: &BufferRef,
-        out_bf16: &BufferRef,
-        start: usize,
-        n: usize,
-    ) -> Result<()> {
-        self.encode_f32_to_bf16_offsets(encoder, input, start, out_bf16, start, n)
-    }
-
-    /// Comme [`Self::encode_f32_to_bf16_at`], avec des éléments de départ
-    /// distincts en entrée (f32) et en sortie (bf16).
-    pub(crate) fn encode_f32_to_bf16_offsets(
-        &self,
-        encoder: &ComputeCommandEncoderRef,
-        input: &BufferRef,
-        input_start: usize,
-        out_bf16: &BufferRef,
-        out_start: usize,
-        n: usize,
-    ) -> Result<()> {
-        let n_u32 = checked_u32(n, "f32_to_bf16 n")?;
-        record_prefill_f32_to_bf16_shape(n);
-        encoder.set_compute_pipeline_state(&self.f32_to_bf16);
-        encoder.set_buffer(0, Some(input), byte_len::<f32>(input_start)?);
-        encoder.set_buffer(1, Some(out_bf16), byte_len::<u16>(out_start)?);
-        encoder.set_bytes(2, 4, std::ptr::from_ref(&n_u32).cast::<c_void>());
-        let width = self.f32_to_bf16.thread_execution_width().max(1);
-        trace_dispatch_path("f32_to_bf16", n, 1, 0);
-        profile_dispatch();
-        encoder.dispatch_threads(
-            MTLSize::new(checked_nsuint(n, "f32_to_bf16 n")?, 1, 1),
-            MTLSize::new(width, 1, 1),
-        );
-        post_dispatch_barrier(encoder);
-        Ok(())
-    }
-
-    /// GEMM Neural Accelerators standalone `out[M,N] = lhs[M,K]·rhs[N,K]^T`
-    /// (bf16-input / f32-accum, = `matmul2d`). `lhs`/`rhs` f32 → convertis bf16 ;
-    /// `rhs` est transposé en `[K,N]` (= `rhs^T`) pour le matmul standard prouvé.
-    /// Renvoie `None` si la NA n'est pas dispo. Réservé au test de correctness
-    /// (le chemin prod passe par `cached_rhs_t_bf16` + `encode_na_gemm` résident).
-    /// Conservé comme façade standalone symétrique des encodeurs résidents,
-    /// exercé par `tests/na_gemm_delta.rs`.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si les dimensions divergent ou si Metal échoue.
-    #[cfg(test)]
-    pub(crate) fn na_gemm(&self, lhs: &Tensor, rhs: &Tensor) -> Result<Option<Tensor>> {
-        let Some(pso) = self.na_gemm_bf16.clone() else {
-            return Ok(None);
-        };
-        let (m, k) = lhs.as_matrix()?;
-        let (n, k2) = rhs.as_matrix()?;
-        if k != k2 {
-            return Err(InferError::Dimension(format!(
-                "na_gemm: lhs[{m},{k}] rhs[{n},{k2}]"
-            )));
-        }
-        // rhs [N,K] → rhs^T [K,N] (CPU).
-        let rhs_data = rhs.data();
-        let mut rhs_t = vec![0.0_f32; k * n];
-        for nn in 0..n {
-            for kk in 0..k {
-                rhs_t[kk * n + nn] = rhs_data[nn * k + kk];
-            }
-        }
-        let a_f32 = self.upload_f32_buffer(lhs.data(), "na_a_f32")?;
-        let bt_f32 = self.upload_f32_buffer(&rhs_t, "na_bt_f32")?;
-        let a_bf16 = self
-            .device
-            .new_buffer((m * k * 2) as u64, MTLResourceOptions::StorageModeShared);
-        let b_bf16 = self
-            .device
-            .new_buffer((k * n * 2) as u64, MTLResourceOptions::StorageModeShared);
-        let out = self.device.new_buffer(
-            byte_len::<f32>(checked_len(m, n, "na out")?)?,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let mnk = [
-            checked_u32(m, "na m")?,
-            checked_u32(n, "na n")?,
-            checked_u32(k, "na k")?,
-            0,
-        ];
-
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        let guard = EncoderEndGuard::new(encoder);
-        self.encode_f32_to_bf16(encoder, &a_f32, &a_bf16, m * k)?;
-        self.encode_f32_to_bf16(encoder, &bt_f32, &b_bf16, k * n)?;
-        encoder.set_compute_pipeline_state(&pso);
-        encoder.set_buffer(0, Some(&a_bf16), 0);
-        encoder.set_buffer(1, Some(&b_bf16), 0);
-        encoder.set_buffer(2, Some(&out), 0);
-        encoder.set_bytes(3, 16, mnk.as_ptr().cast::<c_void>());
-        let width = pso.thread_execution_width().max(1);
-        profile_dispatch();
-        encoder.dispatch_thread_groups(
-            MTLSize::new(m.div_ceil(64) as u64, n.div_ceil(32) as u64, 1),
-            MTLSize::new(width * 4, 1, 1),
-        );
-        post_dispatch_barrier(encoder);
-        guard.end();
-        commit_and_wait(command_buffer)?;
-        Ok(Some(Tensor::from_vec(
-            vec![m, n],
-            read_f32_buffer(&out, m * n)?,
-        )?))
-    }
-
-    /// Construit (et cache par ptr source) le poids transposé bf16 `rhs^T [K,N]`
-    /// depuis `rhs [N,K]` f32, pour le GEMM NA résident. Transpose + arrondi bf16
-    /// (RTNE) une seule fois ; réutilisé sur toutes les transcriptions.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si `rhs` n'est pas une matrice ou si Metal échoue.
-    pub(crate) fn cached_rhs_t_bf16(&self, rhs: &Tensor) -> Result<Buffer> {
-        let (n, k) = rhs.as_matrix()?;
-        self.cached_rhs_t_bf16_matrix(rhs.data(), n, k, rhs.data().as_ptr() as usize)
-    }
-
-    /// Construit (et cache par clé stable) le poids transposé bf16 `rhs^T [K,N]`
-    /// depuis des données f32 interprétées comme `rhs [N,K]`.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si la forme ne correspond pas aux données ou si Metal
-    /// échoue.
-    pub(crate) fn cached_rhs_t_bf16_matrix(
-        &self,
-        data: &[f32],
-        n: usize,
-        k: usize,
-        key: usize,
-    ) -> Result<Buffer> {
-        let expected = checked_len(n, k, "rhs bf16 matrix")?;
-        if data.len() != expected {
-            return Err(InferError::Shape(format!(
-                "rhs bf16 matrix: len={}, attendu {expected} pour [{n},{k}]",
-                data.len()
-            )));
-        }
-        // Le cache ne reçoit que des buffers entièrement construits, sans
-        // mutation de leur contenu sous verrou : l'empoisonnement les laisse valides.
-        if let Some(buf) = self
-            .bf16_rhs_t_cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&key)
-        {
-            return Ok(buf.clone());
-        }
-        // rhs [N,K] → rhs^T [K,N] + arrondi bf16 (RTNE) en un passage.
-        let mut bf = vec![0u16; checked_len(k, n, "rhs_t bf16")?];
-        for nn in 0..n {
-            for kk in 0..k {
-                let bits = data[nn * k + kk].to_bits();
-                bf[kk * n + nn] =
-                    ((bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16) & 0xffff) as u16;
-            }
-        }
-        let buffer = self.device.new_buffer_with_data(
-            bf.as_ptr().cast::<c_void>(),
-            byte_len::<u16>(bf.len())?,
-            MTLResourceOptions::StorageModeShared,
-        );
-        self.bf16_rhs_t_cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, buffer.clone());
-        Ok(buffer)
-    }
-
-    /// Encode le GEMM NA résident `out[M,N] = lhs_bf16[M,K]·rhs_t_bf16[K,N]`
-    /// (matmul2d, accum f32) dans un command buffer partagé. Opérandes déjà bf16.
-    ///
-    /// # Errors
-    ///
-    /// Renvoie une erreur si la NA est indisponible ou si les dims débordent.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "GEMM bas niveau (dims + buffers)"
-    )]
-    pub(crate) fn encode_na_gemm(
-        &self,
-        encoder: &ComputeCommandEncoderRef,
-        lhs_bf16: &BufferRef,
-        rhs_t_bf16: &BufferRef,
-        out: &BufferRef,
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<()> {
-        let use_bn128 = !matches!(
-            crate::runtime_flags::env_var("SARAGOSSA_STT_NAX_BN128").as_deref(),
-            Some("0" | "false" | "off" | "no")
-        ) && n % 128 == 0;
-        let pso = if use_bn128 {
-            self.na_gemm_bf16_bn128
-                .as_ref()
-                .or(self.na_gemm_bf16.as_ref())
-        } else {
-            self.na_gemm_bf16.as_ref()
-        }
-        .ok_or_else(|| InferError::Config("encode_na_gemm: NA indisponible".into()))?;
-        let tile_n = if use_bn128 && self.na_gemm_bf16_bn128.is_some() {
-            128
-        } else {
-            32
-        };
-        let simdgroups = if tile_n == 128 { 8 } else { 4 };
-        let mnk = [
-            checked_u32(m, "na m")?,
-            checked_u32(n, "na n")?,
-            checked_u32(k, "na k")?,
-            0,
-        ];
-        encoder.set_compute_pipeline_state(pso);
-        encoder.set_buffer(0, Some(lhs_bf16), 0);
-        encoder.set_buffer(1, Some(rhs_t_bf16), 0);
-        encoder.set_buffer(2, Some(out), 0);
-        encoder.set_bytes(3, 16, mnk.as_ptr().cast::<c_void>());
-        let width = pso.thread_execution_width().max(1);
-        trace_dispatch_path(
-            if tile_n == 128 {
-                "gemm_nax_bf16_bn128"
-            } else {
-                "gemm_nax"
-            },
-            m,
-            n,
-            k,
-        );
-        profile_dispatch();
-        encoder.dispatch_thread_groups(
-            MTLSize::new(m.div_ceil(64) as u64, n.div_ceil(tile_n) as u64, 1),
-            MTLSize::new(width * simdgroups, 1, 1),
-        );
-        post_dispatch_barrier(encoder);
-        Ok(())
-    }
-
     /// Encode l'attention single-query `out = softmax(q·Kᵀ·scale)·V` (decode
     /// Whisper, self ou cross), une tête par threadgroup.
     #[allow(
@@ -564,6 +273,8 @@ impl MetalExecutor {
         } else {
             &self.whisper_attn_decode_f32
         };
+        let threads = if use_vec64 { 1024 } else { 256 };
+        check_threadgroup_size(pipeline, threads, "Whisper attention decode")?;
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q), 0);
         encoder.set_buffer(1, Some(keys), 0);
@@ -571,7 +282,6 @@ impl MetalExecutor {
         encoder.set_buffer(3, Some(out), 0);
         encoder.set_bytes(4, 16, dims.as_ptr().cast::<c_void>());
         profile_dispatch();
-        let threads = if use_vec64 { 1024 } else { 256 };
         encoder.dispatch_thread_groups(
             MTLSize::new(checked_nsuint(heads, "attn heads")?, 1, 1),
             MTLSize::new(threads, 1, 1),
@@ -712,9 +422,25 @@ impl MetalExecutor {
         h_input: &Tensor,
         enc: &WhisperResidentEncoder,
     ) -> Result<Tensor> {
+        let (seq, _) = h_input.as_matrix()?;
+        self.encode_whisper_encoder_keys(h_input, enc, seq)
+    }
+
+    /// Comme [`Self::encode_whisper_encoder`], mais seules les `key_rows`
+    /// premières trames servent de clés (trames de queue masquées).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde ou si Metal échoue.
+    pub(crate) fn encode_whisper_encoder_keys(
+        &self,
+        h_input: &Tensor,
+        enc: &WhisperResidentEncoder,
+        key_rows: usize,
+    ) -> Result<Tensor> {
         let (seq, dim) = h_input.as_matrix()?;
         let h = self.upload_f32_buffer(h_input.data(), "we_h")?;
-        let resident = self.encode_whisper_encoder_buffer(&h, seq, dim, enc)?;
+        let resident = self.encode_whisper_encoder_buffer(&h, seq, dim, enc, key_rows)?;
         Tensor::from_vec(
             vec![resident.rows, resident.cols],
             read_f32_buffer(
@@ -724,12 +450,61 @@ impl MetalExecutor {
         )
     }
 
+    /// Frontend conv puis encodeur, sortie laissée sur le GPU : supprime le
+    /// readback de la conv, son ré-upload, le readback des features et leur
+    /// ré-upload pour le KV cross. Copies f32 exactes en moins : les features
+    /// sont identiques au bit à [`Self::encode_whisper_conv`] suivi de
+    /// [`Self::encode_whisper_encoder`].
+    ///
+    /// NOTE: le buffer rendu est mémoïsé par label (`we_normed`) ; il doit être
+    /// consommé avant le prochain encodage Whisper sur cet exécuteur. Invariant
+    /// tenu par serve : `AudioState::with_stt` prend `&mut self` (src/serve/audio.rs:208)
+    /// depuis `ServeState::audio_mut(&mut self)` (src/serve/state.rs:152), tous deux
+    /// sur l'unique thread moteur (`assert_engine_thread`, src/serve/state.rs:211),
+    /// et l'exécuteur STT (src/serve/audio.rs:244) n'est partagé avec aucun autre
+    /// modèle (la diarisation a le sien, audio.rs:260) : deux STT ne se chevauchent pas.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si une dimension déborde ou si Metal échoue.
+    pub(crate) fn encode_whisper_features_resident(
+        &self,
+        nlc: &Tensor,
+        conv: &WhisperConvWeights,
+        enc: &WhisperResidentEncoder,
+    ) -> Result<WhisperResidentMatrix> {
+        let h = self.encode_whisper_conv_resident(nlc, conv)?;
+        self.encode_whisper_encoder_buffer(&h.buffer, h.rows, h.cols, enc, h.rows)
+    }
+
+    /// KV decode depuis des features restées sur le GPU
+    /// ([`Self::encode_whisper_features_resident`]).
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si les formes divergent ou si Metal échoue.
+    pub(crate) fn build_whisper_decode_kv_from_resident(
+        &self,
+        features: &WhisperResidentMatrix,
+        dec: &WhisperResidentDecoder,
+        capacity: usize,
+    ) -> Result<WhisperDecodeKv> {
+        self.build_whisper_decode_kv_resident_from_buffer(
+            &features.buffer,
+            features.rows,
+            features.cols,
+            dec,
+            capacity,
+        )
+    }
+
     fn encode_whisper_encoder_buffer(
         &self,
         h: &BufferRef,
         seq: usize,
         dim: usize,
         enc: &WhisperResidentEncoder,
+        key_rows: usize,
     ) -> Result<WhisperResidentMatrix> {
         if dim != enc.d_model {
             return Err(InferError::Dimension(format!(
@@ -754,6 +529,13 @@ impl MetalExecutor {
         let q = self.new_f32_buffer(nd, "we_q")?;
         let k = self.new_f32_buffer(nd, "we_k")?;
         let v = self.new_f32_buffer(nd, "we_v")?;
+        // Alloué seulement si une couche fusionne q/k/v.
+        #[cfg(feature = "diar")]
+        let qkv_buf = if enc.layers.iter().any(|l| l.qkv.is_some()) {
+            self.new_f32_buffer(3 * nd, "we_qkv")?
+        } else {
+            self.new_f32_buffer(1, "we_qkv")?
+        };
         let ctx = self.new_f32_buffer(nd, "we_ctx")?;
         let proj = self.new_f32_buffer(nd, "we_proj")?;
         let f1 = self.new_f32_buffer(nf, "we_f1")?;
@@ -827,43 +609,39 @@ impl MetalExecutor {
 
         for (i, layer) in enc.layers.iter().enumerate() {
             // Self-attention : q/k/v depuis `normed`.
-            self.encode_proj_gemm(
-                encoder,
-                na,
-                &normed,
-                &normed_bf16,
-                &layer.q,
-                &q,
-                seq,
-                dim,
-                dim,
+            match (&layer.qkv, na) {
+                #[cfg(feature = "diar")]
+                (Some(qkv), false) => {
+                    let n3 = 3 * dim;
+                    self.encode_dense_gemm(encoder, &normed, &qkv.weight, &qkv_buf, seq, n3, dim)?;
+                    self.encode_proj_bias(encoder, &qkv_buf, qkv.bias.as_ref(), seq, n3)?;
+                    self.encode_split_qkv(encoder, &qkv_buf, [&q, &k, &v], seq, dim)?;
+                }
+                _ => {
+                    for (proj, out) in [(&layer.q, &q), (&layer.k, &k), (&layer.v, &v)] {
+                        self.encode_proj_gemm(
+                            encoder,
+                            na,
+                            &normed,
+                            &normed_bf16,
+                            proj,
+                            out,
+                            seq,
+                            dim,
+                            dim,
+                        )?;
+                        self.encode_proj_bias(encoder, out, proj.bias.as_ref(), seq, dim)?;
+                    }
+                }
+            }
+            #[cfg(feature = "diar")]
+            if let Some(theta) = enc.rope_theta {
+                self.encode_rope_heads_inplace(encoder, &q, seq, enc.heads, head_dim, theta)?;
+                self.encode_rope_heads_inplace(encoder, &k, seq, enc.heads, head_dim, theta)?;
+            }
+            self.encode_noncausal_attention_prefill_keys(
+                encoder, &q, &k, &v, &ctx, attn_spec, key_rows,
             )?;
-            self.encode_proj_bias(encoder, &q, layer.q.bias.as_ref(), seq, dim)?;
-            self.encode_proj_gemm(
-                encoder,
-                na,
-                &normed,
-                &normed_bf16,
-                &layer.k,
-                &k,
-                seq,
-                dim,
-                dim,
-            )?;
-            self.encode_proj_bias(encoder, &k, layer.k.bias.as_ref(), seq, dim)?;
-            self.encode_proj_gemm(
-                encoder,
-                na,
-                &normed,
-                &normed_bf16,
-                &layer.v,
-                &v,
-                seq,
-                dim,
-                dim,
-            )?;
-            self.encode_proj_bias(encoder, &v, layer.v.bias.as_ref(), seq, dim)?;
-            self.encode_noncausal_attention_prefill(encoder, &q, &k, &v, &ctx, attn_spec)?;
             if na {
                 self.encode_f32_to_bf16(encoder, &ctx, &ctx_bf16, nd)?;
             }
@@ -964,6 +742,78 @@ impl MetalExecutor {
         })
     }
 
+    /// `[seq, 3d]` → trois buffers `[seq, d]` (copie exacte).
+    #[cfg(feature = "diar")]
+    fn encode_split_qkv(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        qkv: &BufferRef,
+        [q, k, v]: [&BufferRef; 3],
+        seq: usize,
+        dim: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(seq, "split seq")?,
+            checked_u32(dim, "split dim")?,
+        ];
+        encoder.set_compute_pipeline_state(&self.split_qkv_rows_f32);
+        encoder.set_buffer(0, Some(qkv), 0);
+        encoder.set_buffer(1, Some(q), 0);
+        encoder.set_buffer(2, Some(k), 0);
+        encoder.set_buffer(3, Some(v), 0);
+        set_u32_bytes(encoder, 4, &dims, "split_qkv_dims")?;
+        profile_dispatch();
+        encoder.dispatch_threads(
+            MTLSize::new(
+                checked_nsuint(dim, "split dim")?,
+                checked_nsuint(seq, "split seq")?,
+                1,
+            ),
+            MTLSize::new(32, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
+    /// RoPE rotate-half en place sur `[seq, heads * head_dim]`, positions `0..seq`.
+    #[cfg(feature = "diar")]
+    fn encode_rope_heads_inplace(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        x: &BufferRef,
+        seq: usize,
+        heads: usize,
+        head_dim: usize,
+        theta: f32,
+    ) -> Result<()> {
+        if head_dim % 2 != 0 {
+            return Err(InferError::Dimension(format!(
+                "RoPE encodeur: head_dim={head_dim} impair"
+            )));
+        }
+        let dims = [
+            checked_u32(seq, "rope seq")?,
+            checked_u32(heads, "rope heads")?,
+            checked_u32(head_dim, "rope head_dim")?,
+        ];
+        let frequencies = self.rope_frequencies(theta, head_dim)?;
+        encoder.set_compute_pipeline_state(&self.rope_heads_inplace_f32);
+        encoder.set_buffer(0, Some(x), 0);
+        set_u32_bytes(encoder, 1, &dims, "rope_inplace_dims")?;
+        encoder.set_buffer(2, Some(&frequencies), 0);
+        profile_dispatch();
+        encoder.dispatch_threads(
+            MTLSize::new(
+                checked_nsuint(head_dim / 2, "rope pairs")?,
+                checked_nsuint(heads, "rope heads")?,
+                checked_nsuint(seq, "rope seq")?,
+            ),
+            MTLSize::new(32, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
     /// GEMM d'une projection encodeur : matmul2d NA (`na`, lhs bf16 + `weight_na`)
     /// ou GEMM dense f32 byte-identique. `out[m,n] = lhs[m,k]·weight[n,k]^T`.
     #[expect(
@@ -1018,6 +868,46 @@ impl MetalExecutor {
         self.encode_dense_qmv(encoder, lhs, &proj.weight, out, 0, 1, out_dim, in_dim)
     }
 
+    /// QMV d'une projection d'attention decode : poids bf16 en opt-in
+    /// (`SARAGOSSA_STT_DEC_ATTN_BF16`), sinon f32 inchangé. `out_offset` sert à
+    /// l'append K/V.
+    #[expect(clippy::too_many_arguments, reason = "qmv bas niveau (dims + buffers)")]
+    fn encode_decode_attn_qmv(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs: &BufferRef,
+        proj: &WhisperResidentProj,
+        out: &BufferRef,
+        out_offset: u64,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<()> {
+        if super::whisper_decode_attn_bf16_enabled() {
+            if let Some(weight_bf16) = proj.weight_bf16.as_ref() {
+                return self.encode_dense_qmv_rhs_bf16_at(
+                    encoder,
+                    lhs,
+                    weight_bf16,
+                    out,
+                    out_offset,
+                    1,
+                    out_dim,
+                    in_dim,
+                );
+            }
+        }
+        self.encode_dense_qmv(
+            encoder,
+            lhs,
+            &proj.weight,
+            out,
+            out_offset,
+            1,
+            out_dim,
+            in_dim,
+        )
+    }
+
     /// Ajoute le biais si présent (k_proj est biasless dans Whisper).
     fn encode_proj_bias(
         &self,
@@ -1049,8 +939,9 @@ impl MetalExecutor {
         h_input: &Tensor,
         dec: &WhisperResidentDecoder,
         kv: &mut WhisperDecodeKv,
-        emit_argmax: bool,
-    ) -> Result<Option<u32>> {
+        emit: WhisperStepEmit,
+    ) -> Result<WhisperStepOutput> {
+        let emit_argmax = emit == WhisperStepEmit::Argmax;
         let (rows, dim) = h_input.as_matrix()?;
         if rows != 1 || dim != dec.d_model {
             return Err(InferError::Dimension(format!(
@@ -1113,28 +1004,10 @@ impl MetalExecutor {
             let self_keys = &kv.self_keys[i];
             let self_values = &kv.self_values[i];
             // Self-attn : q→scratch, k/v→append device-side dans le KV à la ligne `len`.
-            self.encode_dense_qmv(encoder, &normed, &layer.q.weight, &q, 0, 1, dim, dim)?;
+            self.encode_decode_attn_qmv(encoder, &normed, &layer.q, &q, 0, dim, dim)?;
             self.encode_proj_bias(encoder, &q, layer.q.bias.as_ref(), 1, dim)?;
-            self.encode_dense_qmv(
-                encoder,
-                &normed,
-                &layer.k.weight,
-                self_keys,
-                kv_off,
-                1,
-                dim,
-                dim,
-            )?;
-            self.encode_dense_qmv(
-                encoder,
-                &normed,
-                &layer.v.weight,
-                self_values,
-                kv_off,
-                1,
-                dim,
-                dim,
-            )?;
+            self.encode_decode_attn_qmv(encoder, &normed, &layer.k, self_keys, kv_off, dim, dim)?;
+            self.encode_decode_attn_qmv(encoder, &normed, &layer.v, self_values, kv_off, dim, dim)?;
             if let Some(bias) = layer.v.bias.as_ref() {
                 self.encode_add_row_bias(encoder, self_values, kv_off, bias, 1, dim)?;
             }
@@ -1148,7 +1021,7 @@ impl MetalExecutor {
                 head_dim,
                 self_len,
             )?;
-            self.encode_dense_qmv(encoder, &ctx, &layer.o.weight, &proj, 0, 1, dim, dim)?;
+            self.encode_decode_attn_qmv(encoder, &ctx, &layer.o, &proj, 0, dim, dim)?;
             self.encode_proj_bias(encoder, &proj, layer.o.bias.as_ref(), 1, dim)?;
             // h += attn ; normed = cross_ln(h).
             self.encode_add_layer_norm_rows(
@@ -1164,16 +1037,7 @@ impl MetalExecutor {
                 eps,
             )?;
             // Cross-attn sur le KV statique.
-            self.encode_dense_qmv(
-                encoder,
-                &normed,
-                &layer.cross_q.weight,
-                &cross_q,
-                0,
-                1,
-                dim,
-                dim,
-            )?;
+            self.encode_decode_attn_qmv(encoder, &normed, &layer.cross_q, &cross_q, 0, dim, dim)?;
             self.encode_proj_bias(encoder, &cross_q, layer.cross_q.bias.as_ref(), 1, dim)?;
             self.encode_whisper_attn_decode(
                 encoder,
@@ -1185,7 +1049,7 @@ impl MetalExecutor {
                 head_dim,
                 kv.cross_len,
             )?;
-            self.encode_dense_qmv(encoder, &ctx, &layer.cross_o.weight, &proj, 0, 1, dim, dim)?;
+            self.encode_decode_attn_qmv(encoder, &ctx, &layer.cross_o, &proj, 0, dim, dim)?;
             self.encode_proj_bias(encoder, &proj, layer.cross_o.bias.as_ref(), 1, dim)?;
             // h += cross ; normed = final_ln(h).
             self.encode_add_layer_norm_rows(
@@ -1249,13 +1113,15 @@ impl MetalExecutor {
         guard.end();
         commit_and_wait(command_buffer)?;
         kv.len += 1;
-        match next_index {
-            Some(next_index) => read_u32_buffer(&next_index, 1)?
+        match (emit, next_index) {
+            (WhisperStepEmit::Argmax, Some(next_index)) => read_u32_buffer(&next_index, 1)?
                 .into_iter()
                 .next()
-                .map(Some)
+                .map(WhisperStepOutput::Token)
                 .ok_or_else(|| InferError::Metal("decode résident: argmax sans token".to_string())),
-            None => Ok(None),
+            // `h` précède le LayerNorm final : l'appelant applique la tête complète.
+            (WhisperStepEmit::Hidden, _) => read_f32_buffer(&h, dim).map(WhisperStepOutput::Hidden),
+            _ => Ok(WhisperStepOutput::Advanced),
         }
     }
 
@@ -1432,6 +1298,9 @@ pub(crate) struct WhisperResidentLayer {
     pub q: WhisperResidentProj,
     pub k: WhisperResidentProj,
     pub v: WhisperResidentProj,
+    /// `[q; k; v]` empilés `[3d, d]` (diarisation, `SARAGOSSA_DIAR_FUSED_QKV=1`) :
+    /// un seul GEMM remplace les trois. Ignoré par le chemin bf16 NA.
+    pub qkv: Option<WhisperResidentProj>,
     pub o: WhisperResidentProj,
     pub final_ln: WhisperResidentNorm,
     pub fc1: WhisperResidentProj,
@@ -1446,6 +1315,10 @@ pub(crate) struct WhisperResidentEncoder {
     pub heads: usize,
     pub ffn_dim: usize,
     pub eps: f32,
+    /// RoPE rotate-half sur q et k avant l'attention (diarisation Nemotron) ;
+    /// `None` pour Whisper, dont les positions sont apprises.
+    #[cfg(feature = "diar")]
+    pub rope_theta: Option<f32>,
 }
 
 /// Poids GPU d'une couche décodeur Whisper (self-attn + cross-attn + FFN).
@@ -1486,4 +1359,23 @@ pub(crate) struct WhisperDecodeKv {
     pub cross_len: usize,
     pub len: usize,
     pub capacity: usize,
+}
+
+/// Sortie demandée à un pas de decode Whisper résident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WhisperStepEmit {
+    /// Avance le KV sans sortie (préfixe).
+    Nothing,
+    /// Argmax GPU de la tête : seul l'id du token est relu.
+    Argmax,
+    /// Relit l'état caché avant LayerNorm final, pour des logits complets.
+    Hidden,
+}
+
+/// Résultat d'un pas de decode Whisper résident.
+#[derive(Debug)]
+pub(crate) enum WhisperStepOutput {
+    Advanced,
+    Token(u32),
+    Hidden(Vec<f32>),
 }

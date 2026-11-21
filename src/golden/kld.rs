@@ -108,12 +108,42 @@ fn within_noise(engine: Stats, noise: Stats) -> bool {
 
 #[test]
 fn external_kld_references_are_consistent() -> TestResult {
-    for (name, _) in CHAT_MODELS {
+    for name in CHAT_MODELS.iter().map(|(name, _)| *name).chain([
+        "gemma4_long_1024",
+        "gemma4_long_2048",
+        "gemma4_long_4100",
+    ]) {
         let reference = load(name)?;
         for (ids, logprobs) in &reference.rows {
             assert!(logprobs.windows(2).all(|v| v[0] >= v[1]) && logprobs[0] <= 0.0);
             let unique: std::collections::HashSet<_> = ids.iter().collect();
             assert_eq!(unique.len(), ids.len());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn external_kld_gemma4_long_protocol() -> TestResult {
+    for length in [1024, 2048, 4100] {
+        let name = format!("gemma4_long_{length}");
+        let reference = load(&name)?;
+        let (header, _) = read(&format!("kld/{name}"))?;
+        let (meta_header, _) = read(&format!("kld/{name}_meta"))?;
+        assert_eq!(header.source, meta_header.source);
+        assert_eq!(header.source["versions"]["mlx"], "0.32.4");
+        assert_eq!(header.source["versions"]["mlx-lm"], "0.32.2");
+        assert!(!header.source["weight_sha256"]
+            .as_object()
+            .ok_or("empreintes des poids longues absentes")?
+            .is_empty());
+        assert_eq!(reference.meta.scored, 128);
+        assert_eq!(reference.meta.top_k, 64);
+        assert_eq!(reference.meta.chunks.len(), 1);
+        let chunk = &reference.meta.chunks[0];
+        assert_eq!(chunk.len(), length + 128);
+        for ((ids, _), token) in reference.rows.iter().zip(&chunk[length..]) {
+            assert_eq!(ids[0], *token, "la continuation doit être greedy f32");
         }
     }
     Ok(())
@@ -151,6 +181,251 @@ fn external_kld_ratio_gate() {
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn compare(name: &str, env: &str) -> TestResult {
+    compare_with_prefill(name, env, |model, prompt| model.prefill_cache(prompt))
+}
+
+/// Même référence, provenance et seuils que l'oracle externe ; les deux chemins
+/// doivent réellement s'exécuter. Une absence de poids ou un refus résident
+/// fait échouer cette qualification même sans SARAGOSSA_REQUIRE_REAL_MODELS.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn compare_gemma4_prefill(resident: bool) -> TestResult {
+    let env = "SARAGOSSA_GEMMA4_DIR";
+    local(env)?.ok_or("SARAGOSSA_GEMMA4_DIR requis pour cet oracle")?;
+    let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(resident);
+    eprintln!("kld/gemma4: prefill résident={resident}");
+    compare_with_prefill("gemma4", env, |model, prompt| {
+        let (cache, state) = if resident {
+            model
+                .prefill_cache_state_metal_resident_for_test(prompt)?
+                .ok_or_else(|| {
+                    crate::InferError::Config("oracle: prefill résident refusé".into())
+                })?
+        } else {
+            model.prefill_cache_state_batched_for_test(prompt)?
+        };
+        Ok((cache, model.logits_from_final_state(&state)?))
+    })
+}
+
+/// Référence indépendante mlx-lm f32 et bruit bf16 calibré sur le même prompt.
+/// Le prefill candidat est forcé sans repli ; le decode et les tokens de la
+/// référence sont communs aux deux chemins. Les seuils restent ceux du golden.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn compare_gemma4_long_reference(name: &str, resident: bool) -> TestResult {
+    let env = "SARAGOSSA_GEMMA4_DIR";
+    local(env)?.ok_or("SARAGOSSA_GEMMA4_DIR requis pour cet oracle")?;
+    let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(resident);
+    eprintln!("kld/{name}: prefill résident={resident}");
+    compare_with_prefill(name, env, |model, prompt| {
+        crate::MetalExecutor::take_long_d512_dispatches_for_test();
+        let (cache, state) = if resident {
+            model
+                .prefill_cache_state_metal_resident_for_test(prompt)?
+                .ok_or_else(|| {
+                    crate::InferError::Config("oracle MLX long: résident refusé".into())
+                })?
+        } else {
+            model.prefill_cache_state_batched_for_test(prompt)?
+        };
+        let trace = crate::MetalExecutor::take_long_d512_dispatches_for_test();
+        eprintln!(
+            "kld/{name}: prompt={} résident={resident} trace={trace:?}",
+            prompt.len()
+        );
+        assert_eq!(
+            trace.len(),
+            if resident && prompt.len() > 2048 {
+                5
+            } else {
+                0
+            }
+        );
+        assert!(trace
+            .iter()
+            .all(|&(seq, dim)| seq == prompt.len() && dim == 512));
+        Ok((cache, model.logits_from_final_state(&state)?))
+    })
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+macro_rules! long_oracle {
+    ($test:ident, $name:literal, $resident:literal) => {
+        #[test]
+        #[ignore = "oracle MLX long q4a8-ls : poids locaux et verrou GPU, borne >= 4100 ; échec top-1 connu à 4100 sur les deux chemins (docs/perf/gemma4-prefill.md)"]
+        fn $test() -> TestResult {
+            compare_gemma4_long_reference($name, $resident)
+        }
+    };
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+long_oracle!(
+    external_kld_gemma4_long_1024_per_op,
+    "gemma4_long_1024",
+    false
+);
+#[cfg(all(target_os = "macos", feature = "metal"))]
+long_oracle!(
+    external_kld_gemma4_long_1024_resident,
+    "gemma4_long_1024",
+    true
+);
+#[cfg(all(target_os = "macos", feature = "metal"))]
+long_oracle!(
+    external_kld_gemma4_long_2048_per_op,
+    "gemma4_long_2048",
+    false
+);
+#[cfg(all(target_os = "macos", feature = "metal"))]
+long_oracle!(
+    external_kld_gemma4_long_2048_resident,
+    "gemma4_long_2048",
+    true
+);
+#[cfg(all(target_os = "macos", feature = "metal"))]
+long_oracle!(
+    external_kld_gemma4_long_4100_per_op,
+    "gemma4_long_4100",
+    false
+);
+#[cfg(all(target_os = "macos", feature = "metal"))]
+long_oracle!(
+    external_kld_gemma4_long_4100_resident,
+    "gemma4_long_4100",
+    true
+);
+
+/// Équivalent interne record/compare : référence per-op en mémoire, puis
+/// replay forcé des mêmes tokens après un prefill résident sans repli.
+/// La partition top-K + reste et le p99 des Δp maximaux par position sont
+/// exactement ceux du golden, contrairement aux métriques plein vocab CLI.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn compare_gemma4_long_prefill(
+    model: &crate::CausalDecoder,
+    prompt: &[usize],
+) -> TestResult {
+    assert!((4096..=4128).contains(&prompt.len()), "prompt long attendu");
+    compare_gemma4_prefill_at_length(model, prompt)
+}
+
+/// Même oracle et mêmes seuils, à une longueur totale contrôlée par le test.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+pub(crate) fn compare_gemma4_prefill_at_length(
+    model: &crate::CausalDecoder,
+    prompt: &[usize],
+) -> TestResult {
+    let meta: Meta = json("kld/gemma4_meta")?;
+    assert_eq!(meta.model, "gemma4");
+    assert!(
+        prompt.len() <= crate::runtime_flags::prefill_resident_gemma4_max_tokens(),
+        "relever explicitement SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4_MAX_TOKENS pour cet oracle"
+    );
+    let n = meta.scored;
+    let mut rows = Vec::with_capacity(n);
+    let mut forced = Vec::with_capacity(n);
+    crate::MetalExecutor::take_long_d512_dispatches_for_test();
+    {
+        let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(false);
+        let (mut cache, state) = model.prefill_cache_state_batched_for_test(prompt)?;
+        let mut logits = model.logits_from_final_state(&state)?;
+        for position in 0..n {
+            let values = logits.data();
+            assert!(values.iter().all(|v| v.is_finite()));
+            let token = crate::argmax(values)?;
+            let max = f64::from(values[token]);
+            let log_z = max
+                + values
+                    .iter()
+                    .map(|&v| (f64::from(v) - max).exp())
+                    .sum::<f64>()
+                    .ln();
+            let mut ids: Vec<usize> = (0..values.len()).collect();
+            ids.sort_by(|&a, &b| values[b].total_cmp(&values[a]).then(a.cmp(&b)));
+            ids.truncate(meta.top_k);
+            let logprobs: Vec<f64> = ids
+                .iter()
+                .map(|&id| f64::from(values[id]) - log_z)
+                .collect();
+            rows.push((ids, logprobs));
+            forced.push(token);
+            if position + 1 < n {
+                logits = model.next_logits_cached(&mut cache, token)?;
+            }
+        }
+    }
+    assert!(
+        crate::MetalExecutor::take_long_d512_dispatches_for_test().is_empty(),
+        "la référence doit utiliser le per-op (attention CPU f32)"
+    );
+    eprintln!(
+        "kld/gemma4-long: référence per-op enregistrée, prompt={} positions={n}",
+        prompt.len()
+    );
+    let _flag = crate::runtime_flags::override_prefill_resident_gemma4_for_test(true);
+    // Diagnostic limité au prefill candidat : référence et decode inchangés.
+    let strict = crate::runtime_flags::env_var("SARAGOSSA_GEMMA4_ORACLE_GEMM_F32")
+        .is_some_and(|value| value == "1");
+    let global_ablation = crate::runtime_flags::env_var("SARAGOSSA_GEMMA4_ORACLE_GLOBAL_PER_OP");
+    let (mut cache, state) = crate::metal_backend::with_verify_strict_override(strict, || {
+        let _greedy = crate::metal_backend::install_verify_greedy_scope(strict);
+        assert_eq!(crate::metal_backend::verify_strict_active(), strict);
+        if let Some(mode) = &global_ablation {
+            assert!(mode == "1" || mode == "control");
+            model
+                .prefill_gemma4_global_ablation_for_test(prompt, mode == "1")
+                .map(Some)
+        } else {
+            model.prefill_cache_state_metal_resident_for_test(prompt)
+        }
+    })?
+    .ok_or("oracle long: prefill résident refusé")?;
+    let trace = crate::MetalExecutor::take_long_d512_dispatches_for_test();
+    eprintln!("kld/gemma4-long: trace causal_attention_prefill_long_d512_f32 {trace:?}");
+    assert_eq!(
+        !trace.is_empty(),
+        prompt.len() > 2048 && global_ablation.as_deref() != Some("1"),
+        "dispatch long d512 incohérent avec la longueur"
+    );
+    assert!(trace
+        .iter()
+        .all(|&(seq, dim)| seq == prompt.len() && dim == 512));
+    let mut logits = model.logits_from_final_state(&state)?;
+    let (mut kls, mut deltas, mut same) = (Vec::new(), Vec::new(), 0);
+    for (position, ((ids, logprobs), &token)) in rows.iter().zip(&forced).enumerate() {
+        assert!(logits.data().iter().all(|v| v.is_finite()));
+        let (kl, delta) = metrics(logits.data(), ids, logprobs);
+        kls.push(kl);
+        deltas.push(delta);
+        same += usize::from(crate::argmax(logits.data())? == token);
+        if position + 1 < n {
+            logits = model.next_logits_cached(&mut cache, token)?;
+        }
+    }
+    let engine = summarize(&kls, &mut deltas, same);
+    let noise = meta.mlx_bf16_noise;
+    eprintln!("kld/gemma4-long: résident vs per-op {engine:?}");
+    eprintln!("kld/gemma4-long: mlx bf16 {noise:?}");
+    eprintln!(
+        "kld/gemma4-long: ratio KL {:.6}, ratio p99 Δp {:.6}, limite {MAX_NOISE_RATIO}",
+        engine.mean_kl / noise.mean_kl,
+        engine.p99_delta_p / noise.p99_delta_p
+    );
+    assert!(
+        within_noise(engine, noise),
+        "kld/gemma4-long: hors du bruit bf16"
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn compare_with_prefill(
+    name: &str,
+    env: &str,
+    prefill: impl Fn(
+        &crate::CausalDecoder,
+        &[usize],
+    ) -> crate::Result<(crate::CausalDecoderCache, crate::Tensor)>,
+) -> TestResult {
     let Some(path) = local(env)? else {
         return Ok(());
     };
@@ -162,14 +437,18 @@ fn compare(name: &str, env: &str) -> TestResult {
     let model =
         crate::load_causal_decoder_for_metal(&assets, &executor)?.with_metal_executor(executor)?;
     let (mut kls, mut deltas, mut same) = (Vec::new(), Vec::new(), 0);
+    // NOTE: export opt-in par position (« kl top1 » par ligne) pour les
+    // comparaisons appariées entre variantes ; sans effet sur les seuils.
+    let mut tops = Vec::new();
     let mut rows = reference.rows.iter();
     for chunk in &meta.chunks {
         // Même découpe que kld.py : prefill du contexte, puis decode token par token.
         let start = chunk.len() - meta.scored;
-        let (mut cache, mut logits) = model.prefill_cache(&chunk[..start])?;
+        let (mut cache, mut logits) = prefill(&model, &chunk[..start])?;
         for position in start..chunk.len() {
             let (ids, logprobs) = rows.next().ok_or("référence trop courte")?;
             let values = logits.data();
+            assert!(values.iter().all(|v| v.is_finite()), "logits non finis");
             let (kl, delta) = metrics(values, ids, logprobs);
             kls.push(kl);
             deltas.push(delta);
@@ -183,17 +462,26 @@ fn compare(name: &str, env: &str) -> TestResult {
                 );
             }
             same += usize::from(actual == ids[0]);
+            tops.push(actual == ids[0]);
             if position + 1 < chunk.len() {
                 logits = model.next_logits_cached(&mut cache, chunk[position])?;
             }
         }
+    }
+    if let Ok(dump) = std::env::var("SARAGOSSA_TEST_KLD_DUMP") {
+        let lines: String = kls
+            .iter()
+            .zip(&tops)
+            .map(|(kl, top)| format!("{kl:e} {}\n", u8::from(*top)))
+            .collect();
+        std::fs::write(dump, lines)?;
     }
     let engine = summarize(&kls, &mut deltas, same);
     let noise = meta.mlx_bf16_noise;
     eprintln!("kld/{name}: saragossa {engine:?}");
     eprintln!("kld/{name}: mlx bf16  {noise:?}");
     eprintln!(
-        "kld/{name}: ratio KL {:.2}, ratio p99 Δp {:.2}",
+        "kld/{name}: ratio KL {:.6}, ratio p99 Δp {:.6}",
         engine.mean_kl / noise.mean_kl,
         engine.p99_delta_p / noise.p99_delta_p
     );

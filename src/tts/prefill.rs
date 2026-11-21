@@ -77,6 +77,9 @@ impl TtsPrefillMemo {
 
 impl TtsModel {
     pub(super) fn prefill_talker(&self, input: &Tensor) -> Result<(CausalDecoderCache, Tensor)> {
+        let _qmm_scope = crate::runtime_flags::install_tts_qmm_na_dequant_scope(
+            crate::runtime_flags::tts_qmm_na_dequant_enabled(),
+        );
         let full = || {
             #[cfg(test)]
             tests::FULL_PREFILLS.with(|count| count.set(count.get() + 1));

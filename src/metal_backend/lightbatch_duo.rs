@@ -64,9 +64,9 @@ impl MetalExecutor {
     /// duo (jamais de repli silencieux vers le matmul générique).
     pub(crate) fn qmm2_eligible_weight(&self, weight: &MetalLinearWeightBuffers) -> bool {
         match weight {
-            MetalLinearWeightBuffers::Dense { .. } | MetalLinearWeightBuffers::DenseBf16 { .. } => {
-                false
-            }
+            MetalLinearWeightBuffers::MicroScaled(_)
+            | MetalLinearWeightBuffers::Dense { .. }
+            | MetalLinearWeightBuffers::DenseBf16 { .. } => false,
             MetalLinearWeightBuffers::AffineQuantized {
                 out_dim,
                 in_dim,
@@ -83,6 +83,9 @@ impl MetalExecutor {
 
     fn qmm2_eligible_weight_report(&self, name: &str, weight: &MetalLinearWeightBuffers) -> String {
         match weight {
+            MetalLinearWeightBuffers::MicroScaled(w) => {
+                format!("{name}={} qmm2=false", w.mode.name())
+            }
             MetalLinearWeightBuffers::DenseBf16 {
                 out_dim, in_dim, ..
             }
@@ -107,6 +110,7 @@ impl MetalExecutor {
 
     fn moe_router_duo_eligible(&self, weight: &MetalLinearWeightBuffers) -> bool {
         match weight {
+            MetalLinearWeightBuffers::MicroScaled(_) => false,
             MetalLinearWeightBuffers::Dense { .. } | MetalLinearWeightBuffers::DenseBf16 { .. } => {
                 true
             }
@@ -131,9 +135,9 @@ impl MetalExecutor {
             return false;
         }
         match weight {
-            MetalLinearWeightBuffers::Dense { .. } | MetalLinearWeightBuffers::DenseBf16 { .. } => {
-                false
-            }
+            MetalLinearWeightBuffers::MicroScaled(_)
+            | MetalLinearWeightBuffers::Dense { .. }
+            | MetalLinearWeightBuffers::DenseBf16 { .. } => false,
             MetalLinearWeightBuffers::AffineQuantized {
                 out_dim,
                 in_dim: weight_in_dim,
@@ -513,6 +517,7 @@ impl MetalExecutor {
         in_dim: usize,
         samples: [DuoSampleParams; 2],
         slots: [u64; 2],
+        softcap: Option<f32>,
     ) -> Result<()> {
         let out_dim = self.linear_weight_out_dim(lm_head);
         let logits2 = self.private_f32_buffer(2 * out_dim, "lightbatch_sample_logits2")?;
@@ -552,6 +557,7 @@ impl MetalExecutor {
                 sample.temperature,
                 sample.top_p,
                 sample.rng_state,
+                softcap,
             )?;
         }
         Ok(())

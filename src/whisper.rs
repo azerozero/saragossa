@@ -13,11 +13,23 @@
 //! sans EOT, toute la transcription échoue explicitement : sans timestamps,
 //! une reprise sur le texte partiel ne permettrait pas de garantir l'absence
 //! de mots perdus. Le frontend log-mel seul conserve sa fenêtre fixe de 30 s.
+//!
+//! [`WhisperModel::transcribe_verbose`] décode les mêmes fenêtres avec les
+//! tokens `<|t.tt|>` ; [`WhisperModel::transcribe_with_deltas`] émet le texte
+//! token par token ; [`WhisperStream`] accepte le PCM par morceaux.
 
 mod decoder;
 mod segments;
+mod streaming;
+mod timestamps;
 
+use crate::audio_attention::multi_head_attention;
 pub use decoder::{WhisperDecoder, WhisperModel};
+pub use streaming::{
+    StreamLimit, WhisperStream, WhisperStreamUpdate, MAX_CHUNK_SAMPLES, MAX_SESSION_CHUNKS,
+    MAX_SESSION_INFERENCES, MAX_SESSION_SAMPLES, MIN_PARTIAL_SAMPLES,
+};
+pub use timestamps::{WhisperSegment, WhisperTranscript};
 
 use crate::{
     gelu, layer_norm, load_float_tensors, ForwardRuntime, InferError, Linear, Result, Tensor,
@@ -365,7 +377,8 @@ impl WhisperEncoder {
         let proj = |linear: &Linear| -> Result<WhisperResidentProj> {
             let tensor = match linear.weight() {
                 crate::LinearWeight::Dense(tensor) => tensor,
-                crate::LinearWeight::AffineQuantized(_)
+                crate::LinearWeight::MicroScaled(_)
+                | crate::LinearWeight::AffineQuantized(_)
                 | crate::LinearWeight::DenseBf16(_)
                 | crate::LinearWeight::DenseShared(_) => {
                     return Err(InferError::Config(
@@ -405,6 +418,7 @@ impl WhisperEncoder {
                 q: proj(&layer.self_attn.q_proj)?,
                 k: proj(&layer.self_attn.k_proj)?,
                 v: proj(&layer.self_attn.v_proj)?,
+                qkv: None,
                 o: proj(&layer.self_attn.out_proj)?,
                 final_ln: norm(&layer.final_layer_norm)?,
                 fc1: proj(&layer.fc1)?,
@@ -423,6 +437,8 @@ impl WhisperEncoder {
             heads: self.config.encoder_attention_heads,
             ffn_dim,
             eps: LAYER_NORM_EPS,
+            #[cfg(feature = "diar")]
+            rope_theta: None,
         })
     }
 
@@ -534,6 +550,37 @@ impl WhisperEncoder {
         Ok(encoded)
     }
 
+    /// Comme [`Self::encode_samples`], features laissées sur le GPU pour le KV
+    /// cross du décodeur résident. `None` si un repli per-op (conv ou encodeur)
+    /// est demandé : l'appelant reprend alors le chemin hôte.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn encode_samples_resident(
+        &self,
+        samples: &[f32],
+        metal: &crate::MetalExecutor,
+    ) -> Result<Option<crate::metal_backend::WhisperResidentMatrix>> {
+        if crate::runtime_flags::env_var_os("SARAGOSSA_STT_CONV_PEROP").is_some()
+            || crate::runtime_flags::env_var_os("SARAGOSSA_STT_ENCODER_PEROP").is_some()
+        {
+            return Ok(None);
+        }
+        let timing = crate::runtime_flags::env_var_os("SARAGOSSA_STT_TIMING").is_some();
+        let t_mel = std::time::Instant::now();
+        let mel = self.log_mel_spectrogram(samples)?;
+        if timing {
+            eprintln!("[stt] mel: {} us", t_mel.elapsed().as_micros());
+        }
+        let t_enc = std::time::Instant::now();
+        let nlc = transpose_mel_to_nlc(&mel)?;
+        let conv = self.build_conv_weights(metal)?;
+        let enc = self.build_resident(metal)?;
+        let features = metal.encode_whisper_features_resident(&nlc, &conv, &enc)?;
+        if timing {
+            eprintln!("[stt] encode résident: {} us", t_enc.elapsed().as_micros());
+        }
+        Ok(Some(features))
+    }
+
     /// Calcule le log-mel Whisper `[num_mel_bins, 3000]` depuis du PCM mono
     /// 16 kHz. Le signal est pad/tronqué à 30 secondes comme l'implémentation
     /// Whisper de référence.
@@ -590,6 +637,12 @@ impl WhisperEncoder {
 ///
 /// Renvoie une erreur si `num_mel_bins` n'est pas supporté.
 pub fn log_mel_spectrogram(samples: &[f32], num_mel_bins: usize) -> Result<Tensor> {
+    let serial = crate::runtime_flags::stt_mel_serial();
+    log_mel_impl(samples, num_mel_bins, !serial)
+}
+
+/// Corps du log-mel ; `parallel` répartit les trames sur rayon.
+fn log_mel_impl(samples: &[f32], num_mel_bins: usize, parallel: bool) -> Result<Tensor> {
     use rustfft::num_complex::Complex;
 
     let filters = mel_filter_bank(num_mel_bins)?;
@@ -612,36 +665,55 @@ pub fn log_mel_spectrogram(samples: &[f32], num_mel_bins: usize) -> Result<Tenso
     }
 
     let fft = fft_400();
-    let mut mel = vec![0.0_f32; num_mel_bins * N_FRAMES];
-    let mut buf = vec![Complex::new(0.0_f32, 0.0_f32); N_FFT];
-    let mut power = [0.0_f32; N_FREQS];
-    for frame in 0..N_FRAMES {
+    // Lu une fois : la lecture d'environnement prend un verrou global et coûtait
+    // 3000 appels par fenêtre.
+    let dense = crate::runtime_flags::env_var_os("SARAGOSSA_STT_DENSE_MEL").is_some();
+    // Chaque trame est une FFT et une projection indépendantes, sans
+    // accumulation entre trames : le calcul parallèle reste identique au bit au
+    // calcul séquentiel. `SARAGOSSA_STT_MEL_SERIAL=1` garde la boucle séquentielle.
+    let frame_mel = |frame: usize, out: &mut [f32]| {
+        let mut buf = [Complex::new(0.0_f32, 0.0_f32); N_FFT];
         let start = frame * HOP;
         for index in 0..N_FFT {
             let sample = padded.get(start + index).copied().unwrap_or(0.0);
             buf[index] = Complex::new(sample * hann[index], 0.0);
         }
         fft.process(&mut buf);
+        let mut power = [0.0_f32; N_FREQS];
         for (freq, power_value) in power.iter_mut().enumerate().take(N_FREQS) {
             let value = buf[freq];
             *power_value = value.re * value.re + value.im * value.im;
         }
-        if crate::runtime_flags::env_var_os("SARAGOSSA_STT_DENSE_MEL").is_some() {
-            for mel_bin in 0..num_mel_bins {
-                let mut acc = 0.0_f32;
+        for (mel_bin, slot) in out.iter_mut().enumerate() {
+            let mut acc = 0.0_f32;
+            if dense {
                 for (freq, &power_value) in power.iter().enumerate().take(N_FREQS) {
                     acc += filters.dense_weight(mel_bin, freq) * power_value;
                 }
-                mel[mel_bin * N_FRAMES + frame] = acc;
-            }
-        } else {
-            for mel_bin in 0..num_mel_bins {
-                let mut acc = 0.0_f32;
+            } else {
                 for entry in filters.row(mel_bin) {
                     acc += entry.weight * power[entry.freq];
                 }
-                mel[mel_bin * N_FRAMES + frame] = acc;
             }
+            *slot = acc;
+        }
+    };
+    // Disposition trame-majeure `[frames, bins]`, transposée ensuite.
+    let mut by_frame = vec![0.0_f32; num_mel_bins * N_FRAMES];
+    if !parallel {
+        for (frame, out) in by_frame.chunks_mut(num_mel_bins).enumerate() {
+            frame_mel(frame, out);
+        }
+    } else {
+        by_frame
+            .par_chunks_mut(num_mel_bins)
+            .enumerate()
+            .for_each(|(frame, out)| frame_mel(frame, out));
+    }
+    let mut mel = vec![0.0_f32; num_mel_bins * N_FRAMES];
+    for (frame, row) in by_frame.chunks(num_mel_bins).enumerate() {
+        for (mel_bin, &value) in row.iter().enumerate() {
+            mel[mel_bin * N_FRAMES + frame] = value;
         }
     }
 
@@ -996,82 +1068,6 @@ pub(super) fn attention_forward(
     let v = attn.v_proj.forward_batched(key_value, runtime)?;
     let context = multi_head_attention(&q, &k, &v, heads, causal, runtime)?;
     attn.out_proj.forward_batched(&context, runtime)
-}
-
-pub(super) fn multi_head_attention(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    heads: usize,
-    causal: bool,
-    runtime: ForwardRuntime<'_>,
-) -> Result<Tensor> {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    if let Some(metal) = runtime.metal_executor() {
-        if !causal && q.shape() == k.shape() && k.shape() == v.shape() {
-            return metal.noncausal_attention_prefill(q, k, v, heads, heads);
-        }
-    }
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
-    let _ = runtime;
-    let (q_seq, dim) = q.as_matrix()?;
-    let (kv_seq, k_dim) = k.as_matrix()?;
-    if v.shape() != k.shape() || k_dim != dim {
-        return Err(InferError::Dimension(format!(
-            "attention q={:?}, k={:?}, v={:?}",
-            q.shape(),
-            k.shape(),
-            v.shape()
-        )));
-    }
-    if heads == 0 || dim % heads != 0 {
-        return Err(InferError::Dimension(format!(
-            "attention dim={dim} heads={heads}"
-        )));
-    }
-    let head_dim = dim / heads;
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    let mut out = vec![0.0_f32; q_seq * dim];
-    let mut scores = vec![0.0_f32; kv_seq];
-    for head in 0..heads {
-        let head_base = head * head_dim;
-        for row_q in 0..q_seq {
-            let mut max_score = f32::NEG_INFINITY;
-            for (row_k, score_value) in scores.iter_mut().enumerate().take(kv_seq) {
-                if causal && row_k > row_q {
-                    *score_value = f32::NEG_INFINITY;
-                    continue;
-                }
-                let mut dot = 0.0_f32;
-                for col in 0..head_dim {
-                    dot += q.data()[row_q * dim + head_base + col]
-                        * k.data()[row_k * dim + head_base + col];
-                }
-                let score = dot * scale;
-                *score_value = score;
-                max_score = max_score.max(score);
-            }
-            let mut denom = 0.0_f32;
-            for score in scores.iter_mut().take(kv_seq) {
-                if *score == f32::NEG_INFINITY {
-                    continue;
-                }
-                *score = (*score - max_score).exp();
-                denom += *score;
-            }
-            for col in 0..head_dim {
-                let mut acc = 0.0_f32;
-                for (row_v, prob) in scores.iter().take(kv_seq).enumerate() {
-                    if *prob == f32::NEG_INFINITY {
-                        continue;
-                    }
-                    acc += (*prob / denom) * v.data()[row_v * dim + head_base + col];
-                }
-                out[row_q * dim + head_base + col] = acc;
-            }
-        }
-    }
-    Tensor::from_vec(vec![q_seq, dim], out)
 }
 
 fn feed_forward(

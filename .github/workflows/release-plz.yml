@@ -1,16 +1,16 @@
 name: Release-plz
 
 on:
-  push:
+  workflow_run:
+    workflows: [Rust]
+    types: [completed]
     branches: [main]
-    paths:
-      - "src/**"
-      - "assets/**"
-      - "build.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "release-plz.toml"
-      - ".github/workflows/release-plz.yml"
+  # Relance manuelle, toujours soumise à une CI Rust verte sur main.
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Commit de merge d'une PR de release à taguer (release-plz ignore les autres)
+        required: false
   pull_request:
     types: [closed]
     branches: [main]
@@ -22,9 +22,20 @@ permissions:
 jobs:
   release-pr:
     name: Create release PR
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.head_repository.full_name == github.repository
+        && (github.event.workflow_run.event == 'push'
+          || github.event.workflow_run.event == 'workflow_dispatch'))
+    # cargo package vérifie le crate en le compilant : frameworks Apple requis.
+    runs-on: macos-15
     timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: write
     concurrency:
       group: release-plz-pr
       cancel-in-progress: false
@@ -33,44 +44,83 @@ jobs:
       - uses: step-security/harden-runner@v2
         with:
           egress-policy: audit
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: main
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      - name: Verify green main revision
+        id: green-main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          GREEN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          head_sha=$(git rev-parse HEAD)
+          if [[ "$EVENT_NAME" == workflow_run ]]; then
+            # Un ancien succès ne valide pas un main qui a avancé depuis.
+            if [[ "$head_sha" != "$GREEN_SHA" ]]; then
+              echo "Main has advanced; wait for its Rust workflow."
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            # Le lancement manuel ne contourne pas la validation de main.
+            green_runs=$(gh api --method GET "repos/$REPO/actions/workflows/rust.yml/runs" \
+              -f branch=main -f head_sha="$head_sha" -f status=success \
+              --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")] | length')
+            if [[ "$green_runs" == 0 ]]; then
+              echo "::error::No successful Rust workflow for main at $head_sha"
+              exit 1
+            fi
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.green-main.outputs.ready == 'true'
       - name: Prepare release PR
-        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+        if: steps.green-main.outputs.ready == 'true'
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
-  publish:
-    name: Publish crate and tag
+  release-tag:
+    name: Tag release
     if: >-
       github.event_name == 'pull_request'
       && github.event.pull_request.merged == true
+      && startsWith(github.head_ref, 'release-plz-')
+      && github.event.pull_request.head.repo.full_name == github.repository
       && contains(github.event.pull_request.labels.*.name, 'release')
-    runs-on: ubuntu-latest
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    # cargo package vérifie le crate en le compilant : frameworks Apple requis.
+    runs-on: macos-15
     timeout-minutes: 20
     concurrency:
-      group: release-plz-publish
+      group: release-plz-tag
       cancel-in-progress: false
     steps:
       # Passer à block après validation des endpoints release-plz dans les logs d'audit.
       - uses: step-security/harden-runner@v2
         with:
           egress-policy: audit
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          ref: main
+          ref: ${{ github.event.pull_request.merge_commit_sha || inputs.release_sha || github.sha }}
           token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+      # release-plz exige une branche avec amont : le checkout d'un SHA est détaché.
+      - name: Attach main branch
+        run: |
+          git checkout -B main
+          git branch --set-upstream-to=origin/main main
       - uses: dtolnay/rust-toolchain@stable
-      - name: Publish release
-        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5.131
+      - name: Tag release
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
         with:
           command: release
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

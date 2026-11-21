@@ -66,6 +66,18 @@ fn accepts_affine_u3_quantization_config() {
 }
 
 #[test]
+fn accepts_affine_u5_global_quantization_config() -> Result<()> {
+    let quant: QuantConfig = serde_json::from_str(r#"{"group_size":64,"bits":5,"mode":"affine"}"#)
+        .expect("invariant: config affine u5 synthétique valide");
+    validate_affine_quantization(&quant)?;
+    assert_eq!(
+        quant_params_for(&quant, "model.layers.0.self_attn.q_proj.weight")?,
+        (64, 5)
+    );
+    Ok(())
+}
+
+#[test]
 fn accepts_affine_u6_quantization_config() {
     // mlx-community/*-oQ6 : base bits=6, kernels fast_affine_qmv_u6 existants.
     let quant = QuantConfig {
@@ -81,17 +93,17 @@ fn accepts_affine_u6_quantization_config() {
 }
 
 #[test]
-fn rejects_non_affine_quantization_mode() {
+fn rejects_unknown_quantization_mode() {
     let quant = QuantConfig {
         group_size: Some(32),
         bits: Some(4),
         quant_method: None,
         fmt: None,
-        extra: HashMap::from([("mode".to_string(), serde_json::json!("mxfp4"))]),
+        extra: HashMap::from([("mode".to_string(), serde_json::json!("unknown"))]),
     };
 
-    let err = validate_affine_quantization(&quant).expect_err("mxfp4 doit être refusé");
-    assert!(err.to_string().contains("mode=mxfp4"), "{err}");
+    let err = validate_affine_quantization(&quant).expect_err("mode inconnu refusé");
+    assert!(matches!(err, InferError::UnsupportedQuantization(_)));
 }
 
 #[test]
@@ -1039,4 +1051,43 @@ fn rejects_non_float_required_weight() {
         load_qwen_causal_decoder_from_shards(&test_config(), &[tmp.path().to_path_buf()], &catalog)
             .expect_err("invariant: dtype entier rejeté");
     assert!(matches!(err, InferError::UnsupportedDtype { .. }));
+}
+
+#[test]
+fn accepts_micro_modes_and_checks_overrides() -> Result<()> {
+    for mode in [
+        crate::MicroMode::Mxfp4,
+        crate::MicroMode::Nvfp4,
+        crate::MicroMode::Mxfp8,
+    ] {
+        let mut quant: QuantConfig = serde_json::from_value(serde_json::json!({"mode": mode.name(), "bits": mode.bits(), "group_size": mode.group_size()})).expect("invariant: config synthétique");
+        validate_affine_quantization(&quant)?;
+        assert_eq!(micro_mode_for(&quant, "model.proj.weight")?, Some(mode));
+        quant.bits = Some(3);
+        assert!(validate_affine_quantization(&quant).is_err());
+        quant.extra.insert(
+            "model.proj".into(),
+            serde_json::json!({"mode":"nvfp4","bits":4,"group_size":16}),
+        );
+        assert_eq!(
+            micro_mode_for(&quant, "model.proj.weight")?,
+            Some(crate::MicroMode::Nvfp4)
+        );
+        validate_micro_params(&quant, "model.proj.weight", crate::MicroMode::Nvfp4)?;
+        quant.extra.insert(
+            "model.proj".into(),
+            serde_json::json!({"mode":"unsupported"}),
+        );
+        assert!(matches!(
+            micro_mode_for(&quant, "model.proj.weight"),
+            Err(InferError::UnsupportedQuantization(_))
+        ));
+        // Override MLX sans `mode` : affine, sans hériter du mode global.
+        quant.extra.insert(
+            "model.proj".into(),
+            serde_json::json!({"bits":8,"group_size":64}),
+        );
+        assert_eq!(micro_mode_for(&quant, "model.proj.weight")?, None);
+    }
+    Ok(())
 }

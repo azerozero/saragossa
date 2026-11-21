@@ -2,6 +2,7 @@
 
 impl MetalExecutor {
     /// Exécute le coop routé avec des poids et activations de modèle réels.
+    #[cfg(feature = "devtools")]
     pub(crate) fn moe_routed_rows_coop_real_for_test(
         &self,
         input: &Tensor,
@@ -1500,7 +1501,7 @@ fn coop_qb_tiled_u4_bit_identical_to_u8_same_weights() -> Result<()> {
 }
 
 /// Prédicat du MLP fusionné : accepte seulement trois poids u4 gs64 sans offset
-/// aux bonnes dimensions ; un offset non nul (poids poolé, régression de
+/// aux bonnes dimensions ; un offset mal aligné (poids poolé, régression de
 /// 9f23853), un poids dense ou une forme inattendue renvoient au chemin séparé.
 #[test]
 fn fused_dense_mlp_supported_rejects_offsets_dense_and_shape() -> Result<()> {
@@ -1539,13 +1540,19 @@ fn fused_dense_mlp_supported_rejects_offsets_dense_and_shape() -> Result<()> {
         executor.fused_dense_mlp_supported(batch, in_dim, g, u, d, inter_dim)
     };
     assert!(supported(&gate, &up, &down), "trois poids u4 gs64 sans offset doivent être acceptés");
+    // Depuis f2331f6, les vues mmap décalées sont liées : un offset packed
+    // aligné sur 16 octets passe, un offset mal aligné renvoie au chemin séparé.
     assert!(
-        !supported(&u4(inter_dim, in_dim, 64), &up, &down),
-        "un offset non nul sur gate doit renvoyer au chemin séparé"
+        supported(&u4(inter_dim, in_dim, 64), &up, &down),
+        "un offset aligné sur gate doit être accepté"
     );
     assert!(
-        !supported(&gate, &up, &u4(in_dim, inter_dim, 64)),
-        "un offset non nul sur down doit renvoyer au chemin séparé"
+        !supported(&u4(inter_dim, in_dim, 4), &up, &down),
+        "un offset mal aligné sur gate doit renvoyer au chemin séparé"
+    );
+    assert!(
+        !supported(&gate, &up, &u4(in_dim, inter_dim, 4)),
+        "un offset mal aligné sur down doit renvoyer au chemin séparé"
     );
     assert!(
         !supported(&gate, &up, &u4(in_dim + 64, inter_dim, 0)),
@@ -1581,6 +1588,7 @@ fn run_routed_coop_selected(
     top_k: usize,
     select: &dyn Fn(usize) -> Vec<usize>,
     tiled: bool,
+    router_score: crate::RouterScore,
 ) -> Result<(Vec<f32>, Vec<u32>, usize)> {
     let total = rows * top_k;
     let mut input = Vec::with_capacity(rows * hidden);
@@ -1619,7 +1627,7 @@ fn run_routed_coop_selected(
             hidden,
             weights,
             top_k,
-            crate::RouterScore::Sigmoid,
+            router_score,
         )?;
         guard.end();
         commit_and_wait(cb)
@@ -1686,40 +1694,42 @@ fn moe_routed_coop_tiled_matches_16x32() -> Result<()> {
         ("déséquilibré", 300, 6, &unbalanced),
         ("un expert", 5, 1, &single),
     ];
-    for (label, rows, top_k, select) in cases {
-        let run = |tiled| {
-            run_routed_coop_selected(
-                &executor, &weights, rows, hidden, experts, top_k, select, tiled,
-            )
-        };
-        let (base, base_idx, base_calls) = run(false)?;
-        let (tiled, tiled_idx, tiled_calls) = run(true)?;
-        assert_eq!((base_calls, tiled_calls), (0, 1), "{label}: chemin tuilé");
-        assert_eq!(base_idx, tiled_idx, "{label}: routage");
-        let mut counts = vec![0_usize; experts];
-        for &e in &tiled_idx {
-            counts[e as usize] += 1;
-        }
-        let mut expected = vec![0_usize; experts];
-        for t in 0..rows {
-            for e in select(t) {
-                expected[e] += 1;
+    for score in [crate::RouterScore::Sigmoid, crate::RouterScore::Softmax] {
+        for (label, rows, top_k, select) in cases {
+            let run = |tiled| {
+                run_routed_coop_selected(
+                    &executor, &weights, rows, hidden, experts, top_k, select, tiled, score,
+                )
+            };
+            let (base, base_idx, base_calls) = run(false)?;
+            let (tiled, tiled_idx, tiled_calls) = run(true)?;
+            assert_eq!((base_calls, tiled_calls), (0, 1), "{label}: chemin tuilé");
+            assert_eq!(base_idx, tiled_idx, "{label}: routage");
+            let mut counts = vec![0_usize; experts];
+            for &e in &tiled_idx {
+                counts[e as usize] += 1;
             }
+            let mut expected = vec![0_usize; experts];
+            for t in 0..rows {
+                for e in select(t) {
+                    expected[e] += 1;
+                }
+            }
+            assert_eq!(counts, expected, "{label}: histogramme");
+            let gap = base
+                .iter()
+                .zip(&tiled)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            let scale = base.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+            eprintln!("coop tuilé {label}: histogramme {counts:?} écart {gap} échelle {scale}");
+            assert!(scale > 0.0, "{label}: sortie nulle");
+            let same_bits = base
+                .iter()
+                .zip(&tiled)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(same_bits, "{label}: tuilé != 16×32, écart {gap}");
         }
-        assert_eq!(counts, expected, "{label}: histogramme");
-        let gap = base
-            .iter()
-            .zip(&tiled)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f32, f32::max);
-        let scale = base.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
-        eprintln!("coop tuilé {label}: histogramme {counts:?} écart {gap} échelle {scale}");
-        assert!(scale > 0.0, "{label}: sortie nulle");
-        let same_bits = base
-            .iter()
-            .zip(&tiled)
-            .all(|(a, b)| a.to_bits() == b.to_bits());
-        assert!(same_bits, "{label}: tuilé != 16×32, écart {gap}");
     }
     Ok(())
 }

@@ -6,13 +6,13 @@ repo = "builtin"
 hooks = [
   # main n'avance que par pull request ; refuse un commit local dessus.
   { id = "no-commit-to-branch", args = ["--branch", "main"] },
-  # Les payloads UTF-8 .bin ont une empreinte SHA256 : préserver leurs octets.
-  { id = "trailing-whitespace", exclude = '^tests/fixtures/goldens/.*\.bin$' },
-  { id = "end-of-file-fixer", exclude = '^tests/fixtures/goldens/.*\.bin$' },
+  # Préserver les octets des prompts, goldens et mesures de référence.
+  { id = "trailing-whitespace", exclude = '^(tests/fixtures/|bench/competitors/data/)' },
+  { id = "end-of-file-fixer", exclude = '^(tests/fixtures/|bench/competitors/data/)' },
   { id = "check-toml" },
   { id = "check-yaml", args = ["--allow-multiple-documents"] },
   { id = "check-merge-conflict" },
-  { id = "mixed-line-ending", args = ["--fix", "lf"], exclude = '^tests/fixtures/goldens/.*\.bin$' },
+  { id = "mixed-line-ending", args = ["--fix", "lf"], exclude = '^(tests/fixtures/|bench/competitors/data/)' },
 ]
 
 [[repos]]
@@ -29,7 +29,8 @@ pass_filenames = false
 id = "cargo-fmt"
 name = "cargo fmt"
 language = "system"
-entry = "cargo fmt --all --"
+# --all ignore le filtrage des chemins : vérifier sans réécrire les sources.
+entry = "cargo fmt --all -- --check"
 types = ["rust"]
 pass_filenames = false
 

@@ -89,6 +89,7 @@ impl GpuTensor {
     }
 
     /// Renvoie la taille logique en octets.
+    #[cfg(test)]
     pub(crate) fn byte_len(&self) -> usize {
         self.len * self.element.byte_size()
     }
@@ -257,6 +258,30 @@ impl Drop for ScratchLease {
 /// Un threadgroup par tête de requête (`q_heads` groupes, 256 threads chacun).
 /// Trois phases (port direct de la version CPU, correct pour tout `len`,
 impl DecodeResidentState {
+    #[cfg(feature = "tts")]
+    pub(crate) fn tts_memory_stats(&self) -> Vec<(&'static str, usize)> {
+        let persistent = self
+            .persistent
+            .iter()
+            .map(|b| b.allocated_size() as usize)
+            .sum();
+        let scratch = std::iter::once(&self.scratch)
+            .chain(&self.pipeline_scratch)
+            .map(|pool| {
+                pool.inner
+                    .lock()
+                    .map(|inner| {
+                        inner
+                            .slots
+                            .iter()
+                            .map(|s| s.buffer.allocated_size() as usize)
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0)
+            })
+            .sum();
+        vec![("arena_persistent", persistent), ("arena_scratch", scratch)]
+    }
     /// Crée un état résident sur le device donné (buffers en `StorageModeShared`)
     /// et compile les kernels du chemin résident.
     ///
@@ -341,12 +366,14 @@ impl DecodeResidentState {
             compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_bf16")?;
         let copy_at_bf16_to_f32_kernel =
             compile_kernel(&device, ROPE_DECODE_COPY_KERNELS, "copy_at_bf16_to_f32")?;
-        let rope_append_kv_kernels: [ComputePipelineState; 2] = compile_kernels(
+        let rope_append_kv_kernels: [ComputePipelineState; 4] = compile_kernels(
             &device,
             ROPE_DECODE_COPY_KERNELS,
             &[
                 "rms_norm_rope_append_kv_f32",
                 "rms_norm_rope_append_kv_bf16",
+                "rms_norm_rope_qk_append_kv_f32",
+                "rms_norm_rope_qk_append_kv_bf16",
             ],
             true,
         )?
@@ -384,6 +411,8 @@ impl DecodeResidentState {
             rows_kernels: OnceLock::new(),
             kv_quant_kernels: OnceLock::new(),
             sink_kernels: OnceLock::new(),
+            #[cfg(feature = "tts")]
+            tts_sampler_kernel: OnceLock::new(),
             timer,
             scratch_namespace: 0,
         })

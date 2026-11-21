@@ -5,6 +5,9 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod micro;
+pub use micro::{decode_e2m1, decode_e4m3, decode_e8m0, MicroMode, MicroQuantizedTensor};
+
 const PARALLEL_QUANT_MATMUL_OUTPUT_THRESHOLD: usize = 1024;
 const PARALLEL_QUANT_MATMUL_INNER_THRESHOLD: usize = 128;
 static NEXT_WEIGHT_ID: AtomicU64 = AtomicU64::new(1);
@@ -1029,7 +1032,7 @@ pub(crate) fn bf16_bits(value: f32) -> u16 {
 }
 
 /// Erreur cumulée d'une quantification : `Σ(w − dq)²` et `Σw²`, en f64.
-#[cfg(feature = "devtools")]
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct QuantError {
     pub(crate) sum_sq_err: f64,
@@ -1069,7 +1072,8 @@ impl QuantError {
 /// multiple de `group_size`, si une ligne ne tombe pas sur une frontière de
 /// `u32`, si les tranches ont une mauvaise taille ou si une valeur n'est pas
 /// finie.
-#[cfg(feature = "devtools")]
+// NOTE: aussi hors `devtools` : la tête de draft MTP u4 la quantifie au chargement.
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 pub(crate) fn quantize_affine_bitstream_bf16(
     data: &[f32],
     cols: usize,
@@ -1156,7 +1160,7 @@ pub(crate) fn quantize_affine_bitstream_bf16(
 /// Le biais est arrondi **vers −∞** (`bias ≤ min`) et la scale **vers +∞**
 /// jusqu'à couvrir `max` (`bias + levels·scale ≥ max`) : aucun code n'est alors
 /// écrêté et l'erreur reste bornée par un demi-pas de la scale sérialisée.
-#[cfg(feature = "devtools")]
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 pub(crate) fn affine_params_bf16(min: f32, max: f32, levels: f32) -> Result<(u16, u16)> {
     let mut bias_bits = bf16_bits(min);
     if bf16_value(bias_bits) > min {
@@ -1181,13 +1185,13 @@ pub(crate) fn affine_params_bf16(min: f32, max: f32, levels: f32) -> Result<(u16
     Ok((scale_bits, bias_bits))
 }
 
-#[cfg(feature = "devtools")]
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 pub(crate) fn bf16_value(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
 /// bf16 immédiatement inférieur (vers −∞) à une valeur finie.
-#[cfg(feature = "devtools")]
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 fn bf16_step_down(bits: u16) -> u16 {
     match bits {
         // +0 → plus petit sous-normal négatif.
@@ -1198,7 +1202,7 @@ fn bf16_step_down(bits: u16) -> u16 {
 }
 
 /// bf16 immédiatement supérieur d'une scale strictement positive et finie.
-#[cfg(feature = "devtools")]
+#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
 fn bf16_step_up_positive(bits: u16) -> u16 {
     bits + 1
 }
@@ -1300,6 +1304,7 @@ fn should_parallelize_quant_matmul(outputs: usize, inner: usize) -> bool {
         && inner >= PARALLEL_QUANT_MATMUL_INNER_THRESHOLD
 }
 
+#[cfg(any(feature = "tts", test))]
 pub(crate) fn bytes_to_u32(bytes: &[u8], name: &str) -> Result<Vec<u32>> {
     let chunks = bytes.chunks_exact(4);
     if !chunks.remainder().is_empty() {
@@ -1321,6 +1326,36 @@ pub(crate) fn bytes_to_u32(bytes: &[u8], name: &str) -> Result<Vec<u32>> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn affine_u5_matches_mlx_quantize_dequantize_golden() -> Result<()> {
+        // MLX 0.31.2 : quantize(arange(64) % 32 en bf16, group_size=64,
+        // bits=5) choisit scale=-1 et bias=31. Ce golden indépendant évite
+        // qu'un même défaut du packer et du dépaqueteur passe inaperçu.
+        let words = [
+            1_975_416_799,
+            978_769_862,
+            902_792_293,
+            3_343_013_046,
+            4_469_268,
+        ];
+        let weight = AffineQuantizedTensor::new(
+            &[3, 30],
+            words.repeat(18),
+            Tensor::from_vec(vec![3, 3], vec![-1.0; 9])?,
+            Tensor::from_vec(vec![3, 3], vec![31.0; 9])?,
+            64,
+            5,
+        )?;
+        let expected: Vec<f32> = (0..3 * 192).map(|i| (i % 32) as f32).collect();
+        assert_eq!(weight.dequantize()?.data(), expected);
+        for row in 0..3 {
+            assert_eq!(weight.row(row)?, expected[row * 192..(row + 1) * 192]);
+        }
+        let input = Tensor::from_vec(vec![2, 192], vec![1.0; 384])?;
+        assert_eq!(weight.matmul_rhs_t(&input)?.data(), &[2976.0; 6]);
+        Ok(())
+    }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]
     #[test]

@@ -22,10 +22,13 @@ use crate::runtime_flags::env_flag;
 use std::path::PathBuf;
 
 mod chat;
+#[cfg(feature = "embed")]
 mod embedder;
 pub(crate) mod external;
-mod kld;
+pub(crate) mod kld;
 mod logits;
+#[cfg(feature = "vision")]
+mod vision;
 
 /// SHA reti (HEAD à la capture) — le fork mlx-rs vendoré est figé sur MLX 0.31.2.
 pub const MLX_SHA: &str = "be456e2";

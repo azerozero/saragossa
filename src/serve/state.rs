@@ -6,6 +6,7 @@ use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use saragossa::decoder::{GenerationOutput, GenerationTimings};
+use saragossa::guided::{SchemaTokenCatalog, SchemaTokenConstraint};
 use saragossa::memory_guard::{
     estimate_model_bytes, process_footprint_bytes, process_purge_registry, MemoryGuard,
     MemoryProjection, PurgeOutcome, PurgePressure, PurgeRegistry,
@@ -20,8 +21,15 @@ use saragossa::{
 };
 
 use super::args::{ServeArgs, ServeModelConfig};
+#[cfg(any(
+    feature = "stt",
+    feature = "tts",
+    feature = "diar",
+    feature = "denoise"
+))]
 use super::audio::AudioState;
 use super::cache::{BlockAwarePrefixCache, BlockHash};
+#[cfg(feature = "embed")]
 use super::embeddings::EmbeddingsState;
 use super::error::{ServeError, ServeResult};
 use super::mtp;
@@ -90,10 +98,18 @@ impl ServedCompletion {
 pub(super) struct ServeState {
     engine_thread: ThreadId,
     models: Vec<ModelSlot>,
+    backend: RuntimeKind,
     max_tokens_cap: usize,
     clock: u64,
     memory_guard: MemoryGuard,
+    #[cfg(any(
+        feature = "stt",
+        feature = "tts",
+        feature = "diar",
+        feature = "denoise"
+    ))]
     audio: AudioState,
+    #[cfg(feature = "embed")]
     embeddings: EmbeddingsState,
 }
 
@@ -107,26 +123,41 @@ impl ServeState {
                 .iter()
                 .map(|model| ModelSlot::new(model, args.backend))
                 .collect(),
+            backend: args.backend,
             max_tokens_cap: args.max_tokens_cap,
             clock: 0,
             memory_guard: MemoryGuard::serve(),
+            #[cfg(any(
+                feature = "stt",
+                feature = "tts",
+                feature = "diar",
+                feature = "denoise"
+            ))]
             audio: AudioState::new(args),
+            #[cfg(feature = "embed")]
             embeddings: EmbeddingsState::new(args),
         }
     }
 
     /// Renvoie le plafond serveur du budget de génération.
     pub(super) fn max_tokens_cap(&self) -> usize {
-        self.max_tokens_cap
+        super::reload::max_tokens_cap(self.max_tokens_cap)
     }
 
     /// Renvoie l'état audio mutable pour les endpoints STT/TTS.
+    #[cfg(any(
+        feature = "stt",
+        feature = "tts",
+        feature = "diar",
+        feature = "denoise"
+    ))]
     pub(super) fn audio_mut(&mut self) -> &mut AudioState {
         self.assert_engine_thread();
         &mut self.audio
     }
 
     /// Renvoie l'état embeddings mutable pour l'endpoint `/v1/embeddings`.
+    #[cfg(feature = "embed")]
     pub(super) fn embeddings_mut(&mut self) -> &mut EmbeddingsState {
         self.assert_engine_thread();
         &mut self.embeddings
@@ -178,6 +209,56 @@ impl ServeState {
         self.models.iter().map(|model| model.id.clone()).collect()
     }
 
+    /// Remplace la liste des modèles (rechargement SIGHUP). Un modèle de même
+    /// alias et chemin garde son slot et ses poids ; un retrait ou une
+    /// modification décharge l'ancien, un ajout reste paresseux (chargé par
+    /// `ensure_loaded_index` à la 1re requête). Appelé entre deux requêtes sur
+    /// le thread moteur : rien n'utilise donc les modèles déchargés.
+    pub(super) fn set_models(&mut self, wanted: &[ServeModelConfig]) {
+        self.assert_engine_thread();
+        let mut old = std::mem::take(&mut self.models);
+        self.models = wanted
+            .iter()
+            .map(|model| {
+                match old
+                    .iter()
+                    .position(|slot| slot.id == model.id && slot.path == model.path)
+                {
+                    Some(index) => old.swap_remove(index),
+                    None => ModelSlot::new(model, self.backend),
+                }
+            })
+            .collect();
+        for slot in old {
+            eprintln!(
+                "saragossa serve retiré model={} loaded={}",
+                slot.id,
+                slot.loaded.is_some()
+            );
+        }
+    }
+
+    /// NOTE: `catch_unwind` ne couvre pas une panique entre la création d'un
+    /// encodeur Metal et son `endEncoding`, ni un `Drop` qui panique pendant
+    /// l'unwind (abandon du processus) : l'invalidation reste au mieux.
+    ///
+    /// Abandonne tous les poids chargés après une panique du moteur ; les
+    /// slots se rechargent à la prochaine requête.
+    pub(super) fn invalidate_models(&mut self) {
+        for slot in &mut self.models {
+            slot.loaded = None;
+        }
+        #[cfg(any(
+            feature = "stt",
+            feature = "tts",
+            feature = "diar",
+            feature = "denoise"
+        ))]
+        self.audio.invalidate();
+        #[cfg(feature = "embed")]
+        self.embeddings.invalidate();
+    }
+
     /// Garde de l'invariant thread moteur (voir [`ServeState`]).
     fn assert_engine_thread(&self) {
         debug_assert_eq!(
@@ -193,7 +274,7 @@ impl ServeState {
         request: ChatCompletionRequest,
         session_key: Option<&str>,
     ) -> ServeResult<ServedCompletion> {
-        let max_tokens_cap = self.max_tokens_cap;
+        let max_tokens_cap = self.max_tokens_cap();
         let max_tokens = request.validate(max_tokens_cap)?;
         let index = self
             .models
@@ -221,7 +302,7 @@ impl ServeState {
         session_key: Option<&str>,
         mut on_event: impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<ServedCompletion> {
-        let max_tokens_cap = self.max_tokens_cap;
+        let max_tokens_cap = self.max_tokens_cap();
         let max_tokens = request.validate(max_tokens_cap)?;
         let index = self
             .models
@@ -280,7 +361,7 @@ impl ServeState {
         let Some(model) = requests.first().map(|request| request.model.clone()) else {
             return (Vec::new(), 0);
         };
-        let max_tokens_cap = self.max_tokens_cap;
+        let max_tokens_cap = self.max_tokens_cap();
         let loaded = self
             .models
             .iter()
@@ -566,7 +647,7 @@ impl ModelSlot {
                         self.id
                     ))
                 })?;
-                decoder = decoder.with_mtp_sidecar(path)?;
+                decoder = decoder.with_mtp_weights(&assets.mtp)?;
                 eprintln!(
                     "saragossa serve MTP actif model={} sidecar={} max_draft={}",
                     self.id,
@@ -598,6 +679,7 @@ impl ModelSlot {
                 preset,
                 mtp_active,
                 json_token_catalog: OnceLock::new(),
+                schema_token_catalog: OnceLock::new(),
                 prefix_cache: BlockAwarePrefixCache::from_runtime_flags(),
             });
         }
@@ -621,6 +703,7 @@ struct LoadedModel {
     /// `json_object`/`json_lines` : un déploiement texte pur ne paie jamais le
     /// décodage du vocab entier ni son étape faillible au chargement.
     json_token_catalog: OnceLock<Arc<JsonTokenCatalog>>,
+    schema_token_catalog: OnceLock<Arc<SchemaTokenCatalog>>,
     prefix_cache: BlockAwarePrefixCache,
 }
 
@@ -671,6 +754,31 @@ struct CompletionPath {
     prefix_cache: &'static str,
     decode_path: &'static str,
     streaming: bool,
+    /// Compteurs spéculatifs (MTP ou DFlash) ; `None` en AR.
+    speculative: Option<saragossa::SpeculativeStats>,
+}
+
+/// `dflash` quand le drafter DFlash a servi la requête, sinon `mtp` ou `ar`.
+fn speculative_decode_path(stats: Option<&saragossa::SpeculativeStats>) -> &'static str {
+    match stats {
+        Some(stats) if stats.dflash_tours.is_some() => "dflash",
+        Some(_) => "mtp",
+        None => "ar",
+    }
+}
+
+/// Suffixe ` spec_proposed=… spec_accepted=…` du journal, plus ` spec_tours=…`
+/// (un draft + une vérification) en DFlash ; vide en AR.
+fn speculative_log(stats: Option<&saragossa::SpeculativeStats>) -> String {
+    stats.map_or_else(String::new, |stats| {
+        let tours = stats
+            .dflash_tours
+            .map_or_else(String::new, |tours| format!(" spec_tours={tours}"));
+        format!(
+            " spec_proposed={} spec_accepted={}{tours}",
+            stats.proposed, stats.accepted
+        )
+    })
 }
 
 impl LoadedModel {
@@ -689,6 +797,7 @@ impl LoadedModel {
         session_key: Option<&str>,
         memory_guard: &MemoryGuard,
     ) -> ServeResult<ServedCompletion> {
+        let _disk_session = saragossa::decoder::PrefixDiskSession::enter(session_key);
         let prepared = self.prepare(&request, max_tokens)?;
         let PreparedRequest {
             tokens: prompt_tokens_ids,
@@ -699,25 +808,28 @@ impl LoadedModel {
         let token_constraint = options.token_constraint.clone();
         let started = Instant::now();
         let use_mtp = self.routes_mtp(&request, &prepared);
-        let (output, reused_prefix_tokens, prefix_cache) = if use_mtp {
+        let (output, reused_prefix_tokens, prefix_cache, speculative) = if use_mtp {
             // NOTE: v1 MTP assume son propre prefill via le prefix-cache du
             // décodeur (longest-prefix + extension). Il by-passe donc les
             // snapshots par blocs de serve pour ces seules requêtes greedy
             // non guidées ; le chemin AR reste strictement inchangé.
             let mut text_stop = TextStop::new(&self.assets, stop_texts, max_tokens);
-            let output = self.decoder.generate_greedy_mtp_streaming_with_options(
+            let output = self.decoder.generate_greedy_mtp_routed(
                 prompt_tokens_ids,
                 max_tokens,
                 options,
                 mtp::max_draft_tokens(),
+                request.allows_dflash(),
                 |token| text_stop.push(token),
             )?;
             text_stop.finish()?;
             let reused = output.stats.reused_prefix_tokens;
+            let stats = output.stats.clone();
             (
                 mtp::into_generation_output(output, started.elapsed()),
                 reused,
                 "decoder-longest-prefix",
+                Some(stats),
             )
         } else {
             let (prompt_state, reused_prefix_tokens, prefill) = self
@@ -751,7 +863,7 @@ impl LoadedModel {
                 text_stop.finish()?;
                 output
             };
-            (output, reused_prefix_tokens, "block-snapshots")
+            (output, reused_prefix_tokens, "block-snapshots", None)
         };
         ensure_guided_finished(token_constraint.as_deref())?;
         self.finish_completion(
@@ -761,8 +873,9 @@ impl LoadedModel {
             started.elapsed(),
             CompletionPath {
                 prefix_cache,
-                decode_path: if use_mtp { "mtp" } else { "ar" },
+                decode_path: speculative_decode_path(speculative.as_ref()),
                 streaming: false,
+                speculative,
             },
         )
     }
@@ -775,6 +888,7 @@ impl LoadedModel {
         memory_guard: &MemoryGuard,
         on_event: &mut impl FnMut(CompletionStreamEvent<'_>) -> ServeResult<()>,
     ) -> ServeResult<ServedCompletion> {
+        let _disk_session = saragossa::decoder::PrefixDiskSession::enter(session_key);
         let prepared = self.prepare(&request, max_tokens)?;
         let PreparedRequest {
             tokens: prompt_tokens_ids,
@@ -810,16 +924,18 @@ impl LoadedModel {
         let mut detokenizer = StreamingTextDetokenizer::new(&self.assets, stop_texts, max_tokens);
         let mut stream_error = None;
         let mut stream_started = !use_mtp;
+        let mut speculative = None;
         let output = if use_mtp {
             // NOTE: comme le non-stream, MTP préremplit via le cache longest-prefix
             // du décodeur et by-passe les snapshots serve v1. Le callback observe
             // uniquement les tokens committés, puis le detokenizer existant garde
             // l'exacte même politique de stops et de texte visible.
-            let output = self.decoder.generate_greedy_mtp_streaming_with_options(
+            let output = self.decoder.generate_greedy_mtp_routed(
                 prompt_tokens_ids,
                 max_tokens,
                 options,
                 mtp::max_draft_tokens(),
+                request.allows_dflash(),
                 |token| {
                     if stream_error.is_some() {
                         return false;
@@ -853,6 +969,7 @@ impl LoadedModel {
                 },
             )?;
             reused_prefix_tokens = output.stats.reused_prefix_tokens;
+            speculative = Some(output.stats.clone());
             mtp::into_generation_output(output, started.elapsed())
         } else {
             self.decoder
@@ -906,8 +1023,9 @@ impl LoadedModel {
                 } else {
                     "block-snapshots"
                 },
-                decode_path: if use_mtp { "mtp" } else { "ar" },
+                decode_path: speculative_decode_path(speculative.as_ref()),
                 streaming: true,
+                speculative,
             },
         )?;
         detokenizer.finish(&completion.content, on_event)?;
@@ -952,12 +1070,14 @@ impl LoadedModel {
         // La fermeture racine termine json_object même lorsqu'elle consomme
         // le dernier token du budget : aucun pas supplémentaire pour EOS
         // n'est alors disponible. Une frontière NDJSON reste prolongeable.
-        let completed_json_object = prepared.response_format == ResponseFormatMode::JsonObject
-            && prepared
-                .options
-                .token_constraint
-                .as_ref()
-                .is_some_and(|constraint| constraint.is_finished());
+        let completed_json_object = matches!(
+            prepared.response_format,
+            ResponseFormatMode::JsonObject | ResponseFormatMode::JsonSchema
+        ) && prepared
+            .options
+            .token_constraint
+            .as_ref()
+            .is_some_and(|constraint| constraint.is_finished());
         let finish_reason = if output.tokens.len() >= prepared.max_tokens
             && matched_stop.is_none()
             && !completed_json_object
@@ -968,7 +1088,7 @@ impl LoadedModel {
         };
         let content = strip_text_stops(decoded, &prepared.stop_texts);
         eprintln!(
-            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}{} footprint_bytes={} prefix_cache_bytes={}{}",
+            "saragossa serve completion model={} prompt_tokens={} completion_tokens={} prefill_ms={} decode_ms={} total_ms={} reused_prefix_tokens={} prefix_cache={} decode_path={}{}{} footprint_bytes={} prefix_cache_bytes={}{}",
             self.id,
             prompt_tokens,
             output.tokens.len(),
@@ -978,6 +1098,7 @@ impl LoadedModel {
             reused_prefix_tokens,
             path.prefix_cache,
             path.decode_path,
+            speculative_log(path.speculative.as_ref()),
             if path.streaming { " streaming=true" } else { "" },
             process_footprint_bytes().unwrap_or(0),
             self.prefix_cache_bytes(),
@@ -1187,6 +1308,7 @@ impl LoadedModel {
                 prefix_cache: "decoder-longest-prefix",
                 decode_path: "batch",
                 streaming: true,
+                speculative: None,
             },
         );
         let completion = match completion {
@@ -1282,13 +1404,37 @@ impl LoadedModel {
         }
 
         let block_tokens = self.prefix_cache.block_tokens();
-        let full_block_tokens = tokens.len() / block_tokens * block_tokens;
+        // Queue effective du décodeur (alignement et seuil du prolongement
+        // résident) : elle passe par le prefill résident, comme les mêmes
+        // positions d'un prefill à froid, et non par l'extension en lignes.
+        let tail = self
+            .decoder
+            .prefix_resume_align()
+            .filter(|(align, _)| cheap_extend && block_tokens % align == 0)
+            .map_or(0, |(_, tail)| tail);
+        let full_block_tokens = tokens.len().saturating_sub(tail) / block_tokens * block_tokens;
         let root = BlockHash::for_session(session_key);
         let hit = self
             .prefix_cache
             .match_prefix(root, tokens)
             .filter(|hit| cheap_extend || hit.tokens.saturating_mul(2) >= full_block_tokens);
-        let reused_prefix_tokens = hit.as_ref().map_or(0, |hit| hit.tokens);
+        let minimum = hit
+            .as_ref()
+            .map_or(0, |hit| hit.tokens)
+            .max(if cheap_extend {
+                0
+            } else {
+                full_block_tokens.div_ceil(2).saturating_sub(1)
+            });
+        let persistent = self.decoder.load_persistent_prefix(
+            &tokens[..full_block_tokens],
+            block_tokens,
+            minimum,
+        )?;
+        let reused_prefix_tokens = persistent.as_ref().map_or_else(
+            || hit.as_ref().map_or(0, |hit| hit.tokens),
+            CausalDecoderPromptState::position,
+        );
 
         // NOTE: une seule frontière mémorisée par prompt, la dernière complète.
         // Un snapshot par bloc partageait l'Arc du KV avec l'état vivant : chaque
@@ -1296,7 +1442,9 @@ impl LoadedModel {
         // ponytail: un préfixe commun plus court que le prompt servi (prompt
         // système partagé) n'est réutilisé que s'il a été servi seul ; ajouter
         // une frontière déclarée (fin du message système) si ce cas compte.
-        let mut state = if let Some(hit) = hit {
+        let mut state = if let Some(state) = persistent {
+            self.extend_persistent_prefix(root, &tokens[..full_block_tokens], state, memory_guard)?
+        } else if let Some(hit) = hit {
             let hit_kv = kv_allocations(&hit.state);
             let mut state = hit.state;
             let metal = self.decoder.copy_prompt_state_metal_snapshot(&hit.metal)?;
@@ -1323,13 +1471,37 @@ impl LoadedModel {
         if reused_prefix_tokens < full_block_tokens {
             let hash = tokens[..full_block_tokens]
                 .chunks_exact(block_tokens)
-                .fold(root, BlockHash::chain);
+                .fold(root, |hash, block| hash.chain(block, &[]));
+            self.decoder
+                .persist_prompt(&tokens[..full_block_tokens], &state)?;
             self.remember_prefix_block(root, hash, full_block_tokens, &state, memory_guard)?;
         }
         self.decoder
             .extend_prompt_state(&mut state, &tokens[full_block_tokens..])?;
 
         Ok((state, reused_prefix_tokens, started.elapsed()))
+    }
+
+    /// La relecture possède déjà sa récurrence Metal indépendante. La garder
+    /// vivante évite snapshot + restauration ; seule l'entrée RAM est copiée.
+    fn extend_persistent_prefix(
+        &mut self,
+        root: BlockHash,
+        tokens: &[usize],
+        mut state: CausalDecoderPromptState,
+        memory_guard: &MemoryGuard,
+    ) -> ServeResult<CausalDecoderPromptState> {
+        let boundary = state.position();
+        if boundary == tokens.len() {
+            let hash = tokens
+                .chunks_exact(self.prefix_cache.block_tokens())
+                .fold(root, |hash, block| hash.chain(block, &[]));
+            self.remember_prefix_block(root, hash, boundary, &state, memory_guard)?;
+        }
+        // Une frontière prolongée sera mémorisée une seule fois par l'appelant.
+        self.decoder
+            .extend_prompt_state(&mut state, &tokens[boundary..])?;
+        Ok(state)
     }
 
     fn remember_prefix_block(
@@ -1409,6 +1581,28 @@ impl LoadedModel {
         let stop_token_ids = self.assets.stop_token_ids();
         let token_constraint = match response_format {
             ResponseFormatMode::Text => None,
+            ResponseFormatMode::JsonSchema => {
+                let schema = request
+                    .response_format
+                    .as_ref()
+                    .ok_or_else(|| ServeError::Http("response_format.json_schema requis".into()))?
+                    .compiled_schema()?;
+                if self.schema_token_catalog.get().is_none() {
+                    let catalog = SchemaTokenCatalog::from_tokenizer(
+                        &self.assets.tokenizer,
+                        &stop_token_ids,
+                    )?;
+                    let _ = self.schema_token_catalog.set(Arc::new(catalog));
+                }
+                let catalog = self
+                    .schema_token_catalog
+                    .get()
+                    .ok_or_else(|| ServeError::Http("json_schema: catalogue absent".into()))?;
+                Some(Arc::new(
+                    SchemaTokenConstraint::new(Arc::clone(catalog), &schema)
+                        .map_err(|error| ServeError::Http(error.to_string()))?,
+                ) as Arc<dyn TokenConstraint>)
+            }
             ResponseFormatMode::JsonObject => Some(Arc::new(JsonTokenConstraint::new(
                 self.json_catalog()?,
                 &stop_token_ids,
@@ -1424,7 +1618,9 @@ impl LoadedModel {
             stop_token_ids,
             stop_sequences: if matches!(
                 response_format,
-                ResponseFormatMode::JsonObject | ResponseFormatMode::JsonLines
+                ResponseFormatMode::JsonObject
+                    | ResponseFormatMode::JsonLines
+                    | ResponseFormatMode::JsonSchema
             ) {
                 Vec::new()
             } else {
@@ -1512,12 +1708,15 @@ fn stop_texts_for_response_format(
     let stop_texts = request.stop_texts();
     if matches!(
         response_format,
-        ResponseFormatMode::JsonObject | ResponseFormatMode::JsonLines
+        ResponseFormatMode::JsonObject
+            | ResponseFormatMode::JsonLines
+            | ResponseFormatMode::JsonSchema
     ) && stop_texts.iter().any(|stop| !stop.is_empty())
     {
         let format = match response_format {
             ResponseFormatMode::JsonObject => "json_object",
             ResponseFormatMode::JsonLines => "json_lines",
+            ResponseFormatMode::JsonSchema => "json_schema",
             ResponseFormatMode::Text => "text",
         };
         return Err(ServeError::Http(format!(
@@ -1743,6 +1942,59 @@ mod tests {
     use saragossa::ChatTemplateMessage;
 
     #[test]
+    fn speculative_log_distinguishes_dflash_from_mtp() {
+        assert_eq!(speculative_decode_path(None), "ar");
+        assert_eq!(speculative_log(None), "");
+        let mut stats = saragossa::SpeculativeStats {
+            proposed: 12,
+            accepted: 7,
+            verifications: 5,
+            ..Default::default()
+        };
+        assert_eq!(speculative_decode_path(Some(&stats)), "mtp");
+        assert_eq!(
+            speculative_log(Some(&stats)),
+            " spec_proposed=12 spec_accepted=7"
+        );
+        stats.dflash_tours = Some(3);
+        assert_eq!(speculative_decode_path(Some(&stats)), "dflash");
+        assert!(speculative_log(Some(&stats)).ends_with("spec_tours=3"));
+    }
+
+    fn cfg(id: &str, path: &str) -> ServeModelConfig {
+        ServeModelConfig {
+            id: id.to_string(),
+            path: path.into(),
+            hf_repo: None,
+        }
+    }
+
+    // Le moteur applique la liste entre deux requêtes : tant qu'il ne l'a pas
+    // fait (requête simulée en cours), le modèle retiré reste en place avec ses
+    // poids ; modifié = retrait + ajout paresseux, inchangé = slot gardé.
+    #[test]
+    fn set_models_waits_for_the_engine_and_keeps_unchanged_slots() {
+        let args = ServeArgs::parse(
+            ["--model", "a=/x/a", "--model", "b=/x/b", "--backend", "cpu"].map(String::from),
+        )
+        .expect("args");
+        let mut state = ServeState::new(&args);
+        state.models[1].last_used = 7;
+        let wanted = [cfg("b", "/x/b"), cfg("c", "/x/c")];
+        assert_eq!(
+            state.model_ids(),
+            ["a", "b"],
+            "requête en cours : rien appliqué"
+        );
+        state.set_models(&wanted);
+        assert_eq!(state.model_ids(), ["b", "c"]);
+        assert_eq!(state.models[0].last_used, 7, "b garde son slot");
+        assert!(state.models.iter().all(|slot| slot.loaded.is_none()));
+        state.set_models(&[cfg("b", "/y/b")]);
+        assert_eq!(state.models[0].last_used, 0, "modifié = nouveau slot");
+    }
+
+    #[test]
     fn metal_loader_passes_model_profile_to_executor() {
         // Inspecter le chemin réel sans créer de device ni charger de poids en CI CPU.
         let loader = include_str!("state.rs")
@@ -1856,6 +2108,50 @@ mod tests {
         assert_eq!(
             fitting_streams(&MemoryGuard::disabled(), &rest, |bytes| *bytes),
             4
+        );
+    }
+
+    #[test]
+    fn persistent_prefix_keeps_one_reusable_frontier() {
+        let mut loaded = super::json_tests::tiny_loaded_model();
+        loaded.prefix_cache = BlockAwarePrefixCache::new(1, 8);
+        let root = BlockHash::for_session(Some("ssd"));
+        let guard = MemoryGuard::disabled();
+        let make_state = |loaded: &LoadedModel| {
+            loaded
+                .decoder
+                .prefill_prompt_state_uncached(&[0, 1])
+                .unwrap()
+        };
+        let state = make_state(&loaded);
+        let state = loaded
+            .extend_persistent_prefix(root, &[0, 1], state, &guard)
+            .unwrap();
+        let hit = loaded.prefix_cache.match_prefix(root, &[0, 1]).unwrap();
+        assert_eq!(hit.tokens, 2);
+        let generate = |state| {
+            loaded
+                .decoder
+                .generate_greedy_timed_from_prompt_state_with_options(
+                    state,
+                    Duration::ZERO,
+                    4,
+                    &GenerationOptions::default(),
+                )
+                .unwrap()
+                .tokens
+        };
+        assert_eq!(generate(state), generate(hit.state));
+
+        loaded.prefix_cache = BlockAwarePrefixCache::new(1, 8);
+        let state = make_state(&loaded);
+        let state = loaded
+            .extend_persistent_prefix(root, &[0, 1, 2], state, &guard)
+            .unwrap();
+        assert_eq!(state.position(), 3);
+        assert!(
+            loaded.prefix_cache.match_prefix(root, &[0, 1, 2]).is_none(),
+            "la frontière intermédiaire ne doit pas déclencher de snapshot"
         );
     }
 

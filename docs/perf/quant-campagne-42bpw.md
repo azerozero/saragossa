@@ -17,6 +17,13 @@ allocation.
 | Mesure | `chat_kl.py eval --json` par prompt : KL moyenne, p99, max, top-1, NLL ; `paired.py` : IC 95 % par bootstrap sur les prompts, refus si une catégorie régresse de plus de 10 % |
 | Budget | `audit_bytes.py` : octets `language_model.*` sérialisés / 26 895 998 464, refus au-delà de 4,200 |
 
+Tokenizer : le `tokenizer.json` de D et celui de `ai_model/Qwen3.8-27B-u4ls`
+sont des rendus de transformers (regex Qwen2, SHA `0997f410…`). main les refuse
+désormais (`tokenizer_sidecar.py`). Les KL n'en dépendent pas, car le candidat est
+évalué sur les ids de la référence BF16. Le contrôle kld u4ls a été lancé sur le
+tokenizer d'origine (`.bak`). `convert_ls.py` et `gptq.py` recopient maintenant le
+tokenizer de la source BF16.
+
 Limite connue : le corpus de l'imatrix existante (calib_sha256 `e1e20f0f…`) est
 introuvable. Sa disjonction n'est vérifiée que contre les 8 prompts historiques.
 

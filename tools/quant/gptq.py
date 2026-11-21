@@ -14,6 +14,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import convert_ls
+from tokenizer_sidecar import copy_tokenizer  # noqa: E402
 import imatrix
 import opt_quant
 from gptq_capture import collect_hessians, hessian_batches
@@ -240,8 +241,10 @@ def convert(src, template, dst, calib, samples=128, length=512, chat=False,
             mx.save_safetensors(str(output / path.name), shard, metadata={"format": "mlx"})
             print(f"écrit {path.name}", flush=True)
         for path in template.iterdir():
-            if path.is_file() and path not in shards and path.name not in ("README.md", "gptq.json"):
+            if path.is_file() and path not in shards and path.name not in ("README.md", "gptq.json", "tokenizer.json"):
                 shutil.copy2(path, output / path.name)
+        # Même règle que convert_ls : le tokenizer vient de la source BF16.
+        copy_tokenizer(src, output)
         (output / "gptq.json").write_text(json.dumps(report, indent=2) + "\n")
         (output / "README.md").write_text(
             "Checkpoint MLX affine gs64 GPTQ, groupes statiques, largeur du template conservée.\n"

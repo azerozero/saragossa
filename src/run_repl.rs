@@ -183,14 +183,12 @@ impl ReplModel {
         let mut decoder = load_decoder_with_runtime(&assets, args.backend)?;
         let mtp_active = args.temperature.abs() <= f32::EPSILON
             && crate::serve::mtp::active_for(&assets, args.backend);
+        if mtp_active && assets.mtp.path.is_some() {
+            decoder = decoder.with_mtp_weights(&assets.mtp)?;
+        }
+        #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
         if mtp_active {
-            if let Some(path) = assets.mtp.path.as_ref() {
-                decoder = decoder.with_mtp_sidecar(path)?;
-            }
-            #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-            {
-                decoder = decoder.with_dflash_draft_from_env(&assets.config)?;
-            }
+            decoder = decoder.with_dflash_draft_from_env(&assets.config)?;
         }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         if args.backend == RuntimeKind::Metal {
@@ -280,11 +278,20 @@ impl ChatTurnGenerator for ReplModel {
         let tokens = if self.mtp_active && crate::serve::mtp::supports_options(&self.options, false)
         {
             self.decoder
-                .generate_greedy_mtp_streaming_with_options(
+                .generate_greedy_mtp_routed(
                     &prompt_ids,
                     self.max_tokens,
                     &self.options,
                     crate::serve::mtp::max_draft_tokens(),
+                    saragossa::spec_route::allows_dflash(
+                        history.iter().map(|message| {
+                            (
+                                message.role.as_str(),
+                                message.content.as_deref().unwrap_or(""),
+                            )
+                        }),
+                        false,
+                    ),
                     on_token,
                 )?
                 .tokens

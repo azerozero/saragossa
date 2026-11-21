@@ -1,0 +1,481 @@
+use super::dsp::{self, Analysis, Synthesis, FREQ_BINS};
+use super::*;
+
+#[test]
+fn erb_widths_cover_all_bins_with_minimum_two() {
+    let widths = dsp::erb_widths();
+    assert_eq!(widths.len(), NB_ERB);
+    assert_eq!(widths.iter().sum::<usize>(), FREQ_BINS);
+    assert!(widths.iter().all(|&w| w >= 2));
+}
+
+#[test]
+fn stft_round_trip_is_identity_after_one_hop() {
+    let window = dsp::vorbis_window();
+    let mut planner = FftPlanner::new();
+    let mut analysis = Analysis::new(&mut planner, &window);
+    let mut synthesis = Synthesis::new(&mut planner, &window);
+    let signal: Vec<f32> = (0..HOP_SIZE * 8)
+        .map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0)
+        .collect();
+    let mut spec = vec![Complex32::default(); FREQ_BINS];
+    let mut out = Vec::new();
+    let mut hop = [0.0_f32; HOP_SIZE];
+    for chunk in signal.chunks_exact(HOP_SIZE) {
+        analysis.process(chunk, &mut spec);
+        synthesis.process(&spec, &mut hop);
+        out.extend_from_slice(&hop);
+    }
+    // Reconstruction parfaite retardée de N − H : Σ w² = 1 à 50 % de recouvrement.
+    let delay = FFT_SIZE - HOP_SIZE;
+    let err = signal[..signal.len() - delay]
+        .iter()
+        .zip(&out[delay..])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(err < 1e-5, "erreur de reconstruction {err}");
+}
+
+/// Oracle contre la référence PyTorch officielle (`tools/voice/dfn3_ref.py`).
+///
+/// Tolérances figées avant la première comparaison : f32 partout, mais ordres
+/// de sommation différents (8 accumulateurs contre BLAS) sur des produits de
+/// 3 072 termes et cinq GRU récurrents sur ~300 trames. L'erreur relative
+/// attendue est de l'ordre de 1e-5 ; une erreur de disposition des poids donne
+/// au mieux −20 dB. Seuils : features ≤ 1e-4 en absolu, masque ≤ 1e-3, sortie
+/// audio ≥ 60 dB de SNR contre la référence et ≤ 1e-3 en écart absolu.
+#[test]
+#[ignore = "requiert SARAGOSSA_DFN3_DIR (dfn3.safetensors + golden.safetensors)"]
+fn dfn3_matches_pytorch_reference() {
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_DFN3_DIR") else {
+        return;
+    };
+    let model = DeepFilterNet3::load(dir.join("dfn3.safetensors")).unwrap();
+    let golden = crate::safetensor::load_f32_tensors(dir.join("golden.safetensors")).unwrap();
+    let audio = golden["audio"].data();
+    let want = golden["out"].data();
+
+    // Features : rejoue l'analyse sur le signal paddé comme la référence.
+    let mut planner = FftPlanner::new();
+    let mut analysis = Analysis::new(&mut planner, &model.window);
+    let mut features = dsp::FeatureState::new(model.widths.clone());
+    let mut padded = audio.to_vec();
+    padded.resize(audio.len() + FFT_SIZE, 0.0);
+    let (ref_erb, ref_cplx) = (golden["erb_feat"].data(), golden["spec_feat"].data());
+    let mut spec = vec![Complex32::default(); FREQ_BINS];
+    let (mut erb, mut cplx) = ([0.0_f32; NB_ERB], [0.0_f32; 2 * NB_DF]);
+    let mut feat_err = 0.0_f32;
+    for (t, chunk) in padded.chunks_exact(HOP_SIZE).enumerate() {
+        analysis.process(chunk, &mut spec);
+        features.process(&spec, &mut erb, &mut cplx);
+        for b in 0..NB_ERB {
+            feat_err = feat_err.max((erb[b] - ref_erb[t * NB_ERB + b]).abs());
+        }
+        for f in 0..NB_DF {
+            let r = &ref_cplx[(t * NB_DF + f) * 2..][..2];
+            feat_err = feat_err.max((cplx[f] - r[0]).abs());
+            feat_err = feat_err.max((cplx[NB_DF + f] - r[1]).abs());
+        }
+    }
+
+    // Masque : pas réseau par pas réseau.
+    let ref_mask = golden["mask"].data();
+    let mut stream = model.stream();
+    let mut mask_err = 0.0_f32;
+    let mut tau = 0;
+    let mut analysis = Analysis::new(&mut planner, &model.window);
+    let mut feats = dsp::FeatureState::new(model.widths.clone());
+    for (t, chunk) in padded.chunks_exact(HOP_SIZE).enumerate() {
+        analysis.process(chunk, &mut spec);
+        feats.process(&spec, &mut erb, &mut cplx);
+        if t < CONV_LOOKAHEAD {
+            continue;
+        }
+        let step = model.net.step(&mut stream.state, &erb, &cplx);
+        for b in 0..NB_ERB {
+            mask_err = mask_err.max((step.mask[b] - ref_mask[tau * NB_ERB + b]).abs());
+        }
+        tau += 1;
+    }
+
+    let got = model.enhance(audio).unwrap();
+    assert_eq!(got.len(), want.len());
+    let (mut num, mut den, mut max_abs) = (0.0_f64, 0.0_f64, 0.0_f32);
+    for (g, w) in got.iter().zip(want) {
+        num += f64::from(w * w);
+        den += f64::from((g - w) * (g - w));
+        max_abs = max_abs.max((g - w).abs());
+    }
+    let snr = 10.0 * (num / den.max(1e-30)).log10();
+    eprintln!(
+        "dfn3 oracle: feat {feat_err:.2e} mask {mask_err:.2e} out {max_abs:.2e} SNR {snr:.1} dB"
+    );
+    assert!(feat_err <= 1e-4, "features {feat_err}");
+    assert!(mask_err <= 1e-3, "masque {mask_err}");
+    assert!(
+        max_abs <= 1e-3 && snr >= 60.0,
+        "sortie {max_abs} / {snr} dB"
+    );
+}
+
+/// Latence CPU par hop de 10 ms (p50/p99/max) sur le clip doré, un seul thread.
+/// `SARAGOSSA_DFN3_MODEL` choisit le fichier de poids du dossier (variante faible latence).
+#[test]
+#[ignore = "mesure ; requiert SARAGOSSA_DFN3_DIR"]
+fn dfn3_hop_latency() {
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_DFN3_DIR") else {
+        return;
+    };
+    let name = std::env::var("SARAGOSSA_DFN3_MODEL").unwrap_or_else(|_| "dfn3.safetensors".into());
+    let model = DeepFilterNet3::load(dir.join(name)).unwrap();
+    let golden = crate::safetensor::load_f32_tensors(dir.join("golden.safetensors")).unwrap();
+    let audio = golden["audio"].data();
+    let mut times = Vec::new();
+    let mut hop = [0.0_f32; HOP_SIZE];
+    for _ in 0..3 {
+        let mut stream = model.stream();
+        for chunk in audio.chunks_exact(HOP_SIZE) {
+            let t0 = std::time::Instant::now();
+            stream.process_hop(chunk, &mut hop).unwrap();
+            times.push(t0.elapsed().as_secs_f64() * 1e6);
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    let q = |p: f64| times[((times.len() - 1) as f64 * p) as usize];
+    eprintln!(
+        "dfn3 CPU hop µs: p50 {:.0} p99 {:.0} max {:.0} (n={}) RTF {:.4}",
+        q(0.5),
+        q(0.99),
+        q(1.0),
+        times.len(),
+        q(0.5) / 10_000.0
+    );
+}
+
+mod synthetic;
+
+fn ll_metadata() -> std::collections::HashMap<String, String> {
+    [
+        ("sr", "48000"),
+        ("fft_size", "960"),
+        ("hop_size", "480"),
+        ("nb_erb", "32"),
+        ("nb_df", "96"),
+        ("df_order", "5"),
+        ("df_lookahead", "0"),
+        ("conv_lookahead", "0"),
+        ("conv_ch", "64"),
+        ("conv_kernel", "2,3"),
+        ("conv_kernel_inp", "3,3"),
+        ("emb_hidden_dim", "512"),
+        ("emb_num_layers", "3"),
+        ("enc_linear_groups", "16"),
+        ("linear_groups", "16"),
+        ("df_hidden_dim", "512"),
+        ("df_num_layers", "3"),
+        ("df_pathway_kernel_size_t", "5"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+#[test]
+fn config_reads_low_latency_metadata_and_defaults_to_std() {
+    assert_eq!(
+        Config::from_metadata(&Default::default()).unwrap(),
+        Config::STD
+    );
+    let ll = Config::from_metadata(&ll_metadata()).unwrap();
+    assert_eq!(
+        ll,
+        Config {
+            hidden: 512,
+            erb_layers: 2,
+            df_layers: 3,
+            conv_kt: 2,
+            enc_groups: 16,
+            lookahead: 0,
+        }
+    );
+    for (key, bad) in [
+        ("df_lookahead", "2"),
+        ("df_hidden_dim", "256"),
+        ("nb_erb", "24"),
+        ("conv_kernel", "2"),
+        ("df_order", "x"),
+    ] {
+        let mut meta = ll_metadata();
+        meta.insert(key.into(), bad.into());
+        assert!(Config::from_metadata(&meta).is_err(), "{key} = {bad}");
+    }
+}
+
+/// Oracle onnxruntime de DeepFilterNet3_ll (`tools/voice/dfn3_onnx_ref.py`).
+///
+/// Tolérances figées avant la première comparaison, celles de l'oracle
+/// PyTorch standard : masque et coefficients ≤ 1e-3, LSNR ≤ 1e-2 dB. Les
+/// features du golden sont rejouées telles quelles : sans anticipation, le
+/// pas τ lit la trame τ.
+#[test]
+#[ignore = "requiert SARAGOSSA_DFN3_LL_DIR (dfn3_ll.safetensors + golden_ll.safetensors)"]
+fn dfn3_ll_matches_onnxruntime() {
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_DFN3_LL_DIR") else {
+        return;
+    };
+    let model = DeepFilterNet3::load(dir.join("dfn3_ll.safetensors")).unwrap();
+    assert_eq!(model.net.config.lookahead, 0);
+    assert_eq!(model.stream().delay_samples(), FFT_SIZE - HOP_SIZE);
+    let golden = crate::safetensor::load_f32_tensors(dir.join("golden_ll.safetensors")).unwrap();
+    let (erb, spec) = (golden["erb_feat"].data(), golden["spec_feat"].data());
+    let (mask, coefs, lsnr) = (
+        golden["mask"].data(),
+        golden["coefs"].data(),
+        golden["lsnr"].data(),
+    );
+    let width = NB_DF * 2 * ORDER;
+    let mut state = model.net.new_state();
+    let (mut mask_err, mut coef_err, mut lsnr_err) = (0.0_f32, 0.0_f32, 0.0_f32);
+    for t in 0..lsnr.len() {
+        let mut cplx = [0.0_f32; 2 * NB_DF];
+        for f in 0..NB_DF {
+            cplx[f] = spec[(t * NB_DF + f) * 2];
+            cplx[NB_DF + f] = spec[(t * NB_DF + f) * 2 + 1];
+        }
+        let step = model
+            .net
+            .step(&mut state, &erb[t * NB_ERB..(t + 1) * NB_ERB], &cplx);
+        for (g, w) in step.mask.iter().zip(&mask[t * NB_ERB..]) {
+            mask_err = mask_err.max((g - w).abs());
+        }
+        for (g, w) in step.coefs.iter().zip(&coefs[t * width..]) {
+            coef_err = coef_err.max((g - w).abs());
+        }
+        lsnr_err = lsnr_err.max((step.lsnr - lsnr[t]).abs());
+    }
+    eprintln!("dfn3_ll oracle ORT: masque {mask_err:.2e} coefs {coef_err:.2e} lsnr {lsnr_err:.2e}");
+    assert!(mask_err <= 1e-3, "masque {mask_err}");
+    assert!(coef_err <= 1e-3, "coefficients {coef_err}");
+    assert!(lsnr_err <= 1e-2, "lsnr {lsnr_err}");
+}
+
+#[test]
+fn enhance_preserves_partial_hops_and_matches_streaming() {
+    let model = synthetic::model();
+    for len in [
+        0,
+        1,
+        HOP_SIZE - 1,
+        HOP_SIZE,
+        HOP_SIZE + 1,
+        2 * HOP_SIZE - 1,
+        2 * HOP_SIZE + 17,
+    ] {
+        let input: Vec<f32> = (0..len)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+            .collect();
+        let output = model.enhance(&input).unwrap();
+        assert_eq!(output.len(), len);
+        assert!(output.iter().all(|x| x.is_finite()));
+        // Oracle par flux : conserve le hop partiel et vide explicitement le retard.
+        let mut stream = model.stream();
+        let mut reference = Vec::new();
+        let mut hop = [0.0; HOP_SIZE];
+        for chunk in input.chunks(HOP_SIZE) {
+            let mut padded = [0.0; HOP_SIZE];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            stream.process_hop(&padded, &mut hop).unwrap();
+            reference.extend_from_slice(&hop);
+        }
+        for _ in 0..FFT_SIZE / HOP_SIZE {
+            stream.process_hop(&[0.0; HOP_SIZE], &mut hop).unwrap();
+            reference.extend_from_slice(&hop);
+        }
+        reference.extend(stream.finish());
+        assert_eq!(
+            output,
+            reference[DfStream::DELAY_SAMPLES..DfStream::DELAY_SAMPLES + len]
+        );
+        if len > HOP_SIZE {
+            assert!(
+                output.last().unwrap().abs() > 0.01,
+                "fin de signal perdue: {len}"
+            );
+        }
+    }
+}
+
+#[test]
+fn arbitrary_chunks_are_bit_exact_against_historical_batch() {
+    let model = synthetic::recurrent_model();
+    for len in [0, 1, 479, 480, 481, 960, 5777] {
+        let input: Vec<f32> = (0..len)
+            .map(|i| ((i * 7919 % 997) as f32 - 498.0) / 997.0)
+            .collect();
+        // Oracle indépendant : ancien batch, padding et compensation explicites.
+        let mut padded = input.clone();
+        padded.resize((len + FFT_SIZE).div_ceil(HOP_SIZE) * HOP_SIZE, 0.0);
+        let mut raw = model.stream();
+        let mut reference = Vec::new();
+        for chunk in padded.chunks(HOP_SIZE) {
+            let mut hop = [0.0; HOP_SIZE];
+            raw.process_hop(chunk, &mut hop).unwrap();
+            reference.extend(hop);
+        }
+        reference.extend(raw.finish());
+        let want: Vec<u32> = reference[DfStream::DELAY_SAMPLES..DfStream::DELAY_SAMPLES + len]
+            .iter()
+            .map(|s| s.to_bits())
+            .collect();
+        for (size, threads) in [1, 7, 480, 4800, usize::MAX]
+            .into_iter()
+            .flat_map(|size| [(size, 1), (size, 3)])
+        {
+            let mut stream = DenoiseStream::with_threads(&model, threads);
+            let mut result = Vec::new();
+            let mut pos = 0;
+            let mut seed = 42_u32;
+            while pos < input.len() {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let n = if size == usize::MAX {
+                    1 + seed as usize % 1753
+                } else {
+                    size
+                };
+                let end = (pos + n).min(input.len());
+                result.extend(stream.push(&input[pos..end]).unwrap());
+                pos = end;
+            }
+            result.extend(stream.finish().unwrap());
+            assert_eq!(
+                result.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+                want,
+                "len={len}, chunk={size}, threads={threads}"
+            );
+        }
+    }
+}
+
+#[test]
+fn enhance_resampling_preserves_validation_without_tts() {
+    for (from, to) in [(0, SAMPLE_RATE), (SAMPLE_RATE, 0)] {
+        assert!(matches!(resample(&[], from, to), Err(InferError::Audio(_))));
+    }
+    let signal = vec![0.25; 160];
+    assert_eq!(resample(&signal, SAMPLE_RATE, SAMPLE_RATE).unwrap(), signal);
+    let converted = resample(&signal, 16_000, SAMPLE_RATE).unwrap();
+    assert_eq!(converted.len(), 480);
+    assert!(converted.iter().all(|value| value.is_finite()));
+}
+
+/// Le mode multi-cœur exact parallélise tout sauf la récurrence des GRU :
+/// la sortie doit être identique bit à bit au chemin trame par trame, sur
+/// plusieurs blocs et un bloc final partiel.
+#[test]
+fn multicore_stream_is_bit_exact() {
+    let model = synthetic::recurrent_model();
+    // 6,5 s : deux blocs entiers de 2,56 s et un reste.
+    let input: Vec<f32> = (0..6_u64 * 48_000 + 24_000)
+        .map(|i| ((i * 7919 % 997) as f32 - 498.0) / 997.0 * 0.5)
+        .collect();
+    let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+    let mono = bits(model.enhance(&input).unwrap());
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    for threads in [1, 2, 4, 8, cores] {
+        let mut stream = DenoiseStream::with_threads(&model, threads);
+        let mut out = Vec::new();
+        for chunk in input.chunks(10_007) {
+            out.extend(stream.push(chunk).unwrap());
+        }
+        out.extend(stream.finish().unwrap());
+        assert_eq!(bits(out), mono, "threads={threads}");
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn gpu_enhance_is_bit_exact_against_cpu_common_math() {
+    if metal::Device::system_default().is_none() {
+        return;
+    }
+    let model = synthetic::recurrent_model();
+    // ~200 pas : traverse trois frontières de morceau GPU (64 pas en test).
+    let input: Vec<f32> = (0..200 * HOP_SIZE + 17)
+        .map(|i| ((i * 7919 % 997) as f32 - 498.0) / 997.0 * 0.5)
+        .collect();
+    let cpu = model.enhance_common(&input).unwrap();
+    let gpu = model.enhance_gpu(&input).unwrap();
+    assert_eq!(cpu.len(), input.len());
+    let bits = |v: &[f32]| v.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&gpu), bits(&cpu));
+}
+
+/// Sonde de l'étape 1 : boucle GRU persistante, µs par pas (hidden 256).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "mesure GPU ; lancer sous le verrou GPU"]
+fn dfn3_gpu_gru_step_probe() {
+    let model = synthetic::recurrent_model();
+    for seqs in [1, 2] {
+        let us = super::gpu::gru_probe(&model.net, 29_300, seqs).unwrap();
+        eprintln!("dfn3 GRU persistant, {seqs} séquence(s) : {us:.2} µs/pas");
+    }
+}
+
+/// Vitesse et identité sur un clip long réel : CPU historique, CPU commun, GPU.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "requiert SARAGOSSA_DFN3_DIR et SARAGOSSA_DFN3_LONG_WAV ; GPU sous verrou"]
+fn dfn3_gpu_long_file_bit_exact_and_speed() {
+    let Some(dir) = crate::test_support::local_dir("SARAGOSSA_DFN3_DIR") else {
+        return;
+    };
+    let Some(wav) = crate::test_support::require_real_model(
+        std::env::var("SARAGOSSA_DFN3_LONG_WAV").ok(),
+        "SARAGOSSA_DFN3_LONG_WAV",
+    ) else {
+        eprintln!("skip: SARAGOSSA_DFN3_LONG_WAV absent");
+        return;
+    };
+    let model = DeepFilterNet3::load(dir.join("dfn3.safetensors")).unwrap();
+    let (raw, rate) = decode_wav(&std::fs::read(wav).unwrap()).unwrap();
+    let audio = resample(&raw, rate, SAMPLE_RATE).unwrap();
+    let time = |f: &dyn Fn() -> Vec<f32>| {
+        let t0 = std::time::Instant::now();
+        let out = f();
+        (out, t0.elapsed().as_secs_f64())
+    };
+    let (gpu, t_gpu) = time(&|| model.enhance_gpu(&audio).unwrap());
+    let (common, t_common) = time(&|| model.enhance_common(&audio).unwrap());
+    let (libm, t_libm) = time(&|| model.enhance_libm(&audio).unwrap());
+    let same = gpu
+        .iter()
+        .zip(&common)
+        .filter(|(a, b)| a.to_bits() == b.to_bits())
+        .count();
+    let differ = libm
+        .iter()
+        .zip(&common)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let signal: f64 = libm.iter().map(|&s| f64::from(s).powi(2)).sum();
+    let error: f64 = libm
+        .iter()
+        .zip(&common)
+        .map(|(&a, &b)| f64::from(a - b).powi(2))
+        .sum();
+    let max_abs = libm
+        .iter()
+        .zip(&common)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+    eprintln!(
+        "dfn3 {:.1} s : GPU {t_gpu:.2} s, CPU commun {t_common:.2} s, CPU libm {t_libm:.2} s ; \
+         GPU = commun sur {same}/{} échantillons ; commun vs libm : {differ} échantillons différents, SNR {:.1} dB, max {max_abs:.2e}",
+        audio.len() as f64 / f64::from(SAMPLE_RATE),
+        gpu.len(),
+        10.0 * (signal / error.max(1e-30)).log10()
+    );
+    assert_eq!(gpu.len(), common.len());
+    assert_eq!(same, gpu.len(), "GPU différent du CPU commun");
+}

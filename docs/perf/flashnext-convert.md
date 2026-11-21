@@ -28,6 +28,7 @@ Options :
   terminés.
 
 **Reprise.**
+
 - Un shard terminé est sauté sur sa taille. La finalisation rehache tous les
   fichiers ; un shard divergent est retiré du journal, et la commande échoue
   pour qu'une relance le réécrive.
@@ -56,6 +57,7 @@ Le décodage des experts FP8 suit `w = e4m3 × weight_scale_inv`, avec une
 
 Les codes valent `round((w − b) / s)`, calculés en f64 contre la scale `s` et
 le biais `b` déjà arrondis en bf16 :
+
 - le biais est arrondi vers −∞ et la scale vers +∞, pour qu'aucun code ne soit
   écrêté ;
 - l'étendue du groupe est calculée en f64 ;
@@ -63,6 +65,7 @@ le biais `b` déjà arrondis en bf16 :
 
 Les normes sont copiées à l'octet, mais deux conventions de lecture coexistent
 (voir le manifeste) :
+
 - `Qwen4ExpTextRMSNorm` lit un gain `1 + w` : `hc_norm`, `q/k_norm`, normes de
   l'indexeur et du PLE, `mtp.pre_fc_norm_*` ;
 - `linear_attn.norm` (`Qwen4ExpTextRMSNormGated`) lit un gain `w` direct.

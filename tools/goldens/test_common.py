@@ -18,7 +18,7 @@ class CaptureVersionsTest(unittest.TestCase):
                 common.require_versions(packages)
 
     def test_each_script_refuses_version_drift_before_loading(self):
-        for name in ("chat_templates", "logits", "embedder", "whisper"):
+        for name in ("chat_templates", "logits", "embedder", "whisper", "gemma4_long"):
             module = importlib.import_module(name)
             with self.subTest(script=name), patch.object(module, "local_model") as load:
                 with patch("common.importlib.metadata.version", return_value="unexpected"):

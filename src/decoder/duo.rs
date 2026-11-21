@@ -109,15 +109,18 @@ impl CausalDecoder {
             None
         };
 
+        let positions = [cache_a.current_pos()?, cache_b.current_pos()?];
         let CausalDecoderCache {
             layers: layers_a,
             position: position_a,
             resident: resident_a,
+            ..
         } = cache_a;
         let CausalDecoderCache {
             layers: layers_b,
             position: position_b,
             resident: resident_b,
+            ..
         } = cache_b;
         let arena = resident_a
             .as_mut()
@@ -125,7 +128,6 @@ impl CausalDecoder {
         let arena_b = resident_b
             .as_ref()
             .ok_or_else(|| InferError::Metal("arène résidente B absente (duo)".to_string()))?;
-        let positions = [*position_a, *position_b];
         let slots = [
             arena.state.scratch_namespace(),
             arena_b.state.scratch_namespace(),
@@ -295,6 +297,7 @@ impl CausalDecoder {
                     hidden,
                     params,
                     slots,
+                    self.config.final_logit_softcapping,
                 )?;
             }
             None => {

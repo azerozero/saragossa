@@ -18,8 +18,12 @@ use serde::Serialize;
 use super::anthropic::{
     anthropic_chat, handle_anthropic_messages, send_anthropic_error, AnthropicSse,
 };
-use super::audio::{handle_speech, handle_transcription};
+#[cfg(feature = "diar")]
+use super::audio::handle_diarization;
+#[cfg(feature = "tts")]
+use super::audio::handle_speech;
 use super::dispatch::{self, Front};
+#[cfg(feature = "embed")]
 use super::embeddings::handle_embeddings;
 use super::error::{ServeError, ServeResult};
 use super::flint_output::FlintEvent;
@@ -30,6 +34,11 @@ use super::protocol::{
 };
 use super::state::{ServeState, ServedCompletion};
 use super::streaming::{CompletionSink, CompletionStreamEvent};
+#[cfg(feature = "stt")]
+use super::stt::{
+    handle_transcription, handle_transcription_stream, StreamChunkHeaders, STT_FINAL_HEADER,
+    STT_LANGUAGE_HEADER, STT_SESSION_HEADER,
+};
 use super::tool_output::ToolOutputParser;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -45,21 +54,67 @@ pub(super) fn serve_tcp(
     state: &mut ServeState,
     read_timeout: Duration,
 ) -> ServeResult<()> {
-    let listener =
-        TcpListener::bind(addr).map_err(|e| ServeError::io(format!("bind TCP {addr}"), e))?;
+    #[cfg(unix)]
+    let listener = match super::relay::inherited()? {
+        Some(fd) => adopt_tcp(TcpListener::from(fd), addr)?,
+        None => bind_tcp(addr)?,
+    };
+    #[cfg(not(unix))]
+    let listener = bind_tcp(addr)?;
     eprintln!("saragossa serve TCP listening on http://{addr}/v1");
     eprintln!("saragossa serve TCP bearer auth enabled");
     let front = Front::new(Some(api_key.to_string()), state.model_ids());
     dispatch::serve(state, front, read_timeout, move |dispatcher| {
         // NOTE: sans TCP_NODELAY, Nagle et l'ACK retardé regroupent les petits
         // événements SSE d'un flux ; un échec de réglage laisse le défaut.
-        let incoming = listener.incoming().map(|stream| {
+        let nodelay = |stream: std::io::Result<TcpStream>| {
             stream.inspect(|stream| {
                 let _ = stream.set_nodelay(true);
             })
-        });
-        dispatcher.accept_all(incoming, "accept TCP")
+        };
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = listener.as_raw_fd();
+            super::relay::watch(fd);
+            super::relay::ready()?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| ServeError::io("listener TCP non bloquant", e))?;
+            // NOTE: macOS transmet O_NONBLOCK du listener à la socket acceptée.
+            let incoming = super::relay::incoming(fd, || {
+                let (stream, _) = listener.accept()?;
+                stream.set_nonblocking(false).map(|()| stream)
+            });
+            dispatcher.accept_all(incoming.map(nodelay), "accept TCP")
+        }
+        #[cfg(not(unix))]
+        dispatcher.accept_all(listener.incoming().map(nodelay), "accept TCP")
     })
+}
+
+fn bind_tcp(addr: &str) -> ServeResult<TcpListener> {
+    TcpListener::bind(addr).map_err(|e| ServeError::io(format!("bind TCP {addr}"), e))
+}
+
+/// Refuse une socket héritée qui n'écoute pas sur l'adresse demandée.
+#[cfg(unix)]
+fn adopt_tcp(listener: TcpListener, addr: &str) -> ServeResult<TcpListener> {
+    use std::net::ToSocketAddrs;
+    let local = listener
+        .local_addr()
+        .map_err(|e| ServeError::io("adresse de la socket héritée", e))?;
+    let wanted = addr
+        .to_socket_addrs()
+        .map_err(|e| ServeError::io(format!("résolution {addr}"), e))?;
+    let mut wanted = wanted;
+    if wanted.any(|candidate| candidate == local) {
+        Ok(listener)
+    } else {
+        Err(ServeError::args(format!(
+            "socket héritée sur {local}, attendue sur {addr}"
+        )))
+    }
 }
 
 /// Sert en HTTP sur socket Unix avec permissions propriétaire.
@@ -69,19 +124,49 @@ pub(super) fn serve_unix(
     state: &mut ServeState,
     read_timeout: Duration,
 ) -> ServeResult<()> {
-    prepare_socket_path(path)?;
-    let listener = UnixListener::bind(path)
-        .map_err(|e| ServeError::io(format!("bind socket {}", path.display()), e))?;
-    let permissions = fs::Permissions::from_mode(0o600);
-    fs::set_permissions(path, permissions)
-        .map_err(|e| ServeError::io(format!("chmod 0600 {}", path.display()), e))?;
+    let listener = match super::relay::inherited()? {
+        Some(fd) => {
+            let listener = UnixListener::from(fd);
+            let local = listener
+                .local_addr()
+                .map_err(|e| ServeError::io("adresse de la socket héritée", e))?;
+            if local.as_pathname() != Some(path) {
+                return Err(ServeError::args(format!(
+                    "socket héritée sur {local:?}, attendue sur {}",
+                    path.display()
+                )));
+            }
+            listener
+        }
+        None => {
+            prepare_socket_path(path)?;
+            let listener = UnixListener::bind(path)
+                .map_err(|e| ServeError::io(format!("bind socket {}", path.display()), e))?;
+            let permissions = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(path, permissions)
+                .map_err(|e| ServeError::io(format!("chmod 0600 {}", path.display()), e))?;
+            listener
+        }
+    };
     eprintln!(
         "saragossa serve Unix socket listening on {} (0600)",
         path.display()
     );
     let front = Front::new(None, state.model_ids());
     dispatch::serve(state, front, read_timeout, move |dispatcher| {
-        dispatcher.accept_all(listener.incoming(), "accept socket Unix")
+        use std::os::fd::AsRawFd;
+        let fd = listener.as_raw_fd();
+        super::relay::watch(fd);
+        super::relay::ready()?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| ServeError::io("listener Unix non bloquant", e))?;
+        // NOTE: macOS transmet O_NONBLOCK du listener à la socket acceptée.
+        let incoming = super::relay::incoming(fd, || {
+            let (stream, _) = listener.accept()?;
+            stream.set_nonblocking(false).map(|()| stream)
+        });
+        dispatcher.accept_all(incoming, "accept socket Unix")
     })
 }
 
@@ -196,8 +281,20 @@ pub(super) fn route_front<S: Write>(
             return Some(send_error(stream, 401, "authentification bearer requise"));
         }
     }
+    #[cfg(feature = "webtransport")]
+    if request.method == "GET" && path == "/v1/audio/enhance/certificate" {
+        return Some((|| match front.enhance.certificate_info()? {
+            Some(info) => send_json(
+                stream,
+                200,
+                &info,
+                vec![("Cache-Control", "no-store".into())],
+            ),
+            None => send_error(stream, 503, "listener WebTransport non activé"),
+        })());
+    }
     if request.method == "GET" && path == "/v1/models" {
-        let models = ModelsResponse::from_ids(&front.model_ids);
+        let models = ModelsResponse::from_ids(&super::reload::model_ids(&front.model_ids));
         return Some(send_json(stream, 200, &models, Vec::new()));
     }
     if request.method == "GET" {
@@ -206,11 +303,13 @@ pub(super) fn route_front<S: Write>(
                 Ok(id) => id,
                 Err(error) => return Some(send_failure(stream, &error, false)),
             };
-            return Some(if front.model_ids.iter().any(|model| model == &id) {
-                send_json(stream, 200, &ModelInfo::new(&id), Vec::new())
-            } else {
-                send_failure(stream, &ServeError::UnknownModel(id), false)
-            });
+            return Some(
+                if super::reload::model_ids(&front.model_ids).contains(&id) {
+                    send_json(stream, 200, &ModelInfo::new(&id), Vec::new())
+                } else {
+                    send_failure(stream, &ServeError::UnknownModel(id), false)
+                },
+            );
         }
     }
     None
@@ -271,16 +370,69 @@ fn route_engine<S: Write>(
             Ok(()) => Ok(()),
             Err(error) => send_failure(stream, &error, true),
         },
+        #[cfg(feature = "stt")]
         ("POST", "/v1/audio/transcriptions") => handle_transcription(
             stream,
             state.audio_mut(),
             request.header("content-type"),
             &request.body,
         ),
+        #[cfg(feature = "diar")]
+        ("POST", "/v1/audio/diarization") => handle_diarization(
+            stream,
+            state.audio_mut(),
+            request.header("content-type"),
+            &request.body,
+        ),
+        #[cfg(feature = "stt")]
+        ("POST", "/v1/audio/transcriptions/stream") => handle_transcription_stream(
+            stream,
+            state.audio_mut(),
+            &StreamChunkHeaders {
+                session: request.header(STT_SESSION_HEADER),
+                is_final: request
+                    .header(STT_FINAL_HEADER)
+                    .is_some_and(|value| value.eq_ignore_ascii_case("true")),
+                language: request.header(STT_LANGUAGE_HEADER),
+            },
+            &request.body,
+        ),
+        #[cfg(feature = "tts")]
         ("POST", "/v1/audio/speech") => handle_speech(stream, state.audio_mut(), &request.body),
+        #[cfg(feature = "embed")]
         ("POST", "/v1/embeddings") => {
             handle_embeddings(stream, state.embeddings_mut(), &request.body)
         }
+        #[cfg(not(feature = "stt"))]
+        ("POST", "/v1/audio/transcriptions" | "/v1/audio/transcriptions/stream") => send_error(
+            stream,
+            501,
+            "modalité STT absente : recompiler avec --features stt",
+        ),
+        #[cfg(not(feature = "diar"))]
+        ("POST", "/v1/audio/diarization") => send_error(
+            stream,
+            501,
+            "modalité diarisation absente : recompiler avec --features diar",
+        ),
+        #[cfg(not(feature = "tts"))]
+        ("POST", "/v1/audio/speech") => send_error(
+            stream,
+            501,
+            "modalité TTS absente : recompiler avec --features tts",
+        ),
+        #[cfg(not(feature = "denoise"))]
+        ("POST", "/v1/audio/enhance") => send_error(
+            stream,
+            501,
+            "modalité débruitage absente : recompiler avec --features denoise",
+        ),
+        #[cfg(not(feature = "embed"))]
+        ("POST", "/v1/embeddings") => send_error(
+            stream,
+            501,
+            "modalité embeddings absente : recompiler avec --features embed",
+        ),
         _ => send_error(stream, 404, "endpoint inconnu"),
     }
 }
@@ -714,7 +866,7 @@ fn sanitize_header_value(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
-fn error_status(error: &ServeError) -> u16 {
+pub(in crate::serve) fn error_status(error: &ServeError) -> u16 {
     match error {
         ServeError::UnknownModel(_) => 404,
         ServeError::Args(_)
@@ -742,7 +894,22 @@ fn reason_phrase(status: u16) -> &'static str {
     }
 }
 
-fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
+pub(in crate::serve) fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
+    #[cfg(feature = "ws")]
+    if request.method == "GET"
+        && request.route() == "/v1/audio/enhance/ws"
+        && request
+            .header("sec-websocket-protocol")
+            .is_some_and(|protocols| {
+                protocols.split(',').any(|p| {
+                    p.trim().strip_prefix("bearer.").is_some_and(|token| {
+                        constant_time_eq(token.as_bytes(), expected.as_bytes())
+                    })
+                })
+            })
+    {
+        return true;
+    }
     if is_anthropic_route(request.route()) {
         if let Some(key) = request.header("x-api-key") {
             if constant_time_eq(key.as_bytes(), expected.as_bytes()) {
@@ -753,13 +920,20 @@ fn is_authorized(request: &HttpRequest, expected: &str) -> bool {
     let Some(header) = request.header("authorization") else {
         return false;
     };
-    let Some(token) = header.strip_prefix("Bearer ") else {
+    let Some(token) = bearer_token(header) else {
         return false;
     };
     constant_time_eq(token.as_bytes(), expected.as_bytes())
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+/// Jeton d'un en-tête `Authorization: Bearer <jeton>` ; schéma insensible à la
+/// casse (RFC 7235 §2.1).
+pub(in crate::serve) fn bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
+}
+
+pub(super) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     let mut diff = left.len() ^ right.len();
     let max_len = left.len().max(right.len());
     for index in 0..max_len {
@@ -779,12 +953,28 @@ pub(super) struct HttpRequest {
 }
 
 impl HttpRequest {
+    #[cfg(feature = "ws")]
+    pub(super) fn query(&self) -> &str {
+        self.path.split_once('?').map_or("", |(_, query)| query)
+    }
+    #[cfg(feature = "ws")]
+    pub(super) fn header_count(&self, name: &str) -> usize {
+        self.headers.iter().filter(|(key, _)| key == name).count()
+    }
+    pub(super) fn is_enhance(&self) -> bool {
+        self.method == "POST" && self.route() == "/v1/audio/enhance"
+    }
+    #[cfg(feature = "denoise")]
+    pub(super) fn take_prefix(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.body)
+    }
+
     /// Chemin sans query string.
     pub(super) fn route(&self) -> &str {
         self.path.split('?').next().unwrap_or(self.path.as_str())
     }
 
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
         let target = name.to_ascii_lowercase();
         self.headers
             .iter()
@@ -846,8 +1036,14 @@ pub(super) fn read_head<S: Read>(
     let header_text = str::from_utf8(header_bytes)
         .map_err(|e| ServeError::Http(format!("headers non UTF-8: {e}")))?;
     let (method, path, headers) = parse_headers(header_text)?;
-    let content_length = content_length(&headers)?;
-    if content_length > MAX_BODY_BYTES {
+    let enhance = method == "POST" && path.split('?').next() == Some("/v1/audio/enhance");
+    let chunked = enhance && enhance_chunked(&headers)?;
+    let content_length = if chunked {
+        0
+    } else {
+        content_length(&headers)?
+    };
+    if !enhance && content_length > MAX_BODY_BYTES {
         return Err(ServeError::BodyTooLarge {
             anthropic: is_anthropic_route(path.split('?').next().unwrap_or_default()),
         });
@@ -909,7 +1105,9 @@ fn parse_headers(header_text: &str) -> ServeResult<ParsedHeaders> {
     let version = parts
         .next()
         .ok_or_else(|| ServeError::Http("version HTTP absente".to_string()))?;
-    if !version.starts_with("HTTP/") {
+    if !version.starts_with("HTTP/")
+        || (path.split('?').next() == Some("/v1/audio/enhance/ws") && version != "HTTP/1.1")
+    {
         return Err(ServeError::Http(format!(
             "version HTTP invalide: {version}"
         )));
@@ -930,10 +1128,57 @@ fn parse_headers(header_text: &str) -> ServeResult<ParsedHeaders> {
     Ok((method, path, headers))
 }
 
+/// Le chunked n'est ouvert que pour enhance, sans ambiguïté avec Content-Length.
+fn enhance_chunked(headers: &[(String, String)]) -> ServeResult<bool> {
+    let encodings: Vec<_> = headers
+        .iter()
+        .filter(|(name, _)| name == "transfer-encoding")
+        .collect();
+    if encodings.is_empty() {
+        return Ok(false);
+    }
+    if encodings.len() != 1
+        || !encodings[0].1.eq_ignore_ascii_case("chunked")
+        || headers.iter().any(|(name, _)| name == "content-length")
+    {
+        return Err(ServeError::Http(
+            "cadrage enhance ambigu ou Transfer-Encoding non supporté".into(),
+        ));
+    }
+    Ok(true)
+}
+
+/// Seul `Content-Length` cadre un corps. `Transfer-Encoding` est refusé :
+/// seul, il n'est pas lu (501) ; avec `Content-Length`, ou un `Content-Length`
+/// répété ou non numérique, le cadrage est ambigu (400) — c'est la porte du
+/// request smuggling derrière un proxy.
 fn content_length(headers: &[(String, String)]) -> ServeResult<usize> {
-    let Some((_, value)) = headers.iter().find(|(name, _)| name == "content-length") else {
+    let mut lengths = headers
+        .iter()
+        .filter(|(name, _)| name == "content-length")
+        .map(|(_, value)| value);
+    let length = lengths.next();
+    let ambiguous = |why: &str| ServeError::Http(format!("cadrage HTTP ambigu: {why}"));
+    if lengths.next().is_some() {
+        return Err(ambiguous("Content-Length répété"));
+    }
+    if headers.iter().any(|(name, _)| name == "transfer-encoding") {
+        return Err(match length {
+            Some(_) => ambiguous("Transfer-Encoding et Content-Length"),
+            None => ServeError::NotImplemented(
+                "Transfer-Encoding (chunked) non pris en charge: envoyer Content-Length"
+                    .to_string(),
+            ),
+        });
+    }
+    let Some(value) = length else {
         return Ok(0);
     };
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ServeError::Http(format!(
+            "Content-Length invalide: {value:?}"
+        )));
+    }
     value
         .parse::<usize>()
         .map_err(|e| ServeError::Http(format!("Content-Length invalide: {e}")))
@@ -1126,6 +1371,63 @@ mod tests {
             .expect_err("invariant: client au goutte-à-goutte coupé à la deadline");
 
         assert!(error.to_string().contains("délai"));
+    }
+
+    #[test]
+    fn vision_media_refusal_follows_compiled_feature() {
+        for content in [
+            serde_json::json!([{"type": "image_url", "image_url": {"url": "unused"}}]),
+            serde_json::json!([{"type": "input_video"}]),
+            serde_json::json!("<|image_pad|>"),
+        ] {
+            let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "unused", "messages": [{"role": "user", "content": content}]
+            }))
+            .expect("invariant: requête synthétique valide");
+            let error = chat.validate(512).expect_err("média non pris en charge");
+            let mut response = Vec::new();
+            send_failure(&mut response, &error, false).expect("invariant: écriture dans un Vec");
+            let response = String::from_utf8_lossy(&response);
+            let status = if cfg!(feature = "vision") { 400 } else { 501 };
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{response}"
+            );
+            assert!(response.contains("messages.content"), "{response}");
+            if !cfg!(feature = "vision") {
+                assert!(response.contains("--features vision"), "{response}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_chunked_and_ambiguous_framing() {
+        for (headers, status) in [
+            ("Transfer-Encoding: chunked\r\n", "501"),
+            ("Transfer-Encoding: chunked\r\nContent-Length: 2\r\n", "400"),
+            (
+                "Content-Length: 2\r\nTransfer-Encoding: identity\r\n",
+                "400",
+            ),
+            ("Content-Length: 2\r\nContent-Length: 2\r\n", "400"),
+            ("Content-Length: 2\r\nContent-Length: 3\r\n", "400"),
+            ("Content-Length: +2\r\n", "400"),
+            ("Content-Length: 2, 2\r\n", "400"),
+            ("Content-Length: \r\n", "400"),
+        ] {
+            let raw = format!(
+                "POST /v1/audio/transcriptions/stream HTTP/1.1\r\n{headers}\r\n2\r\n{{}}\r\n0\r\n\r\n"
+            );
+            let error = read_request(&mut Cursor::new(raw.into_bytes()), far_deadline())
+                .expect_err("invariant: cadrage refusé");
+            let mut response = Vec::new();
+            let _ = send_failure(&mut response, &error, false);
+            let response = String::from_utf8_lossy(&response);
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{headers}: {response}"
+            );
+        }
     }
 
     #[test]
@@ -1358,6 +1660,72 @@ mod tests {
         drop(peer);
     }
 
+    #[test]
+    #[cfg(feature = "diar")]
+    fn diarization_route_without_model_returns_400() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        let mut wav = Cursor::new(Vec::new());
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::new(&mut wav, spec).expect("invariant: WAV mémoire");
+        writer
+            .write_sample(0_i16)
+            .expect("invariant: échantillon valide");
+        writer.finalize().expect("invariant: WAV terminé");
+        let mut body =
+            b"--BND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\n"
+                .to_vec();
+        body.extend_from_slice(&wav.into_inner());
+        body.extend_from_slice(b"\r\n--BND--\r\n");
+        let mut raw = format!("POST /v1/audio/diarization HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=BND\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        raw.extend_from_slice(&body);
+        let mut stream = Cursor::new(raw);
+        let error = handle_connection(&mut stream, &mut state, None, far_deadline())
+            .expect_err("invariant: modèle non configuré");
+        assert!(error.to_string().contains("diarisation non configuré"));
+        let response = String::from_utf8_lossy(&stream.into_inner()).into_owned();
+        assert!(response.contains("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("--diar-model"));
+    }
+
+    #[test]
+    fn missing_modalities_return_501_before_parsing_body() {
+        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        for (enabled, route, feature) in [
+            (cfg!(feature = "stt"), "/v1/audio/transcriptions", "stt"),
+            (
+                cfg!(feature = "stt"),
+                "/v1/audio/transcriptions/stream",
+                "stt",
+            ),
+            (cfg!(feature = "diar"), "/v1/audio/diarization", "diar"),
+            (cfg!(feature = "tts"), "/v1/audio/speech", "tts"),
+            (cfg!(feature = "embed"), "/v1/embeddings", "embed"),
+            (cfg!(feature = "denoise"), "/v1/audio/enhance", "denoise"),
+        ] {
+            if enabled {
+                continue;
+            }
+            let mut wire = Vec::new();
+            handle_job(&mut wire, &mut state, &post(route, "invalid body"))
+                .expect("invariant: réponse 501 écrite");
+            let response = response_json(wire, 501);
+            let message = response["error"]["message"]
+                .as_str()
+                .expect("invariant: message d'erreur JSON");
+            assert!(
+                message.contains(&format!("--features {feature}")),
+                "{message}"
+            );
+        }
+    }
+
     fn response_json(bytes: Vec<u8>, status: u16) -> serde_json::Value {
         let response = String::from_utf8(bytes).expect("invariant: réponse UTF-8");
         assert!(
@@ -1402,11 +1770,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "stt", feature = "tts", feature = "diar", feature = "embed"))]
     fn auxiliary_only_startup_keeps_llm_routes_explicitly_unavailable() {
         for flags in [
+            #[cfg(feature = "diar")]
+            vec!["--diar-model"],
+            #[cfg(feature = "embed")]
             vec!["--embed-model"],
+            #[cfg(feature = "stt")]
             vec!["--stt-model"],
+            #[cfg(feature = "tts")]
             vec!["--tts-model"],
+            #[cfg(all(feature = "stt", feature = "tts", feature = "embed"))]
             vec!["--stt-model", "--tts-model", "--embed-model"],
         ] {
             let mut args = ServeArgs::parse(
@@ -1495,28 +1870,34 @@ mod tests {
     }
 
     #[test]
-    fn chat_json_schema_response_format_returns_501() {
-        let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
-        let mut state = ServeState::new(&args);
-        let body =
-            br#"{"model":"reti-35b","messages":[],"response_format":{"type":"json_schema"}}"#;
-        let raw = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            str::from_utf8(body).expect("invariant: JSON test UTF-8")
-        );
-        let mut stream = Cursor::new(raw.into_bytes());
-
-        let error = handle_connection(&mut stream, &mut state, None, far_deadline())
-            .expect_err("invariant: json_schema refusé");
-
-        assert!(error.to_string().contains("json_schema"));
-        let response = String::from_utf8(stream.into_inner()).expect("invariant: réponse UTF-8");
-        assert!(response.contains("HTTP/1.1 501 Not Implemented"));
-        assert!(response.contains("json_schema"));
+    fn chat_json_schema_invalid_requests_return_400_before_model_loading() {
+        for format in [
+            serde_json::json!({"type":"json_schema"}),
+            serde_json::json!({"type":"json_schema", "json_schema":{"name":"x", "schema":{"type":"object", "required":42}}}),
+            serde_json::json!({"type":"json_schema", "json_schema":{"name":"x", "schema":{"type":"object", "properties":{"x":{"minimum":0}}}}}),
+            serde_json::json!({"type":"json_schema", "json_schema":{"name":"x", "schema":{"type":"object"}, "strict":"true"}}),
+        ] {
+            let args = ServeArgs::parse(Vec::<String>::new()).expect("args");
+            let mut state = ServeState::new(&args);
+            let body =
+                serde_json::json!({"model":"missing", "messages":[], "response_format":format})
+                    .to_string();
+            let raw = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let mut stream = Cursor::new(raw.into_bytes());
+            handle_connection(&mut stream, &mut state, None, far_deadline())
+                .expect_err("schema refused");
+            let response = String::from_utf8(stream.into_inner()).expect("UTF-8");
+            assert!(response.contains("HTTP/1.1 400 Bad Request"), "{response}");
+            assert!(!response.contains("modèle inconnu"), "{response}");
+        }
     }
 
     #[test]
+    #[cfg(feature = "tts")]
     fn audio_speech_route_without_model_returns_400() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut state = ServeState::new(&args);
@@ -1538,6 +1919,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "stt")]
     fn audio_transcription_route_without_model_returns_400() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut state = ServeState::new(&args);
@@ -1569,6 +1951,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "embed")]
     fn embeddings_route_without_model_returns_400() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut state = ServeState::new(&args);
@@ -1619,6 +2002,99 @@ mod tests {
         assert!(value["error"]["message"]
             .as_str()
             .is_some_and(|message| message.contains("max_tokens")));
+    }
+
+    #[test]
+    fn logit_bias_returns_400_before_model_loading() {
+        for streaming in [false, true] {
+            for bias in [
+                serde_json::json!({"42": -100}),
+                serde_json::json!({"42": 0}),
+                serde_json::json!(false),
+            ] {
+                let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+                let mut state = ServeState::new(&args);
+                let body = serde_json::json!({
+                    "model": "modele-inexistant", "messages": [], "max_tokens": 1,
+                    "stream": streaming, "logit_bias": bias
+                })
+                .to_string();
+                let raw = format!(
+                    "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let mut stream = Cursor::new(raw.into_bytes());
+                handle_connection(&mut stream, &mut state, None, far_deadline())
+                    .expect_err("invariant: biais non pris en charge");
+                let response = String::from_utf8(stream.into_inner()).expect("invariant: UTF-8");
+                let start = response
+                    .rfind("HTTP/1.1 400 Bad Request")
+                    .expect("invariant: HTTP 400");
+                assert!(!response[start..].contains("text/event-stream"));
+                let (_, body) = response[start..]
+                    .split_once("\r\n\r\n")
+                    .expect("invariant: corps HTTP");
+                let value: serde_json::Value = serde_json::from_str(body).expect("invariant: JSON");
+                assert_eq!(value["error"]["type"], "invalid_request_error");
+                assert_eq!(value["error"]["param"], "logit_bias");
+                assert!(value["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("logit_bias")));
+            }
+        }
+    }
+
+    #[test]
+    fn neutral_or_anthropic_logit_bias_reaches_model_lookup() {
+        for route in ["/v1/chat/completions", "/v1/messages"] {
+            for streaming in [false, true] {
+                let mut biases = vec![
+                    None,
+                    Some(serde_json::json!(null)),
+                    Some(serde_json::json!({})),
+                ];
+                if route == "/v1/messages" {
+                    biases.extend([
+                        Some(serde_json::json!({"42": -100})),
+                        Some(serde_json::json!(false)),
+                    ]);
+                }
+                for bias in biases {
+                    let args =
+                        ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
+                    let mut state = ServeState::new(&args);
+                    let mut body = serde_json::json!({
+                        "model": "modele-inexistant", "messages": [], "max_tokens": 1,
+                        "stream": streaming
+                    });
+                    if let Some(bias) = bias {
+                        body["logit_bias"] = bias;
+                    }
+                    let body = body.to_string();
+                    let raw = format!(
+                        "POST {route} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let mut stream = Cursor::new(raw.into_bytes());
+                    let _ = handle_connection(&mut stream, &mut state, None, far_deadline());
+                    let response =
+                        String::from_utf8(stream.into_inner()).expect("invariant: UTF-8");
+                    let start = response
+                        .rfind("HTTP/1.1 404 Not Found")
+                        .expect("invariant: recherche du modèle atteinte");
+                    let (_, body) = response[start..]
+                        .split_once("\r\n\r\n")
+                        .expect("invariant: corps HTTP");
+                    let value: serde_json::Value =
+                        serde_json::from_str(body).expect("invariant: JSON");
+                    let message = value["error"]["message"]
+                        .as_str()
+                        .expect("invariant: message d'erreur");
+                    assert!(message.contains("modele-inexistant"));
+                    assert!(!message.contains("logit_bias"));
+                }
+            }
+        }
     }
 
     #[test]

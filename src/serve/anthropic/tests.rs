@@ -7,6 +7,75 @@ use serde_json::{json, Value};
 use super::*;
 
 #[test]
+fn tools_and_arguments_keep_main_sorted_bytes_for_client_key_orders() {
+    use saragossa::chat_template::render_qwen_chatml_with_tools;
+
+    let expected_tool = r#"{"function":{"description":"D","name":"f","parameters":{"properties":{"a":{"type":"string"},"z":{"items":{"properties":{"a":{"type":"string"},"z":{"type":"integer"}},"required":["z","a"],"type":"object"},"type":"array"}},"required":["z","a"],"type":"object"}},"type":"function"}"#;
+    let expected_call = r#"{"function":{"arguments":{"a":"A","z":[{"a":"é","z":2}]},"name":"f"},"id":"c","type":"function"}"#;
+    for schema in [
+        r#"{"type":"object","required":["z","a"],"properties":{"z":{"type":"array","items":{"type":"object","required":["z","a"],"properties":{"z":{"type":"integer"},"a":{"type":"string"}}}},"a":{"type":"string"}}}"#,
+        r#"{"properties":{"a":{"type":"string"},"z":{"items":{"properties":{"a":{"type":"string"},"z":{"type":"integer"}},"required":["z","a"],"type":"object"},"type":"array"}},"required":["z","a"],"type":"object"}"#,
+    ] {
+        for input in [
+            r#"{"z":[{"z":2,"a":"é"}],"a":"A"}"#,
+            r#"{"a":"A","z":[{"a":"é","z":2}]}"#,
+        ] {
+            let body = format!(
+                r#"{{"model":"m","max_tokens":1,"tools":[{{"name":"f","description":"D","input_schema":{schema}}}],"messages":[{{"role":"assistant","content":[{{"type":"tool_use","id":"c","name":"f","input":{input}}}]}}]}}"#
+            );
+            let (chat, _, _) =
+                anthropic_chat(body.as_bytes(), None).expect("invariant: requête valide");
+            let tools = chat.active_tools().expect("invariant: outils actifs");
+            let messages = chat.template_messages();
+            assert_eq!(tools[0].json.as_bytes(), expected_tool.as_bytes());
+            assert_eq!(
+                messages[0].tool_calls[0].as_bytes(),
+                expected_call.as_bytes()
+            );
+
+            let mut main_messages = messages.clone();
+            main_messages[0].tool_calls = vec![expected_call.into()];
+            let expected =
+                render_qwen_chatml_with_tools(&main_messages, &[expected_tool.into()], true, false);
+            let actual =
+                render_qwen_chatml_with_tools(&messages, &[tools[0].json.clone()], true, false);
+            assert_eq!(actual.as_bytes(), expected.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn json_content_fallbacks_keep_main_sorted_bytes() {
+    for raw in [
+        r#"{"z":[{"z":2,"a":1}],"a":0}"#,
+        r#"{"a":0,"z":[{"a":1,"z":2}]}"#,
+    ] {
+        let value: Value = serde_json::from_str(raw).expect("invariant: JSON valide");
+        let expected = r#"{"a":0,"z":[{"a":1,"z":2}]}"#;
+        assert_eq!(block_to_text(&value), expected);
+        assert_eq!(content_value_to_text(&value), expected);
+        assert_eq!(
+            tool_result_text(&json!({"type":"tool_result","tool_use_id":"c","content":value}))
+                .expect("invariant: résultat valide"),
+            Some(expected.into())
+        );
+    }
+}
+
+#[test]
+fn request_ignores_logit_bias() {
+    for bias in [json!({"42": -100}), json!({}), json!(null), json!(false)] {
+        let body = json!({
+            "model": "m", "max_tokens": 1, "messages": [], "logit_bias": bias
+        });
+        let (chat, _, _) = anthropic_chat(body.to_string().as_bytes(), None)
+            .expect("invariant: requête Anthropic valide");
+        assert!(chat.logit_bias.is_none());
+        assert_eq!(chat.validate(1).expect("invariant: champ ignoré"), 1);
+    }
+}
+
+#[test]
 fn request_translates_blocks_system_and_stop_sequences() {
     let request: AnthropicMessagesRequest = serde_json::from_str(
         r#"{

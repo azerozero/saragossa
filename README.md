@@ -26,7 +26,7 @@ cargo test --lib --no-default-features --features devtools
 ```
 
 On Windows, use TCP explicitly; Unix sockets are unavailable. Start the server
-with `saragossa serve --backend cpu --port 8090 --api-key TOKEN --model ID=DIR`,
+with `SARAGOSSA_API_KEY=TOKEN saragossa serve --backend cpu --port 8090 --model ID=DIR`,
 where `DIR` is the local weights directory. For `bench-serve`, use
 `--url 127.0.0.1:8090 --api-key TOKEN`. TCP requires bearer authentication;
 there is no automatic unauthenticated fallback from a Unix socket.
@@ -64,7 +64,7 @@ the **single-user latency × Apple Silicon** quadrant:
 
 | Domain | Details |
 |---|---|
-| LLM | Qwen3.5 / 3.6 / 3.8 dense and MoE (27B / 30B / 35B-A3B; MLX `affine` quants only, not `mxfp4`/`nvfp4`), Gemma 4 dense (`gemma4_unified`) and MoE (`gemma4`), plus a generic Llama / Mistral / Gemma 3 loader; u2–u8 (incl. mixed 3/4-bit) quantization at group sizes 32–128, bf16 scales/biases |
+| LLM | Qwen3.5 / 3.6 / 3.8 dense and MoE (27B / 30B / 35B-A3B; MLX `affine` quants; `mxfp4`/`nvfp4`/`mxfp8` for rank-2 dense weights), Gemma 4 dense (`gemma4_unified`) and MoE (`gemma4`), plus a generic Llama / Mistral / Gemma 3 loader; u2–u8 (incl. mixed 3/4-bit) quantization at group sizes 32–128, bf16 scales/biases |
 | STT | Whisper large-v3-turbo (resident encoder + decoder, bf16 Neural-Accelerator GEMM) |
 | TTS | Qwen3-TTS: resident talker + GPU codec + intra-sentence streaming |
 | Embeddings | e5-small, pure Rust (CPU) — for semantic memory / RAG |
@@ -75,14 +75,23 @@ the **single-user latency × Apple Silicon** quadrant:
 | Endpoint | Purpose |
 |---|---|
 | `GET /v1/models` | Served models |
-| `POST /v1/chat/completions` | OpenAI-compatible chat (SSE or not), `response_format: {"type":"json_object"}` |
+| `POST /v1/chat/completions` | OpenAI-compatible chat (SSE or not), `response_format`: `json_object`, `json_schema` |
 | `POST /v1/responses` | Stateless text and function calls (JSON or SSE) |
 | `POST /v1/messages` | Anthropic Messages shim + `tool_use` (drivable by Claude Code) |
-| `POST /v1/audio/transcriptions` | Whisper STT (multipart WAV, opt-in `--stt-model`) |
+| `POST /v1/audio/transcriptions` | Whisper STT (multipart WAV, `json`/`text`/`verbose_json`, SSE `stream=true`, opt-in `--stt-model`) |
+| `POST /v1/audio/transcriptions/stream` | Whisper STT à entrée incrémentale (PCM par morceaux, voir [docs/stt-streaming.md](docs/stt-streaming.md)) |
 | `POST /v1/audio/speech` | Qwen3 TTS (JSON → WAV ou PCM chunked avec `stream: true`, opt-in `--tts-model`) |
 | `POST /v1/embeddings` | e5-small embeddings (opt-in `--embed-model`) |
 
 ### Streaming audio HTTP
+
+CustomVoice accepte `voice` (défaut : `serena`). Une voix inconnue (`alloy`,
+`nova`…) utilise Serena et renvoie `X-Saragossa-TTS-Voice-Fallback` avec le nom
+demandé, en WAV comme en streaming. La cause est journalisée sur stderr.
+VoiceDesign et CustomVoice utilisent le sampling du snapshot avec
+une graine déterministe ; `seed` permet de la choisir par requête.
+Voir [la politique de génération TTS](docs/tts-generation.md) pour les
+paramètres, le flag glouton des oracles et les raisons d'arrêt.
 
 `POST /v1/audio/speech` conserve le WAV complet par défaut (`stream` absent ou
 `false`). L'extension explicite `{"input":"Bonjour.","stream":true}` émet chaque
@@ -90,12 +99,14 @@ lot dès son décodage, en HTTP/1.1 `Transfer-Encoding: chunked`, sans
 `Content-Length`. Le corps déchunké est du **PCM brut signé 16 bits little-endian,
 mono, sans en-tête WAV** (`Content-Type: audio/pcm`). Le taux natif du codec est
 indiqué par `X-Saragossa-Audio-Sample-Rate` (habituellement 24000 Hz) ; chaque
-échantillon utilise la même conversion que le WAV. `model` et `voice` restent
-acceptés sans effet. `stream: true` sélectionne ce format PCM à lui seul.
+échantillon utilise la même conversion que le WAV. `model` reste accepté sans
+effet. `stream: true` sélectionne ce format PCM à lui seul.
 
 Le plafond audio existant et `SARAGOSSA_TTS_MAX_FRAMES` s'appliquent aux deux
 modes. En streaming, `X-Saragossa-TTS-Frame-Limit-Reached` est un **trailer HTTP**
 annoncé par `Trailer`, transmis après le chunk zéro ; en WAV, il reste un en-tête.
+`X-Saragossa-TTS-Stop-Reason` suit le même transport et distingue `eos`, `repeat`
+et `cap`.
 Un client qui ignore les trailers ne reçoit pas cette indication. Une erreur
 après le début de la réponse ferme le flux sans chunk terminal : le client doit
 traiter ce corps comme incomplet. Une déconnexion arrête la synthèse dès l'échec
@@ -135,6 +146,11 @@ These numbers hold for their context (hardware, model, length) — measure on yo
 own machine before committing to a choice.
 
 ## Quantization formats: footprint, throughput & quality
+
+MLX micro-scaled `mxfp4`, `nvfp4` and `mxfp8` weights are supported for
+rank-2 projections and embeddings, with compact QMV and NAX prefill kernels.
+See [micro-scale formats and validation](docs/quantization/micro-scales.md)
+for layouts, hardware requirements and current limitations.
 
 saragossa loads **MLX affine** integer weights `u2`/`u3`/`u4`/`u6`/`u8`
 (group-size 64) and **fp8** (`e4m3`). Trade-offs on a **27B dense** model
@@ -189,8 +205,7 @@ into shared Metal buffers, one copy. See
 ### Homebrew (Apple Silicon)
 
 ```sh
-brew install azerozero/tap/saragossa          # latest tagged release (stable)
-# brew install --HEAD azerozero/tap/saragossa # build from the main branch
+brew install azerozero/tap/saragossa # prebuilt binary from the latest stable release
 ```
 
 ### From source
@@ -228,6 +243,10 @@ Face page first, then export `HF_TOKEN`.
 saragossa \
   --model-dir models/Qwen3.6-35B-A3B-oQ8 --backend metal \
   --prompt "Hello" --max-tokens 64 --temperature 0 --metrics
+
+# Offline audio tools (features `denoise` and `diar`, on by default):
+saragossa enhance --model dfn3.safetensors --input noisy.wav --output clean.wav
+saragossa diarize --model-dir DIR [--format rttm|json] [--cpu] audio.wav
 ```
 
 ## Library usage
@@ -241,7 +260,7 @@ Add the crate and drive the engine directly. The main entry points are
 A **single-threaded**, multi-model local HTTP server. The default behavior is
 single-user: the warm state is global to a model until a session key is supplied.
 The transport is a Unix socket by default (`/tmp/saragossa-serve.sock`, mode
-0600); TCP loopback requires a bearer (`--api-key` or `SARAGOSSA_API_KEY`). A
+0600); TCP loopback requires a bearer (`SARAGOSSA_API_KEY`; `--api-key` is deprecated because `ps` shows it). A
 per-connection read deadline (30 s) and a hard `max_tokens` ceiling (4096) shed
 runaway requests.
 
@@ -275,19 +294,42 @@ The supplied schema guides the prompt and parser but is not a generation guarant
 At the output token limit, the response becomes `incomplete`. Closed items keep
 their status; only the text item still open at truncation becomes `incomplete`.
 
-### Structured output (v1: `json_object`)
+### Structured output (`json_object`, `json_schema`)
 
 `POST /v1/chat/completions` accepts `response_format: {"type":"json_object"}`.
 The output is constrained by a byte-level JSON automaton in the sampler:
 mandatory root object, strings/escapes/numbers/booleans/null and nested
 structures. End-of-turn is only admissible after the root object closes.
 
-In v1, only these guided requests switch to the CPU sampling path (logits read
+Only these guided requests switch to the CPU sampling path (logits read
 back, then masked before sampling). Requests without `response_format`, or with
-`{"type":"text"}`, keep the existing resident/GPU path. The
-`{"type":"json_schema"}` mode returns 501: it is reserved for a later version.
+`{"type":"text"}`, keep the existing resident/GPU path.
 
-v1 limits: the automaton guarantees JSON grammar (surrogate pairs `𐀀`
+For schema-constrained content, use:
+
+```json
+{"response_format":{"type":"json_schema","json_schema":{
+  "name":"greeting", "strict":true,
+  "schema":{"type":"object","properties":{"greeting":{"enum":["Bonjour"]}},
+            "required":["greeting"],"additionalProperties":false}
+}}}
+```
+
+`json_schema` uses llguidance CPU masks in both greedy and sampled generation,
+including SSE. Anthropic Messages accepts the equivalent
+`output_config: {"format":{"type":"json_schema","schema":{...}}}`.
+Invalid or unsupported schemas return HTTP 400. `strict` may be omitted, `true`
+or `false`; all accepted schemas are enforced. This does not enable strict tool
+calling. `stop` is rejected for guided output.
+
+Supported keywords: `type` (including nullable unions), `properties`, `required`,
+scalar `enum`, `items`, `additionalProperties`; `title`, `description`, `default`
+are annotations. The root must have `type: "object"`. Other keywords are rejected,
+including `$ref`, `$defs`, combinators, bounds, `pattern` and `format`.
+See [schema output and dependency decision](docs/serve-json-schema.md) for limits,
+tokenizer handling and the Rust 1.85 version pin.
+
+JSON limits: the automaton guarantees JSON grammar (surrogate pairs `𐀀`
 included) but not a number's magnitude beyond `f64`; in non-streaming mode, an
 object left unclosed at the `max_tokens` budget raises an error rather than
 returning truncated JSON; in SSE, the deltas stay a valid JSON prefix and an
@@ -344,6 +386,11 @@ default Unix socket, with no bearer, any caller allowed by the file permissions
 can claim any session id. For a real multi-tenant boundary, authenticate upstream
 (a front gateway) or use the TCP bearer of `saragossa serve`.
 
+An opt-in [persistent SSD prefix cache](docs/serve-prefix-ssd.md) survives RAM
+eviction and server restarts. Enable it with `--prefix-cache-ssd-dir DIR` and
+`--prefix-cache-ssd-gib 32`; the guide covers integrity, priority eviction and
+32k/128k restart measurements.
+
 ### OOM guard + LRU model pool
 
 - **Predictive OOM guard** — projects the process footprint (`phys_footprint`
@@ -359,6 +406,19 @@ variables — see [`src/runtime_flags.rs`](src/runtime_flags.rs) for the exact
 names and defaults (block size, LRU capacity, pool size, host headroom, static
 memory cap, …).
 
+The NA matmul path that materializes a full bf16 weight is limited to
+512 MiB per weight by `SARAGOSSA_RUST_QMM_NA_DEQUANT_MAX_BYTES` (bytes).
+Above the limit, selection falls back to qmv before allocating the scratch.
+Set it to `0` to disable this dequantization path; an absent or invalid value
+uses the default. Fused NA kernels do not materialize that weight and keep
+their existing selection rules. This currently applies to `QmmNaU8`; u5/u6
+have no full-weight NA dequantization path in this revision.
+
+The retired experimental `SARAGOSSA_RUST_LINEAR_CHUNKED=1` path now returns
+an explicit configuration error: its scalar and tensor-core kernels had
+unsafe decay ratios, tail reads and device synchronization. Remove the flag
+to keep the existing NAX/sequence-scan selection; no default path changes.
+
 ## Features
 
 | Feature | Default | Purpose |
@@ -371,3 +431,10 @@ Prerequisite: the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain
 ## License
 
 [Apache-2.0](https://spdx.org/licenses/Apache-2.0.html) (SPDX `Apache-2.0`).
+
+## Compilation modulaire
+
+Toutes les modalités sont actives par défaut. Le [tableau des features](docs/features.md)
+détaille les binaires LLM et STT minimaux, les réponses 501 du serveur et les
+vérifications de compilation. Les [profils TOML](docs/design/configuration.md)
+sont une proposition de conception, sans implémentation à ce stade.

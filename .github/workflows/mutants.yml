@@ -1,0 +1,36 @@
+name: Mutations CPU hebdomadaires
+
+on:
+  schedule:
+    - cron: "0 5 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        file:
+          - src/tts/sampling.rs
+          - src/tts/helpers.rs
+          - src/tts/synth.rs
+          - src/serve/audio.rs
+          - src/sampling.rs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Installer Rust figé en CI
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Installer cargo-mutants en CI
+        run: cargo +1.98.1 install cargo-mutants --version 24.11.2 --locked
+      # Un mutant survivant sort en code 2 : le rapport sert d'alerte, pas le statut.
+      - name: Muter un module et exécuter ses tests CPU
+        continue-on-error: true
+        run: cargo +1.98.1 mutants --no-default-features --features devtools --file "${{ matrix.file }}" -C --locked -- --lib --bins
+      - name: Publier les survivants dans le journal
+        if: always()
+        run: tail -n +1 mutants.out/*.txt

@@ -1,5 +1,6 @@
 //! Encodage bas niveau des matmuls Metal.
 
+use super::matmul_select::AffineMatmulKernel;
 use super::*;
 
 const MATMUL_ROW_TG_WIDTH: u64 = 256;
@@ -35,21 +36,26 @@ impl MetalExecutor {
         group_size == FAST_QMV_GROUP_SIZE && self.na_gemm_coop_qb_tiled_u4_align64.is_some()
     }
 
-    pub(super) fn qmm_skinny_available(&self) -> bool {
-        self.qmm_skinny_pipeline().is_some()
+    pub(super) fn qmm_skinny_available(&self, bits: usize) -> bool {
+        self.qmm_skinny_pipeline(bits).is_some()
     }
 
-    fn qmm_skinny_pipeline(&self) -> Option<&ComputePipelineState> {
-        match qmm_skinny_kernel() {
-            SkinnyKernel::Bf16 => self.na_gemm_skinny_u4.as_ref(),
-            SkinnyKernel::X3 => self.na_gemm_skinny_u4_x3.as_ref(),
-            SkinnyKernel::X2 => self.na_gemm_skinny_u4_x2.as_ref(),
+    /// u2 et u3 n'ont que la variante x2 (q exact en bf16, A hi+lo) : la portée
+    /// bf16 du drafter DFlash et le choix x3 ne concernent que le u4.
+    fn qmm_skinny_pipeline(&self, bits: usize) -> Option<&ComputePipelineState> {
+        match (bits, qmm_skinny_kernel()) {
+            (2, _) => self.na_gemm_skinny_u2_x2.as_ref(),
+            (3, _) => self.na_gemm_skinny_u3_x2.as_ref(),
+            (4, SkinnyKernel::Bf16) => self.na_gemm_skinny_u4.as_ref(),
+            (4, SkinnyKernel::X3) => self.na_gemm_skinny_u4_x3.as_ref(),
+            (4, SkinnyKernel::X2) => self.na_gemm_skinny_u4_x2.as_ref(),
+            _ => None,
         }
     }
 
     /// Pipeline qmv-T `name`, créé à la première demande : seul le mode strict
     /// les utilise, le démarrage n'en paie aucun.
-    fn qmvt_pipeline(&self, name: &str) -> Result<ComputePipelineState> {
+    pub(super) fn qmvt_pipeline(&self, name: &str) -> Result<ComputePipelineState> {
         let mut cache = self
             .qmvt_pipelines
             .lock()
@@ -207,8 +213,10 @@ impl MetalExecutor {
             checked_u32(groups, "qmm skinny groups")?,
         ];
         let batch_u32 = [checked_u32(batch, "qmm skinny batch")?];
+        // Le sélecteur garantit K % 512 == 0 : packed_cols = K·bits/32 est exact.
+        let bits = packed_cols * 32 / in_dim.max(1);
         let pso = self
-            .qmm_skinny_pipeline()
+            .qmm_skinny_pipeline(bits)
             .ok_or_else(|| InferError::Config("qmm skinny NA indisponible".into()))?;
         encoder.set_compute_pipeline_state(pso);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
@@ -218,15 +226,20 @@ impl MetalExecutor {
         encoder.set_buffer(4, Some(output_buffer), 0);
         set_u32_bytes(encoder, 5, &dims, "qmm_skinny_dims")?;
         set_u32_bytes(encoder, 6, &batch_u32, "qmm_skinny_batch")?;
+        let (profile_name, kernel_name) = match bits {
+            2 => ("qmm_skinny_u2_gs64", "qmm_skinny_u2_gs64_f32"),
+            3 => ("qmm_skinny_u3_gs64", "qmm_skinny_u3_gs64_f32"),
+            _ => ("qmm_skinny_u4_gs64", "qmm_skinny_u4_gs64_f32"),
+        };
         profile_dispatch_shape(DispatchProfileShape::matmul(
-            "qmm_skinny_u4_gs64",
+            profile_name,
             batch,
             in_dim,
             out_dim,
             FAST_QMV_GROUP_SIZE,
-            4,
+            bits,
         ));
-        trace_dispatch_path("qmm_skinny_u4_gs64_f32", batch, out_dim, in_dim);
+        trace_dispatch_path(kernel_name, batch, out_dim, in_dim);
         #[cfg(test)]
         SKINNY_DISPATCHES.with(|count| count.set(count.get() + 1));
         profile_dispatch();
@@ -340,8 +353,8 @@ impl MetalExecutor {
         in_dim: usize,
         out_dim: usize,
     ) -> Result<()> {
-        // Sous le plancher par défaut (formes que seuls flint et les poids k/v
-        // d'un Qwen dense ouvrent), le bf16×3 lit le lhs f32 directement : pas
+        // Sous le plancher par défaut (formes que seuls flint, les Qwen MoE et
+        // les poids k/v d'un Qwen dense ouvrent), le bf16×3/×4 lit le lhs f32 directement : pas
         // de conversion bf16 préalable.
         if in_dim.min(out_dim) < QMM_NA_U4_DEFAULT_MIN_DIM {
             if out_dim % 64 != 0 {
@@ -349,9 +362,18 @@ impl MetalExecutor {
                     "qmm na tiled u4 x3 attend out_dim%64=0, reçu out_dim={out_dim}"
                 )));
             }
-            let pso = self.na_gemm_coop_qb_tiled_u4_x3.as_ref().ok_or_else(|| {
-                InferError::Config("gemm_nax_coop_qb_tiled_u4_x3: NA indisponible".into())
-            })?;
+            let (pso, name) = if self.qmm_na_u4_x4 {
+                (
+                    self.na_gemm_coop_qb_tiled_u4_x4.as_ref(),
+                    "gemm_nax_coop_qb_tiled_u4_x4",
+                )
+            } else {
+                (
+                    self.na_gemm_coop_qb_tiled_u4_x3.as_ref(),
+                    "gemm_nax_coop_qb_tiled_u4_x3",
+                )
+            };
+            let pso = pso.ok_or_else(|| InferError::Config(format!("{name}: NA indisponible")))?;
             #[cfg(test)]
             super::flags::count_qmm_na_u4_x3_dispatch();
             return self.dispatch_affine_qmm_na_fused_tiled_u4(
@@ -439,8 +461,45 @@ impl MetalExecutor {
         down: &MetalLinearWeightBuffers,
         inter_dim: usize,
     ) -> bool {
-        // Ce chemin MLP ne sert pas les projections GDN ; le dispatch down
-        // ci-dessous reste lié à zéro, donc les vues décalées en sont exclues.
+        if let (
+            MetalLinearWeightBuffers::MicroScaled(g),
+            MetalLinearWeightBuffers::MicroScaled(u),
+            MetalLinearWeightBuffers::MicroScaled(d),
+        ) = (gate, up, down)
+        {
+            return Self::fused_micro_mlp_supported(batch, in_dim, inter_dim, [g, u, d]);
+        }
+        if let (
+            MetalLinearWeightBuffers::DenseBf16 {
+                out_dim: gate_out,
+                in_dim: gate_in,
+                ..
+            },
+            MetalLinearWeightBuffers::DenseBf16 {
+                out_dim: up_out,
+                in_dim: up_in,
+                ..
+            },
+            MetalLinearWeightBuffers::DenseBf16 {
+                out_dim: down_out,
+                in_dim: down_in,
+                ..
+            },
+        ) = (gate, up, down)
+        {
+            // Mêmes GEMM X1 que les passes séparées : l'égalité au bit en dépend.
+            return crate::runtime_flags::dense_bf16_fused_mlp_enabled()
+                && self.na_gemm_bf16_nt_gate_up_swiglu.is_some()
+                && self.na_gemm_bf16_nt_bn128.is_some()
+                && (*gate_out, *gate_in) == (inter_dim, in_dim)
+                && (*up_out, *up_in) == (inter_dim, in_dim)
+                && (*down_out, *down_in) == (in_dim, inter_dim)
+                && super::matmul::uses_dense_bf16_gemm_x1(batch, in_dim, inter_dim)
+                && super::matmul::uses_dense_bf16_gemm_x1(batch, inter_dim, in_dim);
+        }
+        // Les vues décalées (poids mmap, sous-vues) passent si leurs offsets
+        // respectent l'alignement des kernels tuilés ; les trois dispatches
+        // lient chacun leurs offsets.
         let u4_gs64 = |weight: &MetalLinearWeightBuffers, expect_in: usize, expect_out: usize| {
             matches!(
                 weight,
@@ -449,14 +508,19 @@ impl MetalExecutor {
                     in_dim: weight_in,
                     group_size,
                     bits,
-                    packed_offset: 0,
-                    scales_offset: 0,
-                    biases_offset: 0,
+                    packed_offset,
+                    scales_offset,
+                    biases_offset,
                     ..
                 } if *out_dim == expect_out
                     && *weight_in == expect_in
                     && *group_size == FAST_QMV_GROUP_SIZE
                     && *bits == FAST_QMV_BITS
+                    && AffineMatmulKernel::QmmNaFusedTiledU4.supports_offsets(
+                        *packed_offset,
+                        *scales_offset,
+                        *biases_offset,
+                    )
             )
         };
         super::flags::prefill_fused_mlp_enabled()
@@ -519,15 +583,65 @@ impl MetalExecutor {
                     biases,
                     *biases_offset,
                 )),
-                MetalLinearWeightBuffers::Dense { .. }
+                MetalLinearWeightBuffers::MicroScaled(_)
+                | MetalLinearWeightBuffers::Dense { .. }
                 | MetalLinearWeightBuffers::DenseBf16 { .. } => Err(InferError::Config(format!(
                     "MLP fusionné : {name} n'est pas quantifié"
                 ))),
             }
         }
+        if let (
+            MetalLinearWeightBuffers::MicroScaled(g),
+            MetalLinearWeightBuffers::MicroScaled(u),
+            MetalLinearWeightBuffers::MicroScaled(d),
+        ) = (gate, up, down)
+        {
+            if !Self::fused_micro_mlp_supported(batch, in_dim, inter_dim, [g, u, d]) {
+                return Err(InferError::Config(
+                    "MLP micro fusionné : poids ou dimensions hors prédicat".into(),
+                ));
+            }
+            let lhs_bf16 = self.private_bf16_buffer(
+                checked_len(batch, in_dim, "MLP micro lhs")?,
+                "fused_mlp_lhs_bf16",
+            )?;
+            let hidden_bf16 = self.private_bf16_buffer(
+                checked_len(batch, inter_dim, "MLP micro hidden")?,
+                "fused_mlp_hidden_bf16",
+            )?;
+            self.encode_f32_to_bf16(encoder, lhs_buffer, &lhs_bf16, batch * in_dim)?;
+            self.encode_micro_gate_up_swiglu(
+                encoder,
+                &lhs_bf16,
+                g,
+                u,
+                &hidden_bf16,
+                batch,
+                in_dim,
+            )?;
+            self.encode_micro_gemm_bf16(encoder, &hidden_bf16, output_buffer, batch, inter_dim, d)?;
+            return Ok(());
+        }
+        if let (
+            MetalLinearWeightBuffers::DenseBf16 { rhs: g, .. },
+            MetalLinearWeightBuffers::DenseBf16 { rhs: u, .. },
+            MetalLinearWeightBuffers::DenseBf16 { rhs: d, .. },
+        ) = (gate, up, down)
+        {
+            return self.encode_fused_dense_bf16_mlp(
+                encoder,
+                lhs_buffer,
+                batch,
+                in_dim,
+                [gate, up, down],
+                [g, u, d],
+                inter_dim,
+                output_buffer,
+            );
+        }
         let (gp, gpo, gs, gso, gb, gbo) = quant(gate, "gate_proj")?;
         let (up_p, upo, us, uso, ub, ubo) = quant(up, "up_proj")?;
-        let (dp, _, ds, _, db, _) = quant(down, "down_proj")?;
+        let (dp, dpo, ds, dso, db, dbo) = quant(down, "down_proj")?;
         // Le prédicat de décision est réévalué par l'encodeur lui-même, avant tout
         // dispatch : une grille tronquée (dimension non multiple de 64), un poids
         // poolé (offset non nul) ou un u8/gs32 lu comme du u4 gs64 donnerait un
@@ -597,17 +711,84 @@ impl MetalExecutor {
             down_pso,
             &hidden_bf16,
             dp,
-            0,
+            dpo,
             ds,
-            0,
+            dso,
             db,
-            0,
+            dbo,
             output_buffer,
             batch,
             inter_dim,
             in_dim,
             "gemm_nax_coop_qb_tiled_u4",
             "qmm_na_fused_tiled_u4_gs64",
+        )
+    }
+
+    /// MLP bf16 dense fusionné : x arrondi une fois en bf16, gate+up+SwiGLU en
+    /// un dispatch vers H bf16, puis le down X1 sur H. Mêmes arrondis que les
+    /// passes X1 séparées, à `f32_to_bf16(swiglu_f32(g, u))` près, égal au bit.
+    fn encode_fused_dense_bf16_mlp(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        [gate, up, down]: [&MetalLinearWeightBuffers; 3],
+        [g, u, d]: [&Buffer; 3],
+        inter_dim: usize,
+        output_buffer: &BufferRef,
+    ) -> Result<()> {
+        if !self.fused_dense_mlp_supported(batch, in_dim, gate, up, down, inter_dim) {
+            return Err(InferError::Config(
+                "MLP bf16 fusionné : poids ou dimensions hors prédicat".into(),
+            ));
+        }
+        let (Some(pso), Some(down_pso)) = (
+            self.na_gemm_bf16_nt_gate_up_swiglu.as_ref(),
+            self.na_gemm_bf16_nt_bn128.as_ref(),
+        ) else {
+            return Err(InferError::Config(
+                "MLP bf16 fusionné : kernel NA indisponible".into(),
+            ));
+        };
+        let lhs_len = checked_len(batch, in_dim, "MLP bf16 fusionné lhs")?;
+        let hidden_len = checked_len(batch, inter_dim, "MLP bf16 fusionné hidden")?;
+        let lhs_bf16 = self.private_bf16_buffer(lhs_len, "fused_mlp_lhs_bf16")?;
+        let hidden_bf16 = self.private_bf16_buffer(hidden_len, "fused_mlp_hidden_bf16")?;
+        self.encode_f32_to_bf16(encoder, lhs_buffer, &lhs_bf16, lhs_len)?;
+        let mnk = [
+            checked_u32(batch, "MLP bf16 fusionné batch")?,
+            checked_u32(inter_dim, "MLP bf16 fusionné inter_dim")?,
+            checked_u32(in_dim, "MLP bf16 fusionné in_dim")?,
+            0,
+        ];
+        encoder.set_compute_pipeline_state(pso);
+        encoder.set_buffer(0, Some(&lhs_bf16), 0);
+        encoder.set_buffer(1, Some(g), 0);
+        encoder.set_buffer(2, Some(u), 0);
+        encoder.set_buffer(3, Some(&hidden_bf16), 0);
+        encoder.set_bytes(4, 16, mnk.as_ptr().cast::<std::ffi::c_void>());
+        trace_dispatch_path("gemm_nax_bf16_nt_gate_up_swiglu", batch, inter_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(inter_dim / 128, "MLP bf16 fusionné inter tiles")?,
+                checked_nsuint(batch.div_ceil(64), "MLP bf16 fusionné batch tiles")?,
+                1,
+            ),
+            MTLSize::new(pso.thread_execution_width().max(1) * 8, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, &hidden_bf16);
+        self.dispatch_dense_bf16_gemm_x1(
+            encoder,
+            down_pso,
+            &hidden_bf16,
+            d,
+            output_buffer,
+            batch,
+            in_dim,
+            inter_dim,
         )
     }
 
@@ -659,7 +840,7 @@ impl MetalExecutor {
     }
 
     /// Dispatch du GEMM tuilé u4 : lhs bf16, ou f32 pour la variante x3.
-    fn dispatch_affine_qmm_na_fused_tiled_u4(
+    pub(super) fn dispatch_affine_qmm_na_fused_tiled_u4(
         &self,
         encoder: &ComputeCommandEncoderRef,
         pso: &ComputePipelineState,
@@ -1014,6 +1195,75 @@ impl MetalExecutor {
         Ok(())
     }
 
+    pub(super) fn encode_affine_qmv_u5_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
+        scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
+        biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+        packed_cols: usize,
+        groups: usize,
+    ) -> Result<()> {
+        let dims = [
+            checked_u32(out_dim, "qmv u5 out_dim")?,
+            checked_u32(in_dim, "qmv u5 in_dim")?,
+            checked_u32(packed_cols, "qmv u5 packed_cols")?,
+            checked_u32(groups, "qmv u5 groups")?,
+        ];
+        let aligned = out_dim % 8 == 0 && in_dim % 512 == 0;
+        let (pipeline, profile_label, kernel_name) = if aligned {
+            (
+                &self.affine_qmv_fast_aligned_u5_gs64_f32,
+                "affine_qmv_u5_aligned_gs64",
+                "affine_qmv_fast_aligned_u5_gs64_f32",
+            )
+        } else {
+            (
+                &self.affine_qmv_fast_u5_gs64_f32,
+                "affine_qmv_u5_tail_gs64",
+                "affine_qmv_fast_u5_gs64_f32",
+            )
+        };
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(biases_buffer), biases_offset);
+        encoder.set_buffer(4, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 5, &dims, "qmv_u5_dims")?;
+        profile_dispatch_shape(DispatchProfileShape::matmul(
+            profile_label,
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            FAST_QMV_U5_BITS,
+        ));
+        trace_dispatch_path(kernel_name, batch, out_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(batch, "qmv u5 batch")?,
+                checked_nsuint(
+                    out_dim.div_ceil(if aligned { 8 } else { 2 }),
+                    "qmv u5 out groups",
+                )?,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(())
+    }
+
     pub(super) fn encode_affine_qmv_u6_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1037,7 +1287,8 @@ impl MetalExecutor {
             checked_u32(packed_cols, "qmv u6 packed_cols")?,
             checked_u32(groups, "qmv u6 groups")?,
         ];
-        let (pipeline, profile_label, kernel_name) = if out_dim % 2 == 0 {
+        let aligned = out_dim % 8 == 0 && in_dim % 512 == 0;
+        let (pipeline, profile_label, kernel_name) = if aligned {
             (
                 &self.affine_qmv_fast_aligned_u6_gs64_f32,
                 "affine_qmv_u6_aligned_gs64",
@@ -1070,7 +1321,10 @@ impl MetalExecutor {
         encoder.dispatch_thread_groups(
             MTLSize::new(
                 checked_nsuint(batch, "qmv u6 batch")?,
-                checked_nsuint(out_dim.div_ceil(2), "qmv u6 out groups")?,
+                checked_nsuint(
+                    out_dim.div_ceil(if aligned { 8 } else { 2 }),
+                    "qmv u6 out groups",
+                )?,
                 1,
             ),
             MTLSize::new(64, 1, 1),
@@ -1190,6 +1444,19 @@ impl MetalExecutor {
             ));
         }
         match embedding {
+            MetalEmbeddingWeightBuffers::MicroScaled(weight) => {
+                return self.encode_micro_embedding(
+                    encoder,
+                    weight,
+                    index_buffer,
+                    index_offset,
+                    output_buffer,
+                    expected_dim,
+                    token_count,
+                    embedding_scale,
+                    recast_bf16,
+                );
+            }
             MetalEmbeddingWeightBuffers::Dense { table, vocab, dim }
             | MetalEmbeddingWeightBuffers::DenseBf16 { table, vocab, dim } => {
                 if *dim != expected_dim {
@@ -1378,7 +1645,7 @@ impl MetalExecutor {
         clippy::too_many_arguments,
         reason = "helper interne partagé par deux variantes d'encodage Metal"
     )]
-    /// Dé-quantifie un poids u8 gs64 `[out_dim,in_dim]` en bf16 dense TRANSPOSÉ
+    /// Dé-quantifie un poids u5/u6/u8 gs64 `[out_dim,in_dim]` en bf16 dense TRANSPOSÉ
     /// `[in_dim,out_dim]` (= `W^T`, layout `[K,N]` du GEMM NA), dans l'encodeur
     /// partagé. Pour le chemin prefill matmul2d.
     pub(super) fn encode_dequant_qweight_to_bf16_t(
@@ -1394,7 +1661,18 @@ impl MetalExecutor {
         out_dim: usize,
         in_dim: usize,
         packed_cols: usize,
+        bits: usize,
     ) -> Result<()> {
+        let (pipeline, name) = match bits {
+            5 => (&self.dequant_u5_to_bf16_t_gs64, "dequant_u5_to_bf16_t_gs64"),
+            6 => (&self.dequant_u6_to_bf16_t_gs64, "dequant_u6_to_bf16_t_gs64"),
+            8 => (&self.dequant_u8_to_bf16_t_gs64, "dequant_u8_to_bf16_t_gs64"),
+            _ => {
+                return Err(InferError::Config(format!(
+                    "déquant NA : bits={bits} non supporté"
+                )))
+            }
+        };
         let total = checked_len(out_dim, in_dim, "dequant na total")?;
         let dims = [
             checked_u32(out_dim, "dequant na out_dim")?,
@@ -1402,14 +1680,15 @@ impl MetalExecutor {
             checked_u32(packed_cols, "dequant na packed_cols")?,
             0,
         ];
-        encoder.set_compute_pipeline_state(&self.dequant_u8_to_bf16_t_gs64);
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(packed), packed_offset);
         encoder.set_buffer(1, Some(scales), scales_offset);
         encoder.set_buffer(2, Some(biases), biases_offset);
         encoder.set_buffer(3, Some(wt), 0);
         set_u32_bytes(encoder, 4, &dims, "dequant_na_dims")?;
-        trace_dispatch_path("dequant_u8_to_bf16_t_gs64", out_dim, in_dim, packed_cols);
-        self.dispatch_1d(encoder, &self.dequant_u8_to_bf16_t_gs64, total)
+        trace_dispatch_path(name, out_dim, in_dim, packed_cols);
+        self.dispatch_1d(encoder, pipeline, total)?;
+        Ok(())
     }
 
     pub(crate) fn encode_copy(

@@ -15,6 +15,58 @@ pub(crate) fn metal_executor() -> crate::Result<Option<crate::MetalExecutor>> {
     }
 }
 
+use std::ffi::{OsStr, OsString};
+use std::sync::{Mutex, MutexGuard};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Verrou d'environnement unique des tests : sérialise les écritures et
+/// restaure chaque variable touchée à la sortie, même sur panique.
+///
+/// NOTE: les tests qui seulement lisent des flags ne le prennent pas ; il
+/// protège les écrivains les uns des autres et supprime les fuites.
+pub(crate) struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    saved: Vec<(OsString, Option<OsString>)>,
+}
+
+/// Prend le verrou d'environnement ; un verrou empoisonné reste utilisable.
+pub(crate) fn env_guard() -> EnvGuard {
+    EnvGuard {
+        _lock: ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner()),
+        saved: Vec::new(),
+    }
+}
+
+impl EnvGuard {
+    fn remember(&mut self, name: &OsStr) {
+        if !self.saved.iter().any(|(saved, _)| saved == name) {
+            self.saved.push((name.to_owned(), std::env::var_os(name)));
+        }
+    }
+
+    pub(crate) fn set(&mut self, name: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
+        self.remember(name.as_ref());
+        std::env::set_var(name, value);
+    }
+
+    pub(crate) fn remove(&mut self, name: impl AsRef<OsStr>) {
+        self.remember(name.as_ref());
+        std::env::remove_var(name);
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(&name, value),
+                None => std::env::remove_var(&name),
+            }
+        }
+    }
+}
+
 use std::path::PathBuf;
 
 /// Résout une fixture voix de référence (`reti-fr.wav`, `reti-fr.txt`).
@@ -34,6 +86,19 @@ pub(crate) fn voice_fixture(name: &str) -> Option<PathBuf> {
     }
     let workspace = manifest.join("../../voices").join(name);
     workspace.is_file().then_some(workspace)
+}
+
+/// Répertoire local désigné par `var` ; `None` (test sauté, ou échec en mode
+/// strict) si la variable est absente, vide ou ne désigne pas un répertoire.
+pub(crate) fn local_dir(var: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir());
+    if dir.is_none() {
+        eprintln!("skip: {var} absent ou introuvable (test sur poids locaux)");
+    }
+    require_real_model(dir, var)
 }
 
 /// Exige une précondition de modèle réel quand le mode strict est actif.
@@ -98,5 +163,25 @@ mod tests {
                 "{name} diverge entre assets/voices et voices/"
             );
         }
+    }
+
+    #[test]
+    fn env_guard_restores_previous_values() {
+        const SET: &str = "SARAGOSSA_TEST_GUARD_SET";
+        const NEW: &str = "SARAGOSSA_TEST_GUARD_NEW";
+        // Noms propres à ce test : aucun autre test ne les lit.
+        std::env::set_var(SET, "a");
+        {
+            let mut env = env_guard();
+            env.set(NEW, "x");
+            env.set(SET, "b");
+            env.set(SET, "c");
+            env.remove(NEW);
+            assert_eq!(std::env::var(SET).as_deref(), Ok("c"));
+            assert!(std::env::var_os(NEW).is_none());
+        }
+        assert_eq!(std::env::var(SET).as_deref(), Ok("a"));
+        assert!(std::env::var_os(NEW).is_none());
+        std::env::remove_var(SET);
     }
 }

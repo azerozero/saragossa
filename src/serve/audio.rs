@@ -1,54 +1,98 @@
 //! Endpoints audio OpenAI-compatibles de `saragossa serve`.
 //!
-//! Deux routes purement additives :
-//! - `POST /v1/audio/transcriptions` : STT Whisper, requête `multipart/form-data`
-//!   (`file` = WAV, plus `model`/`language`/`response_format` optionnels), réponse
-//!   JSON `{"text": ...}` (ou texte brut si `response_format=text`).
+//! - `POST /v1/audio/transcriptions` et la session incrémentale
+//!   `/v1/audio/transcriptions/stream` : voir [`super::stt`], qui emprunte le
+//!   modèle Whisper de cet état.
+//! - `POST /v1/audio/diarization` : diarisation Nemotron-3-Diarization, même
+//!   multipart (`file` = WAV, `response_format` = `json` par défaut ou `rttm`),
+//!   réponse `{"duration", "segments": [{"speaker", "start", "end"}]}`.
 //! - `POST /v1/audio/speech` : TTS Qwen3, requête JSON `{"model", "input", "voice"?}`,
 //!   réponse WAV par défaut, ou PCM s16le mono chunked avec `stream: true`.
+//!
+//! - `POST /v1/audio/enhance` (extension saragossa) : débruitage DeepFilterNet3,
+//!   WAV/multipart en duplex, réponse WAV mono 48 kHz : voir [`super::enhance`].
 //!
 //! Les modèles sont opt-in (`--stt-model`, `--tts-model`) et chargés paresseusement
 //! au premier appel : sans configuration, la route renvoie une erreur 400 claire.
 
-use std::io::{Cursor, Write};
+#[cfg(feature = "tts")]
+use std::io::Cursor;
+#[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
+use std::io::Write;
 use std::path::PathBuf;
 
-use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+#[cfg(feature = "diar")]
+use super::http::send_json;
+#[cfg(all(test, feature = "tts"))]
+use hound::WavReader;
+#[cfg(feature = "tts")]
+use hound::{SampleFormat, WavSpec, WavWriter};
+#[cfg(feature = "diar")]
+use saragossa::wire_audio::extract_boundary;
+#[cfg(feature = "tts")]
 use serde::Deserialize;
+#[cfg(any(feature = "diar", all(test, feature = "tts")))]
 use serde_json::json;
 
+#[cfg(feature = "tts")]
 use saragossa::tts::TTS_GENERATION_HARD_CAP;
+#[cfg(any(feature = "stt", feature = "diar"))]
+use saragossa::ForwardRuntime;
 #[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(any(feature = "stt", feature = "diar"))]
 use saragossa::MetalExecutor;
-use saragossa::{ForwardRuntime, TtsModel, TtsSynthesisOutput, WhisperModel};
+#[cfg(feature = "stt")]
+use saragossa::WhisperModel;
+#[cfg(feature = "tts")]
+use saragossa::{TtsModel, TtsSynthesisOutput};
 
 use super::args::ServeArgs;
+#[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
 use super::error::{ServeError, ServeResult};
-use super::http::{send_json, write_headers};
+#[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
+use super::http::write_headers;
+#[cfg(any(feature = "stt", feature = "diar"))]
 use crate::RuntimeKind;
 
-/// Fréquence d'échantillonnage attendue par l'encodeur Whisper.
-const WHISPER_SAMPLE_RATE: u32 = 16_000;
-/// De la téléphonie à la prise de son haute résolution ; borne l'amplification à ×2.
-const WAV_SAMPLE_RATE_RANGE: std::ops::RangeInclusive<u32> = 8_000..=192_000;
-/// Valeurs entrelacées, tous canaux confondus : au plus 32 Mo décodés en f32.
-const MAX_WAV_SAMPLES: u64 = 8_000_000;
 /// Budget minimal conservé pour les clauses courtes.
+#[cfg(feature = "tts")]
 const MIN_TTS_MAX_FRAMES: usize = 160;
 /// Surcharge du cap de frames TTS pour les entrées longues.
+#[cfg(feature = "tts")]
 const TTS_MAX_FRAMES_ENV: &str = "SARAGOSSA_TTS_MAX_FRAMES";
+#[cfg(feature = "stt")]
 const STT_NOT_CONFIGURED: &str =
     "endpoint STT non configuré: relancez saragossa serve avec --stt-model <dir>";
+#[cfg(feature = "tts")]
 const TTS_NOT_CONFIGURED: &str =
     "endpoint TTS non configuré: relancez saragossa serve avec --tts-model <dir>";
 
 /// Etat audio du serveur : slots STT/TTS chargés à la demande.
 pub(super) struct AudioState {
+    #[cfg(any(feature = "stt", feature = "diar"))]
     backend: RuntimeKind,
+    #[cfg(feature = "stt")]
     stt: SttSlot,
+    #[cfg(feature = "diar")]
+    diar: DiarSlot,
+    #[cfg(feature = "tts")]
     tts: TtsSlot,
+    #[cfg(feature = "denoise")]
+    enhance_path: Option<PathBuf>,
+    /// Sessions STT à entrée incrémentale, indépendantes du modèle chargé.
+    #[cfg(feature = "stt")]
+    pub(super) stt_sessions: super::stt::SttSessions,
 }
 
+#[cfg(feature = "diar")]
+struct DiarSlot {
+    path: Option<PathBuf>,
+    model: Option<saragossa::diarization::DiarizationModel>,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    metal: Option<MetalExecutor>,
+}
+
+#[cfg(feature = "stt")]
 struct SttSlot {
     path: Option<PathBuf>,
     model: Option<WhisperModel>,
@@ -56,6 +100,7 @@ struct SttSlot {
     metal: Option<MetalExecutor>,
 }
 
+#[cfg(feature = "tts")]
 struct TtsSlot {
     path: Option<PathBuf>,
     model: Option<TtsModel>,
@@ -63,7 +108,16 @@ struct TtsSlot {
 
 // Seule la synthèse est substituable : les tests conservent le choix WAV/PCM
 // du gestionnaire de production, sans charger de poids ni initialiser Metal.
+#[cfg(feature = "tts")]
 pub(super) trait SpeechSynthesis {
+    fn configure_voice(
+        &mut self,
+        _voice: Option<&str>,
+        _seed: Option<u64>,
+    ) -> ServeResult<Option<String>> {
+        Ok(None)
+    }
+
     fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput>;
     fn stream_sample_rate(&mut self) -> ServeResult<u32>;
     fn synthesize_streaming(
@@ -78,18 +132,63 @@ impl AudioState {
     /// Construit l'état audio depuis les chemins CLI, sans charger les poids.
     pub(super) fn new(args: &ServeArgs) -> Self {
         Self {
+            #[cfg(any(feature = "stt", feature = "diar"))]
             backend: args.backend,
+            #[cfg(feature = "stt")]
             stt: SttSlot {
                 path: args.stt_model.clone(),
                 model: None,
                 #[cfg(all(target_os = "macos", feature = "metal"))]
                 metal: None,
             },
+            #[cfg(feature = "diar")]
+            diar: DiarSlot {
+                path: args.diar_model.clone(),
+                model: None,
+                #[cfg(all(target_os = "macos", feature = "metal"))]
+                metal: None,
+            },
+            #[cfg(feature = "tts")]
             tts: TtsSlot {
                 path: args.tts_model.clone(),
                 model: None,
             },
+            #[cfg(feature = "denoise")]
+            enhance_path: args.enhance_model.clone(),
+            #[cfg(feature = "stt")]
+            stt_sessions: super::stt::SttSessions::default(),
         }
+    }
+
+    /// Abandonne les modèles et sessions chargés (après une panique du moteur) ;
+    /// ils se rechargent à la prochaine requête.
+    pub(super) fn invalidate(&mut self) {
+        #[cfg(feature = "stt")]
+        {
+            self.stt.model = None;
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            {
+                self.stt.metal = None;
+            }
+            self.stt_sessions = super::stt::SttSessions::default();
+        }
+        #[cfg(feature = "diar")]
+        {
+            self.diar.model = None;
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            {
+                self.diar.metal = None;
+            }
+        }
+        #[cfg(feature = "tts")]
+        {
+            self.tts.model = None;
+        }
+    }
+
+    #[cfg(feature = "denoise")]
+    pub(super) fn enhance_path(&self) -> Option<PathBuf> {
+        self.enhance_path.clone()
     }
 
     /// Transcrit des échantillons mono 16 kHz avec le backend Whisper.
@@ -97,7 +196,25 @@ impl AudioState {
     /// # Errors
     ///
     /// Renvoie une erreur si le modèle STT n'est pas configuré ou si l'inférence échoue.
+    #[cfg(feature = "stt")]
     pub(super) fn transcribe(&mut self, samples: &[f32], lang: &str) -> ServeResult<String> {
+        self.with_stt(|model, runtime| Ok(model.transcribe(samples, lang, runtime)?.0))
+    }
+
+    /// Comme [`Self::with_stt`], en prêtant aussi les sessions incrémentales.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le modèle STT n'est pas configuré, ou celle de `use_model`.
+    #[cfg(feature = "stt")]
+    pub(super) fn with_stt_sessions<T>(
+        &mut self,
+        use_model: impl FnOnce(
+            &WhisperModel,
+            ForwardRuntime<'_>,
+            &mut super::stt::SttSessions,
+        ) -> ServeResult<T>,
+    ) -> ServeResult<T> {
         self.ensure_stt_loaded()?;
         let runtime = self.stt.forward_runtime(self.backend);
         let model = self
@@ -105,10 +222,30 @@ impl AudioState {
             .model
             .as_ref()
             .ok_or_else(|| ServeError::args("modèle STT absent après chargement"))?;
-        let (text, _lang) = model.transcribe(samples, lang, runtime)?;
-        Ok(text)
+        use_model(model, runtime, &mut self.stt_sessions)
     }
 
+    /// Charge Whisper si besoin, puis prête le modèle et son runtime.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le modèle STT n'est pas configuré, ou celle de `use_model`.
+    #[cfg(feature = "stt")]
+    pub(super) fn with_stt<T>(
+        &mut self,
+        use_model: impl FnOnce(&WhisperModel, ForwardRuntime<'_>) -> ServeResult<T>,
+    ) -> ServeResult<T> {
+        self.ensure_stt_loaded()?;
+        let runtime = self.stt.forward_runtime(self.backend);
+        let model = self
+            .stt
+            .model
+            .as_ref()
+            .ok_or_else(|| ServeError::args("modèle STT absent après chargement"))?;
+        use_model(model, runtime)
+    }
+
+    #[cfg(feature = "stt")]
     fn ensure_stt_loaded(&mut self) -> ServeResult<()> {
         if self.stt.model.is_some() {
             return Ok(());
@@ -142,6 +279,56 @@ impl AudioState {
         Ok(())
     }
 
+    /// Diarise des échantillons mono 16 kHz avec son exécuteur Metal.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie une erreur si le modèle n'est pas configuré ou si l'inférence échoue.
+    #[cfg(feature = "diar")]
+    pub(super) fn diarize(
+        &mut self,
+        samples: &[f32],
+    ) -> ServeResult<Vec<saragossa::diarization::SpeakerSegment>> {
+        if self.diar.model.is_none() {
+            let path = self.diar.path.clone().ok_or_else(|| {
+                ServeError::args(
+                    "endpoint diarisation non configuré: relancez saragossa serve avec --diar-model <dir>",
+                )
+            })?;
+            eprintln!(
+                "saragossa serve loading diarization model path={}",
+                path.display()
+            );
+            let model = saragossa::diarization::DiarizationModel::from_model_dir(&path)?;
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            if self.backend == RuntimeKind::Metal && self.diar.metal.is_none() {
+                self.diar.metal = Some(MetalExecutor::new()?);
+            }
+            self.diar.model = Some(model);
+        }
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        let runtime = self
+            .diar
+            .metal
+            .as_ref()
+            .map_or_else(ForwardRuntime::cpu, ForwardRuntime::metal);
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let runtime = if self.backend == RuntimeKind::Metal {
+            return Err(ServeError::args(
+                "backend metal diarisation indisponible — recompiler avec --features metal",
+            ));
+        } else {
+            ForwardRuntime::cpu()
+        };
+        let model = self
+            .diar
+            .model
+            .as_ref()
+            .ok_or_else(|| ServeError::args("modèle de diarisation absent après chargement"))?;
+        Ok(model.diarize(samples, runtime)?.segments)
+    }
+
+    #[cfg(feature = "tts")]
     fn ensure_tts_loaded(&mut self) -> ServeResult<()> {
         if self.tts.model.is_some() {
             return Ok(());
@@ -164,7 +351,35 @@ impl AudioState {
     }
 }
 
+#[cfg(feature = "tts")]
 impl SpeechSynthesis for AudioState {
+    fn configure_voice(
+        &mut self,
+        voice: Option<&str>,
+        seed: Option<u64>,
+    ) -> ServeResult<Option<String>> {
+        self.ensure_tts_loaded()?;
+        let model = self
+            .tts
+            .model
+            .as_mut()
+            .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
+        model.set_seed(seed);
+        match model.set_voice(voice) {
+            Ok(()) => Ok(None),
+            Err(cause) => {
+                let Some(requested) = voice else {
+                    return Err(cause.into());
+                };
+                // Le défaut est résolu à nouveau pour ne pas conserver la voix
+                // d'une requête précédente. Un défaut invalide reste une erreur.
+                model.set_voice(None)?;
+                eprintln!("saragossa serve TTS: {cause} ; repli sur serena");
+                Ok(Some(requested.to_owned()))
+            }
+        }
+    }
+
     fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput> {
         self.ensure_tts_loaded()?;
         let model = self
@@ -200,6 +415,7 @@ impl SpeechSynthesis for AudioState {
     }
 }
 
+#[cfg(feature = "stt")]
 impl SttSlot {
     fn forward_runtime(&self, backend: RuntimeKind) -> ForwardRuntime<'_> {
         match backend {
@@ -217,6 +433,7 @@ impl SttSlot {
     }
 }
 
+#[cfg(feature = "tts")]
 fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
     override_value
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -230,8 +447,9 @@ fn tts_max_frames(text: &str, override_value: Option<&str>) -> usize {
         .min(TTS_GENERATION_HARD_CAP)
 }
 
-/// Sert `POST /v1/audio/transcriptions`.
-pub(super) fn handle_transcription<S: Write>(
+/// Sert `POST /v1/audio/diarization`.
+#[cfg(feature = "diar")]
+pub(super) fn handle_diarization<S: Write>(
     stream: &mut S,
     audio: &mut AudioState,
     content_type: Option<&str>,
@@ -247,17 +465,23 @@ pub(super) fn handle_transcription<S: Write>(
         .iter()
         .find(|field| field.name == "file")
         .ok_or_else(|| ServeError::Http("champ multipart 'file' requis".to_string()))?;
-    let language = text_field(&fields, "language").unwrap_or_else(|| "auto".to_string());
     let response_format = text_field(&fields, "response_format").unwrap_or_default();
     let samples = wav_to_mono_16k(&file.data)?;
-    let text = audio.transcribe(&samples, &language)?;
-    if response_format.eq_ignore_ascii_case("text") {
-        return send_text(stream, &text);
+    let segments = audio.diarize(&samples)?;
+    if response_format.eq_ignore_ascii_case("rttm") {
+        return send_text(stream, &saragossa::diarization::to_rttm(&segments, "audio"));
     }
-    send_json(stream, 200, &json!({ "text": text }), Vec::new())
+    let duration = samples.len() as f64 / 16_000.0;
+    send_json(
+        stream,
+        200,
+        &json!({ "duration": duration, "segments": saragossa::diarization::to_json(&segments) }),
+        Vec::new(),
+    )
 }
 
 /// Sert `POST /v1/audio/speech`.
+#[cfg(feature = "tts")]
 pub(super) fn handle_speech<S: Write>(
     stream: &mut S,
     audio: &mut impl SpeechSynthesis,
@@ -268,13 +492,18 @@ pub(super) fn handle_speech<S: Write>(
         body,
         // Nom canonique depuis l'origine : pas d'alias `RETI_` à honorer ici.
         saragossa::runtime_flags::env_var_exact(TTS_MAX_FRAMES_ENV).as_deref(),
-        |stream, text, max_frames, streaming| {
+        |stream, text, max_frames, streaming, voice, seed| {
+            let fallback = audio.configure_voice(voice, seed)?;
             if !streaming {
-                return send_speech(stream, &audio.synthesize(text, max_frames)?);
+                return send_speech(
+                    stream,
+                    &audio.synthesize(text, max_frames)?,
+                    fallback.as_deref(),
+                );
             }
             // Le chargement peut encore produire une erreur HTTP avant les en-têtes.
             let sample_rate = audio.stream_sample_rate()?;
-            send_speech_stream(stream, sample_rate, |on_audio| {
+            send_speech_stream(stream, sample_rate, fallback.as_deref(), |on_audio| {
                 audio.synthesize_streaming(text, max_frames, on_audio)
             })
         },
@@ -283,11 +512,12 @@ pub(super) fn handle_speech<S: Write>(
 
 // L'injection permet de vérifier les arguments transmis par la route sans
 // charger de poids ni initialiser Metal.
+#[cfg(feature = "tts")]
 fn handle_speech_with<S: Write>(
     stream: &mut S,
     body: &[u8],
     override_value: Option<&str>,
-    synthesize: impl FnOnce(&mut S, &str, usize, bool) -> ServeResult<()>,
+    synthesize: impl FnOnce(&mut S, &str, usize, bool, Option<&str>, Option<u64>) -> ServeResult<()>,
 ) -> ServeResult<()> {
     let request: SpeechRequest = serde_json::from_slice(body)
         .map_err(|e| ServeError::json("désérialisation audio/speech", e))?;
@@ -302,15 +532,48 @@ fn handle_speech_with<S: Write>(
         input,
         tts_max_frames(input, override_value),
         request.stream,
+        request.voice.as_deref(),
+        request.seed,
     )
 }
 
-fn send_speech<S: Write>(stream: &mut S, output: &TtsSynthesisOutput) -> ServeResult<()> {
+// Valeur fournie par le client : échapper les contrôles et l'UTF-8 pour ne
+// jamais injecter une ligne HTTP. Les noms usuels (alloy, nova…) restent tels quels.
+#[cfg(feature = "tts")]
+fn voice_fallback_header(voice: Option<&str>) -> Option<(&'static str, String)> {
+    voice.map(|voice| {
+        let value = voice
+            .bytes()
+            .map(|byte| {
+                if (b' '..=b'~').contains(&byte) && byte != b'%' {
+                    char::from(byte).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect();
+        ("X-Saragossa-TTS-Voice-Fallback", value)
+    })
+}
+
+#[cfg(feature = "tts")]
+fn send_speech<S: Write>(
+    stream: &mut S,
+    output: &TtsSynthesisOutput,
+    fallback: Option<&str>,
+) -> ServeResult<()> {
     let wav = mono_f32_to_wav(&output.samples, output.sample_rate)?;
-    let headers = vec![(
-        "X-Saragossa-TTS-Frame-Limit-Reached",
-        output.frame_limit_reached.to_string(),
-    )];
+    let mut headers = vec![
+        (
+            "X-Saragossa-TTS-Frame-Limit-Reached",
+            output.frame_limit_reached.to_string(),
+        ),
+        (
+            "X-Saragossa-TTS-Stop-Reason",
+            output.stop_reason.as_str().into(),
+        ),
+    ];
+    headers.extend(voice_fallback_header(fallback));
     write_headers(stream, 200, "OK", "audio/wav", Some(wav.len()), headers)?;
     stream
         .write_all(&wav)
@@ -322,9 +585,11 @@ fn send_speech<S: Write>(stream: &mut S, output: &TtsSynthesisOutput) -> ServeRe
 
 // L'écriture reste synchrone sur le thread moteur : pas de producteur détaché
 // ni de file audio non bornée. Les sockets ont déjà un timeout d'écriture.
+#[cfg(feature = "tts")]
 fn send_speech_stream<S: Write>(
     stream: &mut S,
     sample_rate: u32,
+    fallback: Option<&str>,
     synthesize: impl FnOnce(
         &mut dyn FnMut(&[f32]) -> saragossa::Result<()>,
     ) -> ServeResult<TtsSynthesisOutput>,
@@ -336,11 +601,17 @@ fn send_speech_stream<S: Write>(
             "OK",
             "audio/pcm",
             None,
-            vec![
+            [
                 ("Transfer-Encoding", "chunked".into()),
                 ("X-Saragossa-Audio-Sample-Rate", sample_rate.to_string()),
-                ("Trailer", "X-Saragossa-TTS-Frame-Limit-Reached".into()),
-            ],
+                (
+                    "Trailer",
+                    "X-Saragossa-TTS-Frame-Limit-Reached, X-Saragossa-TTS-Stop-Reason".into(),
+                ),
+            ]
+            .into_iter()
+            .chain(voice_fallback_header(fallback))
+            .collect(),
         )?;
         stream
             .flush()
@@ -354,8 +625,8 @@ fn send_speech_stream<S: Write>(
         // Le budget atteint n'est connu qu'après la génération : trailer HTTP.
         write!(
             stream,
-            "0\r\nX-Saragossa-TTS-Frame-Limit-Reached: {}\r\n\r\n",
-            output.frame_limit_reached
+            "0\r\nX-Saragossa-TTS-Frame-Limit-Reached: {}\r\nX-Saragossa-TTS-Stop-Reason: {}\r\n\r\n",
+            output.frame_limit_reached, output.stop_reason.as_str()
         )
         .and_then(|()| stream.flush())
         .map_err(|e| ServeError::io("fin réponse PCM", e))
@@ -368,6 +639,7 @@ fn send_speech_stream<S: Write>(
     Ok(())
 }
 
+#[cfg(feature = "tts")]
 fn write_pcm_chunk<S: Write>(stream: &mut S, samples: &[f32]) -> std::io::Result<()> {
     if samples.is_empty() {
         return Ok(());
@@ -382,22 +654,28 @@ fn write_pcm_chunk<S: Write>(stream: &mut S, samples: &[f32]) -> std::io::Result
     stream.flush()
 }
 
-fn pcm_i16(sample: f32) -> i16 {
+#[cfg(any(feature = "tts", feature = "denoise"))]
+pub(super) fn pcm_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
 }
 
-/// Requête `/v1/audio/speech`. Le backend expose une voix VoiceDesign unique,
-/// donc `model`/`voice` (ignorés) sont acceptés sans effet.
+/// Requête `/v1/audio/speech` : `voice` sélectionne un locuteur CustomVoice.
 #[derive(Debug, Deserialize)]
+#[cfg(feature = "tts")]
 struct SpeechRequest {
     /// Texte à synthétiser.
     input: String,
+    #[serde(default)]
+    voice: Option<String>,
+    #[serde(default)]
+    seed: Option<u64>,
     /// Extension explicite : PCM s16le mono chunked au lieu du WAV complet.
     #[serde(default)]
     stream: bool,
 }
 
-fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(super) fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
     let body = text.as_bytes();
     write_headers(
         stream,
@@ -415,198 +693,32 @@ fn send_text<S: Write>(stream: &mut S, text: &str) -> ServeResult<()> {
         .map_err(|e| ServeError::io("flush réponse texte", e))
 }
 
-/// Un champ de formulaire `multipart/form-data`.
-#[derive(Debug)]
-struct MultipartField {
-    name: String,
-    #[allow(
-        dead_code,
-        reason = "conservé pour le diagnostic des parties multipart"
-    )]
-    filename: Option<String>,
-    data: Vec<u8>,
+// Les cibles fuzz et le serveur exécutent le même décodeur, sans copie.
+#[cfg(any(feature = "diar", all(test, feature = "stt", feature = "tts")))]
+use saragossa::wire_audio::text_field;
+#[cfg(any(feature = "stt", feature = "diar"))]
+use saragossa::wire_audio::MultipartField;
+#[cfg(all(test, feature = "stt", feature = "tts"))]
+use saragossa::wire_audio::MAX_WAV_SAMPLES;
+
+#[cfg(all(test, feature = "stt", feature = "tts"))]
+fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult<Vec<f32>> {
+    saragossa::wire_audio::downsample(samples, input_rate, target_rate)
+        .map_err(|e| ServeError::Http(e.0))
 }
 
-fn text_field(fields: &[MultipartField], name: &str) -> Option<String> {
-    let value = fields
-        .iter()
-        .find(|field| field.name == name)
-        .map(|field| String::from_utf8_lossy(&field.data).trim().to_string())?;
-    (!value.is_empty()).then_some(value)
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(super) fn parse_multipart(body: &[u8], boundary: &str) -> ServeResult<Vec<MultipartField>> {
+    saragossa::wire_audio::parse_multipart(body, boundary).map_err(|e| ServeError::Http(e.0))
 }
 
-/// Extrait la valeur `boundary` d'un Content-Type multipart.
-fn extract_boundary(content_type: &str) -> Option<String> {
-    for part in content_type.split(';') {
-        let Some((name, value)) = part.trim().split_once('=') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("boundary") {
-            let value = value.trim().trim_matches('"');
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Parse un corps `multipart/form-data` à la main (le serveur n'a pas de crate HTTP).
-fn parse_multipart(body: &[u8], boundary: &str) -> ServeResult<Vec<MultipartField>> {
-    let delimiter = format!("--{boundary}");
-    let delimiter = delimiter.as_bytes();
-    let closing = format!("\r\n--{boundary}");
-    let closing = closing.as_bytes();
-    let mut index = find_sub(body, delimiter)
-        .ok_or_else(|| ServeError::Http("délimiteur multipart absent".to_string()))?;
-    let mut fields = Vec::new();
-    loop {
-        let after_delim = index + delimiter.len();
-        // `--` après le délimiteur marque la frontière de clôture.
-        if body[after_delim..].starts_with(b"--") {
-            break;
-        }
-        let part_start = if body[after_delim..].starts_with(b"\r\n") {
-            after_delim + 2
-        } else {
-            return Err(ServeError::Http(
-                "délimiteur multipart sans fin de ligne".to_string(),
-            ));
-        };
-        let next = find_sub(&body[part_start..], closing).ok_or_else(|| {
-            ServeError::Http("partie multipart sans délimiteur suivant".to_string())
-        })?;
-        fields.push(parse_part(&body[part_start..part_start + next])?);
-        // Repositionne sur le délimiteur suivant (saute le `\r\n` de tête).
-        index = part_start + next + 2;
-    }
-    Ok(fields)
-}
-
-fn parse_part(part: &[u8]) -> ServeResult<MultipartField> {
-    let split = find_sub(part, b"\r\n\r\n")
-        .ok_or_else(|| ServeError::Http("partie multipart sans en-têtes".to_string()))?;
-    let headers = std::str::from_utf8(&part[..split])
-        .map_err(|e| ServeError::Http(format!("en-têtes multipart non UTF-8: {e}")))?;
-    let data = part[split + 4..].to_vec();
-    let mut name = None;
-    let mut filename = None;
-    for line in headers.split("\r\n") {
-        let Some((header, value)) = line.split_once(':') else {
-            continue;
-        };
-        if header.trim().eq_ignore_ascii_case("content-disposition") {
-            (name, filename) = parse_content_disposition(value);
-        }
-    }
-    let name = name.ok_or_else(|| ServeError::Http("Content-Disposition sans name".to_string()))?;
-    Ok(MultipartField {
-        name,
-        filename,
-        data,
-    })
-}
-
-fn parse_content_disposition(value: &str) -> (Option<String>, Option<String>) {
-    let mut name = None;
-    let mut filename = None;
-    for part in value.split(';') {
-        let Some((key, raw)) = part.trim().split_once('=') else {
-            continue;
-        };
-        let raw = raw.trim().trim_matches('"').to_string();
-        match key.trim().to_ascii_lowercase().as_str() {
-            "name" => name = Some(raw),
-            "filename" => filename = Some(raw),
-            _ => {}
-        }
-    }
-    (name, filename)
-}
-
-fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-/// Décode un WAV en échantillons mono f32 @ 16 kHz (format Whisper).
-fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
-    let invalid_wav = |e| ServeError::Http(format!("WAV invalide: {e}"));
-    let mut cursor = Cursor::new(bytes);
-    let file_len = hound::read_wave_header(&mut cursor).map_err(invalid_wav)?;
-    if file_len > bytes.len() as u64 {
-        return Err(ServeError::Http(
-            "WAV tronqué: taille RIFF supérieure au corps".into(),
-        ));
-    }
-    let reader = WavReader::new(Cursor::new(bytes)).map_err(invalid_wav)?;
-    let spec = reader.spec();
-    let samples_len = u64::from(reader.len());
-    let data_start = reader.into_inner().position() as usize;
-    // Le curseur de Hound suit immédiatement la taille du bloc data.
-    let size_bytes = bytes
-        .get(data_start.saturating_sub(4)..data_start)
-        .and_then(|raw| raw.try_into().ok())
-        .ok_or_else(|| ServeError::Http("WAV sans taille data".into()))?;
-    let data_len = u32::from_le_bytes(size_bytes);
-    // Hound déduit la longueur de l'itérateur de l'en-tête, sans vérifier le corps.
-    // Vérifier les octets stockés (y compris le padding des samples) avant collect.
-    if data_start as u64 + u64::from(data_len) > file_len {
-        return Err(ServeError::Http(
-            "WAV tronqué: bloc data supérieur au corps RIFF".into(),
-        ));
-    }
-    validate_wav_limits(spec.sample_rate, spec.channels, samples_len)?;
-    let mut reader = WavReader::new(Cursor::new(bytes)).map_err(invalid_wav)?;
-    let samples: Vec<f32> = match spec.sample_format {
-        SampleFormat::Int => match spec.bits_per_sample {
-            16 => reader
-                .samples::<i16>()
-                .map(|sample| sample.map(|value| f32::from(value) / f32::from(i16::MAX)))
-                .collect::<Result<Vec<_>, _>>(),
-            bits @ (24 | 32) => {
-                // hound rend la valeur 24 bits telle quelle dans un i32, sans la décaler.
-                let full_scale = ((1_u64 << (bits - 1)) - 1) as f32;
-                reader
-                    .samples::<i32>()
-                    .map(|sample| sample.map(|value| value as f32 / full_scale))
-                    .collect()
-            }
-            other => {
-                return Err(ServeError::Http(format!(
-                    "profondeur WAV non supportée: {other} bits"
-                )))
-            }
-        },
-        SampleFormat::Float => reader.samples::<f32>().collect(),
-    }
-    .map_err(invalid_wav)?;
-    let mono = to_mono(&samples, spec.channels as usize);
-    downsample(&mono, spec.sample_rate, WHISPER_SAMPLE_RATE)
-}
-
-fn validate_wav_limits(sample_rate: u32, channels: u16, samples: u64) -> ServeResult<()> {
-    if !WAV_SAMPLE_RATE_RANGE.contains(&sample_rate) {
-        return Err(ServeError::Http(format!(
-            "taux WAV hors plage 8000–192000 Hz: {sample_rate}"
-        )));
-    }
-    if channels == 0 {
-        return Err(ServeError::Http("WAV sans canal".into()));
-    }
-    if samples > MAX_WAV_SAMPLES {
-        return Err(ServeError::Http(format!(
-            "WAV dépasse {MAX_WAV_SAMPLES} échantillons"
-        )));
-    }
-    Ok(())
+#[cfg(any(feature = "stt", feature = "diar"))]
+pub(super) fn wav_to_mono_16k(bytes: &[u8]) -> ServeResult<Vec<f32>> {
+    saragossa::wire_audio::wav_to_mono_16k(bytes).map_err(|e| ServeError::Http(e.0))
 }
 
 /// Encode des échantillons mono f32 en WAV PCM i16 en mémoire.
+#[cfg(feature = "tts")]
 fn mono_f32_to_wav(samples: &[f32], sample_rate: u32) -> ServeResult<Vec<u8>> {
     let spec = WavSpec {
         channels: 1,
@@ -631,53 +743,24 @@ fn mono_f32_to_wav(samples: &[f32], sample_rate: u32) -> ServeResult<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
-/// Replie des canaux entrelacés en mono par moyenne.
-fn to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
-    if channels <= 1 {
-        return samples.to_vec();
+#[cfg(all(test, feature = "tts"))]
+fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
     }
-    samples
-        .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect()
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
-/// Rééchantillonne linéairement vers `target_rate` (sur/sous-échantillonnage).
-fn downsample(samples: &[f32], input_rate: u32, target_rate: u32) -> ServeResult<Vec<f32>> {
-    validate_wav_limits(input_rate, 1, samples.len() as u64)?;
-    validate_wav_limits(target_rate, 1, 0)?;
-    if input_rate == target_rate || samples.is_empty() {
-        return Ok(samples.to_vec());
-    }
-    if input_rate < target_rate {
-        let ratio = f64::from(target_rate) / f64::from(input_rate);
-        let out_len = (samples.len() as f64 * ratio) as usize;
-        validate_wav_limits(target_rate, 1, out_len as u64)?;
-        return Ok((0..out_len)
-            .map(|i| samples[((i as f64 / ratio) as usize).min(samples.len() - 1)])
-            .collect());
-    }
-    let ratio = f64::from(input_rate) / f64::from(target_rate);
-    let out_len = (samples.len() as f64 / ratio) as usize;
-    validate_wav_limits(target_rate, 1, out_len as u64)?;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let start = (i as f64 * ratio) as usize;
-        let end = (((i + 1) as f64) * ratio) as usize;
-        let slice = &samples[start..end.min(samples.len())];
-        if !slice.is_empty() {
-            out.push(slice.iter().sum::<f32>() / slice.len() as f32);
-        }
-    }
-    Ok(out)
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "stt", feature = "tts"))]
 mod tests {
     use std::io::Cursor;
 
     use super::super::args::ServeArgs;
+    use super::super::stt::handle_transcription;
     use super::*;
+    use saragossa::wire_audio::extract_boundary;
 
     fn multipart_body(boundary: &str, file: &[u8], language: Option<&str>) -> Vec<u8> {
         let mut body = Vec::new();
@@ -728,14 +811,17 @@ mod tests {
             ("é".repeat(200), Some("2000"), 800),
             ("é".repeat(200), Some("0"), 400),
         ] {
-            let body = json!({ "input": format!("  {text}\n") }).to_string();
+            let body = json!({ "input": format!("  {text}\n"), "voice": "vivian", "seed": 123 })
+                .to_string();
             let mut response = Vec::new();
             let mut called = false;
             handle_speech_with(
                 &mut response,
                 body.as_bytes(),
                 override_value,
-                |stream, input, max_frames, streaming| {
+                |stream, input, max_frames, streaming, voice, seed| {
+                    assert_eq!(voice, Some("vivian"));
+                    assert_eq!(seed, Some(123));
                     called = true;
                     assert!(!streaming);
                     assert_eq!(input, text);
@@ -747,7 +833,9 @@ mod tests {
                             samples: vec![0.0],
                             sample_rate: 24_000,
                             frame_limit_reached: false,
+                            stop_reason: saragossa::TtsStopReason::Eos,
                         },
+                        None,
                     )
                 },
             )?;
@@ -765,9 +853,14 @@ mod tests {
                 samples: vec![0.0, 0.25, -0.25],
                 sample_rate: 24_000,
                 frame_limit_reached: reached,
+                stop_reason: if reached {
+                    saragossa::TtsStopReason::Cap
+                } else {
+                    saragossa::TtsStopReason::Eos
+                },
             };
             let mut response = Vec::new();
-            send_speech(&mut response, &output)?;
+            send_speech(&mut response, &output, None)?;
             let split = response
                 .windows(4)
                 .position(|w| w == b"\r\n\r\n")
@@ -1054,6 +1147,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "denoise")]
+    fn enhance_model_flag_is_parsed() {
+        let args = ServeArgs::parse([
+            "--enhance-model".to_string(),
+            "dfn3.safetensors".to_string(),
+        ])
+        .expect("invariant: args valides");
+        assert_eq!(args.enhance_model, Some(PathBuf::from("dfn3.safetensors")));
+    }
+
+    #[test]
     fn speech_without_model_returns_clear_error() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
         let mut audio = AudioState::new(&args);
@@ -1081,5 +1185,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tts"))]
 mod stream_tests;
+
+#[cfg(all(test, feature = "tts"))]
+mod mutation_tests;

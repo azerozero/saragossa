@@ -123,6 +123,7 @@ Chacune doit faire passer la porte au rouge.
 ### Résultats (2051 tokens, 98 448 points token × couche)
 
 Points de marge de probabilité :
+
 - ≤ 1e-7 : **26** ;
 - ≤ 1e-6 : **293** ;
 - ≤ 1e-5 : **2871**.
@@ -172,6 +173,7 @@ Pic `peak memory footprint` du binaire de test N2 sur 2051 tokens :
 **84,5 Go**, sur les passes native et imposées, les deux mutations et les
 essais de seuil. Il
 comprend :
+
 - les poids GPU (~73 Go) ;
 - la référence CPU, une couche déquantifiée à la fois ;
 - les résiduels CPU conservés (48 × 2051 × 10240 f32, soit 4 Go).
@@ -199,6 +201,7 @@ pour la plus lente. Préparation CPU (embedding, PLE) 0,2–0,3 ms et encodage
 ### Profil par brique
 
 `profile_resident_decode_after_1k_context` (devtools) :
+
 - `SARAGOSSA_FLASH_NEXT_PROFILE=1` donne un encodeur par brique, avec des
   timestamps aux frontières d'étape (seul mode du M5 Max) ;
 - `SARAGOSSA_RUST_DECODE_PROFILE=1` compte les dispatches (1600 par pas).
@@ -222,6 +225,7 @@ disparaît, et la première bascule tombe au token 313, couche 2, sur une marge
 de 3,4e-8.
 
 N2 complet sur 2051 tokens après ces optimisations :
+
 - seuil 1e-6 retenu ; 1e-7 est rouge à cause d'un point au token 1722, de marge
   comprise entre 1e-7 et 1e-6 ;
 - passe imposée : écart max 9,4e-4, KL 7,6e-9, argmax identique, routage

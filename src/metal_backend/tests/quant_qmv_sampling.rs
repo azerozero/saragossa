@@ -148,7 +148,7 @@ fn sample_topk_topp_matches_cpu() -> Result<()> {
     let logits = linear.forward(&input)?;
     let mut sampler = crate::DeterministicSampler::new(1234);
     let cpu = crate::sample_token_top_k_top_p(logits.as_row()?, 0.7, 0.95, 20, &mut sampler)?;
-    let gpu = executor.sample_linear_biasless_topk_topp(&input, &linear, 0.7, 0.95, 20, 1234)?;
+    let gpu = executor.sample_linear_biasless_topk_topp(&input, &linear, 0.7, 0.95, 20, 1234, None)?;
 
     assert_eq!(gpu, cpu);
     Ok(())
@@ -183,7 +183,7 @@ fn sample_topk32_topp_multiblock_matches_cpu() -> Result<()> {
     let logits = linear.forward(&input)?;
     let mut sampler = crate::DeterministicSampler::new(0x5eed);
     let cpu = crate::sample_token_top_k_top_p(logits.as_row()?, 0.7, 0.95, 32, &mut sampler)?;
-    let gpu = executor.sample_linear_biasless_topk_topp(&input, &linear, 0.7, 0.95, 32, 0x5eed)?;
+    let gpu = executor.sample_linear_biasless_topk_topp(&input, &linear, 0.7, 0.95, 32, 0x5eed, None)?;
 
     assert_eq!(gpu, cpu);
     Ok(())
@@ -231,8 +231,8 @@ fn sample_gumbel_matches_cpu_and_distribution() -> Result<()> {
     let mut counts = vec![0_usize; logits.len()];
 
     for seed in 0..1024_u64 {
-        let gpu = executor.sample_linear_biasless_gumbel(&input, &linear, temperature, seed)?;
-        let repeat = executor.sample_linear_biasless_gumbel(&input, &linear, temperature, seed)?;
+        let gpu = executor.sample_linear_biasless_gumbel(&input, &linear, temperature, seed, None)?;
+        let repeat = executor.sample_linear_biasless_gumbel(&input, &linear, temperature, seed, None)?;
         let cpu = cpu_gumbel_argmax_for_test(&logits, temperature, seed);
         assert_eq!(gpu, repeat, "seed {seed}");
         assert_eq!(gpu, cpu, "seed {seed}");
@@ -1566,7 +1566,9 @@ fn affine_qmv_u3_gs64_dequantizes_like_cpu_bit_exact() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
-    for in_dim in [256_usize, 512_usize] {
+    // 1536 et 1792 : nombre impair de blocs de 512 (dernière paire incomplète) et
+    // demi-bloc final, pour la boucle à deux blocs.
+    for in_dim in [256_usize, 512, 1024, 1536, 1792] {
         let out_dim = 8_usize;
         let weight = test_affine_mlx_u3(out_dim, in_dim)?;
         assert!(matches!(
@@ -1669,7 +1671,7 @@ fn qmm_skinny_u4_gs64_matches_qmv_for_5_to_31_rows() -> Result<()> {
     let in_dim = 1024_usize;
     let out_dim = 64_usize;
     let weight = test_affine_varied(out_dim, in_dim)?;
-    if !executor.qmm_skinny_available() {
+    if !executor.qmm_skinny_available(4) {
         eprintln!("skip: GEMM NA skinny indisponible (macOS < 26 ?)");
         return Ok(());
     }
@@ -1987,38 +1989,204 @@ fn qmm_skinny_u4_x2_and_x3_match_f64_on_qwen_shapes() -> Result<()> {
     Ok(())
 }
 
+/// Poids u2/u3 gs64 pseudo-aléatoire, codes conservés pour l'oracle f64. En
+/// mode `cancel`, 90 % des codes valent le milieu de la plage et le biais
+/// l'annule (`s·q + b ≈ 0`), comme l'oracle d'annulation du skinny u4.
+fn test_affine_random_low_bits(
+    out_dim: usize,
+    in_dim: usize,
+    bits: usize,
+    seed: u64,
+    cancel: bool,
+) -> Result<(AffineQuantizedTensor, Vec<u32>)> {
+    let mut state = seed;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let levels = 1u32 << bits;
+    let mid = levels / 2;
+    let codes: Vec<u32> = (0..out_dim * in_dim)
+        .map(|_| {
+            if cancel && next() < 0.9 {
+                mid
+            } else {
+                (next() * f64::from(levels)) as u32 & (levels - 1)
+            }
+        })
+        .collect();
+    let packed_cols = in_dim * bits / 32;
+    let mut packed = vec![0_u32; out_dim * packed_cols];
+    for (index, &q) in codes.iter().enumerate() {
+        let (row, col) = (index / in_dim, index % in_dim);
+        let bit = col * bits;
+        let word = row * packed_cols + bit / 32;
+        packed[word] |= q << (bit % 32);
+        if bit % 32 + bits > 32 {
+            packed[word + 1] |= q >> (32 - bit % 32);
+        }
+    }
+    let groups = in_dim / 64;
+    let scales: Vec<f32> = (0..out_dim * groups)
+        .map(|_| bf16_round((0.004 + 0.036 * next()) as f32))
+        .collect();
+    let biases = scales
+        .iter()
+        .map(|s| {
+            let offset = if cancel { 0.0 } else { next() as f32 - 0.5 };
+            bf16_round(-s * (mid as f32 + offset))
+        })
+        .collect();
+    let weight = AffineQuantizedTensor::new(
+        &[out_dim, packed_cols],
+        packed,
+        Tensor::from_vec(vec![out_dim, groups], scales)?,
+        Tensor::from_vec(vec![out_dim, groups], biases)?,
+        64,
+        bits,
+    )?;
+    Ok((weight, codes))
+}
+
+/// Oracle f64 du skinny x2 u2/u3 (même borne que le u4 x2) : formes du 27B,
+/// tailles impaires (N = 96, K = 1536, lots 5 à 31), régime d'annulation. Le
+/// qmv répliqué (f32, ~1e-7) est imprimé comme témoin ; le x2 porte l'erreur
+/// 2⁻¹⁶ de l'activation scindée (~4e-6). En u3, les codes chevauchent deux mots.
+#[test]
+fn qmm_skinny_u2_u3_x2_match_f64() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    if !executor.qmm_skinny_available(3) || !executor.qmm_skinny_available(2) {
+        eprintln!("skip: GEMM NA skinny indisponible (macOS < 26 ?)");
+        return Ok(());
+    }
+    let cases: [(usize, usize, &[usize], bool); 6] = [
+        (5120, 17408, &[5, 16], false),
+        (17408, 5120, &[8, 17], false),
+        (6144, 5120, &[5, 16], false),
+        (1536, 96, &[5, 9, 31], false),
+        (512, 32, &[5, 7], false),
+        (5120, 64, &[8, 16], true),
+    ];
+    for bits in [2_usize, 3] {
+        for (index, &(in_dim, out_dim, batches, cancel)) in cases.iter().enumerate() {
+            let (weight, codes) = test_affine_random_low_bits(
+                out_dim,
+                in_dim,
+                bits,
+                0x51ED_270B + (bits * 16 + index) as u64,
+                cancel,
+            )?;
+            let scales = weight.scales_f32();
+            let biases = weight.biases_f32();
+            let groups = in_dim / 64;
+            for &batch in batches {
+                assert!(matches!(
+                    executor.select_owned_affine_matmul_kernel(batch, in_dim, &weight, false),
+                    AffineMatmulKernel::Skinny
+                ));
+                let lhs: Vec<f32> = (0..batch * in_dim)
+                    .map(|i| {
+                        let x = ((i * 2_654_435_761) % 10_007) as f32 / 10_007.0 - 0.5;
+                        if i % 997 == 0 {
+                            x * 40.0
+                        } else {
+                            x
+                        }
+                    })
+                    .collect();
+                let cols: Vec<usize> = (0..out_dim).step_by(37.min(out_dim / 8)).collect();
+                let mut reference = Vec::with_capacity(batch * cols.len());
+                let mut magnitude = Vec::with_capacity(batch * cols.len());
+                for row in 0..batch {
+                    let x = &lhs[row * in_dim..(row + 1) * in_dim];
+                    for &n in &cols {
+                        let (mut acc, mut abs) = (0.0f64, 0.0f64);
+                        for (k, &xk) in x.iter().enumerate() {
+                            let g = n * groups + k / 64;
+                            let w = f64::from(codes[n * in_dim + k]) * f64::from(scales[g])
+                                + f64::from(biases[g]);
+                            acc += f64::from(xk) * w;
+                            abs += (f64::from(xk) * w).abs();
+                        }
+                        reference.push(acc);
+                        magnitude.push(abs);
+                    }
+                }
+                let scale = reference.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+                let error = |actual: &[f32]| {
+                    let mut worst = 0.0f64;
+                    for row in 0..batch {
+                        for (c, &n) in cols.iter().enumerate() {
+                            let r = row * cols.len() + c;
+                            let denom = if cancel { magnitude[r] } else { scale };
+                            let value = f64::from(actual[row * out_dim + n]);
+                            worst = worst.max((value - reference[r]).abs() / denom);
+                        }
+                    }
+                    worst
+                };
+                let skinny = skinny_matmul(
+                    &executor,
+                    SkinnyKernel::X2,
+                    &weight,
+                    &lhs,
+                    batch,
+                    in_dim,
+                    out_dim,
+                )?;
+                let replicated = with_qmm_skinny_min_batch_override(usize::MAX, || {
+                    matmul_via_selected_kernel(&executor, &weight, &lhs, batch, in_dim, out_dim)
+                })?;
+                let (worst, witness) = (error(&skinny), error(&replicated));
+                eprintln!(
+                    "skinny x2 u{bits} {in_dim}→{out_dim} M={batch} cancel={cancel}: \
+                     écart {worst:.2e} (qmv {witness:.2e})"
+                );
+                assert!(worst <= 5.0e-5, "u{bits} {in_dim}→{out_dim} M={batch}: {worst:e}");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn affine_qmm2_u3_gs64_matches_two_qmv_bit_exact() -> Result<()> {
     let Some(executor) = test_executor()? else {
         return Ok(());
     };
-    let in_dim = 256_usize;
-    let out_dim = 40_usize;
-    let weight = test_affine_mlx_u3(out_dim, in_dim)?;
-    assert!(matches!(
-        executor.select_owned_affine_matmul_kernel(2, in_dim, &weight, false),
-        AffineMatmulKernel::Qmm2
-    ));
-    let row0 = varied_row(in_dim, 71);
-    let row1 = varied_row(in_dim, 73);
-    let reference0 =
-        executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row0.clone())?, &weight)?;
-    let reference1 =
-        executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row1.clone())?, &weight)?;
-    let mut lhs = row0;
-    lhs.extend_from_slice(&row1);
-    let actual = executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![2, in_dim], lhs)?, &weight)?;
+    // 1792 : trois blocs et demi, la boucle qmv à deux blocs finit sur un bloc seul.
+    for in_dim in [256_usize, 1792] {
+        let out_dim = 40_usize;
+        let weight = test_affine_mlx_u3(out_dim, in_dim)?;
+        assert!(matches!(
+            executor.select_owned_affine_matmul_kernel(2, in_dim, &weight, false),
+            AffineMatmulKernel::Qmm2
+        ));
+        let row0 = varied_row(in_dim, 71);
+        let row1 = varied_row(in_dim, 73);
+        let reference0 =
+            executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row0.clone())?, &weight)?;
+        let reference1 =
+            executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![1, in_dim], row1.clone())?, &weight)?;
+        let mut lhs = row0;
+        lhs.extend_from_slice(&row1);
+        let actual = executor.matmul_rhs_t_affine(&Tensor::from_vec(vec![2, in_dim], lhs)?, &weight)?;
 
-    assert_bits_equal(
-        &actual.data()[..out_dim],
-        reference0.data(),
-        "qmm2 u3 ligne 0",
-    );
-    assert_bits_equal(
-        &actual.data()[out_dim..],
-        reference1.data(),
-        "qmm2 u3 ligne 1",
-    );
+        assert_bits_equal(
+            &actual.data()[..out_dim],
+            reference0.data(),
+            "qmm2 u3 ligne 0",
+        );
+        assert_bits_equal(
+            &actual.data()[out_dim..],
+            reference1.data(),
+            "qmm2 u3 ligne 1",
+        );
+    }
     Ok(())
 }
 
@@ -2551,13 +2719,14 @@ fn affine_embedding_u3_fallback_dequantizes_like_cpu_bit_exact() -> Result<()> {
 }
 
 #[test]
-#[ignore = "GPU Metal : comparaison qmm/qmv u6 strictement bit à bit"]
+#[ignore = "GPU Metal : qmm u6 scalaire bit à bit, qmv aligné epsilon u4"]
 fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
     use super::flags::with_qmm_u6_override;
     use super::profiling::take_dispatch_shapes_for_test;
 
     // Un lancement explicite doit échouer sans device, pas réussir sans calcul.
-    let executor = MetalExecutor::new()?;
+    let mut executor = MetalExecutor::new()?;
+    executor.na_gemm_bf16 = None;
     let assert_exact = |actual: &[f32], expected: &[f32], context: &str| {
         assert_eq!(actual.len(), expected.len(), "{context}");
         for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
@@ -2581,8 +2750,16 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
         let biases =
             executor.buffer_from_f32_as_bf16(weight.biases_f32().as_ref(), "qmm_u6_biases")?;
         let buffers = executor.resolve_linear_weight_buffers(&owned_weight, "qmm_u6_weight")?;
+        // Les batchs ci-dessous sont des préfixes des mêmes 33 lignes : cet
+        // oracle CPU couvre chaque forme, pas seulement les batchs du test QMV.
+        let cpu = Tensor::from_vec(
+            vec![33, in_dim],
+            (0..33).flat_map(|row| varied_row(in_dim, 53 + row)).collect(),
+        )?
+        .matmul_rhs_t(&weight.dequantize()?)?;
         // Toutes les queues de tuile, plusieurs tuiles et des sorties impaires.
         for batch in [1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 31, 32, 33] {
+            let cpu_expected = &cpu.data()[..batch * out_dim];
             assert!(can_use_fast_affine_qmv_u6_buffers(
                 batch, in_dim, out_dim, 64, 6
             ));
@@ -2590,7 +2767,7 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
                 .flat_map(|row| varied_row(in_dim, 53 + row))
                 .collect();
             let expected =
-                fast_qmv_u6_reference(&executor, &weight, &lhs, batch, "qmm_u6_qmv_ref")?;
+                generic_affine_reference(&executor, &weight, &lhs, batch, "qmm_u6_qmv_ref")?;
             // Chaque ligne doit détecter un encodeur qui laisse sa sortie à zéro.
             assert!(expected
                 .chunks_exact(out_dim)
@@ -2641,7 +2818,7 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
                     assert_eq!(qmm_u6_enabled(), enabled);
                     let kind = if enabled && batch > 1 {
                         "affine_qmm_batched_u6_gs64"
-                    } else if out_dim % 2 == 0 {
+                    } else if out_dim % 8 == 0 && in_dim % 512 == 0 {
                         "affine_qmv_u6_aligned_gs64"
                     } else {
                         "affine_qmv_u6_tail_gs64"
@@ -2674,11 +2851,18 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
                         encoder.end_encoding();
                         commit_and_wait(command_buffer)?;
                         assert_eq!(take_dispatch_shapes_for_test(), [dispatch], "{context}");
-                        assert_exact(
-                            &read_f32_buffer(&output, batch * out_dim)?,
-                            &expected,
-                            &context,
-                        );
+                        let actual = read_f32_buffer(&output, batch * out_dim)?;
+                        if kind == "affine_qmv_u6_aligned_gs64" {
+                            // Le kernel vectorisé somme 16/32 produits par lane
+                            // avant scale/bias et la réduction SIMD : l'ordre de
+                            // sommation f32 diffère du générique scalaire. Seule
+                            // cette comparaison utilise 1e-3 (comme u4 align64) ;
+                            // l'oracle CPU ci-dessous garde 1e-5 de l'échelle.
+                            assert_close_eps(&actual, &expected, 1.0e-3);
+                        } else {
+                            assert_exact(&actual, &expected, &context);
+                        }
+                        assert_all_close_scaled(&actual, cpu_expected, &context);
                     }
 
                     // L'API Tensor alloue sa propre sortie neuve à chaque appel.
@@ -2689,11 +2873,14 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
                         [dispatch],
                         "{context}, API Tensor, flag={enabled}"
                     );
-                    assert_exact(
-                        direct.data(),
-                        &expected,
-                        &format!("{context}, API Tensor, flag={enabled}"),
-                    );
+                    if kind == "affine_qmv_u6_aligned_gs64" {
+                        // Même ordre vectorisé que les routes owned/résidente ;
+                        // la comparaison CPU stricte couvre aussi cette API.
+                        assert_close_eps(direct.data(), &expected, 1.0e-3);
+                    } else {
+                        assert_exact(direct.data(), &expected, &context);
+                    }
+                    assert_all_close_scaled(direct.data(), cpu_expected, &context);
                     Ok(())
                 })?;
             }
@@ -2712,6 +2899,8 @@ fn affine_qmv_u6_gs64_matches_generic_and_routes() -> Result<()> {
         (65, 512, 2),
         (256, 1024, 1),
         (2048, 2048, 1),
+        (8, 5120, 3),
+        (16, 17408, 2),
     ] {
         let weight = test_affine_varied_u6(out_dim, in_dim)?;
         let mut lhs = Vec::with_capacity(batch * in_dim);
@@ -2722,17 +2911,24 @@ fn affine_qmv_u6_gs64_matches_generic_and_routes() -> Result<()> {
         let generic =
             generic_affine_reference(&executor, &weight, &lhs, batch, "qmv_u6_generic_ref")?;
         let fast = fast_qmv_u6_reference(&executor, &weight, &lhs, batch, "qmv_u6_fast_ref")?;
-        assert_bits_equal(
-            &fast,
-            &generic,
-            &format!("qmv u6 fast vs generic ({out_dim}x{in_dim}) batch={batch}"),
-        );
+        // Le kernel aligné vectorisé somme 16/32 produits par lane avant
+        // scale/bias puis réduit les lanes SIMD : cet ordre de sommation f32
+        // diffère du générique scalaire. Epsilon absolu 1e-3 comme u4 align64 ;
+        // le CPU juste après garde 1e-5 de l'échelle sur les mêmes N/K/batch.
+        if out_dim % 8 == 0 && in_dim % 512 == 0 {
+            assert_close_eps(&fast, &generic, 1.0e-3);
+        } else {
+            assert_bits_equal(&fast, &generic, "qmv u6 tail/générique");
+        }
+        let cpu = Tensor::from_vec(vec![batch, in_dim], lhs.clone())?
+            .matmul_rhs_t(&weight.dequantize()?)?;
+        assert_all_close_scaled(&fast, cpu.data(), "qmv u6/CPU");
 
         let input = Tensor::from_vec(vec![batch, in_dim], lhs.clone())?;
         let direct = executor.matmul_rhs_t_affine(&input, &weight)?;
         assert_bits_equal(
             direct.data(),
-            &generic,
+            &fast,
             &format!("matmul_rhs_t_affine u6 route ({out_dim}x{in_dim}) batch={batch}"),
         );
 
@@ -2754,7 +2950,7 @@ fn affine_qmv_u6_gs64_matches_generic_and_routes() -> Result<()> {
         let routed = read_f32_buffer(&out_buf, batch * out_dim)?;
         assert_bits_equal(
             &routed,
-            &generic,
+            &fast,
             &format!("encode_matmul_weight_buffers u6 route ({out_dim}x{in_dim}) batch={batch}"),
         );
     }
@@ -3109,6 +3305,82 @@ fn qmm_na_fused_tiled_u4_flint_shapes_x3_match_f32_reference() -> Result<()> {
             worst <= budget,
             "{in_dim}→{out_dim} : écart relatif {worst:.3e} > {budget:.3e}"
         );
+    }
+    Ok(())
+}
+
+/// Noyaux bf16×3 et bf16×4 (lo·lo en plus) dispatchés directement sur les
+/// petites formes du 35B-A3B et de flint, contre la référence f32 pure (f64).
+/// Même budget empirique que le x3 ; le x4 doit s'y tenir aussi.
+#[test]
+fn qmm_na_fused_tiled_u4_x4_matches_f32_reference() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let (Some(x3), Some(x4)) = (
+        executor.na_gemm_coop_qb_tiled_u4_x3.as_ref(),
+        executor.na_gemm_coop_qb_tiled_u4_x4.as_ref(),
+    ) else {
+        eprintln!("skip: GEMM NA u4 indisponible (macOS < 26 ?)");
+        return Ok(());
+    };
+    let batch = 65;
+    for (in_dim, out_dim) in [(2048_usize, 512_usize), (2048, 1024), (1024, 2048)] {
+        let weight = test_affine_varied(out_dim, in_dim)?;
+        let MetalLinearWeightBuffers::AffineQuantized {
+            packed,
+            packed_offset,
+            scales,
+            scales_offset,
+            biases,
+            biases_offset,
+            ..
+        } = executor.resolve_linear_weight_buffers(
+            &LinearWeight::AffineQuantized(weight.clone()),
+            "x4_weight",
+        )?
+        else {
+            panic!("poids affine attendu");
+        };
+        let mut lhs = Vec::with_capacity(batch * in_dim);
+        for row in 0..batch {
+            lhs.extend_from_slice(&varied_row(in_dim, 17 + row));
+        }
+        let lhs_buf = executor.upload_f32_buffer(&lhs, "x4_lhs")?;
+        let (exact, abs_dot) = qmm_u4_f64_reference(&weight, &lhs, batch);
+        for (name, pso) in [("x3", x3), ("x4", x4)] {
+            let out_buf = executor.uncached_f32_buffer(batch * out_dim, "x4_out")?;
+            let command_buffer = executor.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            executor.dispatch_affine_qmm_na_fused_tiled_u4(
+                encoder,
+                pso,
+                &lhs_buf,
+                &packed,
+                packed_offset,
+                &scales,
+                scales_offset,
+                &biases,
+                biases_offset,
+                &out_buf,
+                batch,
+                in_dim,
+                out_dim,
+                "x4_test",
+                "x4_test",
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(command_buffer)?;
+            let out = read_f32_buffer(&out_buf, batch * out_dim)?;
+            let mut worst = 0.0_f64;
+            for idx in 0..batch * out_dim {
+                assert!(out[idx].is_finite(), "{name} {in_dim}→{out_dim} [{idx}] non fini");
+                let rel = (f64::from(out[idx]) - exact[idx]).abs() / abs_dot[idx].max(1e-30);
+                worst = worst.max(rel);
+            }
+            eprintln!("{name} {in_dim}→{out_dim} : écart relatif max {worst:.3e}");
+            assert!(worst <= 1e-5, "{name} {in_dim}→{out_dim} : {worst:.3e} > 1e-5");
+        }
     }
     Ok(())
 }
@@ -3611,7 +3883,8 @@ fn fast_qmv_u6_reference(
 
     let command_buffer = executor.queue.new_command_buffer();
     let encoder = command_buffer.new_compute_command_encoder();
-    let pipeline = if *out_dim % 2 == 0 {
+    let aligned = *out_dim % 8 == 0 && *weight_in_dim % 512 == 0;
+    let pipeline = if aligned {
         &executor.affine_qmv_fast_aligned_u6_gs64_f32
     } else {
         &executor.affine_qmv_fast_u6_gs64_f32
@@ -3624,7 +3897,7 @@ fn fast_qmv_u6_reference(
     encoder.set_buffer(4, Some(&out_buf), 0);
     encoder.set_bytes(5, 16, dims.as_ptr().cast());
     encoder.dispatch_thread_groups(
-        MTLSize::new(batch as u64, (*out_dim as u64).div_ceil(2), 1),
+        MTLSize::new(batch as u64, (*out_dim as u64).div_ceil(if aligned { 8 } else { 2 }), 1),
         MTLSize::new(64, 1, 1),
     );
     encoder.end_encoding();
@@ -4561,78 +4834,98 @@ fn sample_rows_with_states_match_isolated_and_cpu() -> Result<()> {
         })
         .collect();
     const SENTINEL: u32 = u32::MAX;
-    for (temperature, top_p, top_k) in [
-        (0.7_f32, 1.0_f32, 0_usize),
-        (0.7, 0.9, 20),
-        (1.3, 0.5, 2),
-        (0.7, 0.9, 1),
-        (0.7, 1.0, 32),
-    ] {
-        for seed in [1_u64, 0xdead_beef] {
-            let states: Vec<u64> = depths
-                .iter()
-                .map(|&depth| crate::sampling::rng_state_for_draw(seed, 5 + depth))
-                .collect();
-            let logits_buffer = executor.upload_f32_buffer(&logits, "rows_test_logits")?;
-            let index_buffer =
-                executor.upload_u32_buffer(&vec![SENTINEL; rows + 2], "rows_test_index")?;
-            for concurrent in [false, true] {
-            let command_buffer = executor.queue.new_command_buffer();
-            let _barrier_guard = concurrent.then(install_dispatch_barrier_scope);
-            let encoder = if concurrent {
-                command_buffer
-                    .compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
-            } else {
-                command_buffer.new_compute_command_encoder()
-            };
-            executor.encode_sample_rows_with_states(
-                encoder,
-                &logits_buffer,
-                vocab,
-                &index_buffer,
-                4,
-                (temperature, top_p, top_k),
-                &states,
-            )?;
-            encoder.end_encoding();
-            commit_and_wait(command_buffer)?;
-            let out = read_u32_buffer(&index_buffer, rows + 2)?;
-            write_u32_buffer(&index_buffer, &vec![SENTINEL; rows + 2])?;
-            assert_eq!(out[0], SENTINEL);
-            assert_eq!(out[rows + 1], SENTINEL);
-            for (row, &state) in states.iter().enumerate() {
-                let line = &logits[row * vocab..(row + 1) * vocab];
-                let single_logits = executor.upload_f32_buffer(line, "rows_test_single")?;
-                let single_index = executor.new_u32_buffer(1, "rows_test_single_index")?;
-                let command_buffer = executor.queue.new_command_buffer();
-                let encoder = command_buffer.new_compute_command_encoder();
-                executor.encode_sample_topk_topp_with_offsets(
-                    encoder,
-                    &single_logits,
-                    0,
-                    &single_index,
-                    0,
-                    vocab,
-                    top_k,
-                    temperature,
-                    top_p,
-                    state,
-                )?;
-                encoder.end_encoding();
-                commit_and_wait(command_buffer)?;
-                let isolated = read_u32_buffer(&single_index, 1)?[0];
-                let cpu = if top_k == 0 {
-                    cpu_gumbel_argmax_for_test(line, temperature, state)
-                } else {
-                    let mut sampler = crate::DeterministicSampler::new(state);
-                    crate::sample_token_top_k_top_p(line, temperature, top_p, top_k, &mut sampler)?
-                };
-                let params = format!(
-                    "T={temperature} top_p={top_p} top_k={top_k} seed={seed} concurrent={concurrent}"
-                );
-                assert_eq!(out[row + 1], isolated, "ligne {row} {params}");
-                assert_eq!(out[row + 1] as usize, cpu, "ligne {row} {params}");
-            }
+    for softcap in [None, Some(0.0_f32), Some(-1.0), Some(0.75), Some(30.0)] {
+        for (temperature, top_p, top_k) in [
+            (0.7_f32, 1.0_f32, 0_usize),
+            (0.7, 0.9, 20),
+            (1.3, 0.5, 2),
+            (0.7, 0.9, 1),
+            (0.7, 1.0, 32),
+        ] {
+            for seed in [1_u64, 0xdead_beef] {
+                let states: Vec<u64> = depths
+                    .iter()
+                    .map(|&depth| crate::sampling::rng_state_for_draw(seed, 5 + depth))
+                    .collect();
+                let logits_buffer = executor.upload_f32_buffer(&logits, "rows_test_logits")?;
+                let index_buffer =
+                    executor.upload_u32_buffer(&vec![SENTINEL; rows + 2], "rows_test_index")?;
+                for concurrent in [false, true] {
+                    let command_buffer = executor.queue.new_command_buffer();
+                    let _barrier_guard = concurrent.then(install_dispatch_barrier_scope);
+                    let encoder = if concurrent {
+                        command_buffer.compute_command_encoder_with_dispatch_type(
+                            metal::MTLDispatchType::Concurrent,
+                        )
+                    } else {
+                        command_buffer.new_compute_command_encoder()
+                    };
+                    executor.encode_sample_rows_with_states(
+                        encoder,
+                        &logits_buffer,
+                        vocab,
+                        &index_buffer,
+                        4,
+                        (temperature, top_p, top_k),
+                        &states,
+                        softcap,
+                    )?;
+                    encoder.end_encoding();
+                    commit_and_wait(command_buffer)?;
+                    let out = read_u32_buffer(&index_buffer, rows + 2)?;
+                    write_u32_buffer(&index_buffer, &vec![SENTINEL; rows + 2])?;
+                    assert_eq!(out[0], SENTINEL);
+                    assert_eq!(out[rows + 1], SENTINEL);
+                    for (row, &state) in states.iter().enumerate() {
+                        let line = &logits[row * vocab..(row + 1) * vocab];
+                        let single_logits = executor.upload_f32_buffer(line, "rows_test_single")?;
+                        let single_index = executor.new_u32_buffer(1, "rows_test_single_index")?;
+                        let command_buffer = executor.queue.new_command_buffer();
+                        let encoder = command_buffer.new_compute_command_encoder();
+                        executor.encode_sample_topk_topp_with_offsets(
+                            encoder,
+                            &single_logits,
+                            0,
+                            &single_index,
+                            0,
+                            vocab,
+                            top_k,
+                            temperature,
+                            top_p,
+                            state,
+                            softcap,
+                        )?;
+                        encoder.end_encoding();
+                        commit_and_wait(command_buffer)?;
+                        let isolated = read_u32_buffer(&single_index, 1)?[0];
+                        let capped: Vec<f32> = line
+                            .iter()
+                            .map(|&x| match softcap {
+                                Some(cap) if cap > 0.0 => cap * (x / cap).tanh(),
+                                _ => x,
+                            })
+                            .collect();
+                        let line = &capped;
+                        let cpu = if top_k == 0 {
+                            cpu_gumbel_argmax_for_test(line, temperature, state)
+                        } else {
+                            let mut sampler = crate::DeterministicSampler::new(state);
+                            crate::sample_token_top_k_top_p(
+                                line,
+                                temperature,
+                                top_p,
+                                top_k,
+                                &mut sampler,
+                            )?
+                        };
+                        let params = format!(
+                            "T={temperature} top_p={top_p} top_k={top_k} seed={seed} \
+                             concurrent={concurrent} softcap={softcap:?}"
+                        );
+                        assert_eq!(out[row + 1], isolated, "ligne {row} {params}");
+                        assert_eq!(out[row + 1] as usize, cpu, "ligne {row} {params}");
+                    }
+                }
             }
         }
     }
@@ -4702,5 +4995,56 @@ fn legacy_public_preset_api_applies_to_executor(
     );
     assert_eq!(initial.kernel_profile, explicit.kernel_profile);
     assert_eq!(before, std::env::vars_os().collect::<Vec<_>>());
+    Ok(())
+}
+
+#[test]
+fn readback_logits_reuse_pool_without_aliasing_or_changing_bits() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let arena = crate::decode_resident::DecodeResidentState::new(executor.device.clone())?;
+    let vocab = 257;
+    let linear = Linear::new(
+        Tensor::from_vec(
+            vec![vocab, 2],
+            (0..vocab * 2).map(|i| (i as f32 - 100.0) / 32.0).collect(),
+        )?,
+        None,
+    )?;
+    let weights = executor.resolve_linear_weight_buffers(linear.weight(), "readback_test")?;
+    let project = |input: &BufferRef, output: &BufferRef| -> Result<Vec<f32>> {
+        let command = executor.queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        let len =
+            executor.encode_lm_head_logits_readback_buffers(encoder, input, &weights, 2, output)?;
+        encoder.end_encoding();
+        commit_and_wait(command)?;
+        read_f32_buffer(output, len)
+    };
+    let mut pointer = None;
+    for values in [[1.0, 2.0], [-3.0, 0.5], [0.0, -1.0]] {
+        let input = executor.buffer_from_f32(&values, "readback_input")?;
+        let lease = arena
+            .scratch()
+            .lease(vocab, crate::decode_resident::GpuElement::F32)?;
+        let buffer = lease.tensor().buffer();
+        if let Some(pointer) = pointer {
+            assert_eq!(buffer.contents(), pointer);
+        }
+        pointer = Some(buffer.contents());
+        let overlapping = arena
+            .scratch()
+            .lease(vocab, crate::decode_resident::GpuElement::F32)?;
+        assert_ne!(buffer.contents(), overlapping.tensor().buffer().contents());
+        let fresh = executor.uncached_f32_buffer(vocab, "readback_reference")?;
+        let expected = project(&input, &fresh)?;
+        let actual = project(&input, buffer)?;
+        assert_eq!(
+            actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(crate::argmax(&actual)?, crate::argmax(&expected)?);
+    }
     Ok(())
 }

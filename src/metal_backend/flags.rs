@@ -1,5 +1,6 @@
 //! Flags runtime du backend Metal.
 
+pub(super) use crate::runtime_flags::qmv_u5_enabled;
 use crate::runtime_flags::{env_flag, gather_fast_mode, qmv_fast_mode};
 
 use super::*;
@@ -66,17 +67,89 @@ pub(crate) fn prefill_fused_mlp_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_FUSED_MLP", true))
 }
 
-/// Active la linear-attn gated-delta en forme CHUNKÉE (port chunked-DeltaNet) au lieu
-/// du séquentiel token-par-token. Opt-in `SARAGOSSA_RUST_LINEAR_CHUNKED`. Exige head_dim=128.
+/// Déroulement complet des pas K des GEMM tuilés NAX (`NAX_KK_UNROLL` de
+/// `na_gemm.metal`), égal au bit. Kill-switch `SARAGOSSA_RUST_NAX_KK_UNROLL=0`.
+pub(crate) fn nax_kk_unroll_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_NAX_KK_UNROLL", true))
+}
+
+/// Préambule des sources NAX : vide par défaut, macro de déroulement vide
+/// sous le kill-switch.
+pub(crate) fn nax_source_prelude() -> &'static str {
+    if nax_kk_unroll_enabled() {
+        ""
+    } else {
+        "#define NAX_KK_UNROLL\n"
+    }
+}
+
+/// QMV micro à quatre lignes par simdgroup (`micro_qmv4_*`), égal au bit au
+/// QMV à une ligne. Opt-in `SARAGOSSA_RUST_MICRO_QMV_ROWS4=1` : la sonde M=1
+/// gagne 7 à 13 % de bande passante, mais le decode mxfp4 du 27B perd 13 %
+/// (31,2 → 27,2 tok/s, 16 nov. 2026), quatre fois moins de simdgroups en vol.
+pub(crate) fn micro_qmv_rows4_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = MICRO_QMV_ROWS4_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MICRO_QMV_ROWS4", false))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MICRO_QMV_ROWS4_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force le QMV micro à quatre lignes sur ce thread le temps de `run`.
+#[cfg(test)]
+pub(crate) fn with_micro_qmv_rows4_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MICRO_QMV_ROWS4_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(MICRO_QMV_ROWS4_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
+    run()
+}
+
+/// Même fusion pour les poids à micro-échelles (`micro_gemm_gate_up_swiglu_*`),
+/// égale au bit aux passes séparées. Kill-switch
+/// `SARAGOSSA_RUST_PREFILL_FUSED_MLP_MICRO=0`.
+pub(crate) fn prefill_fused_mlp_micro_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_FUSED_MLP_MICRO", true))
+}
+
+/// Flag historique retiré. Une demande `SARAGOSSA_RUST_LINEAR_CHUNKED=1`
+/// est refusée dès la construction du backend : garder le NAX ou le scan par défaut.
 pub(crate) fn linear_chunked_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LINEAR_CHUNKED", false))
+}
+
+/// Refuse le chemin retiré avant tout accès Metal, indépendamment du mode
+/// résident ou per-op et de leurs replis sur erreur d'exécution.
+pub(super) fn validate_linear_chunked_flag() -> Result<()> {
+    if linear_chunked_enabled() {
+        return Err(InferError::Config(
+            "SARAGOSSA_RUST_LINEAR_CHUNKED: chemin retiré (course, bornes et ratios de decay); supprimer le flag pour conserver NAX ou le scan séquentiel".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Active le MoE routé prefill via le kernel `gather_qmm` porté (cooperative_tensor
 /// quantifié groupé, ~7,6× le qmv). Tri+pad par expert (16-aligné, CPU, readback des
 /// indices), UN dispatch par projection lisant le poids empilé packed. Opt-in.
 pub(crate) fn moe_coop_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = MOE_COOP_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_COOP", true))
 }
@@ -147,12 +220,12 @@ pub(crate) fn flint_moe_coop_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_MOE_COOP", true))
 }
 
-/// Kernels groupés TUILÉS pour le MoE routé coop de flint
+/// Kernels groupés TUILÉS pour le MoE coop routé et partagé
 /// (`gemm_nax_coop_qb_grouped_*_u4_bm*`) : tuiles d'un expert de
 /// `MOE_COOP_TILED_BM` lignes × 64 colonnes au lieu de 16 × 32, poids
 /// déquantifié une fois par tuile en mémoire threadgroup. Même arithmétique
-/// que les kernels 16 × 32 (oracle bit à bit dans les tests). Qwen3-30B
-/// (softmax) garde les kernels 16 × 32 : pas de modèle local pour mesurer.
+/// que les kernels 16 × 32 (oracle bit à bit dans les tests). Le choix du
+/// routeur (softmax ou sigmoïde) ne change pas cette arithmétique.
 ///
 /// NOTE: Mesuré le 31 oct. 2026 sur flint-int4 (prefill seul, morceaux de
 /// 4096) : MoE routé 4,49 → 3,17 s à 32k et 9,89 → 6,99 s à 64k, prefill
@@ -175,6 +248,11 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+pub(super) fn flint_moe_coop_tiled_override() -> Option<bool> {
+    FLINT_MOE_COOP_TILED_TEST_OVERRIDE.with(Cell::get)
+}
+
 /// Force les kernels coop tuilés de flint sur ce thread le temps de `run`.
 #[cfg(test)]
 pub(crate) fn with_flint_moe_coop_tiled_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
@@ -187,6 +265,26 @@ pub(crate) fn with_flint_moe_coop_tiled_override<R>(enabled: bool, run: impl FnO
     }
     let _restore =
         Restore(FLINT_MOE_COOP_TILED_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
+    run()
+}
+
+#[cfg(test)]
+thread_local! {
+    static MOE_COOP_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Force le MoE coop du prefill sur ce thread le temps de `run` (`false` :
+/// qmv par ligne, seul chemin exact face à une référence float32).
+#[cfg(test)]
+pub(crate) fn with_moe_coop_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MOE_COOP_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(MOE_COOP_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
     run()
 }
 
@@ -258,6 +356,11 @@ pub(super) fn count_qmm_na_u4_x3_dispatch() {
 pub(crate) fn qmm_na_u4_x3_dispatches_for_test() -> usize {
     QMM_NA_U4_X3_DISPATCHES.with(std::cell::Cell::get)
 }
+
+/// Vues de poids mmap sans copie créées par le processus (tests).
+#[cfg(test)]
+pub(crate) static MMAP_WEIGHT_VIEWS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub(super) fn qmm_na_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

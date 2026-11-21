@@ -3,6 +3,21 @@
 use super::attention_checks::TailMoeSharedShape;
 use super::*;
 
+// Trace locale au thread qui encode : aucun faux positif d'un oracle parallèle.
+#[cfg(test)]
+thread_local! {
+    static LONG_D512_DISPATCHES: std::cell::RefCell<Vec<(usize, usize)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+impl MetalExecutor {
+    pub(crate) fn take_long_d512_dispatches_for_test() -> Vec<(usize, usize)> {
+        LONG_D512_DISPATCHES.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
+    }
+}
+
 const FULL_ATTN_PREFILL_TG_WIDTH: u64 = 256;
 const FULL_ATTN_PREFILL_BATCH_LONG_TG_WIDTH: u64 = 32;
 const STEEL_ATTN_BQ: usize = 32;
@@ -10,12 +25,11 @@ const STEEL_ATTN_BK: usize = 32;
 const STEEL_ATTN_BD: usize = 64;
 const STEEL_CAUSAL_ATTN_D256_BQ: usize = 32;
 const STEEL_CAUSAL_ATTN_D256_BK: usize = 64;
-const STEEL_CAUSAL_ATTN_D256_BD: usize = 256;
 const STEEL_SINK_ATTN_D128_BQ: usize = 32;
 const STEEL_SINK_ATTN_D128_BK: usize = 16;
 const STEEL_SINK_ATTN_D128_BD: usize = 128;
 
-/// Instanciation du NAX dsplit d256 : nom Metal, tuiles Q/K, simdgroups
+/// Instanciation du NAX causal : nom Metal, tuiles Q/K, simdgroups
 /// (WM lignes × WN = 2 tranches de D) et ordre de la grille.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct NaxCausalAttnShape {
@@ -54,14 +68,16 @@ pub(super) const NAX_CAUSAL_ATTN_BQ128: NaxCausalAttnShape = NaxCausalAttnShape 
     head_major: false,
 };
 
-/// NAX d128 avec sinks des couches pleines flint (BQ=64, BK=32, WM=4).
-pub(super) const NAX_SINK_ATTN_D128: NaxCausalAttnShape = NaxCausalAttnShape {
+/// NAX d128 (BQ=64, BK=32, WM=4), spécialisé avec ou sans sinks.
+pub(super) const NAX_CAUSAL_ATTN_D128: NaxCausalAttnShape = NaxCausalAttnShape {
     host_name: "steel_attention_nax_bf16_f32out_bq64_bk32_bd128_wm4_wn1",
     block_q: 64,
     block_k: 32,
     simdgroups: 4,
     head_major: false,
 };
+
+pub(super) const NAX_SINK_ATTN_D128: NaxCausalAttnShape = NAX_CAUSAL_ATTN_D128;
 
 impl NaxCausalAttnShape {
     /// Instanciation retenue par les flags `SARAGOSSA_RUST_PREFILL_ATTN_NAX_*`.
@@ -78,7 +94,7 @@ impl NaxCausalAttnShape {
     }
 }
 
-/// Pipeline NAX d256 et la géométrie avec laquelle il doit être dispatché.
+/// Pipeline NAX causal et la géométrie avec laquelle il doit être dispatché.
 #[derive(Debug)]
 pub(super) struct NaxCausalAttention {
     pub(super) pipeline: ComputePipelineState,
@@ -130,6 +146,17 @@ struct TailMoeSharedScratch {
     output: Buffer,
 }
 
+impl PrefillAttentionSpec {
+    /// Retire seulement un masque qui ne cache aucune clé. `kv_rows` vaut
+    /// position max + 1, préfixe inclus, jamais la seule taille du morceau.
+    pub(super) fn with_effective_window(mut self, kv_rows: usize) -> Self {
+        self.window = self
+            .window
+            .filter(|&window| window == 0 || window < kv_rows);
+        self
+    }
+}
+
 pub(super) fn prefill_attn_batch_long_supported(spec: PrefillAttentionSpec) -> bool {
     spec.seq > 2048
         && matches!(
@@ -152,17 +179,17 @@ fn prefill_attn_batch_gqa8_d256_supported(spec: PrefillAttentionSpec) -> bool {
     matches!((spec.q_heads, spec.kv_heads, spec.head_dim), (16, 2, 256))
 }
 
-pub(super) fn prefill_attn_steel_d256_supported(spec: PrefillAttentionSpec) -> bool {
-    spec.seq > 256 && prefill_attn_steel_d256_shape_supported(spec)
+pub(super) fn prefill_attn_steel_supported(spec: PrefillAttentionSpec) -> bool {
+    spec.seq > 256 && prefill_attn_steel_shape_supported(spec)
 }
 
-/// Têtes et dimension couvertes par le Steel/NAX d256, quel que soit `seq`.
-fn prefill_attn_steel_d256_shape_supported(spec: PrefillAttentionSpec) -> bool {
-    // NOTE: (24, 24) seulement sous test : le microbench y compare K/V partagé
-    // par six têtes Q et six copies distinctes, à calcul égal.
-    (matches!((spec.q_heads, spec.kv_heads), (16, 2) | (24, 4))
-        || (cfg!(test) && (spec.q_heads, spec.kv_heads) == (24, 24)))
-        && spec.head_dim == STEEL_CAUSAL_ATTN_D256_BD
+/// Formes causales sans fenêtre couvertes par le Steel/NAX, quel que soit `seq`.
+fn prefill_attn_steel_shape_supported(spec: PrefillAttentionSpec) -> bool {
+    spec.window.is_none()
+        && matches!(spec.head_dim, 128 | 256)
+        && spec.q_heads > 0
+        && spec.kv_heads > 0
+        && spec.q_heads % spec.kv_heads == 0
 }
 
 #[expect(
@@ -1198,6 +1225,75 @@ impl MetalExecutor {
         Ok(())
     }
 
+    pub(crate) fn encode_rms_norm_mrope_heads(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        input_buffer: &BufferRef,
+        weight_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        spec: PrefillAttentionSpec,
+        heads: usize,
+        position_offset: usize,
+        positions: Option<&BufferRef>,
+    ) -> Result<()> {
+        let Some(positions) = positions else {
+            return self.encode_rms_norm_rope_heads(
+                encoder,
+                input_buffer,
+                weight_buffer,
+                output_buffer,
+                spec,
+                heads,
+                position_offset,
+            );
+        };
+        if spec.head_dim != 256
+            || spec.rope_dims != 64
+            || spec.rope_frequency_dim != 64
+            || spec.rope_theta != 10_000_000.0
+        {
+            return Err(InferError::Config(
+                "prefill M-RoPE hors contrat Qwen".into(),
+            ));
+        }
+        encoder.set_buffer(6, Some(positions), (position_offset * 3 * 4) as u64);
+        let dims = [
+            checked_u32(spec.seq, "rope seq")?,
+            checked_u32(heads, "rope heads")?,
+            checked_u32(spec.head_dim, "rope head_dim")?,
+            checked_u32(spec.rope_dims, "rope dims")?,
+        ];
+        let frequencies = self.rope_frequencies(spec.rope_theta, spec.rope_frequency_dim)?;
+        encoder.set_compute_pipeline_state(&self.rms_norm_mrope_heads_f32);
+        encoder.set_buffer(5, Some(&frequencies), 0);
+        encoder.set_buffer(0, Some(input_buffer), 0);
+        encoder.set_buffer(1, Some(weight_buffer), 0);
+        encoder.set_buffer(2, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 3, &dims, "rms_rope_dims")?;
+        set_f32_bytes(
+            encoder,
+            4,
+            &[
+                spec.eps,
+                spec.rope_theta,
+                spec.rope_frequency_dim as f32,
+                position_offset as f32,
+            ],
+            "rms_rope_params",
+        )?;
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(heads, "rope heads")?,
+                checked_nsuint(spec.seq, "rope seq")?,
+                1,
+            ),
+            MTLSize::new(FULL_ATTN_PREFILL_TG_WIDTH, 1, 1),
+        );
+        post_dispatch_barrier(encoder);
+        Ok(())
+    }
+
     pub(super) fn encode_causal_attention_prefill(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1207,6 +1303,22 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
     ) -> Result<()> {
+        if crate::runtime_flags::decision_noncausal() {
+            if spec.seq > 2048 || spec.window.is_some() {
+                return Err(InferError::Config(
+                    "prefill décision hors contrat non causal".into(),
+                ));
+            }
+            return self.encode_noncausal_attention_prefill(
+                encoder,
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                spec,
+            );
+        }
+        let spec = spec.with_effective_window(spec.seq);
         if spec.window.is_some() {
             return Err(InferError::Config(
                 "prefill résident fenêtré réservé à la phase 4".to_string(),
@@ -1228,14 +1340,15 @@ impl MetalExecutor {
             spec.seq,
             spec.seq,
             None,
+            true,
         )? {
             return Ok(());
         }
         // Le kernel court `causal_attention_prefill_f32` reste figé pour seq <=
         // 256. La variante mid garde les scores en threadgroup jusqu'à 2048 pour
         // éviter les trois passes de recalcul du long sur les prompts usuels.
-        // Au-delà, le long reste le fallback non borné ; il exige head_dim <= 256
-        // (une colonne de sortie par thread).
+        // Au-delà, le long reste le fallback non borné ; il accepte head_dim <= 512
+        // (deux colonnes indépendantes par thread).
         let (pipeline, tg_width, grid_heads, grid_rows) = if spec.seq <= 256 {
             (
                 &self.causal_attention_prefill_f32,
@@ -1268,6 +1381,13 @@ impl MetalExecutor {
                 spec.q_heads,
                 spec.seq,
             )
+        } else if spec.head_dim > 256 && spec.head_dim <= 512 {
+            (
+                &self.causal_attention_prefill_long_d512_f32,
+                FULL_ATTN_PREFILL_TG_WIDTH,
+                spec.q_heads,
+                spec.seq,
+            )
         } else if crate::runtime_flags::prefill_attn_batch_long_enabled()
             && prefill_attn_batch_long_supported(spec)
         {
@@ -1291,9 +1411,9 @@ impl MetalExecutor {
                     spec.seq,
                 ),
                 _ => {
-                    if spec.head_dim > 256 {
+                    if spec.head_dim > 512 {
                         return Err(InferError::Dimension(format!(
-                            "prefill causal résident seq={} head_dim={} non supporté (head_dim > 256)",
+                            "prefill causal résident seq={} head_dim={} non supporté (head_dim > 512)",
                             spec.seq, spec.head_dim
                         )));
                     }
@@ -1306,9 +1426,9 @@ impl MetalExecutor {
                 }
             }
         } else {
-            if spec.head_dim > 256 {
+            if spec.head_dim > 512 {
                 return Err(InferError::Dimension(format!(
-                    "prefill causal résident seq={} head_dim={} non supporté (head_dim > 256)",
+                    "prefill causal résident seq={} head_dim={} non supporté (head_dim > 512)",
                     spec.seq, spec.head_dim
                 )));
             }
@@ -1340,6 +1460,19 @@ impl MetalExecutor {
             ),
             MTLSize::new(tg_width, 1, 1),
         );
+        let long_d512 = std::ptr::eq(pipeline, &self.causal_attention_prefill_long_d512_f32);
+        if long_d512 && crate::runtime_flags::trace_prefill_enabled() {
+            eprintln!(
+                "prefill dispatch causal_attention_prefill_long_d512_f32 seq={} head_dim={}",
+                spec.seq, spec.head_dim
+            );
+        }
+        #[cfg(test)]
+        if long_d512 {
+            LONG_D512_DISPATCHES.with(|trace| {
+                trace.borrow_mut().push((spec.seq, spec.head_dim));
+            });
+        }
         post_dispatch_barrier(encoder);
         Ok(())
     }
@@ -1365,6 +1498,17 @@ impl MetalExecutor {
             return Err(InferError::Dimension(
                 "prefill fenêtré avec fenêtre vide".to_string(),
             ));
+        }
+        let spec = spec.with_effective_window(spec.seq);
+        if spec.window.is_none() {
+            return self.encode_causal_attention_prefill(
+                encoder,
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                spec,
+            );
         }
         let dims = [
             checked_u32(spec.seq, "attention fenêtrée seq")?,
@@ -1598,7 +1742,7 @@ impl MetalExecutor {
     ///
     /// # Errors
     ///
-    /// Renvoie une erreur si la forme sort du périmètre Steel/NAX d256.
+    /// Renvoie une erreur si la forme sort du périmètre Steel/NAX d128/d256.
     pub(super) fn encode_causal_attention_prefill_chunk(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1610,7 +1754,9 @@ impl MetalExecutor {
         kv_rows: usize,
         kv_capacity: usize,
         bf16_kv: Option<[&BufferRef; 2]>,
+        allow_nax: bool,
     ) -> Result<()> {
+        let spec = spec.with_effective_window(kv_rows);
         if kv_rows > kv_capacity
             || !self.encode_steel_causal_attention_prefill(
                 encoder,
@@ -1622,10 +1768,11 @@ impl MetalExecutor {
                 kv_rows,
                 kv_capacity,
                 bf16_kv,
+                allow_nax,
             )?
         {
             return Err(InferError::Config(format!(
-                "prefill par morceaux hors périmètre Steel d256 (q={} kv={kv_rows}/{kv_capacity})",
+                "prefill par morceaux hors périmètre Steel/NAX d128/d256 (q={} kv={kv_rows}/{kv_capacity})",
                 spec.seq
             )));
         }
@@ -1637,11 +1784,34 @@ impl MetalExecutor {
         &self,
         spec: PrefillAttentionSpec,
     ) -> bool {
+        let spec = spec.with_effective_window(spec.seq);
         crate::runtime_flags::prefill_attn_steel_d256_enabled()
             && spec.window.is_none()
-            && prefill_attn_steel_d256_shape_supported(spec)
-            && (self.causal_attention_prefill_steel_nax_d256.is_some()
-                || self.causal_attention_prefill_steel_d256_f32.is_some())
+            && prefill_attn_steel_shape_supported(spec)
+            && (self.causal_attention_prefill_nax(spec).is_some()
+                || (spec.head_dim == 256 && self.causal_attention_prefill_steel_d256_f32.is_some()))
+    }
+
+    /// Le lecteur bf16 doit correspondre à la dimension de la couche.
+    pub(super) fn causal_attention_prefill_nax(
+        &self,
+        spec: PrefillAttentionSpec,
+    ) -> Option<&NaxCausalAttention> {
+        if crate::runtime_flags::decision_noncausal() {
+            return (spec.head_dim == 256 && spec.window.is_none())
+                .then_some(self.decision_attention_nax.as_ref())
+                .flatten();
+        }
+        if !crate::runtime_flags::prefill_attn_steel_d256_enabled()
+            || !prefill_attn_steel_shape_supported(spec)
+        {
+            return None;
+        }
+        match spec.head_dim {
+            128 => self.causal_attention_prefill_nax_d128.as_ref(),
+            256 => self.causal_attention_prefill_steel_nax_d256.as_ref(),
+            _ => None,
+        }
     }
 
     fn encode_steel_causal_attention_prefill(
@@ -1655,13 +1825,15 @@ impl MetalExecutor {
         kv_rows: usize,
         kv_capacity: usize,
         bf16_kv: Option<[&BufferRef; 2]>,
+        allow_nax: bool,
     ) -> Result<bool> {
         // NOTE: le seuil seq > 256 est un choix de perf du prefill en un bloc ;
-        // un morceau (kv_rows > seq) passe toujours par le Steel/NAX.
-        let in_scope = if kv_rows > spec.seq {
-            prefill_attn_steel_d256_shape_supported(spec)
+        // Un morceau passe toujours par le Steel/NAX, y compris le premier
+        // (kv_rows == seq) : sa capacité couvre aussi les morceaux suivants.
+        let in_scope = if kv_rows > spec.seq || kv_capacity > spec.seq {
+            prefill_attn_steel_shape_supported(spec)
         } else {
-            prefill_attn_steel_d256_supported(spec)
+            prefill_attn_steel_supported(spec)
         };
         if !crate::runtime_flags::prefill_attn_steel_d256_enabled() || !in_scope {
             return Ok(false);
@@ -1671,8 +1843,8 @@ impl MetalExecutor {
         let nax_q;
         let nax_kv;
         let (pipeline, block_q, block_k, threads_y, q_in, k_in, v_in, head_major) = match self
-            .causal_attention_prefill_steel_nax_d256
-            .as_ref()
+            .causal_attention_prefill_nax(spec)
+            .filter(|_| allow_nax)
         {
             Some(nax) => {
                 let q_len = checked_len(spec.seq, spec.q_heads * spec.head_dim, "nax q")?;
@@ -1707,6 +1879,13 @@ impl MetalExecutor {
                 )
             }
             None => {
+                // Le Steel f32 existant est spécialisé d256 ; d128 reprend le naïf.
+                if crate::runtime_flags::decision_noncausal() {
+                    return Ok(false);
+                }
+                if spec.head_dim != 256 {
+                    return Ok(false);
+                }
                 let Some(pipeline) = self.causal_attention_prefill_steel_d256_f32.as_ref() else {
                     return Ok(false);
                 };
@@ -1722,15 +1901,9 @@ impl MetalExecutor {
                 )
             }
         };
-        let params = steel_attn_params(
-            spec,
-            block_q,
-            block_k,
-            kv_rows,
-            "steel causal d256 attention",
-        )?;
-        let grid_rows = checked_nsuint(spec.seq.div_ceil(block_q), "steel causal d256 NQ")?;
-        let grid_heads = checked_nsuint(spec.q_heads, "steel causal d256 heads")?;
+        let params = steel_attn_params(spec, block_q, block_k, kv_rows, "steel causal attention")?;
+        let grid_rows = checked_nsuint(spec.seq.div_ceil(block_q), "steel causal NQ")?;
+        let grid_heads = checked_nsuint(spec.q_heads, "steel causal heads")?;
         let grid = if head_major {
             MTLSize::new(grid_heads, grid_rows, 1)
         } else {
@@ -1761,6 +1934,22 @@ impl MetalExecutor {
         output_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
     ) -> Result<()> {
+        if crate::runtime_flags::decision_noncausal()
+            && self.encode_steel_causal_attention_prefill(
+                encoder,
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                spec,
+                spec.seq,
+                spec.seq,
+                None,
+                true,
+            )?
+        {
+            return Ok(());
+        }
         if self.encode_steel_noncausal_attention_prefill(
             encoder,
             q_buffer,
@@ -1768,8 +1957,16 @@ impl MetalExecutor {
             v_buffer,
             output_buffer,
             spec,
+            spec.seq,
         )? {
             return Ok(());
+        }
+        // Limites du repli f32 uniquement : le Steel d64 accepte aussi les
+        // séquences longues des autres utilisateurs de l'attention non causale.
+        if spec.seq == 0 || spec.seq > 2048 || spec.head_dim == 0 || spec.head_dim > 256 {
+            return Err(InferError::Dimension(
+                "attention non causale f32 : seq 1..=2048 et head_dim 1..=256 requis".into(),
+            ));
         }
         let dims = [
             checked_u32(spec.seq, "attention seq")?,
@@ -1796,6 +1993,52 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// Attention non causale où seules les `key_rows` premières clés comptent :
+    /// les clés de queue sont masquées, toutes les requêtes restent calculées
+    /// (trame de remplissage finale de la diarisation). Exige le Steel d64.
+    #[cfg(any(feature = "stt", feature = "diar"))]
+    #[expect(clippy::too_many_arguments, reason = "buffers d'attention + spec")]
+    pub(super) fn encode_noncausal_attention_prefill_keys(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        q_buffer: &BufferRef,
+        k_buffer: &BufferRef,
+        v_buffer: &BufferRef,
+        output_buffer: &BufferRef,
+        spec: PrefillAttentionSpec,
+        key_rows: usize,
+    ) -> Result<()> {
+        if key_rows == spec.seq {
+            return self.encode_noncausal_attention_prefill(
+                encoder,
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                spec,
+            );
+        }
+        if key_rows == 0
+            || key_rows > spec.seq
+            || !self.encode_steel_noncausal_attention_prefill(
+                encoder,
+                q_buffer,
+                k_buffer,
+                v_buffer,
+                output_buffer,
+                spec,
+                key_rows,
+            )?
+        {
+            return Err(InferError::Config(format!(
+                "attention à clés masquées : Steel d64 et 1..={} clés requis, reçu {key_rows}",
+                spec.seq
+            )));
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "buffers d'attention + spec")]
     fn encode_steel_noncausal_attention_prefill(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1804,6 +2047,7 @@ impl MetalExecutor {
         v_buffer: &BufferRef,
         output_buffer: &BufferRef,
         spec: PrefillAttentionSpec,
+        key_rows: usize,
     ) -> Result<bool> {
         let Some(pipeline) = self.steel_attention_f32_bq32_bk32_bd64.as_ref() else {
             return Ok(false);
@@ -1812,13 +2056,21 @@ impl MetalExecutor {
             return Ok(false);
         }
         let n_q = spec.seq.div_ceil(STEEL_ATTN_BQ);
-        let params = steel_attn_params(
+        let mut params = steel_attn_params(
             spec,
             STEEL_ATTN_BQ,
             STEEL_ATTN_BK,
             spec.seq,
             "steel attention",
         )?;
+        if key_rows < spec.seq {
+            // Sans masque causal, `qL_off` est ignoré : réduire kL borne la
+            // boucle des clés et masque le reste du dernier bloc (`kL_rem`).
+            params.k_l = checked_i32(key_rows, "steel attention kL")?;
+            params.n_k = checked_i32(key_rows.div_ceil(STEEL_ATTN_BK), "steel attention")?;
+            params.n_k_aligned = checked_i32(key_rows / STEEL_ATTN_BK, "steel attention")?;
+            params.k_l_rem = checked_i32(key_rows % STEEL_ATTN_BK, "steel attention")?;
+        }
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(q_buffer), 0);
         encoder.set_buffer(1, Some(k_buffer), 0);

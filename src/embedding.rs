@@ -8,6 +8,8 @@ use rayon::prelude::*;
 pub enum EmbeddingWeight {
     /// Stocke une table dense f32.
     Dense(Tensor),
+    /// Stocke une table MLX à micro-échelles.
+    MicroScaled(crate::MicroQuantizedTensor),
     /// Stocke une table bf16 native en mémoire unifiée.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     DenseBf16(crate::DenseBf16Tensor),
@@ -21,6 +23,7 @@ impl EmbeddingWeight {
     pub fn shape(&self) -> &[usize] {
         match self {
             Self::Dense(tensor) => tensor.shape(),
+            Self::MicroScaled(tensor) => tensor.shape(),
             #[cfg(all(target_os = "macos", feature = "metal"))]
             Self::DenseBf16(tensor) => tensor.shape(),
             Self::AffineQuantized(tensor) => tensor.shape(),
@@ -30,7 +33,7 @@ impl EmbeddingWeight {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn cpu_data_available(&self) -> bool {
         match self {
-            Self::Dense(_) | Self::DenseBf16(_) => true,
+            Self::Dense(_) | Self::DenseBf16(_) | Self::MicroScaled(_) => true,
             Self::AffineQuantized(weight) => weight.cpu_data_available(),
         }
     }
@@ -38,7 +41,7 @@ impl EmbeddingWeight {
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(crate) fn metal_release_byte_exact(&self) -> bool {
         match self {
-            Self::Dense(_) | Self::DenseBf16(_) => true,
+            Self::Dense(_) | Self::DenseBf16(_) | Self::MicroScaled(_) => true,
             Self::AffineQuantized(weight) => weight.metal_embedding_byte_exact(),
         }
     }
@@ -57,8 +60,10 @@ impl EmbeddingWeight {
         &mut self,
         metal: &crate::MetalExecutor,
     ) -> Result<()> {
-        if let Self::AffineQuantized(weight) = self {
-            weight.move_packed_to_metal_shared(metal)?;
+        match self {
+            Self::AffineQuantized(weight) => weight.move_packed_to_metal_shared(metal)?,
+            Self::MicroScaled(weight) => weight.move_to_metal_shared(metal)?,
+            _ => {}
         }
         Ok(())
     }
@@ -94,6 +99,16 @@ pub fn embed_tokens(table: &Tensor, token_ids: &[usize]) -> Result<Tensor> {
 pub fn embed_weight_tokens(table: &EmbeddingWeight, token_ids: &[usize]) -> Result<Tensor> {
     match table {
         EmbeddingWeight::Dense(table) => embed_tokens(table, token_ids),
+        EmbeddingWeight::MicroScaled(table) => {
+            if token_ids.is_empty() {
+                return Err(InferError::Dimension("séquence de tokens vide".into()));
+            }
+            let mut out = Vec::new();
+            for &token in token_ids {
+                out.extend(table.row(token)?);
+            }
+            Tensor::from_vec(vec![token_ids.len(), table.shape()[1]], out)
+        }
         #[cfg(all(target_os = "macos", feature = "metal"))]
         EmbeddingWeight::DenseBf16(table) => {
             if token_ids.is_empty() {
