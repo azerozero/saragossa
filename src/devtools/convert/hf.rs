@@ -20,6 +20,7 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +33,7 @@ use super::{
     check_done, check_shard, json_err, read_json, refuse_in_place, sha256_bytes, sync_dir,
     write_atomic, write_json, DestLock, OutputFile, ShardRecord, JOURNAL,
 };
+use crate::assets::is_mtp_key;
 use crate::{InferError, Result};
 
 const FORMAT: &str = "saragossa-convert-hf/1";
@@ -100,14 +102,13 @@ struct Identity {
     keep_bf16: Vec<String>,
 }
 
-/// Empreinte d'un shard source : une reprise sur d'autres poids de mêmes
-/// noms et formes est refusée. Hors manifeste (la date dépend de la copie).
+/// Empreinte complète d'un shard source : une reprise sur d'autres poids de
+/// mêmes noms et formes est refusée, même à date de modification conservée.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct SourceShard {
     file: String,
     size: u64,
-    mtime_ns: String,
-    header_sha256: String,
+    sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -117,31 +118,22 @@ struct Journal {
     shards: BTreeMap<String, ShardRecord>,
 }
 
+/// sha256 de chaque shard source, à chaque lancement : une lecture séquentielle
+/// de plus (le shard est lu par blocs pendant la conversion de toute façon).
 fn source_shards(source: &Source) -> Result<Vec<SourceShard>> {
     source
         .headers
-        .iter()
+        .par_iter()
         .map(|header| {
             let path = &header.path;
             let meta = std::fs::metadata(path).map_err(|e| io_err(path, e))?;
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_nanos());
-            let len = usize::try_from(header.data_start)
-                .map_err(|_| InferError::Config(format!("en-tête trop grand: {path:?}")))?;
-            let mut bytes = vec![0_u8; len];
-            let file = std::fs::File::open(path).map_err(|e| io_err(path, e))?;
-            crate::safetensor::pread_exact(&file, &mut bytes, 0).map_err(|e| io_err(path, e))?;
             Ok(SourceShard {
                 file: path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default(),
                 size: meta.len(),
-                mtime_ns: mtime.to_string(),
-                header_sha256: sha256_bytes(&bytes),
+                sha256: file_sha256(path)?,
             })
         })
         .collect()
@@ -177,7 +169,7 @@ fn width(tensor: &TensorRef, options: &HfConvertOptions) -> Result<Option<usize>
     }
     // Le loader MTP (`decoder/mtp.rs`, `load_mtp_linear`) n'accepte que u4 ou
     // bf16 : la tête reste en u4 quelle que soit `--bits`.
-    if name.starts_with("mtp.") {
+    if is_mtp_key(name) {
         if matches(&options.keep_8bit) {
             return Err(InferError::Config(format!(
                 "tête MTP : u4 ou bf16 seulement (--keep-bf16), pas 8 bits : {name}"
@@ -196,9 +188,9 @@ fn width(tensor: &TensorRef, options: &HfConvertOptions) -> Result<Option<usize>
 /// sinon le premier qui en porte. Le loader ne lit une tête embarquée que dans
 /// un seul shard (`assets::embedded_mtp_weights`).
 fn mtp_shard(refs: &[TensorRef]) -> Option<usize> {
-    let mtp = || refs.iter().filter(|t| t.name.starts_with("mtp."));
+    let mtp = || refs.iter().filter(|t| is_mtp_key(&t.name));
     mtp()
-        .find(|t| t.name == "mtp.fc.weight")
+        .find(|t| t.name.ends_with("mtp.fc.weight"))
         .or_else(|| mtp().min_by_key(|t| t.shard))
         .map(|t| t.shard)
 }
@@ -230,7 +222,7 @@ fn plan(source: &Source, refs: &[TensorRef], options: &HfConvertOptions) -> Resu
     let mtp = mtp_shard(refs);
     for tensor in refs {
         let shard = match mtp {
-            Some(shard) if tensor.name.starts_with("mtp.") => shard,
+            Some(shard) if is_mtp_key(&tensor.name) => shard,
             _ => tensor.shard,
         };
         let plan = &mut plans[shard];
@@ -363,7 +355,7 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
         }
         if journal.sources != sources {
             return Err(InferError::Config(
-                "reprise refusée: shards source modifiés (taille, date ou en-tête) depuis le journal"
+                "reprise refusée: shards source modifiés (taille ou sha256) depuis le journal"
                     .to_string(),
             ));
         }
@@ -371,7 +363,7 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
     } else {
         Journal {
             identity: identity.clone(),
-            sources,
+            sources: sources.clone(),
             shards: BTreeMap::new(),
         }
     };
@@ -473,6 +465,7 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
         &serde_json::json!({
             "format": FORMAT,
             "identity": identity,
+            "sources": sources,
             "files": files,
             "tensors": records,
         }),

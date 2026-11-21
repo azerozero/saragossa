@@ -106,8 +106,7 @@ impl MtpHead {
         let mut resolve: HashMap<String, String> = HashMap::new();
         // Shard du tronc à tête embarquée : seules ses clés `mtp.*` comptent,
         // ses clés nues (`layers.*` du tronc) ne sont pas une tête MTP.
-        let prefixed =
-            |name: &str| name.starts_with("mtp.") || name.starts_with("language_model.mtp.");
+        let prefixed = crate::assets::is_mtp_key;
         let embedded = sidecar.header.tensors.keys().any(|name| prefixed(name))
             && sidecar.header.tensors.keys().any(|name| !prefixed(name));
         for name in sidecar.header.tensors.keys() {

@@ -254,7 +254,7 @@ fn embedded_mtp_weights(shards: &[PathBuf]) -> Result<MtpWeightsInfo> {
     for shard in shards {
         let keys: Vec<String> = read_safetensors_keys(shard)?
             .iter()
-            .filter(|key| key.starts_with("mtp.") || key.starts_with("language_model.mtp."))
+            .filter(|key| is_mtp_key(key))
             .map(|key| normalize_mtp_sidecar_key(key))
             .collect();
         if keys.is_empty() {
@@ -276,6 +276,12 @@ fn embedded_mtp_weights(shards: &[PathBuf]) -> Result<MtpWeightsInfo> {
             embedded: true,
         }),
     )
+}
+
+/// Clé de tête MTP embarquée : `mtp.*` ou l'alias `language_model.mtp.*`.
+/// Les clés nues (`layers.*`) désignent le tronc et n'en font pas partie.
+pub(crate) fn is_mtp_key(key: &str) -> bool {
+    key.starts_with("mtp.") || key.starts_with("language_model.mtp.")
 }
 
 fn mtp_weights_info(path: PathBuf) -> Result<MtpWeightsInfo> {

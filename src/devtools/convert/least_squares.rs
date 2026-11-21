@@ -244,6 +244,45 @@ mod tests {
         }
     }
 
+    /// Grilles creuses (codes extrêmes inutilisés) : ni le min-max bf16 ni la
+    /// grille MLX ne sont exacts, les moindres carrés retrouvent l'erreur nulle.
+    /// Oracle indépendant : la régression fermée sur les codes construits donne
+    /// l'échelle au signe près (la solution trouvée peut être la grille miroir
+    /// ou décalée, de même restitution).
+    #[test]
+    fn least_squares_reach_optimum_missed_by_both_minmax() {
+        for (codes_used, scale, bias) in [
+            (&[7_u32, 8, 10, 11, 12][..], -0.5_f32, -1.0_f32),
+            (&[5, 7, 9, 10][..], -0.25, -1.0),
+        ] {
+            let q: Vec<f32> = (0..64)
+                .map(|i| codes_used[i % codes_used.len()] as f32)
+                .collect();
+            let data: Vec<f32> = q.iter().map(|&q| q * scale + bias).collect();
+            let n = 64.0_f64;
+            let (mut sq, mut sqq, mut sw, mut sqw) = (0.0, 0.0, 0.0, 0.0);
+            for (&c, &w) in q.iter().zip(&data) {
+                let (c, w) = (f64::from(c), f64::from(w));
+                (sq, sqq, sw, sqw) = (sq + c, sqq + c * c, sw + w, sqw + c * w);
+            }
+            let oracle = ((n * sqw - sq * sw) / (n * sqq - sq * sq)) as f32;
+            assert_eq!(oracle, scale, "oracle");
+
+            let (mut p0, mut s0, mut b0) = (vec![0; 8], vec![0; 1], vec![0; 1]);
+            let mm = quantize_affine_bitstream_bf16(&data, 64, 64, 4, &mut p0, &mut s0, &mut b0)
+                .expect("invariant: min-max valide");
+            assert!(mm.sum_sq_err > 0.0, "min-max déjà exact");
+            let (ms, mb) = mlx_params(&data, 15.0);
+            let mlx = candidate(&data, ms, mb, 15.0, &mut [0; 64]).map_or(f64::INFINITY, |c| c.2);
+            assert!(mlx > 0.0, "grille MLX déjà exacte");
+
+            let (p, s, b, error) = quantize(&data, 4);
+            assert_eq!(error.sum_sq_err, 0.0, "{codes_used:?}");
+            assert_eq!(dequant(&p, &s, &b, 4), data);
+            assert_eq!(bf16_value(s[0]).abs(), oracle.abs());
+        }
+    }
+
     /// Groupe constant : restitué exactement (codes nuls ou biais seul).
     #[test]
     fn constant_group_is_exact() {

@@ -51,12 +51,13 @@ fn values(shape: &[usize], seed: usize) -> Vec<f32> {
 }
 
 fn write_source(dir: &Path) {
-    write_source_with(dir, false, 0);
+    write_source_with(dir, false, 0, "mtp.");
 }
 
 /// `split_mtp` déplace `mtp.norm.weight` dans le premier shard ; `salt`
-/// change les valeurs sans changer noms ni formes.
-fn write_source_with(dir: &Path, split_mtp: bool, salt: usize) {
+/// change les valeurs sans changer noms ni formes ; `mtp` remplace le préfixe
+/// `mtp.` (alias `language_model.mtp.`).
+fn write_source_with(dir: &Path, split_mtp: bool, salt: usize, mtp: &str) {
     let mut weight_map = serde_json::Map::new();
     for (shard, file) in SHARDS.iter().enumerate() {
         let owned: Vec<(String, Vec<usize>, Vec<u8>)> = tensors()
@@ -71,6 +72,11 @@ fn write_source_with(dir: &Path, split_mtp: bool, salt: usize) {
                 s == shard
             })
             .map(|(seed, (_, name, shape))| {
+                let name = match name.strip_prefix("mtp.") {
+                    Some(rest) => format!("{mtp}{rest}"),
+                    None => name.to_string(),
+                };
+                let name = name.as_str();
                 let bytes = values(&shape, seed + salt)
                     .iter()
                     .flat_map(|v| bf16_bits(*v).to_le_bytes())
@@ -276,37 +282,40 @@ fn least_squares_lowers_error_and_honours_keep_lists_and_resume() {
 
 #[test]
 fn mtp_head_is_regrouped_and_stays_u4() {
-    let root = tempfile::tempdir().expect("invariant: dossier temporaire");
-    let src = root.path().join("src");
-    std::fs::create_dir(&src).expect("invariant: src");
-    write_source_with(&src, true, 0);
-    let dst = root.path().join("u8");
-    let mut opts = options(&src, &dst);
-    opts.bits = 8;
-    convert_hf(&opts).expect("invariant: conversion u8");
-    let index: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(dst.join("model.safetensors.index.json")).expect("invariant: index"),
-    )
-    .expect("invariant: index JSON");
-    let map = index["weight_map"]
-        .as_object()
-        .expect("invariant: weight_map");
-    let mtp: Vec<_> = map.iter().filter(|(k, _)| k.starts_with("mtp.")).collect();
-    assert_eq!(mtp.len(), 7, "{mtp:?}");
-    assert!(mtp.iter().all(|(_, file)| *file == SHARDS[1]), "{mtp:?}");
-    // u4 : 256 colonnes → 32 mots ; le tronc suit --bits 8 (128 → 32 mots).
-    assert_eq!(tensor_bytes(&dst, SHARDS[1], "mtp.fc.weight").1, [8, 32]);
-    let up = "model.language_model.layers.0.mlp.up_proj.weight";
-    assert_eq!(tensor_bytes(&dst, SHARDS[0], up).1, [8, 32]);
-    assert_eq!(
-        config(&dst)["quantization"]["mtp.fc"]["bits"].as_u64(),
-        Some(4)
-    );
+    for prefix in ["mtp.", "language_model.mtp."] {
+        let root = tempfile::tempdir().expect("invariant: dossier temporaire");
+        let src = root.path().join("src");
+        std::fs::create_dir(&src).expect("invariant: src");
+        write_source_with(&src, true, 0, prefix);
+        let dst = root.path().join("u8");
+        let mut opts = options(&src, &dst);
+        opts.bits = 8;
+        convert_hf(&opts).expect("invariant: conversion u8");
+        let index: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dst.join("model.safetensors.index.json")).expect("invariant: index"),
+        )
+        .expect("invariant: index JSON");
+        let map = index["weight_map"]
+            .as_object()
+            .expect("invariant: weight_map");
+        let mtp: Vec<_> = map.iter().filter(|(k, _)| k.starts_with(prefix)).collect();
+        assert_eq!(mtp.len(), 7, "{prefix}: {mtp:?}");
+        assert!(mtp.iter().all(|(_, file)| *file == SHARDS[1]), "{mtp:?}");
+        // u4 : 256 colonnes → 32 mots ; le tronc suit --bits 8 (128 → 32 mots).
+        let fc = format!("{prefix}fc");
+        assert_eq!(
+            tensor_bytes(&dst, SHARDS[1], &format!("{fc}.weight")).1,
+            [8, 32]
+        );
+        let up = "model.language_model.layers.0.mlp.up_proj.weight";
+        assert_eq!(tensor_bytes(&dst, SHARDS[0], up).1, [8, 32]);
+        assert_eq!(config(&dst)["quantization"][&fc]["bits"].as_u64(), Some(4));
 
-    let mut opts = options(&src, &root.path().join("refus"));
-    opts.keep_8bit = vec!["mtp.".to_string()];
-    let error = convert_hf(&opts).expect_err("tête MTP 8 bits acceptée");
-    assert!(error.to_string().contains("MTP"), "{error}");
+        let mut opts = options(&src, &root.path().join("refus"));
+        opts.keep_8bit = vec![prefix.to_string()];
+        let error = convert_hf(&opts).expect_err("tête MTP 8 bits acceptée");
+        assert!(error.to_string().contains("MTP"), "{error}");
+    }
 }
 
 #[test]
@@ -318,7 +327,23 @@ fn resume_refuses_rewritten_source_weights() {
     let dst = root.path().join("dst");
     convert_hf(&options(&src, &dst)).expect("invariant: première conversion");
     // Mêmes noms, formes, index et config : seules les valeurs changent.
-    write_source_with(&src, false, 1);
+    // Mêmes octets d'en-tête et mêmes dates : seul le contenu trahit le changement.
+    let dates: Vec<_> = SHARDS
+        .iter()
+        .map(|file| {
+            std::fs::metadata(src.join(file))
+                .and_then(|m| m.modified())
+                .expect("invariant: date source")
+        })
+        .collect();
+    write_source_with(&src, false, 1, "mtp.");
+    for (file, date) in SHARDS.iter().zip(dates) {
+        std::fs::File::options()
+            .write(true)
+            .open(src.join(file))
+            .and_then(|f| f.set_modified(date))
+            .expect("invariant: date restaurée");
+    }
     let error = convert_hf(&options(&src, &dst)).expect_err("reprise sur d'autres poids acceptée");
     assert!(error.to_string().contains("shards source"), "{error}");
 }
