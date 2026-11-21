@@ -31,7 +31,7 @@ def reject_eval_text(text):
         return "".join(c for c in unicodedata.normalize("NFKC", value).casefold() if c.isalnum())
     normalized = normalize(text)
     if any(normalize(prompt) in normalized for prompt in reserved_prompts()):
-        raise ValueError("calibration contaminée par un prompt réservé (chat_kl.py ou sets/)")
+        raise ValueError("calibration contaminée par un PROMPT réservé (chat_kl.py ou sets/)")
 
 
 def calibration_chunks(tokenizer, text, samples=128, length=512, chat=False):

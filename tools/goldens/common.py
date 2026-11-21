@@ -9,7 +9,8 @@ from pathlib import Path
 import struct
 
 ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / "tests/fixtures/goldens"
+# SARAGOSSA_GOLDEN_ROOT : capture d'un candidat hors du dépôt, jamais des fixtures.
+OUT = Path(os.environ.get("SARAGOSSA_GOLDEN_ROOT") or ROOT / "tests/fixtures/goldens")
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"

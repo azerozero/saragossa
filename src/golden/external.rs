@@ -14,8 +14,13 @@ pub struct Header {
     pub payload_sha256: String,
 }
 
+/// `SARAGOSSA_GOLDEN_ROOT` juge un checkpoint candidat contre sa propre
+/// référence capturée hors du dépôt, avec les mêmes oracles et tolérances.
 pub fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/goldens")
+    std::env::var_os("SARAGOSSA_GOLDEN_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/goldens"))
 }
 
 pub fn read(name: &str) -> TestResult<(Header, Vec<u8>)> {

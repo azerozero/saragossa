@@ -239,8 +239,8 @@ def mlx_checks():
                     assert mx.array_equal(result[name + suffix], value).item()
         # Score poids sans corpus : size · ‖ΔW‖²/‖W‖² du fit uniforme, template
         # rempli sans imatrix ; un template imatrix exige --uniform-fit explicite.
-        assignment, report = sensitivity.scan(model, None, "lm_head", 5.0, 6, base_bits=3)
-        assert report["allocation"] == "weights" and report["actual_bpw"] <= 5.0
+        _, weights = sensitivity.scan(model, None, "lm_head", 5.0, 6, base_bits=3)
+        assert weights["allocation"] == "weights" and weights["actual_bpw"] <= 5.0
         for name, module in imatrix.language_modules(model).items():
             w = module.weight.astype(mx.float32)
             for bits in sensitivity.WIDTHS:
@@ -248,9 +248,10 @@ def mlx_checks():
                 back = mx.dequantize(p, s.astype(mx.float32), b.astype(mx.float32), group_size=64, bits=bits)
                 error = ((back - w) ** 2).sum().item() / (w.shape[0] if name == embed else 1)
                 expected = w.size * error / (w * w).sum().item()
-                assert abs(report["scores"][name][bits] - expected) < 1e-4 * max(expected, 1)
+                assert abs(weights["scores"][name][bits] - expected) < 1e-4 * max(expected, 1)
         template, destination = root / "template-weights", root / "destination-weights"
-        with patch.object(imatrix, "load_bf16", return_value=(model, Tokenizer())):
+        # quantize_model modifie son modèle en place : instance jetable, comme plus haut.
+        with patch.object(imatrix, "load_bf16", return_value=(Tiny(), Tokenizer())):
             assert mixed_quant.main(["--input", str(source), "--output", str(template), "--target-bpw", "5.0",
                                      "--base-bits", "3", "--force-high", "lm_head"]) == 0
         assert json.loads((template / "allocation.json").read_text())["allocation"] == "weights"
