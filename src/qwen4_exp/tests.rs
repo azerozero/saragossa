@@ -596,14 +596,11 @@ fn qsa_selection_size_tail_and_excludable_current_block() {
 }
 
 /// N2 : chemins des poids convertis et des goldens d'`oracle_dump.py`.
-fn n2_paths() -> (PathBuf, PathBuf) {
-    let dir = std::env::var_os("SARAGOSSA_QWEN4EXP_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("SARAGOSSA_QWEN4EXP_DIR requis"));
-    let golden = std::env::var_os("SARAGOSSA_QWEN4EXP_GOLDEN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("SARAGOSSA_QWEN4EXP_GOLDEN requis"));
-    (dir, golden)
+fn n2_paths() -> Option<(PathBuf, PathBuf)> {
+    Some((
+        crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_DIR")?,
+        crate::test_support::local_dir("SARAGOSSA_QWEN4EXP_GOLDEN")?,
+    ))
 }
 
 fn sha256_file(path: &Path) -> String {
@@ -793,7 +790,9 @@ fn prefix_error(a: &Tensor, b: &Tensor, rows: usize, skip: &[usize]) -> f64 {
 #[test]
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_layers_0_to_3_match_transformers_on_8k_tokens() {
-    let (dir, golden_dir) = n2_paths();
+    let Some((dir, golden_dir)) = n2_paths() else {
+        return;
+    };
     check_provenance(&dir, &golden_dir, "layers.safetensors")
         .unwrap_or_else(|e| panic!("provenance N2: {e}"));
     let reference =
@@ -901,7 +900,9 @@ fn n2_layers_0_to_3_match_transformers_on_8k_tokens() {
 #[test]
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_full_model_logits_match_transformers() {
-    let (dir, golden_dir) = n2_paths();
+    let Some((dir, golden_dir)) = n2_paths() else {
+        return;
+    };
     check_provenance(&dir, &golden_dir, "full.safetensors")
         .unwrap_or_else(|e| panic!("provenance N2: {e}"));
     let reference =
@@ -967,7 +968,9 @@ fn forced_torch_routing(
 #[test]
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_long_qsa_layers_anchored_on_transformers() {
-    let (dir, golden_dir) = n2_paths();
+    let Some((dir, golden_dir)) = n2_paths() else {
+        return;
+    };
     check_provenance(&dir, &golden_dir, "long.safetensors")
         .unwrap_or_else(|e| panic!("provenance N2 long : {e}"));
     let reference =
@@ -1055,7 +1058,9 @@ fn n2_long_qsa_layers_anchored_on_transformers() {
 #[test]
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_long_cpu_chain_matches_transformers_on_4k_tokens() {
-    let (dir, golden_dir) = n2_paths();
+    let Some((dir, golden_dir)) = n2_paths() else {
+        return;
+    };
     check_provenance(&dir, &golden_dir, "long.safetensors")
         .unwrap_or_else(|e| panic!("provenance N2 long : {e}"));
     let reference =
@@ -1179,7 +1184,9 @@ fn n2_long_cpu_chain_matches_transformers_on_4k_tokens() {
 #[test]
 #[ignore = "poids réels : SARAGOSSA_QWEN4EXP_DIR et SARAGOSSA_QWEN4EXP_GOLDEN"]
 fn n2_mtp_head_matches_transformers_blocks() {
-    let (dir, golden_dir) = n2_paths();
+    let Some((dir, golden_dir)) = n2_paths() else {
+        return;
+    };
     check_provenance(&dir, &golden_dir, "mtp_golden.safetensors")
         .unwrap_or_else(|e| panic!("provenance MTP : {e}"));
     check_provenance(&dir, &golden_dir, "long.safetensors")
