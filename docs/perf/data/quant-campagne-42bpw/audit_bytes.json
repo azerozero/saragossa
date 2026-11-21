@@ -1,0 +1,59 @@
+{
+ "Qwen3.8-27B-imx42": {
+  "model": "~/workspace/ai_model/Qwen3.8-27B-imx42",
+  "language_bytes": 14120393728,
+  "other_bytes": 0,
+  "language_bpw": 4.199998374300918,
+  "total_bpw": 4.199998374300918,
+  "params": 26895998464,
+  "files": [
+   "model-00001-of-00003.safetensors",
+   "model-00002-of-00003.safetensors",
+   "model-00003-of-00003.safetensors"
+  ],
+  "allocation_bpw": 4.199998374300918
+ },
+ "Qwen3.8-27B-mxfp4": {
+  "model": "~/workspace/ai_model/Qwen3.8-27B-mxfp4",
+  "language_bytes": 14292384768,
+  "other_bytes": 0,
+  "language_bpw": 4.251155735937508,
+  "total_bpw": 4.251155735937508,
+  "params": 26895998464,
+  "files": [
+   "model-00001-of-00003.safetensors",
+   "model-00002-of-00003.safetensors",
+   "model-00003-of-00003.safetensors"
+  ],
+  "refused": "au-dessus de 4.2 bpw"
+ },
+ "Qwen3.8-27B-u4ls": {
+  "model": "~/workspace/ai_model/Qwen3.8-27B-u4ls",
+  "language_bytes": 15132802048,
+  "other_bytes": 1160391136,
+  "language_bpw": 4.501131145811178,
+  "total_bpw": 4.846280224415765,
+  "params": 26895998464,
+  "files": [
+   "model-00001-of-00003.safetensors",
+   "model-00002-of-00003.safetensors",
+   "model-00003-of-00003.safetensors",
+   "mtp.safetensors"
+  ],
+  "refused": "au-dessus de 4.2 bpw"
+ },
+ "E1-A1F0": {
+  "model": "~/workspace/ai_model-quant/E1-A1F0",
+  "language_bytes": 14120393728,
+  "other_bytes": 0,
+  "language_bpw": 4.199998374300918,
+  "total_bpw": 4.199998374300918,
+  "params": 26895998464,
+  "files": [
+   "model-00001-of-00003.safetensors",
+   "model-00002-of-00003.safetensors",
+   "model-00003-of-00003.safetensors"
+  ],
+  "allocation_bpw": 4.199998374300918
+ }
+}

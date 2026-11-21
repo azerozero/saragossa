@@ -1,0 +1,45 @@
+{
+ "D": {
+  "prompt_tokens": 512,
+  "kernels": {
+   "affine_qmv_fast_aligned_u3_gs64_f32": 1720,
+   "f32_to_bf16": 1068,
+   "gemm_nax_coop_qb_tiled_u4": 660,
+   "add_rms_norm_rows_f32": 448,
+   "affine_qmv_fast_aligned_u4_gs64_f32": 445,
+   "rms_norm_rows_f32": 432,
+   "swiglu_f32": 426,
+   "accumulate_scaled_f32": 384,
+   "qmm_na": 312,
+   "dequant_u5_to_bf16_t_gs64": 300,
+   "gemm_nax_bf16_bn128": 204,
+   "affine_qmv_fast_aligned_u5_gs64_f32": 115,
+   "gemm_nax": 108,
+   "gemm_nax_coop_qb_tiled_u4_x3": 72,
+   "weighted_sum_add_topk_f32": 64,
+   "affine_gate_up_swiglu_fast_u4_gs64_f32": 22,
+   "affine_qmv_rms_fast_u4_gs64_f32": 20,
+   "dequant_u6_to_bf16_t_gs64": 12,
+   "affine_qmv_fast_aligned_u6_gs64_f32": 8,
+   "qmm_skinny_u4_gs64_f32": 2
+  }
+ },
+ "u4ls": {
+  "prompt_tokens": 512,
+  "kernels": {
+   "f32_to_bf16": 1536,
+   "gemm_nax_coop_qb_tiled_u4": 1440,
+   "affine_qmv_fast_aligned_u4_gs64_f32": 739,
+   "add_rms_norm_rows_f32": 448,
+   "rms_norm_rows_f32": 404,
+   "gemm_nax_coop_qb_tiled_u4_gate_up_swiglu": 384,
+   "accumulate_scaled_f32": 384,
+   "gemm_nax_coop_qb_tiled_u4_x3": 192,
+   "affine_gate_up_swiglu_fast_u4_gs64_f32": 64,
+   "weighted_sum_add_topk_f32": 64,
+   "affine_qmv_rms_fast_u4_gs64_f32": 48,
+   "standalone_qmv_u4": 3,
+   "qmm_skinny_u4_gs64_f32": 2
+  }
+ }
+}

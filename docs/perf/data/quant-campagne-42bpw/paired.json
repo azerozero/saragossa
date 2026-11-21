@@ -1,0 +1,108 @@
+{
+ "D_vs_u4ls": {
+  "metric": "kl_mean",
+  "prompts": 24,
+  "candidate": 0.05589465321152367,
+  "reference": 0.03300951615478819,
+  "mean_diff": 0.022885137056735467,
+  "ci95": [
+   0.017450929387787285,
+   0.02876510983922764
+  ],
+  "categories": {
+   "code": {
+    "candidate": 0.04201659666054613,
+    "reference": 0.031347362418233,
+    "relative": 0.34035508633758077
+   },
+   "multilingue": {
+    "candidate": 0.06401995226969022,
+    "reference": 0.03606019492536877,
+    "relative": 0.7753634555272864
+   },
+   "prose": {
+    "candidate": 0.06164741070433464,
+    "reference": 0.03162099112076279,
+    "relative": 0.9495723732661902
+   }
+  },
+  "regressed": [
+   "code",
+   "multilingue",
+   "prose"
+  ],
+  "gain": false,
+  "worst_prompt": "hist-5"
+ },
+ "mxfp4_vs_u4ls": {
+  "metric": "kl_mean",
+  "prompts": 24,
+  "candidate": 0.07197486483688226,
+  "reference": 0.03300951615478819,
+  "mean_diff": 0.038965348682094066,
+  "ci95": [
+   0.03379218336872691,
+   0.044456915730293894
+  ],
+  "categories": {
+   "code": {
+    "candidate": 0.06764055941504278,
+    "reference": 0.031347362418233,
+    "relative": 1.1577751426927092
+   },
+   "multilingue": {
+    "candidate": 0.07877569929994888,
+    "reference": 0.03606019492536877,
+    "relative": 1.1845611057562322
+   },
+   "prose": {
+    "candidate": 0.06950833579565507,
+    "reference": 0.03162099112076279,
+    "relative": 1.1981706876358762
+   }
+  },
+  "regressed": [
+   "code",
+   "multilingue",
+   "prose"
+  ],
+  "gain": false,
+  "worst_prompt": "sel-ml-pt"
+ },
+ "A1F0_vs_D": {
+  "metric": "kl_mean",
+  "prompts": 24,
+  "candidate": 0.06907611642257684,
+  "reference": 0.05589465321152367,
+  "mean_diff": 0.013181463211053186,
+  "ci95": [
+   0.009117335635696467,
+   0.01732384931709806
+  ],
+  "categories": {
+   "code": {
+    "candidate": 0.06236763904920241,
+    "reference": 0.04201659666054613,
+    "relative": 0.48435723038382233
+   },
+   "multilingue": {
+    "candidate": 0.07094091163512682,
+    "reference": 0.06401995226969022,
+    "relative": 0.10810628749427044
+   },
+   "prose": {
+    "candidate": 0.07391979858340131,
+    "reference": 0.06164741070433464,
+    "relative": 0.19907385790987903
+   }
+  },
+  "regressed": [
+   "code",
+   "multilingue",
+   "prose"
+  ],
+  "gain": false,
+  "worst_prompt": "hist-2"
+ },
+ "D_repeat_max_abs_diff": 0.0
+}

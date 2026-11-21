@@ -1,0 +1,260 @@
+{
+ "selection": {
+  "file_sha256": "acc78140bd44adb0e17fd5831082b1e309468ed4da9b2884211fae6681219dba",
+  "prompts": [
+   {
+    "id": "hist-1",
+    "category": "prose",
+    "source": "chat_kl.py",
+    "sha256": "0ec0257d9288d0fabf6c94b11cf251ed35f24515288e3e7b1df209d4f35c884f"
+   },
+   {
+    "id": "hist-2",
+    "category": "prose",
+    "source": "chat_kl.py",
+    "sha256": "58a3d2be4a5cf6d1f3019044bd987e3879bdea4dee06ee4f38bbc863417f9880"
+   },
+   {
+    "id": "hist-3",
+    "category": "prose",
+    "source": "chat_kl.py",
+    "sha256": "3a2494d7348621e0fb27f7d0e094e765065411789e8052f0b3f26805a98ed690"
+   },
+   {
+    "id": "hist-4",
+    "category": "code",
+    "source": "chat_kl.py",
+    "sha256": "4e90a7a72cf6a1f91c3595f77878ae5405710290f6b250523ba369de917af9c5"
+   },
+   {
+    "id": "hist-5",
+    "category": "prose",
+    "source": "chat_kl.py",
+    "sha256": "53b6e621dc874cccf8a32be5c631f18b0946fbfa13a2ff3a560f53f4c0b9cb33"
+   },
+   {
+    "id": "hist-6",
+    "category": "prose",
+    "source": "chat_kl.py",
+    "sha256": "247a694e8b8d6475238a5f32e36522c849abba7e33ce4d924c619fcd38199de0"
+   },
+   {
+    "id": "hist-7",
+    "category": "prose",
+    "source": "chat_kl.py",
+    "sha256": "db18ccf415f660a448e122dca1dd6abc425cff7b6e902ad0c5f791ad24478452"
+   },
+   {
+    "id": "hist-8",
+    "category": "prose",
+    "source": "chat_kl.py",
+    "sha256": "fb60fd7b820116835a1f78144a2e97ad03e1dddff061956309f2c46491698e90"
+   },
+   {
+    "id": "sel-code-1",
+    "category": "code",
+    "source": "campagne",
+    "sha256": "fe77e8da4e31679e3830108a03bbe8024f45851699cda52f750732b6d22006d1"
+   },
+   {
+    "id": "sel-code-2",
+    "category": "code",
+    "source": "campagne",
+    "sha256": "62dd654807e037ba6153256c48d2328b348b921efc71a621d97d87730fc8d1cb"
+   },
+   {
+    "id": "sel-code-3",
+    "category": "code",
+    "source": "campagne",
+    "sha256": "ed3e53bb57543940d8c1c5f39045c2077dec1af97cb251aefbfb25acf8196368"
+   },
+   {
+    "id": "sel-code-4",
+    "category": "code",
+    "source": "campagne",
+    "sha256": "b447c3636b1c49a756b507fae84a49a53dc4f7994672a83a6b0e31fa1af7f9fb"
+   },
+   {
+    "id": "sel-code-5",
+    "category": "code",
+    "source": "campagne",
+    "sha256": "c9a63ac9a5256b273180ebc8192083b8b5d74336fa6225119f4a4da1a191cdb4"
+   },
+   {
+    "id": "sel-code-6",
+    "category": "code",
+    "source": "campagne",
+    "sha256": "702b48f51f31bb245156fb1d0dfdc06b8820874d32592e5c4f9598295cf2dd61"
+   },
+   {
+    "id": "sel-code-7",
+    "category": "code",
+    "source": "campagne",
+    "sha256": "54c1e9ddfc2f909213eb7518bb3a18a4f529c1e1df4bb3e820191cfc80618e3e"
+   },
+   {
+    "id": "sel-prose-1",
+    "category": "prose",
+    "source": "campagne",
+    "sha256": "29bd9f880e12ee540fe6545fd64270b221ecdffe674d1fcbca158ca9ef9c1fa5"
+   },
+   {
+    "id": "sel-ml-fr",
+    "category": "multilingue",
+    "source": "campagne",
+    "sha256": "c6d8d321f60acfdc213cd5c1ea937d596552c800f2ac81524229340e7199c425"
+   },
+   {
+    "id": "sel-ml-de",
+    "category": "multilingue",
+    "source": "campagne",
+    "sha256": "3c779019be5b01d62979f0876ccaeb0b22f7100af8a2dd4d32871ec1b4b85787"
+   },
+   {
+    "id": "sel-ml-es",
+    "category": "multilingue",
+    "source": "campagne",
+    "sha256": "72fab0961ff18317ab9d6e103bfa67af5f94d3ce355aa44a305791febc879e0b"
+   },
+   {
+    "id": "sel-ml-it",
+    "category": "multilingue",
+    "source": "campagne",
+    "sha256": "f8bff8bb9b0a4f88deeb0556133bcfec7e9436f889ad7969d987e3b16439ace0"
+   },
+   {
+    "id": "sel-ml-ja",
+    "category": "multilingue",
+    "source": "campagne",
+    "sha256": "0a9dbde4841f636738c462533e3680c65644f4ce65bc6d5e759ccd1870507719"
+   },
+   {
+    "id": "sel-ml-zh",
+    "category": "multilingue",
+    "source": "campagne",
+    "sha256": "4eadec4f168adc1ff12faba278110f5ccbcc16b04e28eb964049551efd347be7"
+   },
+   {
+    "id": "sel-ml-pt",
+    "category": "multilingue",
+    "source": "campagne",
+    "sha256": "21be1337228b21ea79bcd729497996bd84e92c7f79e66bdb35c59a09616874cd"
+   },
+   {
+    "id": "sel-ml-ru",
+    "category": "multilingue",
+    "source": "campagne",
+    "sha256": "0f895d4898e48250b526617b639013e04223ea92390aad86d8b76d4f88955695"
+   }
+  ]
+ },
+ "validation": {
+  "file_sha256": "6892204ef97f12703de9b4fc3cb3ff1a1a03882fd55f68ad6312b646153657ae",
+  "prompts": [
+   {
+    "id": "val-nr-1",
+    "category": "prose",
+    "source": "HuggingFaceH4/no_robots test row 1 (Brainstorm)",
+    "sha256": "7682c850c4e5979cef0ad966b8feb119de2bd323bb40819767a161040b59eb7a"
+   },
+   {
+    "id": "val-nr-2",
+    "category": "prose",
+    "source": "HuggingFaceH4/no_robots test row 2 (Generation)",
+    "sha256": "45971bbe382b81644487690d2018bc3aec8c807f1be52a9744223e5492255928"
+   },
+   {
+    "id": "val-nr-3",
+    "category": "prose",
+    "source": "HuggingFaceH4/no_robots test row 3 (Brainstorm)",
+    "sha256": "ccdce774f24ede2e799686276e8b72e8b08a4aebf6ba75ecc450fc73cfedd1a8"
+   },
+   {
+    "id": "val-nr-4",
+    "category": "prose",
+    "source": "HuggingFaceH4/no_robots test row 4 (Generation)",
+    "sha256": "c1f40447167a99977d745672c0c19cb2739b6f5208647af47fac16c94f88826e"
+   },
+   {
+    "id": "val-nr-20",
+    "category": "code",
+    "source": "HuggingFaceH4/no_robots test row 20 (Coding)",
+    "sha256": "645c6de54016df90ea64d9b72a1686de2c682467cc0988ed2b8379e4af3a3b69"
+   },
+   {
+    "id": "val-nr-72",
+    "category": "code",
+    "source": "HuggingFaceH4/no_robots test row 72 (Coding)",
+    "sha256": "2526b13cafe55ba808ebe720cc2ebfce41f9e0a12b7512ffe6dbf7eb41a559c5"
+   },
+   {
+    "id": "val-nr-119",
+    "category": "prose",
+    "source": "HuggingFaceH4/no_robots test row 119 (Open QA)",
+    "sha256": "ef52784af72fdcb475ca17d2f444011bf89a4f73cba3627ef7a4a369a3dd39f4"
+   },
+   {
+    "id": "val-nr-156",
+    "category": "prose",
+    "source": "HuggingFaceH4/no_robots test row 156 (Open QA)",
+    "sha256": "89e44a65181076ab721592e13a69c971d9f067eb21db9a11468ed41430dadd2d"
+   },
+   {
+    "id": "val-nr-216",
+    "category": "code",
+    "source": "HuggingFaceH4/no_robots test row 216 (Coding)",
+    "sha256": "9f2696fa31f6f52d177f0acde38b92505c990b9a2cb440af41bababe680ca217"
+   },
+   {
+    "id": "val-nr-281",
+    "category": "code",
+    "source": "HuggingFaceH4/no_robots test row 281 (Coding)",
+    "sha256": "bc3916b72a42f1e5762f0b6ec42187c26c4be4e1bdfc91ee538d2ca24a88e4d1"
+   },
+   {
+    "id": "val-nr-293",
+    "category": "code",
+    "source": "HuggingFaceH4/no_robots test row 293 (Coding)",
+    "sha256": "163bae12e8c1649f03d00c75f1f14392d3a165a705e130e2c8c2ef8072900298"
+   },
+   {
+    "id": "val-aya-1",
+    "category": "multilingue",
+    "source": "CohereLabs/aya_dataset test row 1 (Standard Arabic)",
+    "sha256": "bdf3ef9d308229241dbb0edc5dec7c204e14729fe58f827c78ef1a9483885eac"
+   },
+   {
+    "id": "val-aya-53",
+    "category": "multilingue",
+    "source": "CohereLabs/aya_dataset test row 53 (Telugu)",
+    "sha256": "4a6474b306e29a54e34f382338f53d21c98277dcde18c7cba10bcfbc7dbc31f8"
+   },
+   {
+    "id": "val-aya-127",
+    "category": "multilingue",
+    "source": "CohereLabs/aya_dataset test row 127 (Portuguese)",
+    "sha256": "9cd91b382746fe2b80656bfcbfbcdc79cd3b369739c96ebe7d438d3eac0e045d"
+   },
+   {
+    "id": "val-aya-228",
+    "category": "multilingue",
+    "source": "CohereLabs/aya_dataset test row 228 (Turkish)",
+    "sha256": "0bc2d65ef6adb7d6bb7746833b394eb6d64b6e352f0151adf9621a8fe382b0e0"
+   },
+   {
+    "id": "val-aya-1518",
+    "category": "multilingue",
+    "source": "CohereLabs/aya_dataset test row 1518 (Simplified Chinese)",
+    "sha256": "c0f52db97c8e62de31f2d11f81a47ed8cb7680ff7248df831794fc3d293e6424"
+   }
+  ]
+ },
+ "reference": {
+  "file_sha256": "115938c7ae64fb0223041ceb292b94b0347e6c3b25c114d5d6ac21da1b551ee1",
+  "positions": 4608,
+  "full_vocab": {
+   "selection_ref.hist-1.npy": "3536c723b64b853b08f4806ad90608741766a225fc66511e13e059bc05c53b7c",
+   "selection_ref.hist-2.npy": "0d6071cb1ba05c91c6cc3241706c4e48890485cc8b4258e23520895783c0302c"
+  }
+ }
+}

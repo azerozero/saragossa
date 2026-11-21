@@ -1,0 +1,30 @@
+{
+  "name": "selection",
+  "provenance": "8 PROMPTS historiques de chat_kl.py + 16 prompts rédigés pour la campagne quant du 21 nov. 2026",
+  "prompts": [
+    {"id": "hist-1", "category": "prose", "source": "chat_kl.py", "prompt": "Explain how a refrigerator works, in two paragraphs."},
+    {"id": "hist-2", "category": "prose", "source": "chat_kl.py", "prompt": "Write a short story about a lighthouse keeper who finds a message in a bottle."},
+    {"id": "hist-3", "category": "prose", "source": "chat_kl.py", "prompt": "What are the main causes of the French Revolution?"},
+    {"id": "hist-4", "category": "code", "source": "chat_kl.py", "prompt": "Write a Python function that checks whether a string is a palindrome, with comments."},
+    {"id": "hist-5", "category": "prose", "source": "chat_kl.py", "prompt": "Summarize the plot of Romeo and Juliet."},
+    {"id": "hist-6", "category": "prose", "source": "chat_kl.py", "prompt": "Give me five tips to improve my sleep, with a sentence of explanation each."},
+    {"id": "hist-7", "category": "prose", "source": "chat_kl.py", "prompt": "Explain the difference between TCP and UDP to a beginner."},
+    {"id": "hist-8", "category": "prose", "source": "chat_kl.py", "prompt": "Describe the water cycle step by step."},
+    {"id": "sel-code-1", "category": "code", "source": "campagne", "prompt": "Write a Rust function that parses a line of the form key=value into a tuple, returning a Result with a custom error type. Include unit tests."},
+    {"id": "sel-code-2", "category": "code", "source": "campagne", "prompt": "Implement an LRU cache in Python with get and put in O(1), using a dictionary and a doubly linked list. Explain each method briefly."},
+    {"id": "sel-code-3", "category": "code", "source": "campagne", "prompt": "Write a SQL query that returns, for each customer, the total amount of their orders in 2025 and their rank by that total, then explain the window function you used."},
+    {"id": "sel-code-4", "category": "code", "source": "campagne", "prompt": "Write a Bash script that finds every file larger than 100 MB under a directory given as argument and prints them sorted by size, with error handling."},
+    {"id": "sel-code-5", "category": "code", "source": "campagne", "prompt": "In TypeScript, write a debounce function with correct generic typing, then show how to use it on a search input."},
+    {"id": "sel-code-6", "category": "code", "source": "campagne", "prompt": "Explain what this C code does and fix its bug: int sum(int *a, int n) { int s; for (int i = 0; i <= n; i++) s += a[i]; return s; }"},
+    {"id": "sel-code-7", "category": "code", "source": "campagne", "prompt": "Write a Go HTTP handler that accepts a JSON body with a name field, validates it, and responds with a greeting in JSON. Handle malformed input."},
+    {"id": "sel-prose-1", "category": "prose", "source": "campagne", "prompt": "Write a persuasive letter to a city council asking for more bicycle lanes, using three concrete arguments."},
+    {"id": "sel-ml-fr", "category": "multilingue", "source": "campagne", "prompt": "Explique en français, en trois paragraphes, pourquoi les saisons existent sur Terre et pourquoi elles sont inversées entre les deux hémisphères."},
+    {"id": "sel-ml-de", "category": "multilingue", "source": "campagne", "prompt": "Erkläre auf Deutsch, wie eine Wärmepumpe funktioniert und wann sie sich für ein Einfamilienhaus lohnt."},
+    {"id": "sel-ml-es", "category": "multilingue", "source": "campagne", "prompt": "Escribe en español un cuento breve sobre una niña que aprende a tocar el violín con su abuelo."},
+    {"id": "sel-ml-it", "category": "multilingue", "source": "campagne", "prompt": "Descrivi in italiano la storia del Rinascimento a Firenze e il ruolo della famiglia Medici."},
+    {"id": "sel-ml-ja", "category": "multilingue", "source": "campagne", "prompt": "日本語で、健康的な朝食の例を五つ挙げ、それぞれの利点を一文で説明してください。"},
+    {"id": "sel-ml-zh", "category": "multilingue", "source": "campagne", "prompt": "请用中文解释什么是光合作用，并说明它对地球生态系统的重要性。"},
+    {"id": "sel-ml-pt", "category": "multilingue", "source": "campagne", "prompt": "Explique em português como funciona a inflação e quais são as ferramentas de um banco central para controlá-la."},
+    {"id": "sel-ml-ru", "category": "multilingue", "source": "campagne", "prompt": "Расскажи по-русски, как подготовиться к марафону за шесть месяцев, по этапам."}
+  ]
+}
