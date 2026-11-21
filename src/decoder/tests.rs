@@ -6174,7 +6174,7 @@ fn greedy_identity_states_real_model() -> Result<()> {
     }
     eprintln!("identité : largeur d'arbre max {tree_widths:?}, vérifications Skip ≥ 5 lignes {skip_coverage:?}");
     // `dflash-défaut` : la largeur observée est celle du budget par défaut
-    // (B = 3 en greedy strict, B = 8 sinon), pas une autre.
+    // (B = 4 sur cible bf16 dense, B = 3 sinon en greedy), pas une autre.
     for mode in &selected {
         if !coverage.contains_key(mode) {
             failures.push(format!(
@@ -6184,8 +6184,16 @@ fn greedy_identity_states_real_model() -> Result<()> {
     }
     if selected.contains("dflash-défaut") {
         let width = tree_widths.get("dflash-défaut").copied().unwrap_or(0);
-        let expected =
-            crate::runtime_flags::dflash_tree_default_budget(true, model.dense_bf16_mlp()) + 1;
+        // Lignes littérales (budget + ancre) : ne pas recalculer par la fonction
+        // de production, sinon un changement de défaut passerait inaperçu.
+        let expected = match (
+            crate::runtime_flags::verify_strict_enabled(),
+            model.dense_bf16_mlp(),
+        ) {
+            (true, _) => 4,
+            (false, true) => 5,
+            (false, false) => 4,
+        };
         if width != expected {
             failures.push(format!(
                 "dflash-défaut : arbre de {width} lignes au plus, {expected} attendu"
