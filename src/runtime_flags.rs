@@ -2423,13 +2423,25 @@ pub(crate) const DFLASH_TREE_BF16_DEFAULT_BUDGET: usize = 4;
 #[cfg(feature = "devtools")]
 pub(crate) fn dflash_tree_default_budget(greedy: bool, dense_bf16: bool) -> usize {
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    if greedy && verify_strict_enabled() {
-        return DFLASH_TREE_STRICT_DEFAULT_BUDGET;
-    }
-    match (greedy, dense_bf16) {
-        (true, true) => DFLASH_TREE_BF16_DEFAULT_BUDGET,
-        (true, false) => DFLASH_TREE_QUANT_DEFAULT_BUDGET,
-        (false, _) => DFLASH_TREE_DEFAULT_BUDGET,
+    let strict = verify_strict_enabled();
+    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    let strict = false;
+    select_dflash_tree_default_budget(greedy, strict, dense_bf16)
+}
+
+/// Règle de [`dflash_tree_default_budget`] sans lecture de l'environnement
+/// (`strict` : `SARAGOSSA_RUST_VERIFY_STRICT=1`).
+#[cfg(feature = "devtools")]
+pub(crate) fn select_dflash_tree_default_budget(
+    greedy: bool,
+    strict: bool,
+    dense_bf16: bool,
+) -> usize {
+    match (greedy, strict, dense_bf16) {
+        (false, _, _) => DFLASH_TREE_DEFAULT_BUDGET,
+        (true, true, _) => DFLASH_TREE_STRICT_DEFAULT_BUDGET,
+        (true, false, true) => DFLASH_TREE_BF16_DEFAULT_BUDGET,
+        (true, false, false) => DFLASH_TREE_QUANT_DEFAULT_BUDGET,
     }
 }
 
@@ -2987,6 +2999,23 @@ fn hash_environment(
 
 #[cfg(test)]
 mod tests {
+    /// Valeurs littérales du budget d'arbre DFlash par défaut : une régression
+    /// de constante (par exemple 8 au lieu de 3) doit échouer ici.
+    #[test]
+    #[cfg(feature = "devtools")]
+    fn dflash_tree_default_budget_literals() {
+        use super::select_dflash_tree_default_budget as select;
+        assert_eq!(select(true, false, false), 3, "greedy, cible quantifiée");
+        assert_eq!(select(true, false, true), 4, "greedy, cible bf16 dense");
+        assert_eq!(select(false, false, false), 8, "échantillonné, quantifiée");
+        assert_eq!(select(false, false, true), 8, "échantillonné, bf16");
+        assert_eq!(select(false, true, true), 8, "échantillonné, strict");
+        assert_eq!(select(true, true, false), 3, "greedy strict, quantifiée");
+        assert_eq!(select(true, true, true), 3, "greedy strict, bf16");
+        assert_eq!(super::parse_dflash_tree_budget(" 8 "), Some(8));
+        assert_eq!(super::parse_dflash_tree_budget("huit"), None);
+    }
+
     #[test]
     fn vision_kill_switch_is_fail_closed_and_fingerprinted() {
         assert_eq!(super::vision_flag_value(None).ok(), Some(false));

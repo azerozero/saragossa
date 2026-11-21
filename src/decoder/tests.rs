@@ -6184,8 +6184,16 @@ fn greedy_identity_states_real_model() -> Result<()> {
     }
     if selected.contains("dflash-défaut") {
         let width = tree_widths.get("dflash-défaut").copied().unwrap_or(0);
-        let expected =
-            crate::runtime_flags::dflash_tree_default_budget(true, model.dense_bf16_mlp()) + 1;
+        // Lignes littérales (budget + ancre) : ne pas recalculer par la fonction
+        // de production, sinon un changement de défaut passerait inaperçu.
+        let expected = match (
+            crate::runtime_flags::verify_strict_enabled(),
+            model.dense_bf16_mlp(),
+        ) {
+            (true, _) => 4,
+            (false, true) => 5,
+            (false, false) => 4,
+        };
         if width != expected {
             failures.push(format!(
                 "dflash-défaut : arbre de {width} lignes au plus, {expected} attendu"
