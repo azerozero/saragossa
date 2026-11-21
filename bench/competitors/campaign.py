@@ -66,6 +66,7 @@ def inventory(ext, models, ai):
     """Poids par modèle et par moteur ; None = format absent localement."""
     gguf = ai / "Qwen3.8-27B-GGUF-bench"
     ggml = ai / "Qwen3.8-27B-GGUF-ggml"
+    vlm = ext / "mlx-vlm/drafters"        # convertis par mlx-vlm 0.8.0 (SOURCES)
     return {
         "27b-4bit": {
             "mlx": models / "Qwen3.8-27B-4bit", "bf16": ai / "Qwen3.8-27B-BF16",
@@ -73,12 +74,15 @@ def inventory(ext, models, ai):
             "gguf": gguf / "Qwen3.8-27B-Q4_K_M.gguf", "gguf_mtp": gguf / "mtp-Qwen3.8-27B-Q4_0-pure.gguf",
             "gguf_dflash": ai / "Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-BF16.gguf",
             "nvfp4": models / "nvfp4/Qwen3.8-27B-NVFP4",
+            "vlm_mtp": vlm / "Qwen3.8-27B-MTP-4bit", "vlm_dflash": vlm / "Qwen3.8-27B-DFlash2-4bit",
         },
         "35b-a3b-4bit": {
             "mlx": ai / "Qwen3.6-35B-A3B-4bit", "bf16": None,
             "dflash": ai / "Qwen3.6-35B-A3B-DFlash2",
             "mtp_sidecar": ai / "Qwen3.6-35B-A3B-4bit/mtp-official/mtp.safetensors",
             "gguf": None, "gguf_mtp": None, "gguf_dflash": None, "nvfp4": None,
+            "vlm_mtp": vlm / "Qwen3.6-35B-A3B-MTP-4bit",
+            "vlm_dflash": vlm / "Qwen3.6-35B-A3B-DFlash2-4bit",
         },
         "27b-bf16": {
             "mlx": ai / "Qwen3.8-27B-BF16", "bf16": ai / "Qwen3.8-27B-BF16",
@@ -86,6 +90,7 @@ def inventory(ext, models, ai):
             "gguf": ggml / "Qwen3.8-27B-BF16.gguf", "gguf_mtp": ggml / "mtp-Qwen3.8-27B-BF16.gguf",
             "gguf_dflash": ai / "Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-BF16.gguf",
             "nvfp4": None,
+            "vlm_mtp": ai / "Qwen3.8-27B-BF16", "vlm_dflash": models / "Qwen3.8-27B-DFlash2",
         },
     }
 
@@ -99,6 +104,10 @@ def engines(ext, sar_bin):
                             "llama-b12359-bin-macos-arm64.tar.gz, sha256 82b00abc…"},
         "mlx": {"bin": ext / "mlx-lm/venv/bin/python",
                 "source": "PyPI mlx-lm 0.32.2 (mlx 0.32.4), venv dédié"},
+        "mlx-vlm": {"bin": ext / "mlx-vlm/venv/bin/python",
+                    "source": "PyPI mlx-vlm 0.8.0 (mlx 0.32.4, transformers 5.23.0), venv dédié "
+                              "(uv) ; MTP natif et DFlash2 du serveur mlx_vlm (mlx-lm 0.32.2 jette "
+                              "mtp.* et n'a pas DFlash ; PR mlx-lm #990 encore ouverte)"},
         "llmd": {"bin": ext / "llmd/llmd",
                  "source": "zml/homebrew-zml llmd 20261114.0, mirror.zml.ai tar.zst, sha256 9fd6d1c6…"},
         "ollama": {"bin": ext / "ollama/v0.40.16/ollama",
@@ -117,6 +126,14 @@ SOURCES = {
     "llama": "night1 matrix.frozen.json : -fa on, -ngl all, KV f16, -b 2048 -ub 512, MTP "
              "--spec-draft-n-max 1, DFlash --spec-draft-n-max 3, cache de prompt coupé",
     "mlx": "night1 matrix.frozen.json : --prefill-step-size 2048, cache de prompt 0, un flux",
+    "mlx-vlm": "README mlx-vlm 0.8.0 « Speculative Decoding » : drafter DFlash2 converti en "
+               "4 bits (`mlx_vlm.convert --quantize --q-bits 4 --q-group-size 64`) pour les cibles "
+               "4 bits, BF16 d'origine pour la cible BF16, vérification adaptative 3 à 5 lignes ; "
+               "MTP : tête native extraite par `mlx_vlm.split_mtp --q-bits 4 --q-group-size 64` "
+               "(27B depuis le BF16 local, 35B depuis Qwen/Qwen3.6-35B-A3B@345d467b, shards "
+               "25-26, sha LFS vérifiés), tête BF16 groupée pour la cible BF16 ; bloc MTP 3 "
+               "(profondeur 1 + 2, défaut du splitter) ; --prefill-step-size 2048, "
+               "--max-num-seqs 1, APC coupé ; greedy",
     "llmd": "night1 matrix.frozen.json : --token-batch-size=2048 --prefill-chunk-size=2048 "
             "--top-k=1 (--topk retiré en 20261114), fractions 0,5/0,5 (4 bits) ; BF16 : 0,85/0,3 pour loger 54 Go ; "
             "drafter natif retenté (en échec avec 20261029)",
@@ -203,6 +220,16 @@ def configs(model, w, eng, port=PORT):
         out["llmd-ar"] = out["llmd-native"] = {
             "unsupported": "pas de checkpoint NVFP4 ou BF16 local lisible par llmd"}
 
+    for mode, kind in (("mtp", "mtp"), ("dflash", "dflash")):
+        draft = w[f"vlm_{mode}"]
+        out[f"mlx-{mode}"] = {
+            "engine": "mlx-vlm", "model_name": str(w["mlx"]), "files": [w["mlx"], draft],
+            "env": {"APC_ENABLED": "0", "APC_DISK_ENABLED": "0", "MLX_VLM_MAX_NUM_SEQS": "1"},
+            "argv": [str(eng["mlx-vlm"]["bin"]), "-I", "-m", "mlx_vlm", "server", "--model",
+                     str(w["mlx"]), "--host", "127.0.0.1", "--port", p, "--draft-model",
+                     str(draft), "--draft-kind", kind, "--prefill-step-size", "2048",
+                     "--max-num-seqs", "1"]}
+
     out["mlx-ar"] = {"engine": "mlx", "env": {}, "model_name": "default_model", "files": [w["mlx"]],
                      "argv": [str(eng["mlx"]["bin"]), "-I", "-m", "mlx_lm.server", "--model",
                               str(w["mlx"]), "--host", "127.0.0.1", "--port", p,
@@ -239,6 +266,9 @@ DIALECT = {
     "llama": {"health": ["/health"], "extra": {"cache_prompt": False,
                                                "chat_template_kwargs": {"enable_thinking": False}}},
     "mlx": {"health": ["/v1/models"], "extra": {"chat_template_kwargs": {"enable_thinking": False}}},
+    # /health répond 200 pendant le préchargement : prêt seulement avec model_ready.
+    "mlx-vlm": {"health": ["/health"], "ready": lambda body: bool((body or {}).get("model_ready")),
+                "extra": {"chat_template_kwargs": {"enable_thinking": False}}},
     "llmd": {"health": ["/v1/models", "/health"],
              "extra": {"chat_template_kwargs": {"enable_thinking": False}}},
     "ollama": {"health": ["/api/version"], "extra": {"reasoning_effort": "none"}},
@@ -370,9 +400,10 @@ def hash_weights(paths, cache_path):
 
 def engine_version(name, spec):
     binary = spec["bin"]
-    if name == "mlx":
+    if name in ("mlx", "mlx-vlm"):
+        pkg = "mlx-lm" if name == "mlx" else "mlx-vlm"
         return sh(binary, "-I", "-c", "import importlib.metadata as m;"
-                  "print('mlx-lm', m.version('mlx-lm'), 'mlx', m.version('mlx'))")
+                  f"print('{pkg}', m.version('{pkg}'), 'mlx', m.version('mlx'))")
     if name == "llmd":
         return re.sub(r".*/llmd/v([^/]+)/.*", r"llmd \1", (binary.read_text()
                                                           if binary.exists() else "absent"),
@@ -478,9 +509,9 @@ class Server:
                 return False
             for path in dialect["health"]:
                 try:
-                    status, _ = client.http_json("127.0.0.1", port, "GET", path,
-                                                 headers=dialect.get("headers"), timeout=5)
-                    if status == 200:
+                    status, body = client.http_json("127.0.0.1", port, "GET", path,
+                                                    headers=dialect.get("headers"), timeout=5)
+                    if status == 200 and dialect.get("ready", lambda _: True)(body):
                         return True
                 except OSError:
                     pass

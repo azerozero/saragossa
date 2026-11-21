@@ -238,7 +238,10 @@ python3 -I -B bench/competitors/campaign.py run "$BENCH_SCRATCH/campagne/nuit"
   `freeze-dryrun.json`. Un format absent est noté « non supporté » et sauté.
 
 Moteurs (dans `$BENCH_SCRATCH/ext-engines/<moteur>/`, versions officielles) :
-llama.cpp b12359 (= 1.0.0), mlx-lm 0.32.2 (venv dédié), llmd 20261114.0,
+llama.cpp b12359 (= 1.0.0), mlx-lm 0.32.2 (venv dédié, `mlx-ar`), mlx-vlm 0.8.0
+(venv dédié, `mlx-mtp` et `mlx-dflash` : drafters préparés dans
+`ext-engines/mlx-vlm/drafters/` par `mlx_vlm.convert` et `mlx_vlm.split_mtp`,
+recette dans `SOURCES`), llmd 20261114.0,
 Ollama 0.40.16 (`ollama serve` lancé et arrêté par la campagne, modèles créés
 depuis les GGUF locaux dans un `OLLAMA_MODELS` isolé), mistral.rs 0.9.5.
 La source de chaque réglage est écrite dans `freeze.json`.
