@@ -71,6 +71,9 @@ pub(crate) struct TensorRef {
 pub(crate) struct Source {
     pub(crate) dir: PathBuf,
     pub(crate) headers: Vec<ShardHeader>,
+    /// Octets de l'index lu, ou index canonique synthétisé pour une source
+    /// mono-fichier (`model.safetensors` seul, Llama 3.2 1B) : identité de reprise.
+    pub(crate) index: Vec<u8>,
     files: Vec<File>,
 }
 
@@ -83,7 +86,28 @@ impl Source {
     /// tenseur est absent, dupliqué ou affecté à un autre shard que l'index.
     pub(crate) fn open(dir: &Path) -> Result<(Self, Vec<TensorRef>)> {
         let index_path = dir.join("model.safetensors.index.json");
-        let raw = std::fs::read(&index_path).map_err(|source| io_err(&index_path, source))?;
+        let single = dir.join("model.safetensors");
+        let raw = match std::fs::read(&index_path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && single.is_file() => {
+                // Tri explicite (serde_json garde l'ordre d'insertion) : index
+                // déterministe pour un même en-tête.
+                let mut names: Vec<String> =
+                    read_shard_header(&single)?.tensors.into_keys().collect();
+                names.sort();
+                let weight_map: serde_json::Map<String, serde_json::Value> = names
+                    .into_iter()
+                    .map(|name| (name, "model.safetensors".into()))
+                    .collect();
+                serde_json::to_vec(&serde_json::json!({ "weight_map": weight_map })).map_err(
+                    |source| InferError::Json {
+                        path: index_path.clone(),
+                        source,
+                    },
+                )?
+            }
+            Err(source) => return Err(io_err(&index_path, source)),
+        };
         let index: serde_json::Value =
             serde_json::from_slice(&raw).map_err(|source| InferError::Json {
                 path: index_path.clone(),
@@ -145,6 +169,7 @@ impl Source {
             Self {
                 dir: dir.to_path_buf(),
                 headers,
+                index: raw,
                 files,
             },
             refs,

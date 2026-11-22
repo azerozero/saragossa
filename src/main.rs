@@ -603,6 +603,7 @@ fn mtp_decode_max_draft() -> usize {
 /// chat), utile pour tester un modèle hors familles connues (Llama/Mistral) —
 /// tokens spéciaux du tokenizer activés (BOS Llama). Gemma 3 : tours
 /// `<start_of_turn>` ; Gemma 4 : tours `<|turn>` avec `<bos>` littéral ;
+/// Llama 3 : en-têtes `<|start_header_id|>` ; Mistral : `[INST]` ;
 /// flint : tours `<|user|>…<|assistant|>`. Sinon : ChatML Qwen, byte-identique.
 fn encode_prompt_ids(assets: &ModelAssets, prompt: &str, raw: bool) -> CliResult<Vec<usize>> {
     if raw {
@@ -620,6 +621,12 @@ fn encode_prompt_ids(assets: &ModelAssets, prompt: &str, raw: bool) -> CliResult
     } else if assets.config.is_gemma() {
         let templated = render_gemma_chat(&[ChatTemplateMessage::new("user", prompt)], true)?;
         assets.encode_prompt_with_special(&templated)?
+    } else if let Some(templated) = saragossa::chat_template::render_llama_or_mistral_chat(
+        &assets.config,
+        &[ChatTemplateMessage::new("user", prompt)],
+    ) {
+        // BOS littéral dans le rendu, comme `{{ bos_token }}` du template HF.
+        assets.encode_prompt(&templated?)?
     } else {
         let templated =
             render_qwen_chatml(&[ChatTemplateMessage::new("user", prompt)], true, false);

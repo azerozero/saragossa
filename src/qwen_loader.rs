@@ -497,6 +497,35 @@ fn validate_supported_config(config: &ModelConfig, catalog: &WeightCatalog) -> R
         )));
     }
     validate_rope_scaling(config)?;
+    // NOTE: Les chemins Metal fusionnés (QK-norm + RoPE) lisent une table de
+    // fréquences sans scaling llama3. Sans QK-norm (Llama, Mistral), la RoPE
+    // reste sur la table CPU scalée ; aucun modèle publié ne combine les deux.
+    if config.rope_llama3_scaling().is_some()
+        && catalog
+            .keys()
+            .iter()
+            .any(|key| key.ends_with("q_norm.weight"))
+    {
+        return Err(InferError::Config(
+            "rope_scaling llama3 avec QK-norm : chemins Metal fusionnés non câblés".to_string(),
+        ));
+    }
+    // Un biais annoncé mais absent serait ignoré sans erreur (le chargeur
+    // détecte les biais par présence) : refus net.
+    for (declared, suffix, field) in [
+        (
+            config.attention_bias,
+            "self_attn.q_proj.bias",
+            "attention_bias",
+        ),
+        (config.mlp_bias, "mlp.down_proj.bias", "mlp_bias"),
+    ] {
+        if declared && !catalog.keys().iter().any(|key| key.ends_with(suffix)) {
+            return Err(InferError::Config(format!(
+                "{field} vrai sans tenseur `{suffix}`"
+            )));
+        }
+    }
     config.router_score()?;
     if config.router_expert_bias == Some(true) {
         return Err(InferError::Config(
@@ -606,28 +635,56 @@ fn validate_no_orphan_tensors(
 
 /// Valide la section `rope_scaling` déclarée par la config.
 ///
-/// Seul le type `linear` est implémenté (Gemma 3 ≥4B : ×8 des positions des
-/// couches globales). Pour Gemma, un autre type produirait du charabia → refus
-/// net, comme le softcapping Gemma 2. Hors Gemma, le statu quo du chargeur
-/// générique est préservé : les types non implémentés (llama3 de Llama 3.2,
-/// yarn…) restent ignorés.
+/// Types implémentés : `default`, `linear` (Gemma 3 ≥4B : ×8 des positions des
+/// couches globales) et `llama3` (table de fréquences de Llama 3.1+). Tout
+/// autre type (`yarn`, `longrope`, `dynamic`…) produirait une RoPE fausse sans
+/// erreur : refus net, comme le softcapping Gemma 2. Gemma n'accepte que
+/// `default` et `linear`.
 fn validate_rope_scaling(config: &ModelConfig) -> Result<()> {
     let Some(scaling) = config.rope_scaling.as_ref() else {
         return Ok(());
     };
-    let scaling_type = scaling.scaling_type();
-    if scaling_type == "linear" && config.rope_position_scale().is_none() {
-        return Err(InferError::Config(format!(
-            "rope_scaling linear sans facteur exploitable: {:?}",
-            scaling.factor
-        )));
+    if let (Some(legacy), Some(modern)) = (&scaling.legacy_type, &scaling.rope_type) {
+        if legacy != modern {
+            return Err(InferError::Config(format!(
+                "rope_scaling: type {legacy} et rope_type {modern} contradictoires"
+            )));
+        }
     }
+    let scaling_type = scaling.scaling_type();
     if config.is_gemma() && !matches!(scaling_type, "linear" | "default") {
         return Err(InferError::Config(format!(
             "rope_scaling type {scaling_type} non supporté pour Gemma"
         )));
     }
-    Ok(())
+    match scaling_type {
+        "default" => Ok(()),
+        "linear" if config.rope_position_scale().is_none() => Err(InferError::Config(format!(
+            "rope_scaling linear sans facteur exploitable: {:?}",
+            scaling.factor
+        ))),
+        "linear" => Ok(()),
+        "llama3" => {
+            let valid = config.rope_llama3_scaling().is_some_and(|llama3| {
+                let positive = |value: f32| value.is_finite() && value > 0.0;
+                positive(llama3.factor)
+                    && positive(llama3.low_freq_factor)
+                    && positive(llama3.original_max_position_embeddings)
+                    && llama3.high_freq_factor.is_finite()
+                    && llama3.high_freq_factor > llama3.low_freq_factor
+            });
+            if valid {
+                Ok(())
+            } else {
+                Err(InferError::Config(format!(
+                    "rope_scaling llama3 invalide (facteur > 0, high > low > 0, contexte > 0): {scaling:?}"
+                )))
+            }
+        }
+        other => Err(InferError::Config(format!(
+            "rope_scaling type {other} non supporté (default, linear, llama3)"
+        ))),
+    }
 }
 
 fn validate_hybrid_config(config: &ModelConfig) -> Result<()> {

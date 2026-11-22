@@ -493,6 +493,7 @@ fn rope_position_scale_rejects_invalid_factors() {
             rope_type: Some("linear".to_string()),
             legacy_type: None,
             factor,
+            ..Default::default()
         });
         assert_eq!(cfg.rope_position_scale(), None, "factor={factor:?}");
     }

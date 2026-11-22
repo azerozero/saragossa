@@ -343,6 +343,10 @@ fn encode_chat_prompt(
         render_gemma4_chat(messages, true, false)
     } else if assets.config.is_gemma() {
         render_gemma_chat(messages, true)?
+    } else if let Some(rendered) =
+        saragossa::chat_template::render_llama_or_mistral_chat(&assets.config, messages)
+    {
+        rendered?
     } else {
         saragossa::chat_template::render_qwen_chatml_profile(
             messages,

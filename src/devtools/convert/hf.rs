@@ -326,7 +326,7 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
     let read = |path: &Path| std::fs::read(path).map_err(|e| io_err(path, e));
     let identity = Identity {
         format: FORMAT.to_string(),
-        source_index_sha256: sha256_bytes(&read(&source.dir.join("model.safetensors.index.json"))?),
+        source_index_sha256: sha256_bytes(&source.index),
         source_config_sha256: sha256_bytes(&read(&config_path)?),
         bits: options.bits,
         fit: if options.minmax {

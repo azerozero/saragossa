@@ -279,6 +279,7 @@ fn rejects_unsupported_rope_scaling_type_for_gemma() {
         rope_type: Some("yarn".to_string()),
         legacy_type: None,
         factor: Some(8.0),
+        ..Default::default()
     });
 
     let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
@@ -298,6 +299,7 @@ fn rejects_linear_rope_scaling_without_usable_factor() {
         rope_type: Some("linear".to_string()),
         legacy_type: None,
         factor: Some(0.0),
+        ..Default::default()
     });
 
     let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
@@ -306,23 +308,90 @@ fn rejects_linear_rope_scaling_without_usable_factor() {
     assert!(err.to_string().contains("facteur"));
 }
 
-#[test]
-fn ignores_non_linear_rope_scaling_outside_gemma() {
-    // Statu quo Llama 3.2 : type `llama3` non implémenté mais le chargement
-    // générique reste accepté (scaling ignoré, comme avant ce chantier).
+fn load_with_rope_scaling(scaling: crate::RopeScalingConfig) -> Result<CausalDecoder> {
     let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
     write_safetensors(tmp.path(), "model.", "lm_head.", None);
     let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
         .expect("invariant: catalog chargeable");
     let mut config = test_config();
-    config.rope_scaling = Some(crate::RopeScalingConfig {
-        rope_type: Some("llama3".to_string()),
-        legacy_type: None,
-        factor: Some(32.0),
-    });
-
+    config.rope_scaling = Some(scaling);
     load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
-        .expect("invariant: llama3 hors Gemma toléré");
+}
+
+fn llama3_scaling() -> crate::RopeScalingConfig {
+    crate::RopeScalingConfig {
+        rope_type: Some("llama3".to_string()),
+        factor: Some(32.0),
+        low_freq_factor: Some(1.0),
+        high_freq_factor: Some(4.0),
+        original_max_position_embeddings: Some(8192),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn llama3_rope_scaling_reaches_the_decoder_config() {
+    load_with_rope_scaling(llama3_scaling()).expect("invariant: llama3 accepté");
+    let mut config = test_config();
+    config.rope_scaling = Some(llama3_scaling());
+    let decoder = crate::CausalDecoderConfig::from(&config);
+    let llama3 = decoder
+        .rope_llama3
+        .expect("invariant: scaling llama3 transmis");
+    assert_eq!(llama3.factor, 32.0);
+    assert_eq!(llama3.original_max_position_embeddings, 8192.0);
+    assert_eq!(decoder.rope_position_scale, None);
+}
+
+#[test]
+fn rejects_unimplemented_or_invalid_rope_scaling() {
+    for kind in ["yarn", "longrope", "dynamic", "mrope"] {
+        let err = load_with_rope_scaling(crate::RopeScalingConfig {
+            rope_type: Some(kind.to_string()),
+            factor: Some(4.0),
+            ..Default::default()
+        })
+        .expect_err("invariant: type non implémenté refusé");
+        assert!(err.to_string().contains("non supporté"), "{kind}: {err}");
+    }
+    let invalid = [
+        crate::RopeScalingConfig {
+            factor: None,
+            ..llama3_scaling()
+        },
+        crate::RopeScalingConfig {
+            high_freq_factor: Some(1.0),
+            ..llama3_scaling()
+        },
+        crate::RopeScalingConfig {
+            original_max_position_embeddings: Some(0),
+            ..llama3_scaling()
+        },
+        crate::RopeScalingConfig {
+            legacy_type: Some("linear".to_string()),
+            ..llama3_scaling()
+        },
+    ];
+    for scaling in invalid {
+        let err = load_with_rope_scaling(scaling).expect_err("invariant: llama3 invalide refusé");
+        assert!(err.to_string().contains("rope_scaling"), "{err}");
+    }
+}
+
+#[test]
+fn rejects_declared_bias_without_tensors() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_safetensors(tmp.path(), "model.", "lm_head.", None);
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    for field in ["attention_bias", "mlp_bias"] {
+        let mut config = test_config();
+        config.attention_bias = field == "attention_bias";
+        config.mlp_bias = field == "mlp_bias";
+        let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+            .expect_err("invariant: biais annoncé absent refusé");
+        assert!(err.to_string().contains(field), "{err}");
+    }
 }
 
 #[test]

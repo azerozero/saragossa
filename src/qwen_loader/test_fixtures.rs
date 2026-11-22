@@ -22,6 +22,8 @@ pub(crate) fn test_config() -> ModelConfig {
         vocab_size: 3,
         eos_token_ids: Vec::new(),
         tie_word_embeddings: false,
+        attention_bias: false,
+        mlp_bias: false,
         quantization: None,
         full_attention_interval: None,
         attn_output_gate: None,
@@ -79,6 +81,8 @@ pub(super) fn write_safetensors(
 pub(super) fn tied_test_config() -> ModelConfig {
     ModelConfig {
         tie_word_embeddings: true,
+        attention_bias: false,
+        mlp_bias: false,
         ..test_config()
     }
 }

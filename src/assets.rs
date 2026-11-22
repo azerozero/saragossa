@@ -135,6 +135,8 @@ impl ModelAssets {
             "<|endofprompt|>",
             crate::chat_template::GEMMA_END_OF_TURN,
             crate::chat_template::GEMMA4_END_OF_TURN,
+            crate::chat_template::LLAMA3_EOT,
+            crate::chat_template::LLAMA3_EOM,
         ] {
             if let Some(id) = self
                 .tokenizer

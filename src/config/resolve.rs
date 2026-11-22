@@ -39,6 +39,18 @@ impl RawModelConfig {
                     map.entry("partial_rotary_factor".to_string())
                         .or_insert(factor);
                 }
+                // transformers 5 sérialise le scaling dans `rope_parameters` :
+                // un type autre que `default` doit atteindre `rope_scaling`,
+                // sinon il serait ignoré en silence. Les dictionnaires par type
+                // de couche (Gemma 4) n'ont pas de type au premier niveau.
+                let scaled = ["rope_type", "type"].iter().any(|key| {
+                    rope.get(*key)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| kind != "default")
+                });
+                if scaled {
+                    map.entry("rope_scaling".to_string()).or_insert(rope);
+                }
             }
             if let Some(eos) = top_eos {
                 map.entry("eos_token_id".to_string()).or_insert(eos);

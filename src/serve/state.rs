@@ -1919,6 +1919,12 @@ fn render_chat_prompt(
     } else if config.is_gemma() {
         check_thinking(thinking, false)?;
         render_gemma_chat(&messages, true).map_err(|e| ServeError::Http(e.to_string()))?
+    } else if let Some(rendered) =
+        saragossa::chat_template::render_llama_or_mistral_chat(config, &messages)
+    {
+        // Outils déjà refusés par `output_parser_for_config` (famille sans parseur).
+        check_thinking(thinking, false)?;
+        rendered.map_err(|e| ServeError::Http(e.to_string()))?
     } else {
         check_thinking(thinking, true)?;
         saragossa::chat_template::render_qwen_chatml_profile(

@@ -358,3 +358,63 @@ fn resume_refuses_rewritten_source_weights() {
     let error = convert_hf(&options(&src, &dst)).expect_err("reprise sur d'autres poids acceptée");
     assert!(error.to_string().contains("shards source"), "{error}");
 }
+
+/// Source mono-fichier sans index (Llama 3.2 1B : `model.safetensors` seul,
+/// embeddings liés) : conversion, reprise à l'identique, refus après altération.
+#[test]
+fn single_file_source_without_index_converts_and_resumes() {
+    let root = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let src = root.path().join("src");
+    std::fs::create_dir(&src).expect("invariant: src");
+    let owned: Vec<(&str, Vec<usize>, Vec<u8>)> = [
+        ("model.embed_tokens.weight", vec![16, 128]),
+        ("model.layers.0.self_attn.q_proj.weight", vec![8, 128]),
+        ("model.layers.0.input_layernorm.weight", vec![128]),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(seed, (name, shape))| {
+        let bytes = values(&shape, seed)
+            .iter()
+            .flat_map(|v| bf16_bits(*v).to_le_bytes())
+            .collect();
+        (name, shape, bytes)
+    })
+    .collect();
+    let views = owned.iter().map(|(name, shape, bytes)| {
+        (
+            (*name).to_string(),
+            TensorView::new(Dtype::BF16, shape.clone(), bytes).expect("invariant: vue BF16"),
+        )
+    });
+    let single = src.join("model.safetensors");
+    serialize_to_file(views, None, &single).expect("invariant: fichier écrit");
+    std::fs::write(src.join("config.json"), r#"{"model_type":"llama"}"#)
+        .expect("invariant: config écrite");
+    std::fs::write(src.join("tokenizer.json"), "{\"pre_tokenizer\":null}\n")
+        .expect("invariant: tokenizer écrit");
+
+    let dst = root.path().join("dst");
+    let first = convert_hf(&options(&src, &dst)).expect("invariant: conversion mono-fichier");
+    assert_eq!(first.units_written, ["model.safetensors"]);
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dst.join("model.safetensors.index.json")).expect("invariant: index"),
+    )
+    .expect("invariant: index JSON");
+    assert_eq!(
+        index["weight_map"]["model.embed_tokens.weight"],
+        "model.safetensors"
+    );
+    assert_eq!(
+        tensor_bytes(&dst, "model.safetensors", "model.embed_tokens.weight").1,
+        [16, 16]
+    );
+    let before = snapshot(&dst);
+    let again = convert_hf(&options(&src, &dst)).expect("invariant: reprise");
+    assert_eq!(again.units_resumed, ["model.safetensors"]);
+    assert_eq!(snapshot(&dst), before);
+
+    perturb_data(&single);
+    let error = convert_hf(&options(&src, &dst)).expect_err("reprise sur d'autres poids acceptée");
+    assert!(error.to_string().contains("shards source"), "{error}");
+}
