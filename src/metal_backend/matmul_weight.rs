@@ -812,7 +812,7 @@ impl MetalExecutor {
         bits: usize,
     ) -> Result<()> {
         // PREFILL : GEMM bf16 sur Neural Accelerators (matmul2d). Dé-quant
-        // u3/u5/u6/u8→bf16 transposée du poids + activations bf16 → tensor-cores.
+        // u5/u6/u8→bf16 transposée du poids + activations bf16 → tensor-cores.
         // Le sélecteur replie sur qmv. Refuser aussi un appel forcé avant allocation.
         if !qmm_na_dequant_fits(
             in_dim,

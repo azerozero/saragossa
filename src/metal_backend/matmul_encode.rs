@@ -1803,7 +1803,7 @@ impl MetalExecutor {
         clippy::too_many_arguments,
         reason = "helper interne partagé par deux variantes d'encodage Metal"
     )]
-    /// Dé-quantifie un poids u3/u5/u6/u8 gs64 `[out_dim,in_dim]` en bf16 dense TRANSPOSÉ
+    /// Dé-quantifie un poids u5/u6/u8 gs64 `[out_dim,in_dim]` en bf16 dense TRANSPOSÉ
     /// `[in_dim,out_dim]` (= `W^T`, layout `[K,N]` du GEMM NA), dans l'encodeur
     /// partagé. Pour le chemin prefill matmul2d.
     pub(super) fn encode_dequant_qweight_to_bf16_t(
@@ -1822,7 +1822,6 @@ impl MetalExecutor {
         bits: usize,
     ) -> Result<()> {
         let (pipeline, name) = match bits {
-            3 => (&self.dequant_u3_to_bf16_t_gs64, "dequant_u3_to_bf16_t_gs64"),
             5 => (&self.dequant_u5_to_bf16_t_gs64, "dequant_u5_to_bf16_t_gs64"),
             6 => (&self.dequant_u6_to_bf16_t_gs64, "dequant_u6_to_bf16_t_gs64"),
             8 => (&self.dequant_u8_to_bf16_t_gs64, "dequant_u8_to_bf16_t_gs64"),

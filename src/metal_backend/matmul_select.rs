@@ -307,14 +307,16 @@ impl MetalExecutor {
             && can_use_qmm_na_fused_tiled_u3(batch, in_dim, weight)
         {
             AffineMatmulKernel::QmmNaFusedTiledU3
+        } else if can_use_fast_affine_qmv_u3(batch, in_dim, weight) {
+            // NOTE: sous le plancher du GEMM tuilé, le u3 garde le qmv f32 (en
+            // lignes dès 3), comme le sélecteur résident : pas de bf16 ici.
+            AffineMatmulKernel::FastQmvU3
         } else if !strict
             && self.na_gemm_bf16.is_some()
             && can_use_qmm_na_dequant(batch, in_dim, weight)
-            && matches!(weight.bits(), 3 | 5 | 6)
+            && matches!(weight.bits(), 5 | 6)
         {
             AffineMatmulKernel::QmmNaDequant
-        } else if can_use_fast_affine_qmv_u3(batch, in_dim, weight) {
-            AffineMatmulKernel::FastQmvU3
         } else if can_use_fast_affine_qmv_u5(batch, in_dim, weight) {
             AffineMatmulKernel::FastQmvU5
         } else if can_use_fast_affine_qmv_u6(batch, in_dim, weight) {

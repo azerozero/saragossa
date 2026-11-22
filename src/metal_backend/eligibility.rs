@@ -580,8 +580,8 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_buffers(
 }
 
 /// GEMM NA tuilé u3 gs64 (`gemm_nax_coop_qb_tiled_u3`) : mêmes formes et même
-/// plancher que le u4 par défaut. Sous le plancher, la déquantification bf16
-/// puis `qmm_na` prend le relais ; le qmv u3 reste servi au decode.
+/// plancher que le u4 par défaut. Sous le plancher, le qmv u3 f32 (en lignes
+/// dès 3) reste servi, comme au sélecteur résident.
 pub(super) fn can_use_qmm_na_fused_tiled_u3_buffers(
     batch: usize,
     in_dim: usize,
@@ -673,7 +673,7 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_align64(
 }
 
 /// Prédicat du GEMM prefill sur Neural Accelerators (matmul2d bf16) : dé-quant
-/// u3/u5/u6/u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
+/// u5/u6/u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
 /// (prefill). Activé par défaut (`SARAGOSSA_RUST_QMM_NA`) ; l'appelant vérifie EN PLUS que la NA est
 /// dispo (`na_gemm_bf16.is_some()`, macOS≥26). bf16 ⇒ non bit-à-bit identique.
 pub(super) fn can_use_qmm_na_dequant(
@@ -692,7 +692,7 @@ pub(super) fn can_use_qmm_na_dequant(
             out_dim,
             crate::runtime_flags::qmm_na_dequant_max_bytes(),
         )
-        && matches!(weight.bits(), 3 | 5 | 6 | 8)
+        && matches!(weight.bits(), 5 | 6 | 8)
         && !(weight.bits() == 6 && qmm_u6_enabled())
         && weight.group_size() == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0

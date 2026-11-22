@@ -480,18 +480,6 @@ static inline void dequant_u56_to_bf16_t(
     wt[k * dims.x + n] = bfloat(float(q) * float(scales[affine]) + float(biases[affine]));
 }
 
-// u3 : même bitstream LSB-first, un code peut franchir un mot u32 (K % 64 == 0).
-kernel void dequant_u3_to_bf16_t_gs64(
-    device const uint* packed [[buffer(0)]],
-    device const bfloat* scales [[buffer(1)]],
-    device const bfloat* biases [[buffer(2)]],
-    device bfloat* wt [[buffer(3)]],
-    constant uint4& dims [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    dequant_u56_to_bf16_t<3u>(packed, scales, biases, wt, dims, gid);
-}
-
 kernel void dequant_u5_to_bf16_t_gs64(
     device const uint* packed [[buffer(0)]],
     device const bfloat* scales [[buffer(1)]],
