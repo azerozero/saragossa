@@ -33,16 +33,12 @@ fn tts_qmm_na_dequant_scope_controls_selection() -> Result<()> {
 }
 
 #[test]
-#[ignore = "device Metal requis : déquant u5/u6 bf16 transposée, sans modèle"]
+#[ignore = "device Metal requis : déquant u3/u5/u6 bf16 transposée, sans modèle"]
 fn dequant_u56_bf16_transpose_matches_cpu() -> Result<()> {
     let metal = MetalExecutor::new()?;
-    for bits in [5, 6] {
+    for bits in [3, 5, 6] {
         for (n, k) in [(1, 64), (13, 192), (64, 512)] {
-            let weight = if bits == 5 {
-                test_affine_varied_u5(n, k)?
-            } else {
-                test_affine_varied_u6(n, k)?
-            };
+            let weight = test_affine_varied_u356(bits, n, k)?;
             let cpu = weight.dequantize()?;
             for offsets in [[0, 0, 0], [4, 2, 6], [64, 128, 192]] {
                 let shifted = offset_weight(&metal, &weight, offsets, 0xdead)?;
@@ -88,7 +84,7 @@ fn dequant_u56_bf16_transpose_matches_cpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "device Metal NAX requis : prefill u5/u6, sans modèle"]
+#[ignore = "device Metal NAX requis : prefill u3/u5/u6, sans modèle"]
 fn qmm_u56_prefill_matches_bf16_cpu_and_routes() -> Result<()> {
     let metal = MetalExecutor::new()?;
     assert!(
@@ -96,25 +92,25 @@ fn qmm_u56_prefill_matches_bf16_cpu_and_routes() -> Result<()> {
         "oracle NAX explicite : pipeline requise"
     );
     super::flags::with_qmm_u6_override(false, || -> Result<()> {
-        for bits in [5, 6] {
+        for bits in [3, 5, 6] {
             for (m, n, k) in [(32, 13, 512), (33, 64, 1024), (524, 128, 512)] {
-                let weight = if bits == 5 {
-                    test_affine_varied_u5(n, k)?
-                } else {
-                    test_affine_varied_u6(n, k)?
-                };
+                let weight = test_affine_varied_u356(bits, n, k)?;
                 assert_eq!(
                     metal.select_owned_affine_matmul_kernel(m, k, &weight, false),
                     AffineMatmulKernel::QmmNaDequant
                 );
-                assert_eq!(
-                    metal.select_owned_affine_matmul_kernel(1, k, &weight, false),
-                    if bits == 5 {
-                        AffineMatmulKernel::FastQmvU5
-                    } else {
-                        AffineMatmulKernel::FastQmvU6
-                    }
-                );
+                // Le decode mono-ligne garde son qmv (u3 : N % 8 requis).
+                let mono = match bits {
+                    3 if n % 8 == 0 => Some(AffineMatmulKernel::FastQmvU3),
+                    3 => None,
+                    5 => Some(AffineMatmulKernel::FastQmvU5),
+                    _ => Some(AffineMatmulKernel::FastQmvU6),
+                };
+                let selected = metal.select_owned_affine_matmul_kernel(1, k, &weight, false);
+                assert_ne!(selected, AffineMatmulKernel::QmmNaDequant);
+                if let Some(mono) = mono {
+                    assert_eq!(selected, mono);
+                }
                 let strict = {
                     let _greedy = install_verify_greedy_scope(true);
                     with_verify_strict_override(true, || {
@@ -160,6 +156,60 @@ fn qmm_u56_prefill_matches_bf16_cpu_and_routes() -> Result<()> {
 }
 
 #[test]
+#[ignore = "device Metal NAX requis : prefill u3 tuilé, sans modèle"]
+fn qmm_u3_tiled_prefill_matches_bf16_cpu_and_routes() -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    assert!(
+        metal.na_gemm_coop_qb_tiled_u3.is_some(),
+        "oracle NAX explicite : pipeline requise"
+    );
+    // M couvre une tuile partielle (40) et plusieurs tuiles (130) ; N et K
+    // atteignent le plancher 2048 du GEMM tuilé.
+    for (m, n, k) in [(40, 2048, 2048), (130, 2112, 2560)] {
+        let weight = test_affine_varied_u356(3, n, k)?;
+        assert_eq!(
+            metal.select_owned_affine_matmul_kernel(m, k, &weight, false),
+            AffineMatmulKernel::QmmNaFusedTiledU3
+        );
+        assert_eq!(
+            metal.select_resident_affine_matmul_kernel(m, k, n, 64, 3, false),
+            AffineMatmulKernel::QmmNaFusedTiledU3
+        );
+        assert_eq!(
+            metal.select_owned_affine_matmul_kernel(1, k, &weight, false),
+            AffineMatmulKernel::FastQmvU3
+        );
+        let lhs: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 37 % 31) as f32 - 15.0) / 64.0)
+            .collect();
+        let cpu_weight = weight.dequantize()?.map(bf16_round);
+        let cpu = Tensor::from_vec(vec![m, k], lhs.clone())?.matmul_rhs_t(&cpu_weight)?;
+        let lhs = metal.upload_f32_buffer(&lhs, "prefill_u3_lhs")?;
+        let out = metal.upload_f32_buffer(&vec![-12345.0; m * n + 32], "prefill_u3_out")?;
+        let weight = LinearWeight::AffineQuantized(weight);
+        let mut scratch = Vec::new();
+        let cb = metal.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        super::profiling::OFFSET_TEST_DISPATCHES.with(|v| *v.borrow_mut() = Some(Vec::new()));
+        metal.encode_matmul_weight(enc, &mut scratch, &lhs, m, k, &weight, &out)?;
+        enc.end_encoding();
+        commit_and_wait(cb)?;
+        let trace = super::profiling::OFFSET_TEST_DISPATCHES
+            .with(|v| v.borrow_mut().take())
+            .expect("invariant: capture active");
+        assert!(trace
+            .iter()
+            .any(|v| v.starts_with("gemm_nax_coop_qb_tiled_u3")));
+        assert!(!trace.iter().any(|v| v.contains("qmv") || v.contains("dequant")));
+        let actual = read_f32_buffer(&out, m * n + 32)?;
+        assert!(actual[m * n..].iter().all(|&v| v == -12345.0));
+        // Même epsilon que l'oracle u5/u6 ci-dessus.
+        assert_close_eps(&actual[..m * n], cpu.data(), 1.0e-3);
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "device Metal requis : identité mono/lot stricte u5/u6"]
 fn qmv_u56_strict_rows_are_bit_exact() -> Result<()> {
     let metal = MetalExecutor::new()?;
@@ -194,4 +244,68 @@ fn qmv_u56_strict_rows_are_bit_exact() -> Result<()> {
             Ok(())
         })
     })
+}
+
+#[test]
+#[ignore = "device Metal requis : qmv u3/u5/u6 en lignes contre qmv mono, au bit"]
+fn qmv_rows_match_mono_bitwise() -> Result<()> {
+    let metal = MetalExecutor::new()?;
+    // u3 : 1536 et 1792 couvrent un bloc de 512 incomplet et le demi-bloc
+    // final ; u5/u6 : 1024 prend la branche à 32 codes par lane, 1536 celle à 16.
+    let cases: [(usize, &[(usize, usize)]); 3] = [
+        (3, &[(16, 512), (8, 1536), (24, 1792)]),
+        (5, &[(16, 512), (8, 1536), (24, 1024)]),
+        (6, &[(16, 512), (8, 1536), (24, 1024)]),
+    ];
+    for (bits, shapes) in cases {
+        for &(n, k) in shapes {
+            let linear = LinearWeight::AffineQuantized(test_affine_varied_u356(bits, n, k)?);
+            for batch in (3..=17).chain([31]) {
+                let lhs: Vec<_> = (0..batch).flat_map(|r| varied_row(k, 71 + r)).collect();
+                let mut mono = Vec::new();
+                for row in lhs.chunks_exact(k) {
+                    mono.extend(routed_affine_outputs(&metal, &linear, row, 1, "rows_mono")?.0);
+                }
+                let mono: Vec<_> = mono.iter().map(|v| v.to_bits()).collect();
+                // Hors strict, le skinny u3 prend la main dès qmm_skinny_min_batch().
+                let _greedy = install_verify_greedy_scope(true);
+                let (owned, resident) = with_verify_strict_override(true, || {
+                    routed_affine_outputs(&metal, &linear, &lhs, batch, "rows")
+                })?;
+                for actual in [&owned, &resident] {
+                    assert_eq!(
+                        actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        mono,
+                        "u{bits} {n}x{k} batch={batch}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Poids u3/u5/u6 gs64 au bitstream MLX, échelles et biais bf16 variés.
+fn test_affine_varied_u356(bits: usize, n: usize, k: usize) -> Result<AffineQuantizedTensor> {
+    match bits {
+        5 => test_affine_varied_u5(n, k),
+        6 => test_affine_varied_u6(n, k),
+        _ => {
+            let packed = test_affine_mlx_u3(n, k)?.packed_data().to_vec();
+            let groups = k / 64;
+            let scales = Tensor::from_vec(
+                vec![n, groups],
+                (0..n * groups)
+                    .map(|i| bf16_round(0.003 + 0.000_2 * ((i % 13) as f32)))
+                    .collect(),
+            )?;
+            let biases = Tensor::from_vec(
+                vec![n, groups],
+                (0..n * groups)
+                    .map(|i| bf16_round(-0.01 + 0.000_5 * ((i % 19) as f32)))
+                    .collect(),
+            )?;
+            AffineQuantizedTensor::new(&[n, k * 3 / 32], packed, scales, biases, 64, 3)
+        }
+    }
 }

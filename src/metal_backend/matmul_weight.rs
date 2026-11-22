@@ -343,6 +343,22 @@ impl MetalExecutor {
                     *out_dim,
                 )?;
             }
+            AffineMatmulKernel::QmmNaFusedTiledU3 => {
+                self.encode_affine_qmm_na_fused_tiled_u3_buffers(
+                    encoder,
+                    lhs_buffer,
+                    &packed_buffer,
+                    packed_offset,
+                    &scales_buffer,
+                    scales_offset,
+                    &biases_buffer,
+                    biases_offset,
+                    output_buffer,
+                    batch,
+                    in_dim,
+                    *out_dim,
+                )?;
+            }
             AffineMatmulKernel::QmmNaFusedTiledU4Align64 => {
                 self.encode_affine_qmm_na_fused_tiled_u4_align64_buffers(
                     encoder,
@@ -796,7 +812,7 @@ impl MetalExecutor {
         bits: usize,
     ) -> Result<()> {
         // PREFILL : GEMM bf16 sur Neural Accelerators (matmul2d). Dé-quant
-        // u5/u6/u8→bf16 transposée du poids + activations bf16 → tensor-cores.
+        // u3/u5/u6/u8→bf16 transposée du poids + activations bf16 → tensor-cores.
         // Le sélecteur replie sur qmv. Refuser aussi un appel forcé avant allocation.
         if !qmm_na_dequant_fits(
             in_dim,

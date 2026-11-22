@@ -277,6 +277,15 @@ pub(super) fn qmvt_small_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMVT_SMALL", true))
 }
 
+/// qmv u3/u5/u6 en R lignes (`affine_qmv_fast_rows_u*_gs64_f32_r*`) dès 3 lignes
+/// servies par le qmv aligné : vérification MTP/DFlash (u5/u6 n'ont pas de
+/// skinny), mode strict et replis du prefill. Mêmes bits que le qmv mono.
+/// Kill-switch `SARAGOSSA_RUST_QMV_ROWS=0` (qmv répliqué).
+pub(super) fn qmv_rows_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMV_ROWS", true))
+}
+
 pub(super) fn can_use_qmvt(
     batch: usize,
     in_dim: usize,
@@ -570,6 +579,42 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_buffers(
         && in_dim % 512 == 0
 }
 
+/// GEMM NA tuilé u3 gs64 (`gemm_nax_coop_qb_tiled_u3`) : mêmes formes et même
+/// plancher que le u4 par défaut. Sous le plancher, la déquantification bf16
+/// puis `qmm_na` prend le relais ; le qmv u3 reste servi au decode.
+pub(super) fn can_use_qmm_na_fused_tiled_u3_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> bool {
+    qmm_na_fused_tiled_enabled()
+        && batch >= qmm_na_min_batch()
+        && out_dim % 64 == 0
+        && in_dim.min(out_dim) >= QMM_NA_U4_DEFAULT_MIN_DIM
+        && bits == FAST_QMV_U3_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % 512 == 0
+}
+
+pub(super) fn can_use_qmm_na_fused_tiled_u3(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+) -> bool {
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_qmm_na_fused_tiled_u3_buffers(
+        batch,
+        in_dim,
+        out_dim,
+        weight.group_size(),
+        weight.bits(),
+    ) && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
+}
+
 pub(super) fn can_use_qmm_na_fused_tiled_u4(
     batch: usize,
     in_dim: usize,
@@ -628,7 +673,7 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_align64(
 }
 
 /// Prédicat du GEMM prefill sur Neural Accelerators (matmul2d bf16) : dé-quant
-/// u5/u6/u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
+/// u3/u5/u6/u8→bf16 transposée du poids + activations bf16 + tensor-cores. `batch` grand
 /// (prefill). Activé par défaut (`SARAGOSSA_RUST_QMM_NA`) ; l'appelant vérifie EN PLUS que la NA est
 /// dispo (`na_gemm_bf16.is_some()`, macOS≥26). bf16 ⇒ non bit-à-bit identique.
 pub(super) fn can_use_qmm_na_dequant(
@@ -647,7 +692,7 @@ pub(super) fn can_use_qmm_na_dequant(
             out_dim,
             crate::runtime_flags::qmm_na_dequant_max_bytes(),
         )
-        && matches!(weight.bits(), 5 | 6 | 8)
+        && matches!(weight.bits(), 3 | 5 | 6 | 8)
         && !(weight.bits() == 6 && qmm_u6_enabled())
         && weight.group_size() == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0

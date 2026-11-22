@@ -413,6 +413,40 @@ impl MetalExecutor {
         )
     }
 
+    pub(super) fn encode_affine_qmm_na_fused_tiled_u3_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        lhs_buffer: &BufferRef,
+        packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
+        scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
+        biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
+        output_buffer: &BufferRef,
+        batch: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> Result<()> {
+        self.encode_affine_qmm_na_fused_tiled_u4_pipeline(
+            encoder,
+            lhs_buffer,
+            packed_buffer,
+            packed_offset,
+            scales_buffer,
+            scales_offset,
+            biases_buffer,
+            biases_offset,
+            output_buffer,
+            batch,
+            in_dim,
+            out_dim,
+            self.na_gemm_coop_qb_tiled_u3.as_ref(),
+            "gemm_nax_coop_qb_tiled_u3",
+            "qmm_na_fused_tiled_u3_gs64",
+        )
+    }
+
     pub(super) fn encode_affine_qmm_na_fused_tiled_u4_align64_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1078,6 +1112,82 @@ impl MetalExecutor {
         Ok(())
     }
 
+    /// qmv u3/u5/u6 gs64 aligné en R lignes (`affine_qmv_fast_rows_u*_gs64_f32_r*`) :
+    /// les poids d'un pas sont lus une fois pour R lignes au lieu d'une fois par
+    /// ligne (qmv répliqué), chaque ligne gardant les bits du qmv mono. Sert la
+    /// vérification spéculative à M petit et les replis qmv à M quelconque.
+    pub(super) fn encode_affine_qmv_rows_buffers(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        bits: usize,
+        lhs_buffer: &BufferRef,
+        packed_buffer: &BufferRef,
+        packed_offset: NSUInteger,
+        scales_buffer: &BufferRef,
+        scales_offset: NSUInteger,
+        biases_buffer: &BufferRef,
+        biases_offset: NSUInteger,
+        output_buffer: &BufferRef,
+        batch: usize,
+        dims: &[u32; 4],
+    ) -> Result<()> {
+        let rows = if batch <= 4 { 4 } else { 8 };
+        let name = match (bits, rows) {
+            (3, 4) => "affine_qmv_fast_rows_u3_gs64_f32_r4",
+            (3, _) => "affine_qmv_fast_rows_u3_gs64_f32_r8",
+            (5, 4) => "affine_qmv_fast_rows_u5_gs64_f32_r4",
+            (5, _) => "affine_qmv_fast_rows_u5_gs64_f32_r8",
+            (6, 4) => "affine_qmv_fast_rows_u6_gs64_f32_r4",
+            (6, _) => "affine_qmv_fast_rows_u6_gs64_f32_r8",
+            _ => {
+                return Err(InferError::Config(format!(
+                    "qmv en lignes : bits={bits} non supporté"
+                )))
+            }
+        };
+        let pso = self.qmvt_pipeline(name)?;
+        encoder.set_compute_pipeline_state(&pso);
+        encoder.set_buffer(0, Some(lhs_buffer), 0);
+        encoder.set_buffer(1, Some(packed_buffer), packed_offset);
+        encoder.set_buffer(2, Some(scales_buffer), scales_offset);
+        encoder.set_buffer(3, Some(biases_buffer), biases_offset);
+        encoder.set_buffer(4, Some(output_buffer), 0);
+        set_u32_bytes(encoder, 5, dims, "qmv_rows_dims")?;
+        set_u32_bytes(
+            encoder,
+            6,
+            &[checked_u32(batch, "qmv rows batch")?],
+            "qmv_rows_batch",
+        )?;
+        let (out_dim, in_dim) = (dims[0] as usize, dims[1] as usize);
+        // Même étiquette de profil que le qmv mono de cette largeur.
+        let profile_label = match bits {
+            3 => "affine_qmv_u3_aligned_gs64",
+            5 => "affine_qmv_u5_aligned_gs64",
+            _ => "affine_qmv_u6_aligned_gs64",
+        };
+        profile_dispatch_shape(DispatchProfileShape::matmul(
+            profile_label,
+            batch,
+            in_dim,
+            out_dim,
+            FAST_QMV_GROUP_SIZE,
+            bits,
+        ));
+        trace_dispatch_path(name, batch, out_dim, in_dim);
+        profile_dispatch();
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                checked_nsuint(batch.div_ceil(rows), "qmv rows tiles")?,
+                checked_nsuint(out_dim / 8, "qmv rows out groups")?,
+                1,
+            ),
+            MTLSize::new(64, 1, 1),
+        );
+        post_dispatch_barrier_buffer(encoder, output_buffer);
+        Ok(())
+    }
+
     pub(super) fn encode_affine_qmv_u3_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
@@ -1101,6 +1211,22 @@ impl MetalExecutor {
             checked_u32(packed_cols, "qmv u3 packed_cols")?,
             checked_u32(groups, "qmv u3 groups")?,
         ];
+        if qmv_rows_enabled() && batch >= 3 {
+            return self.encode_affine_qmv_rows_buffers(
+                encoder,
+                FAST_QMV_U3_BITS,
+                lhs_buffer,
+                packed_buffer,
+                packed_offset,
+                scales_buffer,
+                scales_offset,
+                biases_buffer,
+                biases_offset,
+                output_buffer,
+                batch,
+                &dims,
+            );
+        }
         encoder.set_compute_pipeline_state(&self.affine_qmv_fast_aligned_u3_gs64_f32);
         encoder.set_buffer(0, Some(lhs_buffer), 0);
         encoder.set_buffer(1, Some(packed_buffer), packed_offset);
@@ -1219,6 +1345,22 @@ impl MetalExecutor {
             checked_u32(groups, "qmv u5 groups")?,
         ];
         let aligned = out_dim % 8 == 0 && in_dim % 512 == 0;
+        if aligned && qmv_rows_enabled() && batch >= 3 {
+            return self.encode_affine_qmv_rows_buffers(
+                encoder,
+                FAST_QMV_U5_BITS,
+                lhs_buffer,
+                packed_buffer,
+                packed_offset,
+                scales_buffer,
+                scales_offset,
+                biases_buffer,
+                biases_offset,
+                output_buffer,
+                batch,
+                &dims,
+            );
+        }
         let (pipeline, profile_label, kernel_name) = if aligned {
             (
                 &self.affine_qmv_fast_aligned_u5_gs64_f32,
@@ -1288,6 +1430,22 @@ impl MetalExecutor {
             checked_u32(groups, "qmv u6 groups")?,
         ];
         let aligned = out_dim % 8 == 0 && in_dim % 512 == 0;
+        if aligned && qmv_rows_enabled() && batch >= 3 {
+            return self.encode_affine_qmv_rows_buffers(
+                encoder,
+                FAST_QMV_U6_BITS,
+                lhs_buffer,
+                packed_buffer,
+                packed_offset,
+                scales_buffer,
+                scales_offset,
+                biases_buffer,
+                biases_offset,
+                output_buffer,
+                batch,
+                &dims,
+            );
+        }
         let (pipeline, profile_label, kernel_name) = if aligned {
             (
                 &self.affine_qmv_fast_aligned_u6_gs64_f32,
@@ -1645,7 +1803,7 @@ impl MetalExecutor {
         clippy::too_many_arguments,
         reason = "helper interne partagé par deux variantes d'encodage Metal"
     )]
-    /// Dé-quantifie un poids u5/u6/u8 gs64 `[out_dim,in_dim]` en bf16 dense TRANSPOSÉ
+    /// Dé-quantifie un poids u3/u5/u6/u8 gs64 `[out_dim,in_dim]` en bf16 dense TRANSPOSÉ
     /// `[in_dim,out_dim]` (= `W^T`, layout `[K,N]` du GEMM NA), dans l'encodeur
     /// partagé. Pour le chemin prefill matmul2d.
     pub(super) fn encode_dequant_qweight_to_bf16_t(
@@ -1664,6 +1822,7 @@ impl MetalExecutor {
         bits: usize,
     ) -> Result<()> {
         let (pipeline, name) = match bits {
+            3 => (&self.dequant_u3_to_bf16_t_gs64, "dequant_u3_to_bf16_t_gs64"),
             5 => (&self.dequant_u5_to_bf16_t_gs64, "dequant_u5_to_bf16_t_gs64"),
             6 => (&self.dequant_u6_to_bf16_t_gs64, "dequant_u6_to_bf16_t_gs64"),
             8 => (&self.dequant_u8_to_bf16_t_gs64, "dequant_u8_to_bf16_t_gs64"),
