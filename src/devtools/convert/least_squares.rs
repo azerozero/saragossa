@@ -25,7 +25,7 @@ const ITERS: usize = 8;
 
 /// Codes `clip(round((w − b)/s), 0, levels)` d'un groupe, division en f64
 /// comme le min-max ; une échelle nulle donne des codes nuls.
-fn codes(values: &[f32], scale: f64, bias: f64, levels: f64, out: &mut [u32]) {
+pub(super) fn codes(values: &[f32], scale: f64, bias: f64, levels: f64, out: &mut [u32]) {
     for (code, &value) in out.iter_mut().zip(values) {
         *code = if scale == 0.0 {
             0
@@ -49,7 +49,7 @@ fn group_error(values: &[f32], codes: &[u32], scale: f32, bias: f32) -> f64 {
 /// `(scale, bias)` f32 de `affine_quantize` (MLX, bits ≥ 2), à la lettre :
 /// `w_max` part de 0, l'échelle prend le signe du bord de plus grande valeur
 /// absolue et le biais est ce bord, sauf s'il tombe sur le code 0.
-fn mlx_params(values: &[f32], levels: f32) -> (f32, f32) {
+pub(super) fn mlx_params(values: &[f32], levels: f32) -> (f32, f32) {
     let (w_min, w_max) = values
         .iter()
         .fold((f32::MAX, 0.0_f32), |(lo, hi), &v| (lo.min(v), hi.max(v)));

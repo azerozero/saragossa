@@ -65,8 +65,9 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> CliResult<()> {
     Ok(())
 }
 
-const HF_USAGE: &str = "usage: saragossa convert <dossier bf16 HF> <sortie> [--bits 4|8] [--minmax] [--keep-8bit motif,…] [--keep-bf16 motif,…] [--verify]\n\
-défaut : u4 gs64 aux moindres carrés ; un motif est une sous-chaîne du nom de tenseur HF";
+const HF_USAGE: &str = "usage: saragossa convert <dossier bf16 HF> <sortie> [--bits 4|8] [--minmax] [--keep-8bit motif,…] [--keep-bf16 motif,…] [--bits-for motif=N,…] [--imatrix <fichier>] [--verify]\n\
+défaut : u4 gs64 aux moindres carrés ; un motif est une sous-chaîne du nom de tenseur HF ;\n\
+--imatrix pondère les moindres carrés par E[x²] (format tools/quant/imatrix.py)";
 
 fn patterns(value: &str) -> Vec<String> {
     value
@@ -86,6 +87,8 @@ pub(crate) fn run_hf(args: impl Iterator<Item = String>) -> CliResult<()> {
         keep_8bit: Vec::new(),
         keep_bf16: Vec::new(),
         verify: false,
+        imatrix: None,
+        bits_for: Vec::new(),
     };
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -102,6 +105,19 @@ pub(crate) fn run_hf(args: impl Iterator<Item = String>) -> CliResult<()> {
             "--minmax" => options.minmax = true,
             "--keep-8bit" => options.keep_8bit = patterns(&value("--keep-8bit")?),
             "--keep-bf16" => options.keep_bf16 = patterns(&value("--keep-bf16")?),
+            "--imatrix" => options.imatrix = Some(PathBuf::from(value("--imatrix")?)),
+            "--bits-for" => {
+                for item in patterns(&value("--bits-for")?) {
+                    let parsed = item.rsplit_once('=').and_then(|(pattern, bits)| {
+                        Some((pattern.to_string(), bits.parse().ok()?))
+                    });
+                    options.bits_for.push(parsed.ok_or_else(|| {
+                        cli_error(format!(
+                            "--bits-for : motif=bits attendu, {item}\n{HF_USAGE}"
+                        ))
+                    })?);
+                }
+            }
             "--verify" => options.verify = true,
             "--help" | "-h" => {
                 println!("{HF_USAGE}");
