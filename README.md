@@ -2,18 +2,15 @@
 
 [![CI](https://github.com/azerozero/saragossa/actions/workflows/rust.yml/badge.svg?branch=main)](https://github.com/azerozero/saragossa/actions/workflows/rust.yml)
 [![release](https://img.shields.io/github/v/release/azerozero/saragossa)](https://github.com/azerozero/saragossa/releases)
-[![crates.io](https://img.shields.io/crates/v/saragossa)](https://crates.io/crates/saragossa)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![platform](https://img.shields.io/badge/platform-Apple%20Silicon-black)
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
 ![python](https://img.shields.io/badge/python-zero%20deps-success)
 
-
 **Pure-Rust Metal inference engine for Apple Silicon.** Raw `metal-rs` kernels,
 no Python, no MLX, no CoreML. LLM, speech-to-text and text-to-speech in a single
 binary — usable as a library or behind the OpenAI-compatible HTTP server
 `saragossa serve`.
-
 
 ## Install
 
@@ -95,8 +92,8 @@ the **single-user latency × Apple Silicon** quadrant:
 - Ollama and llama.cpp are general-purpose and cross-platform; saragossa is tuned
   for **one** target (the Apple Silicon GPU, resident decode). In the
   [November 2026 campaign](bench/competitors/data/campagne-2026-11/README.md) it
-  is within a few percent of `mlx-vlm` 0.8.0 with MTP on the 27B 4-bit (ahead
-  at 512, behind at 4096) and ahead on the 35B-A3B MoE and the 27B BF16 (see
+  is close to `mlx-vlm` 0.8.0 with MTP on the 27B 4-bit (+0.4 % at 512,
+  −9.7 % at 4096, −2.8 % at 16384) and ahead on the 35B-A3B MoE and the 27B BF16 (see
   [Performance](#performance)). The fair
   comparison is against `mlx-vlm` with a drafter, not against `mlx_lm` in plain
   autoregressive mode, which is the weak baseline.
@@ -153,7 +150,7 @@ tokens. Source: [`campagne-2026-11/21-final`](bench/competitors/data/campagne-20
 (`summary.json`, `freeze.json`, full journal), described in the
 [campaign README](bench/competitors/data/campagne-2026-11/README.md).
 
-**27B, 4-bit**
+### 27B, 4-bit
 
 | engine | 512 | 4096 | 16384 |
 |---|---|---|---|
@@ -162,16 +159,16 @@ tokens. Source: [`campagne-2026-11/21-final`](bench/competitors/data/campagne-20
 | mlx_lm (AR only) | 30.3 (AR) | 29.7 (AR) | 28.2 (AR) |
 | llama.cpp (GGUF Q4_K_M) | 41.8 (DFLASH) | 43.8 (DFLASH) | 39.9 (DFLASH) |
 
-**27B, BF16**
+### 27B, BF16
 
 | engine | 512 | 4096 | 16384 |
 |---|---|---|---|
 | saragossa | 24.7 (DFLASH) | 24.7 (DFLASH) | 23.4 (DFLASH) |
 | mlx-vlm 0.8.0 | 20.6 (DFLASH) | 21.1 (DFLASH) | 18.8 (MTP) |
 | mlx_lm (AR only) | 9.0 (AR) | 8.9 (AR) | 8.9 (AR) |
-| llama.cpp (GGUF Q4_K_M) | 20.0 (DFLASH) | 23.2 (DFLASH) | 19.1 (DFLASH) |
+| llama.cpp (GGUF BF16) | 20.0 (DFLASH) | 23.2 (DFLASH) | 19.1 (DFLASH) |
 
-**35B-A3B, 4-bit**
+### 35B-A3B, 4-bit
 
 | engine | 512 | 4096 | 16384 |
 |---|---|---|---|
@@ -188,7 +185,8 @@ Caveats:
   BF16 row), not the MLX weights the other engines load, so the weights are not
   identical. llama.cpp was not measured on the 35B-A3B in this run.
 - The `mlx-vlm` 0.8.0 MTP and DFlash outputs are not bit-identical to its own
-  AR output; saragossa's greedy outputs are (see below).
+  AR output; saragossa's greedy speculative output matches its AR decode except
+  at near-ties, with an exact opt-in strict mode (see below).
 - Results hold for this hardware, these models and these prompts; measure on
   your own machine before choosing.
 
@@ -481,6 +479,11 @@ to disable this dequantization path; an absent or invalid value uses the
 default. Fused NA kernels do not materialize that weight and keep their existing
 selection rules. This currently applies to `QmmNaU8`; u5/u6 have no full-weight
 NA dequantization path in this revision.
+
+The retired experimental `SARAGOSSA_RUST_LINEAR_CHUNKED=1` path now returns
+an explicit configuration error: its scalar and tensor-core kernels had
+unsafe decay ratios, tail reads and device synchronization. Remove the flag
+to keep the existing NAX/sequence-scan selection; no default path changes.
 
 ### Modular compilation
 
