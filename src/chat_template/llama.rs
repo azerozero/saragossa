@@ -57,6 +57,9 @@ pub fn render_llama3_chat(
     Ok(out)
 }
 
+/// Date figée par défaut des templates Llama 3.1 et 3.3.
+pub const LLAMA3_FIXED_DATE: &str = "26 Jul 2024";
+
 /// Date du jour au format `%d %b %Y` (UTC), celle de `strftime_now` du template.
 ///
 /// NOTE: transformers lit l'heure locale ; l'écart ne porte que sur l'heure
@@ -87,7 +90,7 @@ pub fn llama3_today() -> String {
 /// Rend des messages au format Mistral Instruct v0.3 sans outils.
 ///
 /// Suit le template HF : `<s>` littéral, `[INST] …[/INST]`, message système
-/// optionnel préfixé au DERNIER tour user, réponses ` …</s>` trimmées. Le
+/// optionnel préfixé au dernier message, s'il est user (`loop.last` : sinon il disparaît), réponses ` …</s>` trimmées. Le
 /// template n'a pas de prompt de génération : le dernier `[/INST]` en tient lieu.
 ///
 /// # Errors
@@ -98,7 +101,6 @@ pub fn render_mistral_chat(messages: &[ChatTemplateMessage]) -> Result<String, T
         Some((first, rest)) if first.role == "system" => (first.content.as_deref(), rest),
         _ => (None, messages),
     };
-    let last_user = turns.iter().rposition(|message| message.role == "user");
     let mut out = String::from("<s>");
     for (index, message) in turns.iter().enumerate() {
         if !message.tool_calls.is_empty() {
@@ -114,7 +116,7 @@ pub fn render_mistral_chat(messages: &[ChatTemplateMessage]) -> Result<String, T
         let content = message.content.as_deref().unwrap_or("");
         if message.role == "user" {
             out.push_str("[INST] ");
-            if let (Some(system), true) = (system, Some(index) == last_user) {
+            if let (Some(system), true) = (system, index + 1 == turns.len()) {
                 out.push_str(system);
                 out.push_str("\n\n");
             }
@@ -140,7 +142,18 @@ pub fn render_llama_or_mistral_chat(
     messages: &[ChatTemplateMessage],
 ) -> Option<Result<String, TemplateError>> {
     if config.is_llama() {
-        Some(render_llama3_chat(messages, true, &llama3_today()))
+        // NOTE: Llama 3.1/3.3 figent `date_string` à « 26 Jul 2024 » ; seul 3.2 appelle
+        // `strftime_now`. La config ne porte pas la version : le facteur de scaling
+        // llama3 (32 pour 3.2 1B/3B, 8 pour 3.1/3.3) la distingue.
+        let date = if config
+            .rope_llama3_scaling()
+            .is_some_and(|scaling| scaling.factor == 32.0)
+        {
+            llama3_today()
+        } else {
+            LLAMA3_FIXED_DATE.to_string()
+        };
+        Some(render_llama3_chat(messages, true, &date))
     } else if config.is_mistral() {
         Some(render_mistral_chat(messages))
     } else {
@@ -187,6 +200,16 @@ mod tests {
         ])
         .expect("invariant: alternance valide");
         assert_eq!(rendered, "<s>[INST] A[/INST] B</s>[INST] Sys\n\nC[/INST]");
+        // `loop.last` : sans dernier tour user, le système disparaît du rendu.
+        assert_eq!(
+            render_mistral_chat(&[
+                msg("system", "Sys"),
+                msg("user", "A"),
+                msg("assistant", "B")
+            ])
+            .as_deref(),
+            Ok("<s>[INST] A[/INST] B</s>")
+        );
         assert_eq!(
             render_mistral_chat(&[msg("assistant", "x")]),
             Err(TemplateError::RoleAlternation)
@@ -200,5 +223,29 @@ mod tests {
         assert_eq!(parts.len(), 3, "{today}");
         assert_eq!(parts[0].len(), 2);
         assert!(parts[2].parse::<u32>().is_ok_and(|year| year >= 2026));
+    }
+
+    #[test]
+    fn llama_date_follows_template_version() {
+        let config = |factor: f32| {
+            let mut config = crate::qwen_loader::test_fixtures::test_config();
+            config.model_type = "llama".to_string();
+            config.rope_scaling = Some(crate::RopeScalingConfig {
+                rope_type: Some("llama3".to_string()),
+                factor: Some(factor),
+                low_freq_factor: Some(1.0),
+                high_freq_factor: Some(4.0),
+                original_max_position_embeddings: Some(8192),
+                ..Default::default()
+            });
+            config
+        };
+        let render = |factor| {
+            render_llama_or_mistral_chat(&config(factor), &[msg("user", "A")])
+                .expect("invariant: famille Llama")
+                .expect("invariant: rôles valides")
+        };
+        assert!(render(8.0).contains("Today Date: 26 Jul 2024"));
+        assert!(!render(32.0).contains("Today Date: 26 Jul 2024"));
     }
 }

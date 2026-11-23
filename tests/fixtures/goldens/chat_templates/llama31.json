@@ -1,0 +1,25 @@
+{
+  "dtype": "utf8",
+  "shape": [
+    2196
+  ],
+  "source": {
+    "model": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+    "path": "${SARAGOSSA_LLAMA31_DIR}",
+    "snapshot": null,
+    "sha256": {
+      "config.json": "e809729d4bc2d0fa9a920c91165dfbf79875821c1b357df2aaf51bff07df382e",
+      "tokenizer.json": "bbc1904d35169c542dffbe1f7589a5994ec7426d9e5b609d07bab876f32e97ab",
+      "tokenizer_config.json": "0514fcf4017bff6ac7bba1cd68247b841060f3d942c2d428d929d5a932477085"
+    },
+    "versions": {
+      "transformers": "5.22.2",
+      "tokenizers": "0.23.3",
+      "jinja2": "3.1.6"
+    }
+  },
+  "tolerance": "exact UTF-8",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-23",
+  "payload_sha256": "6523b60336b6cb92512f6c95c2304db90e3afef4e8f4fdac645324af21df3a69"
+}

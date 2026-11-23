@@ -49,7 +49,34 @@ impl RawModelConfig {
                         .is_some_and(|kind| kind != "default")
                 });
                 if scaled {
-                    map.entry("rope_scaling".to_string()).or_insert(rope);
+                    // Un `rope_scaling: null` sérialisé ne doit pas masquer le
+                    // type de `rope_parameters` : il est remplacé.
+                    match map.get("rope_scaling").filter(|value| !value.is_null()) {
+                        None => {
+                            map.insert("rope_scaling".to_string(), rope);
+                        }
+                        Some(existing) => {
+                            let kind = |value: &serde_json::Value| {
+                                ["rope_type", "type"]
+                                    .iter()
+                                    .find_map(|key| value.get(*key).cloned())
+                            };
+                            let differs = kind(existing) != kind(&rope)
+                                || [
+                                    "factor",
+                                    "low_freq_factor",
+                                    "high_freq_factor",
+                                    "original_max_position_embeddings",
+                                ]
+                                .iter()
+                                .any(|key| existing.get(*key) != rope.get(*key));
+                            if differs {
+                                return Err(InferError::Config(
+                                    "rope_scaling et rope_parameters contradictoires".to_string(),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             if let Some(eos) = top_eos {

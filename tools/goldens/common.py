@@ -51,6 +51,7 @@ MODELS = {
     "gemma3": ("SARAGOSSA_GEMMA3_DIR", None, "mlx-community/gemma-3-4b-it-4bit"),
     "gemma4": ("SARAGOSSA_GEMMA4_DIR", None, "mlx-community/gemma-4-26b-a4b-it-4bit"),
     "llama32_1b": ("SARAGOSSA_LLAMA32_1B_DIR", None, "meta-llama/Llama-3.2-1B-Instruct"),
+    "llama31": ("SARAGOSSA_LLAMA31_DIR", None, "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"),
     "mistral7b": ("SARAGOSSA_MISTRAL7B_DIR", None, "mistralai/Mistral-7B-Instruct-v0.3"),
     "qwen3_tts": ("SARAGOSSA_QWEN3_TTS_VOICEDESIGN_DIR", None,
                   "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-6bit"),

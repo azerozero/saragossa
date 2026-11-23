@@ -7,7 +7,7 @@ pub use gemma4::render_gemma4_chat_with_tools;
 mod llama;
 pub use llama::{
     llama3_today, render_llama3_chat, render_llama_or_mistral_chat, render_mistral_chat,
-    LLAMA3_BOS, LLAMA3_EOM, LLAMA3_EOT,
+    LLAMA3_BOS, LLAMA3_EOM, LLAMA3_EOT, LLAMA3_FIXED_DATE,
 };
 mod qwen;
 pub use qwen::{render_qwen_chatml_profile, render_qwen_chatml_with_tools, QwenProfile};

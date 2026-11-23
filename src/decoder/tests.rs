@@ -7743,3 +7743,106 @@ fn llama3_rotations_use_scaled_table_at_long_positions() {
         }
     }
 }
+
+/// RoPE llama3 : les logits d'un mini-Llama à poids pseudo-aléatoires sont ceux
+/// du CPU, sur ~300 positions bien au-delà de `original_max_position_embeddings`
+/// (64) avec un facteur 32, là où la table scalée diffère de la table standard.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn llama3_rope_metal_matches_cpu_oracle() -> Result<()> {
+    const HIDDEN: usize = 64;
+    const VOCAB: usize = 97;
+    const LAYERS: usize = 2;
+    const HEADS: usize = 4;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIM: usize = 16;
+    const INTER: usize = 128;
+    let tensor = |rows: usize, cols: usize, seed: usize, scale: f32| -> Result<Tensor> {
+        let data = (0..rows * cols)
+            .map(|i| ((i * 7919 + seed * 104_729) as f32 * 0.000_37).sin() * scale)
+            .collect();
+        Tensor::from_vec(vec![rows, cols], data)
+    };
+    let norm = |seed: usize| -> Result<Tensor> {
+        Tensor::from_vec(
+            vec![HIDDEN],
+            (0..HIDDEN)
+                .map(|i| 1.0 + ((i + seed) as f32 * 0.37).sin() * 0.1)
+                .collect(),
+        )
+    };
+    let build = || -> Result<HashMap<String, Tensor>> {
+        let mut weights = HashMap::new();
+        weights.insert("embed_tokens.weight".into(), tensor(VOCAB, HIDDEN, 1, 0.5)?);
+        weights.insert("norm.weight".into(), norm(2)?);
+        weights.insert("lm_head.weight".into(), tensor(VOCAB, HIDDEN, 3, 0.2)?);
+        for layer in 0..LAYERS {
+            let seed = 10 * (layer + 1);
+            let key = |name: &str| format!("layers.{layer}.{name}");
+            weights.insert(key("input_layernorm.weight"), norm(seed)?);
+            weights.insert(key("post_attention_layernorm.weight"), norm(seed + 1)?);
+            weights.insert(
+                key("self_attn.q_proj.weight"),
+                tensor(HEADS * HEAD_DIM, HIDDEN, seed + 2, 0.15)?,
+            );
+            for (name, extra) in [("k_proj", 3), ("v_proj", 4)] {
+                weights.insert(
+                    key(&format!("self_attn.{name}.weight")),
+                    tensor(KV_HEADS * HEAD_DIM, HIDDEN, seed + extra, 0.15)?,
+                );
+            }
+            weights.insert(
+                key("self_attn.o_proj.weight"),
+                tensor(HIDDEN, HEADS * HEAD_DIM, seed + 5, 0.1)?,
+            );
+            weights.insert(
+                key("mlp.gate_proj.weight"),
+                tensor(INTER, HIDDEN, seed + 6, 0.1)?,
+            );
+            weights.insert(
+                key("mlp.up_proj.weight"),
+                tensor(INTER, HIDDEN, seed + 7, 0.1)?,
+            );
+            weights.insert(
+                key("mlp.down_proj.weight"),
+                tensor(HIDDEN, INTER, seed + 8, 0.1)?,
+            );
+        }
+        Ok(weights)
+    };
+    let config = CausalDecoderConfig {
+        num_hidden_layers: LAYERS,
+        num_attention_heads: HEADS,
+        num_key_value_heads: KV_HEADS,
+        head_dim: Some(HEAD_DIM),
+        rope_theta: Some(500_000.0),
+        rope_llama3: Some(crate::rope::Llama3RopeScaling {
+            factor: 32.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 64.0,
+        }),
+        ..CausalDecoderConfig::default()
+    };
+    let cpu = CausalDecoder::from_tensors(build()?, config.clone())?;
+    let metal = CausalDecoder::from_tensors(build()?, config)?.with_metal_runtime()?;
+    let tokens: Vec<usize> = (0..300).map(|i| (i * 31 + 7) % VOCAB).collect();
+    let expected = cpu.next_logits(&tokens)?;
+    let actual = metal.next_logits(&tokens)?;
+    let scale = expected
+        .data()
+        .iter()
+        .fold(0.0_f32, |acc, value| acc.max(value.abs()))
+        .max(1.0);
+    let worst = expected
+        .data()
+        .iter()
+        .zip(actual.data())
+        .fold(0.0_f32, |acc, (a, b)| acc.max((a - b).abs()));
+    assert!(
+        worst <= 1.0e-3 * scale,
+        "écart Metal/CPU {worst} (échelle {scale})"
+    );
+    Ok(())
+}
