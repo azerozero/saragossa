@@ -564,6 +564,16 @@ pub(crate) enum Job {
         proj: Proj,
         out_base: String,
     },
+    /// Experts fusionnés bf16 `[E, R, C]` (transformers) : les `R` lignes de
+    /// chaque expert se découpent en segments consécutifs `(base, lignes)`,
+    /// chacun empilé dans sa pile affine `[E, lignes, C]` (`bits` = 16 : pile
+    /// bf16 recopiée).
+    Stacked {
+        src: TensorRef,
+        outs: Vec<(String, usize)>,
+        bits: usize,
+        fit: AffineFit,
+    },
     Copy {
         src: TensorRef,
         out: String,
@@ -1007,6 +1017,93 @@ pub(crate) fn write_shard(
                 records.push(rec);
                 records.push(record(&names[1], scales.finish()?)?);
                 records.push(record(&names[2], biases.finish()?)?);
+            }
+            Job::Stacked {
+                src,
+                outs,
+                bits,
+                fit,
+            } => {
+                let [experts, rows, cols] = src.shape[..] else {
+                    return Err(InferError::Dimension(src.name.clone()));
+                };
+                if rows == 0 || outs.iter().map(|(_, seg)| seg).sum::<usize>() != rows {
+                    return Err(InferError::Dimension(format!(
+                        "{}: segments {outs:?} pour {rows} lignes",
+                        src.name
+                    )));
+                }
+                if *bits == 16 {
+                    // Piles bf16 : segments recopiés à l'octet, expert par expert.
+                    let mut streams = Vec::with_capacity(outs.len());
+                    for (base, _) in outs {
+                        streams.push(stream(&format!("{base}.weight"))?);
+                    }
+                    let row_bytes = cols * 2;
+                    for expert in 0..experts {
+                        let mut offset = expert * rows * row_bytes;
+                        for ((_, seg), out) in outs.iter().zip(&mut streams) {
+                            out.write(&source.read(src, offset, seg * row_bytes)?)?;
+                            offset += seg * row_bytes;
+                        }
+                    }
+                    for ((base, _), out) in outs.iter().zip(streams) {
+                        let mut rec = record(&format!("{base}.weight"), out.finish()?)?;
+                        rec.source = Some(src.name.clone());
+                        records.push(rec);
+                    }
+                    continue;
+                }
+                let mut streams = Vec::with_capacity(outs.len());
+                for (base, _) in outs {
+                    streams.push([
+                        stream(&format!("{base}.weight"))?,
+                        stream(&format!("{base}.scales"))?,
+                        stream(&format!("{base}.biases"))?,
+                    ]);
+                }
+                let (packed_cols, groups) = (cols * bits / 32, cols / GROUP_SIZE);
+                let expert_bytes = rows * cols * 2;
+                let per_block = (DENSE_BLOCK_ELEMENTS / (rows * cols)).max(1);
+                let mut error = QuantError::default();
+                let mut expert = 0;
+                while expert < experts {
+                    let take = per_block.min(experts - expert);
+                    let bytes = source.read(src, expert * expert_bytes, take * expert_bytes)?;
+                    let data = bytes_to_dense_f32(&bytes, src.dtype, &src.name)?;
+                    // Lignes indépendantes : le bloc entier se quantifie d'un coup.
+                    let block = quantize_block(&data, cols, *bits, *fit)?;
+                    peak.sample();
+                    for local in 0..take {
+                        let mut row = local * rows;
+                        for ((_, seg), [weight, scales, biases]) in outs.iter().zip(&mut streams) {
+                            let end = row + seg;
+                            weight.write(bytemuck::cast_slice(
+                                &block.packed[row * packed_cols..end * packed_cols],
+                            ))?;
+                            scales.write(bytemuck::cast_slice(
+                                &block.scales[row * groups..end * groups],
+                            ))?;
+                            biases.write(bytemuck::cast_slice(
+                                &block.biases[row * groups..end * groups],
+                            ))?;
+                            row = end;
+                        }
+                    }
+                    error.add(block.error);
+                    expert += take;
+                }
+                for ((base, _), [weight, scales, biases]) in outs.iter().zip(streams) {
+                    let mut rec = record(&format!("{base}.weight"), weight.finish()?)?;
+                    rec.source = Some(src.name.clone());
+                    rec.bits = Some(*bits);
+                    rec.group_size = Some(GROUP_SIZE);
+                    // Erreur du tenseur source entier, partagée par ses segments.
+                    rec.rel_err = Some(error.relative());
+                    records.push(rec);
+                    records.push(record(&format!("{base}.scales"), scales.finish()?)?);
+                    records.push(record(&format!("{base}.biases"), biases.finish()?)?);
+                }
             }
             Job::Experts {
                 group,
