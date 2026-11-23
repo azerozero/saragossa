@@ -103,9 +103,8 @@ impl ServeArgs {
                 .map_err(|_| ServeError::args("serve.max_tokens_cap hors plage"))?,
             None => DEFAULT_MAX_TOKENS_CAP,
         };
-        // Convention des autres clés : CLI > env > profil.
-        let mut max_tok_s = std::env::var("SARAGOSSA_RUST_MAX_TOK_S")
-            .ok()
+        // `env_var` applique la convention des autres clés : CLI > `--set` > env > profil.
+        let mut max_tok_s = saragossa::runtime_flags::env_var("SARAGOSSA_RUST_MAX_TOK_S")
             .and_then(|v| saragossa::parse_max_tok_s(v.trim()).ok())
             .or(profile.serve.max_tok_s);
         // invariant: `Profile::validate` borne `serve.gpu_share` à 10..=100.
