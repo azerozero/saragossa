@@ -102,7 +102,7 @@ pub struct ServeSection {
     pub max_tokens_cap: Option<u64>,
     /// Équivalent de `--max-tok-s` : plafond de decode en tokens par seconde.
     pub max_tok_s: Option<f64>,
-    /// Équivalent de `--gpu-share` : part de GPU et de CPU visée, 1 à 100.
+    /// Équivalent de `--gpu-share` : part de GPU et de CPU visée, 10 à 100.
     pub gpu_share: Option<u64>,
     /// Délai max de vidage de l'ancien processus après un relais SIGUSR2.
     pub drain_timeout_secs: Option<u64>,
@@ -204,8 +204,8 @@ impl Profile {
         {
             return Err(err("serve.max_tok_s", "doit être un flottant > 0"));
         }
-        if !self.serve.gpu_share.is_none_or(|v| (1..=100).contains(&v)) {
-            return Err(err("serve.gpu_share", "doit être dans 1..=100"));
+        if !self.serve.gpu_share.is_none_or(|v| (10..=100).contains(&v)) {
+            return Err(err("serve.gpu_share", "doit être dans 10..=100"));
         }
         if let Some(backend) = &self.engine.backend {
             if !matches!(backend.as_str(), "cpu" | "metal") {

@@ -37,7 +37,7 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
 
 fn print_run_help() {
     println!(
-        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N] [--max-tok-s R] [--gpu-share 1-100]\n\nCtrl-D quitte le REPL. HF_TOKEN ou HUGGING_FACE_HUB_TOKEN est requis pour les modèles gated."
+        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N] [--max-tok-s R] [--gpu-share 10-100]\n\nCtrl-D quitte le REPL. HF_TOKEN ou HUGGING_FACE_HUB_TOKEN est requis pour les modèles gated."
     );
 }
 

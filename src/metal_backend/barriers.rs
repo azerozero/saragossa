@@ -201,9 +201,13 @@ pub(crate) fn duty_pause(command_buffer: &metal::CommandBufferRef) {
     let share = crate::runtime_flags::gpu_share();
     if share < 100 {
         let busy = command_buffer_gpu_ns(command_buffer);
-        std::thread::sleep(std::time::Duration::from_nanos(
-            crate::runtime_flags::duty_sleep_ns(busy, share),
-        ));
+        let mut left = crate::runtime_flags::duty_sleep_ns(busy, share).min(1_000_000_000);
+        // Tranches de 20 ms : repasser à 100 à chaud interrompt le sommeil.
+        while left > 0 && crate::runtime_flags::gpu_share() < 100 {
+            let slice = left.min(20_000_000);
+            std::thread::sleep(std::time::Duration::from_nanos(slice));
+            left -= slice;
+        }
     }
 }
 
@@ -219,6 +223,7 @@ pub(crate) fn commit_and_wait(command_buffer: &metal::CommandBufferRef) -> Resul
         command_buffer.commit();
         command_buffer.wait_until_completed();
         record_commit_component(label, started.elapsed().as_secs_f64());
+        duty_pause(command_buffer);
         return ensure_completed(command_buffer.status());
     }
     if decode_profile_enabled() {

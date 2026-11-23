@@ -838,6 +838,8 @@ pub fn set_decode_max_tokens_per_s(rate: Option<f64>) {
     }
 }
 
+/// Plancher du réglage : en dessous, le decode paraîtrait figé.
+const MIN_GPU_SHARE: u8 = 10;
 static GPU_SHARE: AtomicU8 = AtomicU8::new(100);
 
 /// Part de GPU visée en pourcentage (100 = pas de bridage).
@@ -845,12 +847,12 @@ pub fn gpu_share() -> u8 {
     GPU_SHARE.load(AtomicOrdering::Relaxed)
 }
 
-/// Règle à chaud la part de GPU visée (1 à 100, bornée) : après chaque command
+/// Règle à chaud la part de GPU visée (10 à 100, borné) : après chaque command
 /// buffer, le thread dort `busy * (100 / share - 1)`. En dessous de 100, limite
 /// aussi le pool rayon à `share` % des cœurs ; ce pool global se règle une seule
 /// fois par processus, un rechargement ne le redimensionne pas.
 pub fn set_gpu_share(share: u8) {
-    let share = share.clamp(1, 100);
+    let share = share.clamp(MIN_GPU_SHARE, 100);
     GPU_SHARE.store(share, AtomicOrdering::Relaxed);
     if share < 100 {
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
@@ -861,13 +863,13 @@ pub fn set_gpu_share(share: u8) {
     }
 }
 
-/// Analyse `--gpu-share` (entier de 1 à 100).
+/// Analyse `--gpu-share` (entier de 10 à 100).
 pub fn parse_gpu_share(value: &str) -> Result<u8, String> {
     value
         .parse::<u8>()
         .ok()
-        .filter(|v| (1..=100).contains(v))
-        .ok_or_else(|| format!("--gpu-share doit être un entier de 1 à 100, reçu {value}"))
+        .filter(|v| (MIN_GPU_SHARE..=100).contains(v))
+        .ok_or_else(|| format!("--gpu-share doit être un entier de 10 à 100, reçu {value}"))
 }
 
 /// Analyse `--max-tok-s` (flottant fini > 0).
@@ -3060,7 +3062,7 @@ mod tests {
         assert_eq!(sleep(10_000, 100), 0);
         assert_eq!(sleep(10_000, 50), 10_000);
         assert_eq!(sleep(10_000, 25), 30_000);
-        assert_eq!(sleep(10_000, 1), 990_000);
+        assert_eq!(sleep(10_000, 10), 90_000);
         assert_eq!(sleep(u64::MAX, 1), u64::MAX);
     }
 

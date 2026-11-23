@@ -1064,7 +1064,6 @@ impl CausalDecoder {
                 });
             }
         }
-        let throttle_interval = decode_min_interval();
         let mut throttle_last: Option<Instant> = None;
         for step in 0..max_new_tokens {
             if options.stop_token_ids.contains(&token) {
@@ -1077,7 +1076,7 @@ impl CausalDecoder {
             if generated_matches_stop_sequence(&generated, &options.stop_sequences) {
                 break;
             }
-            if let Some(interval) = throttle_interval {
+            if let Some(interval) = decode_min_interval() {
                 if let Some(last) = throttle_last {
                     let elapsed = last.elapsed();
                     if elapsed < interval {

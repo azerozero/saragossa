@@ -103,8 +103,12 @@ impl ServeArgs {
                 .map_err(|_| ServeError::args("serve.max_tokens_cap hors plage"))?,
             None => DEFAULT_MAX_TOKENS_CAP,
         };
-        let mut max_tok_s = profile.serve.max_tok_s;
-        // invariant: `Profile::validate` borne `serve.gpu_share` à 1..=100.
+        // Convention des autres clés : CLI > env > profil.
+        let mut max_tok_s = std::env::var("SARAGOSSA_RUST_MAX_TOK_S")
+            .ok()
+            .and_then(|v| saragossa::parse_max_tok_s(v.trim()).ok())
+            .or(profile.serve.max_tok_s);
+        // invariant: `Profile::validate` borne `serve.gpu_share` à 10..=100.
         let mut gpu_share = profile.serve.gpu_share.map(|v| v as u8);
         let mut prefix_ssd = saragossa::runtime_flags::ServePrefixSsdOptions::from_env()?;
         let mut iter = args.into_iter();
@@ -295,7 +299,7 @@ pub(super) fn help_text() -> String {
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
          [--api-key TOKEN (deprecated, use SARAGOSSA_API_KEY)] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
-         {modality_options}[--backend cpu|metal] [--preload] [--max-tok-s R] [--gpu-share 1-100] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
+         {modality_options}[--backend cpu|metal] [--preload] [--max-tok-s R] [--gpu-share 10-100] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
          Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap, serve.max_tok_s, serve.gpu_share and the [[models]] list (id, path) only. See `saragossa config print`.\n\
          Upgrade (Unix): SIGUSR2 starts the same binary path (or --upgrade-binary PATH) with the same arguments on the inherited listening socket, then the old process drains for at most serve.drain_timeout_secs (30) and exits; enhance h2/WebTransport listeners follow. serve.relay_mode=auto|parallel|sequential (auto: sequential only if the memory guard refuses two resident processes).\n\
          SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
