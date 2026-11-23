@@ -228,20 +228,23 @@ kernel void rms_norm_rope_heads_decode_rows_f32(
         if (tid < stride) { partial[tid] += partial[tid + stride]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    const float inv_rms = rsqrt((partial[0] / float(head_dim)) + eps);
+    // NOTE: une tête sans QK-norm (Llama, Mistral) lie le poids marqueur
+    // `ROPE_ONLY_NORM_MARKER` en weight[0] : rotation seule, x × 1 × 1 exact.
+    const bool rope_only = as_type<uint>(weight[0]) == 0x7FC00001u;
+    const float inv_rms = rope_only ? 1.0f : rsqrt((partial[0] / float(head_dim)) + eps);
     const uint pairs = rope_dims / 2u;
     // Gemma proportional sépare les partenaires sur la tête entière ;
     // Qwen partiel conserve la demi-tranche rotative.
     const uint pair_offset = uint(params.y);
     for (uint col = tid; col < head_dim; col += 256u) {
-        float value = input[start + col] * inv_rms * weight[col];
+        float value = input[start + col] * inv_rms * (rope_only ? 1.0f : weight[col]);
         if (col < pairs || (col >= pair_offset && col < pair_offset + pairs)) {
             const uint pair = (col < pair_offset) ? col : (col - pair_offset);
             const float angle = float(position) * inv_freq[pair];
             const float c = precise::cos(angle);
             const float s = precise::sin(angle);
-            const float first = input[start + pair] * inv_rms * weight[pair];
-            const float second = input[start + pair + pair_offset] * inv_rms * weight[pair + pair_offset];
+            const float first = input[start + pair] * inv_rms * (rope_only ? 1.0f : weight[pair]);
+            const float second = input[start + pair + pair_offset] * inv_rms * (rope_only ? 1.0f : weight[pair + pair_offset]);
             // Fast-math peut contracter first*c - second*s en FMA ;
             // cet écart est admis sous la porte CPU de 1e-5.
             value = (col < pair_offset) ? (first * c - second * s) : (first * s + second * c);

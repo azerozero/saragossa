@@ -5,33 +5,56 @@ use super::*;
 /// Le setup partage les tables entre couches ; les encodeurs résidents
 /// empruntent ensuite leur poignée sans consulter ce cache.
 #[derive(Debug, Default)]
-pub(crate) struct RopeFrequencyCache(Mutex<HashMap<(u32, usize), Buffer>>);
+pub(crate) struct RopeFrequencyCache(Mutex<HashMap<RopeFrequencyKey, Buffer>>);
+
+type RopeFrequencyKey = (u32, usize, Option<[u32; 4]>);
 
 impl RopeFrequencyCache {
-    pub(crate) fn get(&self, device: &Device, theta: f32, frequency_dim: usize) -> Result<Buffer> {
+    pub(crate) fn get(
+        &self,
+        device: &Device,
+        theta: f32,
+        frequency_dim: usize,
+        llama3: Option<crate::rope::Llama3RopeScaling>,
+    ) -> Result<Buffer> {
         let mut cache = self.0.lock().map_err(|_| {
             InferError::Config("cache fréquences RoPE Metal empoisonné".to_string())
         })?;
-        let key = (theta.to_bits(), frequency_dim);
+        let key = (
+            theta.to_bits(),
+            frequency_dim,
+            llama3.map(crate::rope::Llama3RopeScaling::key),
+        );
         if let Some(buffer) = cache.get(&key) {
             return Ok(buffer.clone());
         }
-        let buffer = create_rope_frequencies(device, theta, frequency_dim)?;
+        let buffer = create_rope_frequencies_scaled(device, theta, frequency_dim, llama3)?;
         cache.insert(key, buffer.clone());
         Ok(buffer)
     }
 }
 
 /// Construit la table hors encodage ; les tests et le setup gardent la poignée.
+#[cfg(test)]
 pub(crate) fn create_rope_frequencies(
     device: &Device,
     theta: f32,
     frequency_dim: usize,
 ) -> Result<Buffer> {
+    create_rope_frequencies_scaled(device, theta, frequency_dim, None)
+}
+
+/// Table avec scaling `llama3` éventuel ; `None` garde `inv_freq` au bit près.
+pub(crate) fn create_rope_frequencies_scaled(
+    device: &Device,
+    theta: f32,
+    frequency_dim: usize,
+    llama3: Option<crate::rope::Llama3RopeScaling>,
+) -> Result<Buffer> {
     // Garde la borne des encodeurs avant de dimensionner l’allocation hôte.
     u32::try_from(frequency_dim)
         .map_err(|_| InferError::Dimension("rope frequency_dim hors u32".to_string()))?;
-    let frequencies = crate::rope::inv_freq(frequency_dim, theta);
+    let frequencies = crate::rope::inv_freq_scaled(frequency_dim, theta, llama3);
     // NoPE garde la RMSNorm fusionnée : Metal exige une liaison valide,
     // mais aucune fréquence n’est lue lorsque rope_dims vaut zéro.
     let buffer = if frequencies.is_empty() {
@@ -48,10 +71,33 @@ pub(crate) fn create_rope_frequencies(
 
 impl MetalExecutor {
     pub(crate) fn rope_frequencies(&self, theta: f32, frequency_dim: usize) -> Result<Buffer> {
+        self.rope_frequencies_scaled(theta, frequency_dim, None)
+    }
+
+    /// Table partagée avec le scaling `llama3` éventuel (Llama 3.1+).
+    pub(crate) fn rope_frequencies_scaled(
+        &self,
+        theta: f32,
+        frequency_dim: usize,
+        llama3: Option<crate::rope::Llama3RopeScaling>,
+    ) -> Result<Buffer> {
         self.rope_frequencies
-            .get(&self.device, theta, frequency_dim)
+            .get(&self.device, theta, frequency_dim, llama3)
+    }
+
+    /// Poids de norme Q/K factice d'une tête sans QK-norm (Llama, Mistral) :
+    /// les noyaux RoPE résidents reconnaissent [`ROPE_ONLY_NORM_MARKER`] en
+    /// tête de tampon et n'appliquent alors que la rotation.
+    pub(crate) fn rope_only_norm_weight(&self, head_dim: usize) -> Result<Buffer> {
+        let mut weight = vec![1.0_f32; head_dim.max(1)];
+        weight[0] = f32::from_bits(ROPE_ONLY_NORM_MARKER);
+        self.buffer_from_f32(&weight, "resident_rope_only_norm")
     }
 }
+
+/// NaN silencieux de charge 1, jamais produit par un poids chargé : lu par
+/// `rms_norm_rope_head` et `rms_norm_rope_heads_decode_rows_f32`.
+pub(crate) const ROPE_ONLY_NORM_MARKER: u32 = 0x7FC0_0001;
 
 /// L'écart rotate-half est le nombre de fréquences de la table exacte créée
 /// ci-dessus : head_dim/2 pour Gemma proportional, rope_dims/2 pour Qwen.

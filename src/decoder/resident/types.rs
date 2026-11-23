@@ -139,11 +139,12 @@ pub(super) fn resident_full_layer_unsupported_reason(layer: &DecoderLayer) -> Op
             {
                 return Some("full-attn projection biaisée".to_string());
             }
-            if attention.q_norm.is_none() {
-                return Some("full-attn q_norm absent".to_string());
+            // Sans QK-norm (Llama, Mistral), la RoPE seule n'est câblée qu'au tail dense.
+            if attention.q_norm.is_some() != attention.k_norm.is_some() {
+                return Some("full-attn q_norm/k_norm dépareillés".to_string());
             }
-            if attention.k_norm.is_none() {
-                return Some("full-attn k_norm absent".to_string());
+            if attention.q_norm.is_none() && !matches!(mlp, FeedForward::Dense(_)) {
+                return Some("full-attn sans QK-norm hors MLP dense".to_string());
             }
         }
         AttentionBlock::Linear(_) => {}

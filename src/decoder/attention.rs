@@ -259,7 +259,8 @@ impl DecoderLayer {
     ///
     /// Exige : post-norm + tail MLP encodable (MoE shared-expert ou Dense
     /// gate/up/down biasless) ; pour full-attn, projections Q/K/V/O biasless et
-    /// q_norm/k_norm présents (le kernel fusionné rms_norm+RoPE l'exige). Le
+    /// q_norm/k_norm présents ensemble, ou absents ensemble devant un MLP dense
+    /// (Llama, Mistral : RoPE seule par le poids marqueur). Le
     /// shared-expert/router biasless est re-vérifié à l'encodage (`ensure_biasless`).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(super) fn supports_resident_full(&self) -> bool {
@@ -302,8 +303,8 @@ impl DecoderLayer {
                     && attention.k_proj.bias().is_none()
                     && attention.resident_v_proj().bias().is_none()
                     && attention.o_proj.bias().is_none()
-                    && attention.q_norm.is_some()
-                    && attention.k_norm.is_some()
+                    && attention.q_norm.is_some() == attention.k_norm.is_some()
+                    && (attention.q_norm.is_some() || matches!(mlp, FeedForward::Dense(_)))
             }
             // Linear-attn : chemin résident conv/ssm déjà éprouvé (phases 1a/1b).
             AttentionBlock::Linear(_) => true,

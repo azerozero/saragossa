@@ -26,9 +26,10 @@ impl CausalDecoder {
                 "couche full-attn attendue (decode résident)".to_string(),
             ));
         };
-        if attention.q_norm.is_none() || attention.k_norm.is_none() {
+        // Sans QK-norm, le setup lie le poids marqueur de la RoPE seule.
+        if attention.q_norm.is_some() != attention.k_norm.is_some() {
             return Err(InferError::Config(
-                "q_norm/k_norm manquant (decode résident)".to_string(),
+                "q_norm/k_norm dépareillés (decode résident)".to_string(),
             ));
         }
         if layer.post_attention_norm.is_none() {

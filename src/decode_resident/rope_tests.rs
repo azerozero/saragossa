@@ -437,3 +437,71 @@ fn rope_prefill_and_decode_keys_are_bit_identical() -> Result<()> {
     }
     Ok(())
 }
+
+/// Sans QK-norm (Llama, Mistral), le poids marqueur réduit les noyaux decode
+/// et lignes à la RoPE seule : même porte que la rotation normée.
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn rope_only_marker_rotates_without_norm() -> Result<()> {
+    let state = gpu_state()?;
+    let executor = MetalExecutor::new()?;
+    let (head_dim, theta) = (128, 1.0e6);
+    let marker = executor.rope_only_norm_weight(head_dim)?;
+    let frequencies = create_rope_frequencies(state.device(), theta, head_dim)?;
+    let width = HEADS * head_dim;
+    let (input, _) = data(head_dim, ROWS);
+    let input_gpu = lease_with(&state, &input)?;
+    let decode = state.scratch().lease(width, GpuElement::F32)?;
+    let rows = state.scratch().lease(ROWS * width, GpuElement::F32)?;
+    for position in POSITIONS {
+        let base = position - 1;
+        let command = state.queue().new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        state.encode_rms_norm_rope_decode(
+            encoder,
+            input_gpu.tensor().buffer(),
+            &marker,
+            decode.tensor().buffer(),
+            HEADS,
+            head_dim,
+            head_dim,
+            &frequencies,
+            base,
+            1.0e-6,
+        )?;
+        state.encode_rms_norm_rope_decode_rows(
+            encoder,
+            state.rows_kernels()?,
+            input_gpu.tensor().buffer(),
+            0,
+            width,
+            &marker,
+            rows.tensor().buffer(),
+            width,
+            HEADS,
+            head_dim,
+            head_dim,
+            &frequencies,
+            base,
+            ROWS,
+            1.0e-6,
+        )?;
+        encoder.end_encoding();
+        commit_and_wait(command)?;
+        let actual = read_f32(rows.tensor());
+        for row in 0..ROWS {
+            let expected: Vec<f32> = input[row * width..(row + 1) * width]
+                .chunks_exact(head_dim)
+                .flat_map(|head| {
+                    crate::rope::reference_rotate_half(head, head_dim, head_dim, theta, base + row)
+                })
+                .collect();
+            let label = format!("RoPE seule pos={} ligne={row}", base + row);
+            assert_precise(&actual[row * width..(row + 1) * width], &expected, &label);
+            if row == 0 {
+                assert_precise(&read_f32(decode.tensor()), &expected, &label);
+            }
+        }
+    }
+    Ok(())
+}
