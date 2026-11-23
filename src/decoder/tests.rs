@@ -6659,7 +6659,7 @@ fn gpu_share_keeps_greedy_output_synthetic() -> Result<()> {
     }
     let (model, prompt) = mtp_sign_synthetic_model()?;
     let options = GenerationOptions::default();
-    let run = |share: u8| -> Result<(Vec<u32>, Vec<u32>)> {
+    let run = |share: u8| -> Result<(Vec<usize>, Vec<usize>)> {
         let _reset = Reset;
         crate::set_gpu_share(share);
         model.clear_prefix_cache();
