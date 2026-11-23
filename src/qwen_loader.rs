@@ -481,6 +481,60 @@ pub fn load_qwen_causal_decoder_from_shards_with_memory_guard(
     load_causal_decoder_from_shards_with_memory_guard(config, shards, catalog, guard)
 }
 
+/// Exige des biais attention (q/k/v/o) et MLP (gate/up/down) présents sur toutes
+/// les couches ou absents partout, en accord avec `attention_bias`/`mlp_bias`.
+///
+/// Le chargeur détecte les biais par présence : un biais partiel ou annoncé mais
+/// absent serait ignoré sans erreur. Contrôle limité à Llama/Mistral et aux
+/// familles qui déclarent un biais.
+fn validate_bias_tensors(config: &ModelConfig, catalog: &WeightCatalog) -> Result<()> {
+    let keys = catalog.keys();
+    for (declared, field, suffixes) in [
+        (
+            config.attention_bias,
+            "attention_bias",
+            &[
+                "self_attn.q_proj.bias",
+                "self_attn.k_proj.bias",
+                "self_attn.v_proj.bias",
+                "self_attn.o_proj.bias",
+            ][..],
+        ),
+        (
+            config.mlp_bias,
+            "mlp_bias",
+            &[
+                "mlp.gate_proj.bias",
+                "mlp.up_proj.bias",
+                "mlp.down_proj.bias",
+            ][..],
+        ),
+    ] {
+        if !(declared || config.is_llama() || config.is_mistral()) {
+            continue;
+        }
+        let expected = config.num_hidden_layers * suffixes.len();
+        let present = (0..config.num_hidden_layers)
+            .flat_map(|layer| suffixes.iter().map(move |suffix| (layer, suffix)))
+            .filter(|(layer, suffix)| {
+                let tail = format!("layers.{layer}.{suffix}");
+                keys.iter().any(|key| key.ends_with(&tail))
+            })
+            .count();
+        let coherent = if declared {
+            present == expected
+        } else {
+            present == 0
+        };
+        if !coherent {
+            return Err(InferError::Config(format!(
+                "{field}={declared} incohérent avec les tenseurs de biais ({present}/{expected} présents)"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_supported_config(config: &ModelConfig, catalog: &WeightCatalog) -> Result<()> {
     if crate::runtime_flags::vision_enabled()? {
         vision::require_implementation(catalog)?;
@@ -497,20 +551,15 @@ fn validate_supported_config(config: &ModelConfig, catalog: &WeightCatalog) -> R
         )));
     }
     validate_rope_scaling(config)?;
-    // NOTE: la fenêtre glissante n'est pas implémentée pour Llama/Mistral ; une
-    // fenêtre plus courte que le contexte donnerait une attention fausse.
-    let short_window = config
+    // NOTE: la fenêtre glissante n'est pas implémentée pour Llama/Mistral et la
+    // génération peut dépasser `max_position_embeddings` : tout `sliding_window`
+    // non nul est refusé (Mistral v0.3 le déclare null).
+    if let Some(window) = config
         .sliding_window
-        .filter(|window| *window > 0)
-        .filter(|window| {
-            config
-                .max_position_embeddings
-                .is_none_or(|max| *window < max)
-        });
-    if let Some(window) = short_window.filter(|_| config.is_llama() || config.is_mistral()) {
+        .filter(|window| *window > 0 && (config.is_llama() || config.is_mistral()))
+    {
         return Err(InferError::Config(format!(
-            "sliding_window {window} inférieur au contexte ({:?}) : non supporté pour Llama/Mistral",
-            config.max_position_embeddings
+            "sliding_window {window} non supporté pour Llama/Mistral"
         )));
     }
     // NOTE: Les chemins Metal fusionnés (QK-norm + RoPE) lisent une table de
@@ -526,22 +575,7 @@ fn validate_supported_config(config: &ModelConfig, catalog: &WeightCatalog) -> R
             "rope_scaling llama3 avec QK-norm : chemins Metal fusionnés non câblés".to_string(),
         ));
     }
-    // Un biais annoncé mais absent serait ignoré sans erreur (le chargeur
-    // détecte les biais par présence) : refus net.
-    for (declared, suffix, field) in [
-        (
-            config.attention_bias,
-            "self_attn.q_proj.bias",
-            "attention_bias",
-        ),
-        (config.mlp_bias, "mlp.down_proj.bias", "mlp_bias"),
-    ] {
-        if declared && !catalog.keys().iter().any(|key| key.ends_with(suffix)) {
-            return Err(InferError::Config(format!(
-                "{field} vrai sans tenseur `{suffix}`"
-            )));
-        }
-    }
+    validate_bias_tensors(config, catalog)?;
     config.router_score()?;
     if config.router_expert_bias == Some(true) {
         return Err(InferError::Config(

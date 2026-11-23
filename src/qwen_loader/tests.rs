@@ -1162,7 +1162,7 @@ fn accepts_micro_modes_and_checks_overrides() -> Result<()> {
 }
 
 #[test]
-fn rejects_llama_family_sliding_window_shorter_than_context() {
+fn rejects_llama_family_sliding_window_set() {
     let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
     write_safetensors(tmp.path(), "model.", "lm_head.", None);
     let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
@@ -1177,5 +1177,29 @@ fn rejects_llama_family_sliding_window_shorter_than_context() {
     let err = load(Some(4096)).expect_err("invariant: fenêtre courte refusée");
     assert!(err.to_string().contains("sliding_window"), "{err}");
     load(None).expect("invariant: sliding_window null accepté (Mistral v0.3)");
-    load(Some(32768)).expect("invariant: fenêtre égale au contexte acceptée");
+    let err = load(Some(32768)).expect_err("invariant: fenêtre égale au contexte refusée");
+    assert!(err.to_string().contains("sliding_window"), "{err}");
+}
+
+#[test]
+fn rejects_partial_bias_tensors() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    let bias = TensorFixture::f32(vec![2], vec![0.0, 0.0]);
+    write_safetensors(
+        tmp.path(),
+        "model.",
+        "lm_head.",
+        Some(("model.layers.0.self_attn.q_proj.bias", bias)),
+    );
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    // Annoncé mais seul q_proj en porte un ; non annoncé mais présent (Mistral).
+    for (declared, model_type) in [(true, "qwen3"), (false, "mistral")] {
+        let mut config = test_config();
+        config.model_type = model_type.to_string();
+        config.attention_bias = declared;
+        let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+            .expect_err("invariant: biais partiel refusé");
+        assert!(err.to_string().contains("attention_bias"), "{err}");
+    }
 }

@@ -663,3 +663,40 @@ fn gemma4_explicit_rope_parameters_precede_defaults() {
         assert_eq!(cfg.rope_sliding_partial_rotary_factor, Some(1.0));
     }
 }
+
+fn llama_with_rope(scaling: &str, rope_parameters: &str) -> RawModelConfig {
+    serde_json::from_str(&format!(
+        r#"{{"model_type":"llama","hidden_size":64,"num_hidden_layers":2,
+        "num_attention_heads":4,"num_key_value_heads":2,"intermediate_size":128,
+        "vocab_size":100,"rope_scaling":{scaling},"rope_parameters":{rope_parameters}}}"#
+    ))
+    .expect("invariant: JSON valide")
+}
+
+#[test]
+fn null_rope_scaling_is_replaced_by_rope_parameters() {
+    let cfg = llama_with_rope(
+        "null",
+        r#"{"rope_type":"llama3","rope_theta":500000.0,"factor":8.0,"low_freq_factor":1.0,
+        "high_freq_factor":4.0,"original_max_position_embeddings":8192}"#,
+    )
+    .resolve()
+    .expect("invariant: config valide");
+    assert_eq!(
+        cfg.rope_scaling
+            .expect("invariant: scaling repris")
+            .scaling_type(),
+        "llama3"
+    );
+}
+
+#[test]
+fn contradictory_rope_scaling_and_parameters_are_rejected() {
+    let err = llama_with_rope(
+        r#"{"rope_type":"linear","factor":2.0}"#,
+        r#"{"rope_type":"llama3","rope_theta":500000.0,"factor":8.0}"#,
+    )
+    .resolve()
+    .expect_err("invariant: contradiction refusée");
+    assert!(err.to_string().contains("contradictoires"), "{err}");
+}

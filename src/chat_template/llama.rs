@@ -87,7 +87,7 @@ pub fn llama3_today() -> String {
 /// Rend des messages au format Mistral Instruct v0.3 sans outils.
 ///
 /// Suit le template HF : `<s>` littéral, `[INST] …[/INST]`, message système
-/// optionnel préfixé au DERNIER tour user, réponses ` …</s>` trimmées. Le
+/// optionnel préfixé au dernier message, s'il est user (`loop.last` : sinon il disparaît), réponses ` …</s>` trimmées. Le
 /// template n'a pas de prompt de génération : le dernier `[/INST]` en tient lieu.
 ///
 /// # Errors
@@ -98,7 +98,6 @@ pub fn render_mistral_chat(messages: &[ChatTemplateMessage]) -> Result<String, T
         Some((first, rest)) if first.role == "system" => (first.content.as_deref(), rest),
         _ => (None, messages),
     };
-    let last_user = turns.iter().rposition(|message| message.role == "user");
     let mut out = String::from("<s>");
     for (index, message) in turns.iter().enumerate() {
         if !message.tool_calls.is_empty() {
@@ -114,7 +113,7 @@ pub fn render_mistral_chat(messages: &[ChatTemplateMessage]) -> Result<String, T
         let content = message.content.as_deref().unwrap_or("");
         if message.role == "user" {
             out.push_str("[INST] ");
-            if let (Some(system), true) = (system, Some(index) == last_user) {
+            if let (Some(system), true) = (system, index + 1 == turns.len()) {
                 out.push_str(system);
                 out.push_str("\n\n");
             }
@@ -187,6 +186,16 @@ mod tests {
         ])
         .expect("invariant: alternance valide");
         assert_eq!(rendered, "<s>[INST] A[/INST] B</s>[INST] Sys\n\nC[/INST]");
+        // `loop.last` : sans dernier tour user, le système disparaît du rendu.
+        assert_eq!(
+            render_mistral_chat(&[
+                msg("system", "Sys"),
+                msg("user", "A"),
+                msg("assistant", "B")
+            ])
+            .as_deref(),
+            Ok("<s>[INST] A[/INST] B</s>")
+        );
         assert_eq!(
             render_mistral_chat(&[msg("assistant", "x")]),
             Err(TemplateError::RoleAlternation)
