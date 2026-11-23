@@ -150,8 +150,8 @@ pub(crate) use self::barriers::command_buffer_gpu_ns;
 #[doc(hidden)]
 pub use self::barriers::dump_commit_components;
 pub(crate) use self::barriers::{
-    commit_and_wait, commit_and_wait_with, commit_nonblocking, install_dispatch_barrier_scope,
-    post_dispatch_barrier, wait_for_completion, EncoderEndGuard,
+    commit_and_wait, commit_and_wait_with, commit_nonblocking, duty_pause,
+    install_dispatch_barrier_scope, post_dispatch_barrier, wait_for_completion, EncoderEndGuard,
 };
 pub(crate) use self::byte_helpers::read_u16_buffer;
 pub(crate) use self::byte_helpers::{read_f32_buffer, read_f32_buffer_at, read_u32_buffer};

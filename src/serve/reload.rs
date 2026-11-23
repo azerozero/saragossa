@@ -1,7 +1,8 @@
 //! Rechargement SIGHUP des limites sûres à chaud et de la liste des modèles.
 //!
 //! Chaud : `serve.read_timeout_secs` (nouvelles connexions),
-//! `serve.max_tokens_cap` (prochaine requête) et `[[models]]` : la liste
+//! `serve.max_tokens_cap` (prochaine requête), `serve.max_tok_s` et
+//! `serve.gpu_share` (prochain token ou command buffer) et `[[models]]` : la liste
 //! acceptée sert `/v1/models` aussitôt, le thread moteur l'applique entre deux
 //! requêtes (`ServeState::set_models`), donc une requête en cours finit sur son
 //! modèle avant qu'il soit déchargé.
@@ -187,6 +188,12 @@ fn reload(
     let diff = diff_models(current_models, &models);
     READ_TIMEOUT_SECS.store(args.read_timeout.as_secs(), Ordering::Relaxed);
     MAX_TOKENS_CAP.store(args.max_tokens_cap, Ordering::Relaxed);
+    if changed.contains(&"serve.max_tok_s") {
+        saragossa::set_decode_max_tokens_per_s(args.max_tok_s);
+    }
+    if changed.contains(&"serve.gpu_share") {
+        saragossa::set_gpu_share(args.gpu_share.unwrap_or(100));
+    }
     if !(diff.0.is_empty() && diff.1.is_empty()) {
         *lock(&PENDING) = Some(models);
     }
