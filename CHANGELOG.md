@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.33](https://github.com/azerozero/saragossa/compare/v0.3.32...v0.3.33) - 2026-11-23
+
+### Added
+
+- *(serve)* bridage gpu-share et max-tok-s pour run et serve
+
+### Fixed
+
+- *(serve)* max_tok_s respecte la priorité --set > env > profil
+- *(serve)* gpu-share n'altère plus le lookup, sommeil interruptible, précédence env
+
+### Other
+
+- Merge pull request #337 from azerozero/release-plz-2026-11-23T16-36-03Z
+- Merge pull request #336 from azerozero/feat/bride-gpu
+- Merge remote-tracking branch 'origin/main' into feat/bride-gpu
+- *(decoder)* tokens usize dans le test d'identité gpu-share
+
 ## [0.3.32](https://github.com/azerozero/saragossa/compare/v0.3.31...v0.3.32) - 2026-11-23
 
 ### Added
