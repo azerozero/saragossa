@@ -497,6 +497,22 @@ fn validate_supported_config(config: &ModelConfig, catalog: &WeightCatalog) -> R
         )));
     }
     validate_rope_scaling(config)?;
+    // NOTE: la fenêtre glissante n'est pas implémentée pour Llama/Mistral ; une
+    // fenêtre plus courte que le contexte donnerait une attention fausse.
+    let short_window = config
+        .sliding_window
+        .filter(|window| *window > 0)
+        .filter(|window| {
+            config
+                .max_position_embeddings
+                .is_none_or(|max| *window < max)
+        });
+    if let Some(window) = short_window.filter(|_| config.is_llama() || config.is_mistral()) {
+        return Err(InferError::Config(format!(
+            "sliding_window {window} inférieur au contexte ({:?}) : non supporté pour Llama/Mistral",
+            config.max_position_embeddings
+        )));
+    }
     // NOTE: Les chemins Metal fusionnés (QK-norm + RoPE) lisent une table de
     // fréquences sans scaling llama3. Sans QK-norm (Llama, Mistral), la RoPE
     // reste sur la table CPU scalée ; aucun modèle publié ne combine les deux.

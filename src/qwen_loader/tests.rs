@@ -1160,3 +1160,22 @@ fn accepts_micro_modes_and_checks_overrides() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn rejects_llama_family_sliding_window_shorter_than_context() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_safetensors(tmp.path(), "model.", "lm_head.", None);
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    let load = |window: Option<usize>| {
+        let mut config = test_config();
+        config.model_type = "mistral".to_string();
+        config.max_position_embeddings = Some(32768);
+        config.sliding_window = window;
+        load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+    };
+    let err = load(Some(4096)).expect_err("invariant: fenêtre courte refusée");
+    assert!(err.to_string().contains("sliding_window"), "{err}");
+    load(None).expect("invariant: sliding_window null accepté (Mistral v0.3)");
+    load(Some(32768)).expect("invariant: fenêtre égale au contexte acceptée");
+}
