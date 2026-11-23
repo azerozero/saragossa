@@ -1,14 +1,55 @@
 # saragossa
 
+[![CI](https://github.com/azerozero/saragossa/actions/workflows/rust.yml/badge.svg?branch=main)](https://github.com/azerozero/saragossa/actions/workflows/rust.yml)
+[![release](https://img.shields.io/github/v/release/azerozero/saragossa)](https://github.com/azerozero/saragossa/releases)
+[![crates.io](https://img.shields.io/crates/v/saragossa)](https://crates.io/crates/saragossa)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![platform](https://img.shields.io/badge/platform-Apple%20Silicon-black)
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
 ![python](https://img.shields.io/badge/python-zero%20deps-success)
 
+
 **Pure-Rust Metal inference engine for Apple Silicon.** Raw `metal-rs` kernels,
 no Python, no MLX, no CoreML. LLM, speech-to-text and text-to-speech in a single
 binary — usable as a library or behind the OpenAI-compatible HTTP server
 `saragossa serve`.
+
+
+## Install
+
+### Homebrew (Apple Silicon)
+
+```sh
+brew install azerozero/tap/saragossa # prebuilt binary from the latest stable release
+```
+
+### From source
+
+```sh
+git clone https://github.com/azerozero/saragossa.git
+cd saragossa
+cargo install --path . --locked   # installs the `saragossa` binary
+```
+
+Requirements: **Apple Silicon** and the Metal Toolchain, which saragossa uses to
+compile its GPU kernels on first launch:
+
+```sh
+xcodebuild -downloadComponent MetalToolchain
+```
+
+## Quick start
+
+```sh
+# Start an interactive chat, downloading the HF model if it is missing.
+saragossa run mlx-community/Qwen3-4B-4bit
+
+# List the models already present in the local Hugging Face cache.
+saragossa list
+```
+
+For gated models (Gemma, for instance) accept the license on the model's Hugging
+Face page first, then export `HF_TOKEN`.
 
 ## CPU builds on Linux and Windows
 
@@ -52,8 +93,13 @@ the **single-user latency × Apple Silicon** quadrant:
 - vLLM / SGLang / TGI / LMDeploy require an NVIDIA GPU; here everything is native
   Metal.
 - Ollama and llama.cpp are general-purpose and cross-platform; saragossa is tuned
-  for **one** target (the Apple Silicon GPU, resident decode). On MoE **decode**
-  at comparable quantization it is competitive with — and can exceed — `mlx_lm`
+  for **one** target (the Apple Silicon GPU, resident decode). In the
+  [November 2026 campaign](bench/competitors/data/campagne-2026-11/README.md) it
+  is within a few percent of `mlx-vlm` 0.8.0 with MTP on the 27B 4-bit (ahead
+  at 512, behind at 4096) and ahead on the 35B-A3B MoE and the 27B BF16 (see
+  [Performance](#performance)). The fair
+  comparison is against `mlx-vlm` with a drafter, not against `mlx_lm` in plain
+  autoregressive mode, which is the weak baseline.
   (measured; benchmark on your own hardware).
 - Optimized for local latency (agents, copilots, voice loops), not multi-tenant
   throughput: the server is single-threaded by design.
@@ -79,71 +125,75 @@ the **single-user latency × Apple Silicon** quadrant:
 | `POST /v1/responses` | Stateless text and function calls (JSON or SSE) |
 | `POST /v1/messages` | Anthropic Messages shim + `tool_use` (drivable by Claude Code) |
 | `POST /v1/audio/transcriptions` | Whisper STT (multipart WAV, `json`/`text`/`verbose_json`, SSE `stream=true`, opt-in `--stt-model`) |
-| `POST /v1/audio/transcriptions/stream` | Whisper STT à entrée incrémentale (PCM par morceaux, voir [docs/stt-streaming.md](docs/stt-streaming.md)) |
-| `POST /v1/audio/speech` | Qwen3 TTS (JSON → WAV ou PCM chunked avec `stream: true`, opt-in `--tts-model`) |
+| `POST /v1/audio/transcriptions/stream` | Whisper STT with incremental input (chunked PCM, see [docs/stt-streaming.md](docs/stt-streaming.md)) |
+| `POST /v1/audio/speech` | Qwen3 TTS (JSON → WAV, or chunked PCM with `stream: true`; opt-in `--tts-model`; see [Details](#streaming-audio-over-http)) |
 | `POST /v1/embeddings` | e5-small embeddings (opt-in `--embed-model`) |
-
-### Streaming audio HTTP
-
-CustomVoice accepte `voice` (défaut : `serena`). Une voix inconnue (`alloy`,
-`nova`…) utilise Serena et renvoie `X-Saragossa-TTS-Voice-Fallback` avec le nom
-demandé, en WAV comme en streaming. La cause est journalisée sur stderr.
-VoiceDesign et CustomVoice utilisent le sampling du snapshot avec
-une graine déterministe ; `seed` permet de la choisir par requête.
-Voir [la politique de génération TTS](docs/tts-generation.md) pour les
-paramètres, le flag glouton des oracles et les raisons d'arrêt.
-
-`POST /v1/audio/speech` conserve le WAV complet par défaut (`stream` absent ou
-`false`). L'extension explicite `{"input":"Bonjour.","stream":true}` émet chaque
-lot dès son décodage, en HTTP/1.1 `Transfer-Encoding: chunked`, sans
-`Content-Length`. Le corps déchunké est du **PCM brut signé 16 bits little-endian,
-mono, sans en-tête WAV** (`Content-Type: audio/pcm`). Le taux natif du codec est
-indiqué par `X-Saragossa-Audio-Sample-Rate` (habituellement 24000 Hz) ; chaque
-échantillon utilise la même conversion que le WAV. `model` reste accepté sans
-effet. `stream: true` sélectionne ce format PCM à lui seul.
-
-Le plafond audio existant et `SARAGOSSA_TTS_MAX_FRAMES` s'appliquent aux deux
-modes. En streaming, `X-Saragossa-TTS-Frame-Limit-Reached` est un **trailer HTTP**
-annoncé par `Trailer`, transmis après le chunk zéro ; en WAV, il reste un en-tête.
-`X-Saragossa-TTS-Stop-Reason` suit le même transport et distingue `eos`, `repeat`
-et `cap`.
-Un client qui ignore les trailers ne reçoit pas cette indication. Une erreur
-après le début de la réponse ferme le flux sans chunk terminal : le client doit
-traiter ce corps comme incomplet. Une déconnexion arrête la synthèse dès l'échec
-d'écriture suivant. Le moteur reste sériel, avec la contre-pression et le timeout
-d'écriture des sockets existants ; aucun producteur audio détaché n'est créé.
-
-Le streaming du codec utilise des lots fixes de **4 trames** (environ 320 ms),
-réglables par `SARAGOSSA_TTS_STREAM_LOT`, uniquement quand ses contextes CPU et
-GPU sont réellement incrémentaux (VoiceDesign et clone x-vector). Le repli CPU,
-y compris `SARAGOSSA_TTS_CODEC_GPU=0`, et le clone ICL redécodent le préfixe :
-leurs seuils restent doublés après le premier lot. Les lots fixes évitent de
-doubler l'attente de génération entre émissions ; ils ne garantissent ni un
-coût constant de l'attention sur son historique ni un RTF inférieur à 1.
 
 ## Design principles
 
 - **GPU residency** — in decode, one token is one command buffer, with no
   readback and no per-layer `commit_and_wait`. The CPU-orchestrated per-op path
   exists only as a fallback.
-- **Byte-identity as a gate** — every optimization proves it preserves the output
+- **Exactness as a gate** — every optimization is checked against its output
   (end-to-end md5 oracles, STT/TTS goldens); near-tie drifts are qualified (ids +
-  top-5 + margin) and recorded — never silent.
+  top-5 + margin) and recorded — never silent. Greedy speculative decode is exact
+  by default except for the cases listed under
+  [speculative decode](#quantization-formats-footprint-throughput--quality); the
+  strict mode is `SARAGOSSA_RUST_VERIFY_STRICT=1`.
 - **Everything is switchable** — each optimized path has an environment
   kill-switch; the flags are centralized in
   [`src/runtime_flags.rs`](src/runtime_flags.rs).
 
 ## Performance
 
-Measured 2026-07-06 on an M5 Max:
+Decode throughput, tokens per second, on an M5 Max 128 GiB (AC power, greedy,
+256 generated tokens). Each cell is the median of 3 repetitions of the best mode
+of that engine (the mode is in parentheses), for prompts of 512, 4096 and 16384
+tokens. Source: [`campagne-2026-11/21-final`](bench/competitors/data/campagne-2026-11/21-final)
+(`summary.json`, `freeze.json`, full journal), described in the
+[campaign README](bench/competitors/data/campagne-2026-11/README.md).
 
-- Decode 35B-A3B, greedy @1k: **145.7 tok/s** (`4bit`, production default) ·
-  **105.9 tok/s** (`oQ8`) · **89.8 tok/s** @32k (`oQ8`, KV bf16).
-- Prefill 35B: 1.0 s @2k · 3.5 s @8k · 23.3 s @32k.
-- Whisper turbo STT: rtf 0.107 · TTS: 0.747 end-to-end, streaming TTFA ~1.2 s.
+**27B, 4-bit**
 
-These numbers hold for their context (hardware, model, length) — measure on your
-own machine before committing to a choice.
+| engine | 512 | 4096 | 16384 |
+|---|---|---|---|
+| saragossa | 55.0 (MTP) | 50.4 (DFLASH) | 45.1 (MTP) |
+| mlx-vlm 0.8.0 | 54.7 (MTP) | 55.8 (MTP) | 46.4 (MTP) |
+| mlx_lm (AR only) | 30.3 (AR) | 29.7 (AR) | 28.2 (AR) |
+| llama.cpp (GGUF Q4_K_M) | 41.8 (DFLASH) | 43.8 (DFLASH) | 39.9 (DFLASH) |
+
+**27B, BF16**
+
+| engine | 512 | 4096 | 16384 |
+|---|---|---|---|
+| saragossa | 24.7 (DFLASH) | 24.7 (DFLASH) | 23.4 (DFLASH) |
+| mlx-vlm 0.8.0 | 20.6 (DFLASH) | 21.1 (DFLASH) | 18.8 (MTP) |
+| mlx_lm (AR only) | 9.0 (AR) | 8.9 (AR) | 8.9 (AR) |
+| llama.cpp (GGUF Q4_K_M) | 20.0 (DFLASH) | 23.2 (DFLASH) | 19.1 (DFLASH) |
+
+**35B-A3B, 4-bit**
+
+| engine | 512 | 4096 | 16384 |
+|---|---|---|---|
+| saragossa | 169.7 (MTP) | 162.4 (MTP) | 138.0 (MTP) |
+| mlx-vlm 0.8.0 | 153.9 (MTP) | 138.9 (MTP) | 120.6 (MTP) |
+| mlx_lm (AR only) | 117.4 (AR) | 115.2 (AR) | 105.8 (AR) |
+| llama.cpp (GGUF Q4_K_M) | n/a | n/a | n/a |
+
+Caveats:
+
+- n = 3 per cell, no statistical test; rates are computed from the stream
+  delivery times in the journal (`(tokens - 1) / (last - first event)`).
+- llama.cpp runs GGUF weights (Q4_K_M for the 4-bit row, a BF16 GGUF for the
+  BF16 row), not the MLX weights the other engines load, so the weights are not
+  identical. llama.cpp was not measured on the 35B-A3B in this run.
+- The `mlx-vlm` 0.8.0 MTP and DFlash outputs are not bit-identical to its own
+  AR output; saragossa's greedy outputs are (see below).
+- Results hold for this hardware, these models and these prompts; measure on
+  your own machine before choosing.
+
+Other measurements, older and on other workloads (2026-07-06, M5 Max):
+Whisper turbo STT rtf 0.107; Qwen3-TTS 0.747 end-to-end, streaming TTFA ~1.2 s.
 
 ## Quantization formats: footprint, throughput & quality
 
@@ -157,7 +207,7 @@ saragossa loads **MLX affine** integer weights `u2`/`u3`/`u4`/`u6`/`u8`
 (M5 Max, greedy decode T=0; footprint = resident weights; KL = `KL(bf16‖quant)`
 averaged over 5 prompts):
 
-| quant | bpw | weight footprint | decode | quality vs bf16 |
+| quant | bpw | weight footprint | AR decode³ | quality vs bf16 |
 |-------|-----|------------------|--------|-----------------|
 | `u8` | ~8.5 | ~29 GB | — | near-lossless |
 | `u6` | ~6.5 | ~22 GB | — | near-lossless — **quality sweet-spot** |
@@ -171,70 +221,33 @@ stores weights once, in the shared Metal buffer → ~22 GB footprint (dense);
 the 35B-A3B MoE drops from 40.5 to 19.4 GB.
 ² Sensitivity-based mixed quant: the most sensitive layers move up one bit.
 
+³ Earlier single-run AR figures, kept for the relative cost of each format; current 27B 4-bit figures are in [Performance](#performance).
+
 **fp8** loads but a 27B (29 GB) saturates a 24-32 GB Mac — prefer `u6`/`u8` for
 high fidelity (smaller, same quality).
 
-**Speculative decode (MTP)**: on a **dense** model carrying a native MTP head,
-in greedy (T=0), saragossa verifies the draft against the target model → +15
-to +40% throughput (`u4` 27→~40, `u3` 35→~46 tok/s). The output matches the
-autoregressive (AR) decode except near a tie between the top two logits. Two
-default-on kernels of the batched verification are not bit-identical to the
-single-row step: the skinny u4 matmul, from 5 rows (DFlash, lookup, MTP with
-lookup drafts on long prompts), and the attention prefix, from 16k tokens of
-context with a bf16 KV cache. A tiny drift can then flip such a tie (before the
-other fixes: 1 request in 66 on a 32k prompt). `SARAGOSSA_RUST_VERIFY_STRICT=1`
-(opt-in) makes greedy verification exact: the attention prefix stays on the
-exact path, matmuls of 3 to 16 rows use an exact kernel instead of the skinny
-one, and the DFlash tree defaults to 3 nodes. Cost on the 27B with DFlash: −4 %
-at 4k and −12 % at 32k decode versus the default. Verified states then match
-the AR bit for bit on the test corpus; see
-[docs/perf/greedy-identity.md](docs/perf/greedy-identity.md). On the
-**Qwen3.6-35B-A3B** MoE,
-the official Qwen MTP head (not shipped in mlx-community weights) is opt-in:
-point `SARAGOSSA_RUST_MTP_SIDECAR` at its `mtp.safetensors` (in a subdirectory,
-not directly in the model root, e.g. `<model>/mtp-official/`). Greedy only, same
-AR caveat on near ties: ×1.19 to ×1.61 decode (pairwise, 5 prompts), CLI 151→224-295 tok/s;
-sampled requests stay on AR (the sampled path measured 0.94-0.99× AR). Cost:
-+0.95 GB peak physical footprint in the CLI (+1.33 GB on a 424-token prompt),
-+0.96 GB in serve after a 5,078-token request: the head is quantized straight
-into shared Metal buffers, one copy. See
+**Speculative decode (MTP, DFlash)**: in greedy mode (T=0), saragossa verifies
+the draft against the target model, so the output matches the autoregressive
+(AR) decode by default, except in the cases below. Current throughput is in
+[Performance](#performance). Two default-on kernels of the batched verification
+are not bit-identical to the single-row step: the skinny u4 matmul, from 5 rows
+(DFlash, lookup, MTP with lookup drafts on long prompts), and the attention
+prefix, from 16k tokens of context with a bf16 KV cache. A tiny drift can then
+flip a near tie between the top two logits (before the other fixes: 1 request
+in 66 on a 32k prompt). `SARAGOSSA_RUST_VERIFY_STRICT=1` (opt-in) makes greedy
+verification exact: the attention prefix stays on the exact path, matmuls of 3
+to 16 rows use an exact kernel instead of the skinny one, and the DFlash tree
+defaults to 3 nodes. Cost on the 27B with DFlash: -4 % at 4k and -12 % at 32k
+decode versus the default. Verified states then match the AR bit for bit on the
+test corpus; see [docs/perf/greedy-identity.md](docs/perf/greedy-identity.md).
+On the **Qwen3.6-35B-A3B** MoE, the official Qwen MTP head (not shipped in
+mlx-community weights) is opt-in: point `SARAGOSSA_RUST_MTP_SIDECAR` at its
+`mtp.safetensors` (in a subdirectory, not directly in the model root, e.g.
+`<model>/mtp-official/`). Greedy only, same AR caveat on near ties; sampled
+requests stay on AR. Cost: +0.95 GB peak physical footprint in the CLI (+1.33 GB
+on a 424-token prompt), +0.96 GB in serve after a 5,078-token request: the head
+is quantized straight into shared Metal buffers, one copy. See
 `generate_greedy_mtp_streaming_with_options` and `docs/perf/mtp-pairwise.md`.
-
-## Install
-
-### Homebrew (Apple Silicon)
-
-```sh
-brew install azerozero/tap/saragossa # prebuilt binary from the latest stable release
-```
-
-### From source
-
-```sh
-git clone https://github.com/azerozero/saragossa.git
-cd saragossa
-cargo install --path . --locked   # installs the `saragossa` binary
-```
-
-Requirements: **Apple Silicon** and the Metal Toolchain, which saragossa uses to
-compile its GPU kernels on first launch:
-
-```sh
-xcodebuild -downloadComponent MetalToolchain
-```
-
-## Quick start
-
-```sh
-# Start an interactive chat, downloading the HF model if it is missing.
-saragossa run mlx-community/Qwen3-4B-4bit
-
-# List the models already present in the local Hugging Face cache.
-saragossa list
-```
-
-For gated models (Gemma, for instance) accept the license on the model's Hugging
-Face page first, then export `HF_TOKEN`.
 
 ## CLI usage
 
@@ -406,19 +419,6 @@ variables — see [`src/runtime_flags.rs`](src/runtime_flags.rs) for the exact
 names and defaults (block size, LRU capacity, pool size, host headroom, static
 memory cap, …).
 
-The NA matmul path that materializes a full bf16 weight is limited to
-512 MiB per weight by `SARAGOSSA_RUST_QMM_NA_DEQUANT_MAX_BYTES` (bytes).
-Above the limit, selection falls back to qmv before allocating the scratch.
-Set it to `0` to disable this dequantization path; an absent or invalid value
-uses the default. Fused NA kernels do not materialize that weight and keep
-their existing selection rules. This currently applies to `QmmNaU8`; u5/u6
-have no full-weight NA dequantization path in this revision.
-
-The retired experimental `SARAGOSSA_RUST_LINEAR_CHUNKED=1` path now returns
-an explicit configuration error: its scalar and tensor-core kernels had
-unsafe decay ratios, tail reads and device synchronization. Remove the flag
-to keep the existing NAX/sequence-scan selection; no default path changes.
-
 ## Features
 
 | Feature | Default | Purpose |
@@ -432,9 +432,59 @@ Prerequisite: the Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain
 
 [Apache-2.0](https://spdx.org/licenses/Apache-2.0.html) (SPDX `Apache-2.0`).
 
-## Compilation modulaire
+## Details
 
-Toutes les modalités sont actives par défaut. Le [tableau des features](docs/features.md)
-détaille les binaires LLM et STT minimaux, les réponses 501 du serveur et les
-vérifications de compilation. Les [profils TOML](docs/design/configuration.md)
-sont une proposition de conception, sans implémentation à ce stade.
+### Streaming audio over HTTP
+
+CustomVoice accepts `voice` (default: `serena`). An unknown voice (`alloy`,
+`nova`...) falls back to Serena and returns `X-Saragossa-TTS-Voice-Fallback`
+with the requested name, in WAV and in streaming alike. The cause is logged on
+stderr. VoiceDesign and CustomVoice use the snapshot's sampling with a
+deterministic seed; `seed` selects it per request. See the
+[TTS generation policy](docs/tts-generation.md) for the parameters, the greedy
+flag of the oracles and the stop reasons.
+
+`POST /v1/audio/speech` returns the full WAV by default (`stream` absent or
+`false`). The explicit extension `{"input":"Hello.","stream":true}` emits each
+batch as soon as it is decoded, over HTTP/1.1 `Transfer-Encoding: chunked`,
+without `Content-Length`. The de-chunked body is **raw signed 16-bit
+little-endian mono PCM, with no WAV header** (`Content-Type: audio/pcm`). The
+codec's native rate is given by `X-Saragossa-Audio-Sample-Rate` (usually
+24000 Hz); each sample uses the same conversion as the WAV. `model` is still
+accepted and has no effect. `stream: true` alone selects this PCM format.
+
+The existing audio cap and `SARAGOSSA_TTS_MAX_FRAMES` apply to both modes. In
+streaming, `X-Saragossa-TTS-Frame-Limit-Reached` is an **HTTP trailer**,
+announced by `Trailer` and sent after the zero chunk; in WAV it stays a header.
+`X-Saragossa-TTS-Stop-Reason` follows the same transport and distinguishes
+`eos`, `repeat` and `cap`. A client that ignores trailers does not get this
+information. An error after the response has started closes the stream without a
+terminal chunk: the client must treat that body as incomplete. A disconnect
+stops synthesis at the next failed write. The engine stays serial, with the
+existing socket backpressure and write timeout; no detached audio producer is
+created.
+
+Codec streaming uses fixed batches of **4 frames** (about 320 ms), adjustable
+with `SARAGOSSA_TTS_STREAM_LOT`, only when its CPU and GPU contexts are truly
+incremental (VoiceDesign and x-vector cloning). The CPU fallback, including
+`SARAGOSSA_TTS_CODEC_GPU=0`, and ICL cloning re-decode the prefix: their
+thresholds stay doubled after the first batch. Fixed batches avoid doubling the
+generation wait between emissions; they guarantee neither a constant attention
+cost over its history nor an RTF below 1.
+
+### Full-weight NA dequantization limit
+
+The NA matmul path that materializes a full bf16 weight is limited to 512 MiB
+per weight by `SARAGOSSA_RUST_QMM_NA_DEQUANT_MAX_BYTES` (bytes). Above the
+limit, selection falls back to qmv before allocating the scratch. Set it to `0`
+to disable this dequantization path; an absent or invalid value uses the
+default. Fused NA kernels do not materialize that weight and keep their existing
+selection rules. This currently applies to `QmmNaU8`; u5/u6 have no full-weight
+NA dequantization path in this revision.
+
+### Modular compilation
+
+All modalities are enabled by default. The [feature table](docs/features.md)
+describes the minimal LLM and STT binaries, the server's 501 responses and the
+compile-time checks. The [TOML profiles](docs/design/configuration.md) are a
+design proposal with no implementation at this point.
