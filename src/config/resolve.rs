@@ -61,9 +61,16 @@ impl RawModelConfig {
                                     .iter()
                                     .find_map(|key| value.get(*key).cloned())
                             };
-                            if kind(existing) != kind(&rope)
-                                || existing.get("factor") != rope.get("factor")
-                            {
+                            let differs = kind(existing) != kind(&rope)
+                                || [
+                                    "factor",
+                                    "low_freq_factor",
+                                    "high_freq_factor",
+                                    "original_max_position_embeddings",
+                                ]
+                                .iter()
+                                .any(|key| existing.get(*key) != rope.get(*key));
+                            if differs {
                                 return Err(InferError::Config(
                                     "rope_scaling et rope_parameters contradictoires".to_string(),
                                 ));

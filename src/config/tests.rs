@@ -700,3 +700,20 @@ fn contradictory_rope_scaling_and_parameters_are_rejected() {
     .expect_err("invariant: contradiction refusée");
     assert!(err.to_string().contains("contradictoires"), "{err}");
 }
+
+#[test]
+fn every_rope_field_mismatch_is_rejected() {
+    let scaling = |high: f64| {
+        format!(
+            r#"{{"rope_type":"llama3","factor":8.0,"low_freq_factor":1.0,"high_freq_factor":{high},
+            "original_max_position_embeddings":8192}}"#
+        )
+    };
+    let err = llama_with_rope(&scaling(4.0), &format!(r#"{{"rope_theta":500000.0,"rope_type":"llama3","factor":8.0,"low_freq_factor":1.0,"high_freq_factor":2.0,"original_max_position_embeddings":8192}}"#))
+        .resolve()
+        .expect_err("invariant: high_freq_factor divergent refusé");
+    assert!(err.to_string().contains("contradictoires"), "{err}");
+    llama_with_rope(&scaling(4.0), &format!(r#"{{"rope_theta":500000.0,"rope_type":"llama3","factor":8.0,"low_freq_factor":1.0,"high_freq_factor":4.0,"original_max_position_embeddings":8192}}"#))
+        .resolve()
+        .expect("invariant: scalings identiques acceptés");
+}

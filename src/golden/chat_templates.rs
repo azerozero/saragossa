@@ -32,7 +32,7 @@ struct Message {
 }
 
 #[test]
-fn templates_match_all_34_transformers_references() {
+fn templates_match_all_36_transformers_references() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/goldens/chat_templates");
     let mut count = 0;
@@ -74,6 +74,11 @@ fn templates_match_all_34_transformers_references() {
                 "gemma3" => render_gemma_chat(&messages, case.add_generation_prompt)
                     .map(|s| format!("<bos>{s}")),
                 // Sans outils : tout outil déclaré doit être refusé.
+                "llama31" => render_llama3_chat(
+                    &messages,
+                    case.add_generation_prompt,
+                    crate::chat_template::LLAMA3_FIXED_DATE,
+                ),
                 "mistral7b" | "mistral7b_tail" if !tools.is_empty() => {
                     Err(TemplateError::UnsupportedRole("tools".to_string()))
                 }
@@ -113,7 +118,7 @@ fn templates_match_all_34_transformers_references() {
             count += 1;
         }
     }
-    assert_eq!(count, 34);
+    assert_eq!(count, 36);
 }
 
 #[test]

@@ -1203,3 +1203,40 @@ fn rejects_partial_bias_tensors() {
         assert!(err.to_string().contains("attention_bias"), "{err}");
     }
 }
+
+#[test]
+fn rejects_llama3_scaling_with_qk_norm() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    let norm = TensorFixture::ones(vec![2]);
+    write_safetensors(
+        tmp.path(),
+        "model.",
+        "lm_head.",
+        Some(("model.layers.0.self_attn.q_norm.weight", norm)),
+    );
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    let mut config = test_config();
+    config.rope_scaling = Some(llama3_scaling());
+    let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+        .expect_err("invariant: llama3 avec QK-norm refusé");
+    assert!(err.to_string().contains("QK-norm"), "{err}");
+}
+
+/// Les `config.json` réels des familles goldens (Qwen dense et MoE, Gemma 3 et 4)
+/// traversent la résolution et la validation du scaling RoPE sans erreur.
+#[test]
+fn supported_family_configs_still_resolve() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/configs");
+    for name in ["qwen_dense", "qwen_moe", "gemma3", "gemma4"] {
+        let text = std::fs::read_to_string(root.join(format!("{name}.json")))
+            .expect("invariant: fixture de config");
+        let raw: crate::RawModelConfig =
+            serde_json::from_str(&text).expect("invariant: JSON de config");
+        let config = raw
+            .resolve()
+            .unwrap_or_else(|error| panic!("{name}: resolve: {error}"));
+        validate_rope_scaling(&config)
+            .unwrap_or_else(|error| panic!("{name}: validate_rope_scaling: {error}"));
+    }
+}
