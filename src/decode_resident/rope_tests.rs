@@ -193,7 +193,7 @@ fn check_path(path: Path) -> Result<()> {
                 Path::Decode => state.encode_rms_norm_rope_decode(
                     encoder,
                     input_gpu.tensor().buffer(),
-                    weight_gpu.tensor().buffer(),
+                    Some(weight_gpu.tensor().buffer()),
                     output.tensor().buffer(),
                     HEADS,
                     head_dim,
@@ -208,7 +208,7 @@ fn check_path(path: Path) -> Result<()> {
                             encoder,
                             input_gpu.tensor().buffer(),
                             0,
-                            weight_gpu.tensor().buffer(),
+                            Some(weight_gpu.tensor().buffer()),
                             input_gpu.tensor().buffer(),
                             0,
                             &dims,
@@ -234,7 +234,7 @@ fn check_path(path: Path) -> Result<()> {
                         input_gpu.tensor().buffer(),
                         0,
                         width,
-                        weight_gpu.tensor().buffer(),
+                        Some(weight_gpu.tensor().buffer()),
                         output.tensor().buffer(),
                         width,
                         HEADS,
@@ -394,7 +394,7 @@ fn rope_prefill_and_decode_keys_are_bit_identical() -> Result<()> {
                     encoder,
                     input_gpu.tensor().buffer(),
                     offset,
-                    weight_gpu.tensor().buffer(),
+                    Some(weight_gpu.tensor().buffer()),
                     output.tensor().buffer(),
                     HEADS,
                     head_dim,
@@ -438,15 +438,13 @@ fn rope_prefill_and_decode_keys_are_bit_identical() -> Result<()> {
     Ok(())
 }
 
-/// Sans QK-norm (Llama, Mistral), le poids marqueur réduit les noyaux decode
+/// Sans QK-norm (Llama, Mistral), une norme absente réduit les noyaux decode
 /// et lignes à la RoPE seule : même porte que la rotation normée.
 #[test]
 #[ignore = "GPU Metal requis : échoue explicitement sans device"]
-fn rope_only_marker_rotates_without_norm() -> Result<()> {
+fn rope_only_rotates_without_norm() -> Result<()> {
     let state = gpu_state()?;
-    let executor = MetalExecutor::new()?;
     let (head_dim, theta) = (128, 1.0e6);
-    let marker = executor.rope_only_norm_weight(head_dim)?;
     let frequencies = create_rope_frequencies(state.device(), theta, head_dim)?;
     let width = HEADS * head_dim;
     let (input, _) = data(head_dim, ROWS);
@@ -460,7 +458,7 @@ fn rope_only_marker_rotates_without_norm() -> Result<()> {
         state.encode_rms_norm_rope_decode(
             encoder,
             input_gpu.tensor().buffer(),
-            &marker,
+            None,
             decode.tensor().buffer(),
             HEADS,
             head_dim,
@@ -475,7 +473,7 @@ fn rope_only_marker_rotates_without_norm() -> Result<()> {
             input_gpu.tensor().buffer(),
             0,
             width,
-            &marker,
+            None,
             rows.tensor().buffer(),
             width,
             HEADS,

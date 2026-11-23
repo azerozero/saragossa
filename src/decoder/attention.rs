@@ -260,7 +260,7 @@ impl DecoderLayer {
     /// Exige : post-norm + tail MLP encodable (MoE shared-expert ou Dense
     /// gate/up/down biasless) ; pour full-attn, projections Q/K/V/O biasless et
     /// q_norm/k_norm présents ensemble, ou absents ensemble devant un MLP dense
-    /// (Llama, Mistral : RoPE seule par le poids marqueur). Le
+    /// (Llama, Mistral : RoPE seule, norme `None`). Le
     /// shared-expert/router biasless est re-vérifié à l'encodage (`ensure_biasless`).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(super) fn supports_resident_full(&self) -> bool {

@@ -927,8 +927,9 @@ struct ResidentFullDenseBuffers {
     k_proj: MetalLinearWeightBuffers,
     v_proj: MetalLinearWeightBuffers,
     o_proj: MetalLinearWeightBuffers,
-    q_norm: metal::Buffer,
-    k_norm: metal::Buffer,
+    /// `None` sans QK-norm (Llama, Mistral) : RoPE seule.
+    q_norm: Option<metal::Buffer>,
+    k_norm: Option<metal::Buffer>,
     post_norm: metal::Buffer,
     pre_feedforward_norm: Option<metal::Buffer>,
     post_feedforward_norm: Option<metal::Buffer>,

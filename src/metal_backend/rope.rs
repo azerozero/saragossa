@@ -84,20 +84,7 @@ impl MetalExecutor {
         self.rope_frequencies
             .get(&self.device, theta, frequency_dim, llama3)
     }
-
-    /// Poids de norme Q/K factice d'une tête sans QK-norm (Llama, Mistral) :
-    /// les noyaux RoPE résidents reconnaissent [`ROPE_ONLY_NORM_MARKER`] en
-    /// tête de tampon et n'appliquent alors que la rotation.
-    pub(crate) fn rope_only_norm_weight(&self, head_dim: usize) -> Result<Buffer> {
-        let mut weight = vec![1.0_f32; head_dim.max(1)];
-        weight[0] = f32::from_bits(ROPE_ONLY_NORM_MARKER);
-        self.buffer_from_f32(&weight, "resident_rope_only_norm")
-    }
 }
-
-/// NaN silencieux de charge 1, jamais produit par un poids chargé : lu par
-/// `rms_norm_rope_head` et `rms_norm_rope_heads_decode_rows_f32`.
-pub(crate) const ROPE_ONLY_NORM_MARKER: u32 = 0x7FC0_0001;
 
 /// L'écart rotate-half est le nombre de fréquences de la table exacte créée
 /// ci-dessus : head_dim/2 pour Gemma proportional, rope_dims/2 pour Qwen.

@@ -218,8 +218,8 @@ impl CausalDecoder {
                     k_proj,
                     v_proj,
                     o_proj,
-                    q_norm,
-                    k_norm,
+                    q_norm: Some(q_norm),
+                    k_norm: Some(k_norm),
                     post_norm,
                     pre_feedforward_norm: None,
                     post_feedforward_norm: None,
@@ -828,20 +828,22 @@ impl CausalDecoder {
                                     attention.o_proj.weight(),
                                     "resident_dense_full_o_proj",
                                 )?,
-                                q_norm: match q_norm {
-                                    Some(norm) => metal.cached_buffer_from_f32(
-                                        norm.data(),
-                                        "resident_dense_full_q_norm",
-                                    )?,
-                                    None => metal.rope_only_norm_weight(rope.head_dim)?,
-                                },
-                                k_norm: match k_norm {
-                                    Some(norm) => metal.cached_buffer_from_f32(
-                                        norm.data(),
-                                        "resident_dense_full_k_norm",
-                                    )?,
-                                    None => metal.rope_only_norm_weight(rope.head_dim)?,
-                                },
+                                q_norm: q_norm
+                                    .map(|norm| {
+                                        metal.cached_buffer_from_f32(
+                                            norm.data(),
+                                            "resident_dense_full_q_norm",
+                                        )
+                                    })
+                                    .transpose()?,
+                                k_norm: k_norm
+                                    .map(|norm| {
+                                        metal.cached_buffer_from_f32(
+                                            norm.data(),
+                                            "resident_dense_full_k_norm",
+                                        )
+                                    })
+                                    .transpose()?,
                                 post_norm: metal.cached_buffer_from_f32(
                                     post_norm.data(),
                                     "resident_dense_full_post_norm",

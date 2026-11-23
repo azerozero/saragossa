@@ -506,8 +506,14 @@ impl CausalDecoder {
             rope_frequencies: &resolved.rope_frequencies,
             input_norm: &resolved.input_norm,
             qkv_proj,
-            q_norm: &resolved.q_norm,
-            k_norm: &resolved.k_norm,
+            q_norm: resolved
+                .q_norm
+                .as_ref()
+                .ok_or_else(|| InferError::Config("q_norm absent (trame TTS)".to_string()))?,
+            k_norm: resolved
+                .k_norm
+                .as_ref()
+                .ok_or_else(|| InferError::Config("k_norm absent (trame TTS)".to_string()))?,
             o_proj: &resolved.o_proj,
             post_norm: &resolved.post_norm,
             gate_proj: &resolved.gate_proj,

@@ -190,7 +190,7 @@ kernel void rms_norm_rope_heads_decode_rows_f32(
     device const float* weight [[buffer(1)]],
     device float* out [[buffer(2)]],
     constant uint4& dims [[buffer(3)]],
-    constant float2& params [[buffer(4)]],
+    constant float4& params [[buffer(4)]],
     device const float* inv_freq [[buffer(5)]],
     constant uint2& strides [[buffer(6)]],
 #ifdef TREE_ROWS
@@ -228,9 +228,9 @@ kernel void rms_norm_rope_heads_decode_rows_f32(
         if (tid < stride) { partial[tid] += partial[tid + stride]; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    // NOTE: une tête sans QK-norm (Llama, Mistral) lie le poids marqueur
-    // `ROPE_ONLY_NORM_MARKER` en weight[0] : rotation seule, x × 1 × 1 exact.
-    const bool rope_only = as_type<uint>(weight[0]) == 0x7FC00001u;
+    // `params.z` non nul : tête sans QK-norm (Llama, Mistral), rotation seule,
+    // x × 1 × 1 exact ; `weight` est alors un tampon lié mais jamais utile.
+    const bool rope_only = params.z != 0.0f;
     const float inv_rms = rope_only ? 1.0f : rsqrt((partial[0] / float(head_dim)) + eps);
     const uint pairs = rope_dims / 2u;
     // Gemma proportional sépare les partenaires sur la tête entière ;
@@ -876,7 +876,7 @@ impl DecodeResidentState {
         input: &BufferRef,
         input_offset: u64,
         input_stride: usize,
-        weight: &BufferRef,
+        weight: Option<&BufferRef>,
         output: &BufferRef,
         output_stride: usize,
         num_heads: usize,
@@ -893,10 +893,7 @@ impl DecodeResidentState {
             to_u32(rope_dims, "rope rows rope_dims")?,
             to_u32(position, "rope rows position")?,
         ];
-        let params: [f32; 2] = [
-            eps,
-            crate::metal_backend::rope::rope_half_offset(frequencies),
-        ];
+        let params = super::attention::rope_params(eps, frequencies, weight.is_none());
         let strides = [
             to_u32(input_stride, "rope rows input_stride")?,
             to_u32(output_stride, "rope rows output_stride")?,
@@ -908,7 +905,7 @@ impl DecodeResidentState {
         }
         encoder.set_compute_pipeline_state(&kernels.rope_rows);
         encoder.set_buffer(0, Some(input), input_offset);
-        encoder.set_buffer(1, Some(weight), 0);
+        encoder.set_buffer(1, Some(weight.unwrap_or(input)), 0);
         encoder.set_buffer(2, Some(output), 0);
         set_bytes(encoder, 3, &dims);
         set_bytes(encoder, 4, &params);
