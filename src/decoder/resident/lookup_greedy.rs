@@ -28,7 +28,8 @@ impl CausalDecoder {
         lookup_greedy_options_ok(
             crate::runtime_flags::lookup_greedy_draft_tokens(),
             options,
-            crate::runtime_flags::decode_min_interval().is_some(),
+            crate::runtime_flags::decode_min_interval().is_some()
+                || crate::runtime_flags::gpu_share() < 100,
         ) && cache
             .resident
             .as_ref()

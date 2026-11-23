@@ -6645,6 +6645,37 @@ fn mtp_fixed_depths_match_ar_synthetic() -> Result<()> {
     })
 }
 
+/// Bridage `--gpu-share` : la sortie greedy (AR et MTP D2) est celle du chemin
+/// non bridé, seul le temps change.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn gpu_share_keeps_greedy_output_synthetic() -> Result<()> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::set_gpu_share(100);
+        }
+    }
+    let (model, prompt) = mtp_sign_synthetic_model()?;
+    let options = GenerationOptions::default();
+    let run = |share: u8| -> Result<(Vec<u32>, Vec<u32>)> {
+        let _reset = Reset;
+        crate::set_gpu_share(share);
+        model.clear_prefix_cache();
+        let ar = model.generate_greedy_cached_with_options(&prompt, 24, &options)?;
+        model.clear_prefix_cache();
+        let mtp = crate::runtime_flags::with_mtp_fixed_depth_override(|| {
+            model.generate_greedy_mtp_batched_with_options(&prompt, 24, &options, 2)
+        })?;
+        Ok((ar, mtp.tokens))
+    };
+    let normal = run(100)?;
+    let throttled = run(50)?;
+    assert_eq!(throttled, normal, "le bridage ne doit changer aucun token");
+    Ok(())
+}
+
 /// Profondeur fixe 2 avec tête de draft u4 tirée du lm_head bf16 du tronc
 /// (`quantize_draft_lm_head_u4`, défaut des cibles bf16) : la vérification reste
 /// faite par le lm_head bf16, la sortie greedy est donc celle de l'AR.

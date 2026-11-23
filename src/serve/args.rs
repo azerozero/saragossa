@@ -16,7 +16,7 @@ const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_TOKENS_CAP: usize = 4096;
 
 /// Configuration de lancement du serveur.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct ServeArgs {
     /// Adresse TCP locale.
     pub(super) host: String,
@@ -46,6 +46,10 @@ pub(super) struct ServeArgs {
     pub(super) read_timeout: Duration,
     /// Plafond dur du budget de génération par requête.
     pub(super) max_tokens_cap: usize,
+    /// Plafond de decode en tokens par seconde, rechargeable à chaud.
+    pub(super) max_tok_s: Option<f64>,
+    /// Part de GPU et de CPU visée (1 à 100), rechargeable à chaud.
+    pub(super) gpu_share: Option<u8>,
     /// Cache persistant opt-in.
     pub(super) prefix_ssd: saragossa::runtime_flags::ServePrefixSsdOptions,
 }
@@ -99,6 +103,9 @@ impl ServeArgs {
                 .map_err(|_| ServeError::args("serve.max_tokens_cap hors plage"))?,
             None => DEFAULT_MAX_TOKENS_CAP,
         };
+        let mut max_tok_s = profile.serve.max_tok_s;
+        // invariant: `Profile::validate` borne `serve.gpu_share` à 1..=100.
+        let mut gpu_share = profile.serve.gpu_share.map(|v| v as u8);
         let mut prefix_ssd = saragossa::runtime_flags::ServePrefixSsdOptions::from_env()?;
         let mut iter = args.into_iter();
 
@@ -185,6 +192,18 @@ impl ServeArgs {
                 "--max-tokens-cap" => {
                     max_tokens_cap = parse_positive_usize("--max-tokens-cap", &mut iter)?;
                 }
+                "--max-tok-s" => {
+                    max_tok_s = Some(
+                        saragossa::parse_max_tok_s(&next_value(&mut iter, "--max-tok-s")?)
+                            .map_err(ServeError::args)?,
+                    );
+                }
+                "--gpu-share" => {
+                    gpu_share = Some(
+                        saragossa::parse_gpu_share(&next_value(&mut iter, "--gpu-share")?)
+                            .map_err(ServeError::args)?,
+                    );
+                }
                 "--help" | "-h" => return Err(ServeError::args(help_text())),
                 other => return Err(ServeError::args(format!("argument serve inconnu: {other}"))),
             }
@@ -212,6 +231,8 @@ impl ServeArgs {
             preload,
             read_timeout,
             max_tokens_cap,
+            max_tok_s,
+            gpu_share,
             prefix_ssd,
         })
     }
@@ -274,8 +295,8 @@ pub(super) fn help_text() -> String {
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
          [--api-key TOKEN (deprecated, use SARAGOSSA_API_KEY)] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
-         {modality_options}[--backend cpu|metal] [--preload] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
-         Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap and the [[models]] list (id, path) only. See `saragossa config print`.\n\
+         {modality_options}[--backend cpu|metal] [--preload] [--max-tok-s R] [--gpu-share 1-100] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
+         Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap, serve.max_tok_s, serve.gpu_share and the [[models]] list (id, path) only. See `saragossa config print`.\n\
          Upgrade (Unix): SIGUSR2 starts the same binary path (or --upgrade-binary PATH) with the same arguments on the inherited listening socket, then the old process drains for at most serve.drain_timeout_secs (30) and exits; enhance h2/WebTransport listeners follow. serve.relay_mode=auto|parallel|sequential (auto: sequential only if the memory guard refuses two resident processes).\n\
          SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
          --prefix-cache-ssd-priority-tokens 4096 (0 disables priority).\n\

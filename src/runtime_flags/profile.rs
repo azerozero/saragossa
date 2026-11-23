@@ -38,7 +38,12 @@ pub const PRESETS: [(&str, &str); 2] = [
 ];
 
 /// Clés qu'un rechargement SIGHUP peut appliquer sans redémarrage.
-pub const HOT_KEYS: [&str; 2] = ["serve.read_timeout_secs", "serve.max_tokens_cap"];
+pub const HOT_KEYS: [&str; 4] = [
+    "serve.read_timeout_secs",
+    "serve.max_tokens_cap",
+    "serve.max_tok_s",
+    "serve.gpu_share",
+];
 
 /// Erreur de lecture ou de validation d'un profil.
 #[derive(Debug, thiserror::Error)]
@@ -76,7 +81,7 @@ pub struct ModelEntry {
 }
 
 /// Section `[serve]`.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ServeSection {
     /// `SARAGOSSA_SERVE_MAX_CONNECTIONS`.
@@ -95,6 +100,10 @@ pub struct ServeSection {
     pub read_timeout_secs: Option<u64>,
     /// Équivalent de `--max-tokens-cap`.
     pub max_tokens_cap: Option<u64>,
+    /// Équivalent de `--max-tok-s` : plafond de decode en tokens par seconde.
+    pub max_tok_s: Option<f64>,
+    /// Équivalent de `--gpu-share` : part de GPU et de CPU visée, 1 à 100.
+    pub gpu_share: Option<u64>,
     /// Délai max de vidage de l'ancien processus après un relais SIGUSR2.
     pub drain_timeout_secs: Option<u64>,
     /// Relais SIGUSR2 : `auto` (défaut), `parallel` ou `sequential`.
@@ -122,7 +131,7 @@ pub struct MemorySection {
 }
 
 /// Fichier de profil ; toute clé inconnue est refusée.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     /// Preset embarqué dont ce profil surcharge les valeurs.
@@ -187,6 +196,16 @@ impl Profile {
             if self.models[..i].iter().any(|m| m.id == model.id) {
                 return Err(err("models", format!("id en double: {}", model.id)));
             }
+        }
+        if !self
+            .serve
+            .max_tok_s
+            .is_none_or(|v| v.is_finite() && v > 0.0)
+        {
+            return Err(err("serve.max_tok_s", "doit être un flottant > 0"));
+        }
+        if !self.serve.gpu_share.is_none_or(|v| (1..=100).contains(&v)) {
+            return Err(err("serve.gpu_share", "doit être dans 1..=100"));
         }
         if let Some(backend) = &self.engine.backend {
             if !matches!(backend.as_str(), "cpu" | "metal") {
@@ -270,6 +289,13 @@ impl Profile {
                 num(s.read_timeout_secs),
             ),
             r("serve.max_tokens_cap", None, "4096", num(s.max_tokens_cap)),
+            r(
+                "serve.max_tok_s",
+                Some("SARAGOSSA_RUST_MAX_TOK_S"),
+                "illimité",
+                s.max_tok_s.map(|v| v.to_string()),
+            ),
+            r("serve.gpu_share", None, "100", num(s.gpu_share)),
             r(
                 "serve.drain_timeout_secs",
                 None,

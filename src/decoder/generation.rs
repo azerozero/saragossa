@@ -1004,8 +1004,10 @@ impl CausalDecoder {
                 && self.lookup_greedy_eligible(&cache, options)
         }) {
             let started = Instant::now();
-            let pipelined =
-                allow_pipelined && decode_pipeline_enabled() && decode_min_interval().is_none();
+            let pipelined = allow_pipelined
+                && decode_pipeline_enabled()
+                && decode_min_interval().is_none()
+                && crate::runtime_flags::gpu_share() == 100;
             let tokens = self.decode_tokens_resident_lookup(
                 &mut cache,
                 prompt,
@@ -1033,6 +1035,7 @@ impl CausalDecoder {
             && use_resident_full
             && decode_pipeline_enabled()
             && decode_min_interval().is_none()
+            && crate::runtime_flags::gpu_share() == 100
             && options.stop_sequences.is_empty()
             && oracle_dump_logits_topk().is_none()
             && (options.temperature <= f32::EPSILON
