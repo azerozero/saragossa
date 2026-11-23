@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.32](https://github.com/azerozero/saragossa/compare/v0.3.31...v0.3.32) - 2026-11-23
+
+### Added
+
+- *(convert)* experts MoE fusionnés empilés en switch_mlp
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into feat/convert-moe
+- Merge origin/main dans feat/convert-moe
+
 ## [0.3.31](https://github.com/azerozero/saragossa/compare/v0.3.30...v0.3.31) - 2026-11-21
 
 ### Added
