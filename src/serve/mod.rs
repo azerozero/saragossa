@@ -25,7 +25,8 @@
 //!   en file.
 //!
 //! SIGHUP relit le profil (`--profile`/`--config`, `--set` compris) et n'applique
-//! que `serve.read_timeout_secs`, `serve.max_tokens_cap` et la liste `[[models]]` ;
+//! que `serve.read_timeout_secs`, `serve.max_tokens_cap`, `serve.max_tok_s`,
+//! `serve.gpu_share` et la liste `[[models]]` ;
 //! tout autre changement ou chemin de modèle illisible est refusé en bloc (voir
 //! `reload`).
 //!
@@ -160,6 +161,12 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     }
     model_selection::select_if_missing(&mut args).map_err(boxed_error)?;
     model_selection::resolve_models(&mut args).map_err(boxed_error)?;
+    if let Some(rate) = args.max_tok_s {
+        saragossa::set_decode_max_tokens_per_s(Some(rate));
+    }
+    if let Some(share) = args.gpu_share {
+        saragossa::set_gpu_share(share);
+    }
     reload::set_launch_models(&args.models);
     saragossa::force_resident_full_linear_decode();
     let mut state = state::ServeState::new(&args);

@@ -1322,6 +1322,7 @@ impl MetalExecutor {
             let wait_started = trace.then(std::time::Instant::now);
             command_buffer.commit();
             command_buffer.wait_until_completed();
+            crate::metal_backend::duty_pause(command_buffer);
             ensure_completed(command_buffer.status())?;
             if let Some(timing) = kernel_timing.as_ref() {
                 if let Err(error) = timing.dump_report() {
