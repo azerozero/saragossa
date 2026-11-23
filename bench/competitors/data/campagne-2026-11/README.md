@@ -49,7 +49,9 @@ prompt depends on the commit of the sources.
   measured only on Nov 19; `20-sar` and `20-dfl` cover saragossa only. `21-final`
   re-measures saragossa, mlx and llama.cpp in the same session.
 - mlx-mtp and mlx-dflash go through mlx-vlm 0.8.0, whose output is not
-  bit-identical to its own AR output, whereas saragossa's is.
+  bit-identical to its own AR output, whereas saragossa's is exact by default
+  except for the cases listed in
+  [`docs/perf/greedy-identity.md`](../../../../docs/perf/greedy-identity.md).
 - mlx-vlm without a drafter is faster than mlx_lm.server.
 - llama.cpp was not measured on the 35B in `21-final`.
 - TTFT at 512 tokens in BF16 is bimodal.
