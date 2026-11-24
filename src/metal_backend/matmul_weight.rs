@@ -343,6 +343,22 @@ impl MetalExecutor {
                     *out_dim,
                 )?;
             }
+            AffineMatmulKernel::QmmNaFusedTiledU3 => {
+                self.encode_affine_qmm_na_fused_tiled_u3_buffers(
+                    encoder,
+                    lhs_buffer,
+                    &packed_buffer,
+                    packed_offset,
+                    &scales_buffer,
+                    scales_offset,
+                    &biases_buffer,
+                    biases_offset,
+                    output_buffer,
+                    batch,
+                    in_dim,
+                    *out_dim,
+                )?;
+            }
             AffineMatmulKernel::QmmNaFusedTiledU4Align64 => {
                 self.encode_affine_qmm_na_fused_tiled_u4_align64_buffers(
                     encoder,

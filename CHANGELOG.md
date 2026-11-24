@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.35](https://github.com/azerozero/saragossa/compare/v0.3.34...v0.3.35) - 2026-11-24
+
+### Added
+
+- *(loader)* refuse sliding_window inférieur au contexte pour Llama et Mistral
+- *(loader)* RoPE llama3, templates Llama 3 et Mistral, oracle KL Mistral 7B
+
+### Fixed
+
+- *(config)* entier RoPE non représentable en f64 comparé tel quel
+- *(config)* entiers RoPE comparés exactement, sans passer par f64
+- *(config)* facteurs RoPE comparés numériquement (8 et 8.0 équivalents)
+- *(test)* helper rope sans rms_norm_eps manquant, flottants JSON, liste golden llama31
+- *(config)* rope_parameters remplace rope_scaling nul, biais cohérents, sliding_window refusé, système Mistral en loop.last
+
+### Other
+
+- Merge pull request #339 from azerozero/feat/llama-mistral
+- *(loader)* helpers de test sans collision de noms
+- *(llama)* rétablit les tests de main, date par version, oracle RoPE llama3 et configs de familles
+- fusionne origin/main dans feat/llama-mistral
+
+## [0.3.34](https://github.com/azerozero/saragossa/compare/v0.3.33...v0.3.34) - 2026-11-23
+
+### Fixed
+
+- *(metal)* qmv u3 f32 sous le plancher du GEMM tuilé, tests non périodiques
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into perf/u3-prefill
+- Merge pull request #328 from azerozero/dependabot/cargo/bytes-1.12.2
+- Merge pull request #331 from azerozero/dependabot/github_actions/j178/prek-action-3.1.1
+- *(deps)* bump bytes from 1.12.1 to 1.12.2
+- *(deps)* bump libc from 0.2.186 to 0.2.191
+- *(deps)* bump j178/prek-action from 3.1.0 to 3.1.1
+- Merge pull request #326 from azerozero/dependabot/github_actions/taiki-e/install-action-2.90.6
+- Merge pull request #327 from azerozero/dependabot/cargo/http-1.5.0
+- Merge pull request #329 from azerozero/dependabot/cargo/flate2-1.1.11
+- Merge pull request #330 from azerozero/dependabot/cargo/quinn-0.11.12
+- *(deps)* bump http from 1.4.2 to 1.5.0
+- *(readme)* écarts chiffrés, GGUF BF16, identité nuancée, avertissement LINEAR_CHUNKED rétabli
+- *(deps)* bump taiki-e/install-action from 2.90.4 to 2.90.6
+- *(bench)* nuance l'identité greedy de saragossa dans la page de campagne
+- remet le README et la page de campagne à jour pour la vitrine
+- *(metal)* GEMM de prefill u3 et qmv en lignes u3/u5/u6
+
+## [0.3.33](https://github.com/azerozero/saragossa/compare/v0.3.32...v0.3.33) - 2026-11-23
+
+### Added
+
+- *(serve)* bridage gpu-share et max-tok-s pour run et serve
+
+### Fixed
+
+- *(serve)* max_tok_s respecte la priorité --set > env > profil
+- *(serve)* gpu-share n'altère plus le lookup, sommeil interruptible, précédence env
+
+### Other
+
+- Merge pull request #337 from azerozero/release-plz-2026-11-23T16-36-03Z
+- Merge pull request #336 from azerozero/feat/bride-gpu
+- Merge remote-tracking branch 'origin/main' into feat/bride-gpu
+- *(decoder)* tokens usize dans le test d'identité gpu-share
+
 ## [0.3.32](https://github.com/azerozero/saragossa/compare/v0.3.31...v0.3.32) - 2026-11-23
 
 ### Added

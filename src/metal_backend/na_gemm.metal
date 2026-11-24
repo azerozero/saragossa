@@ -525,6 +525,49 @@ static void load_b_tile_quant_u4_gs64_vec(threadgroup bfloat* Ws,
                                           uint lid) {
   load_b_tile_quant_u4_gs64_split<false>(Ws, Ws, Bp, Bs, Bb, n0, k0, N, K, lid);
 }
+// Chargeur u3 gs64 de même géométrie : la demi-ligne de 32 poids occupe 96 bits,
+// soit trois mots u32 alignés (k0 % 64 == 0, kl0 ∈ {0, 32}). Chaque groupe de 8
+// codes tient dans 24 bits, extraits LSB-first comme le qmv u3.
+static void load_b_tile_quant_u3_gs64_vec(threadgroup bfloat* Ws,
+                                          const device uint* Bp,
+                                          const device bfloat* Bs,
+                                          const device bfloat* Bb,
+                                          uint n0,
+                                          uint k0,
+                                          uint N,
+                                          uint K,
+                                          uint lid) {
+  constexpr uint BKP = 64u + 8u;
+  uint nl = lid >> 1u;
+  uint kl0 = (lid & 1u) * 32u;
+  uint nn = n0 + nl;
+  threadgroup metal::vec<bfloat,8>* dst =
+      (threadgroup metal::vec<bfloat,8>*)(Ws + nl * BKP + kl0);
+  if (nn >= N) {
+    for (uint w = 0; w < 4u; w++) {
+      dst[w] = metal::vec<bfloat,8>(bfloat(0.0f));
+    }
+    return;
+  }
+  uint packed_cols = K * 3u / 32u;
+  uint groups = K / 64u;
+  uint g = k0 / 64u;
+  float s = float(Bs[nn * groups + g]);
+  float b = float(Bb[nn * groups + g]);
+  const device uint* src = Bp + nn * packed_cols + (k0 + kl0) * 3u / 32u;
+  uint w0 = src[0], w1 = src[1], w2 = src[2];
+  uint packs[4] = {w0 & 0x00ffffffu,
+                   (w0 >> 24u) | ((w1 & 0x0000ffffu) << 8u),
+                   (w1 >> 16u) | ((w2 & 0x000000ffu) << 16u),
+                   w2 >> 8u};
+  for (uint w = 0; w < 4u; w++) {
+    metal::vec<bfloat,8> out;
+    for (uint j = 0; j < 8u; j++) {
+      out[j] = bfloat(float((packs[w] >> (3u * j)) & 0x07u) * s + b);
+    }
+    dst[w] = out;
+  }
+}
 static void load_b_tile_quant_gs128(threadgroup bfloat* Ws,
                                     const device uint* Bp,
                                     const device bfloat* Bs,
@@ -593,7 +636,9 @@ kernel void gemm_nax_coop_qb_tiled(device const bfloat* A [[buffer(0)]],
   NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
   NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
 }
-kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
+// BITS = 4 ou 3 : seul le chargeur de la tuile B change.
+template <uint BITS>
+kernel void gemm_nax_coop_qb_tiled_ub(device const bfloat* A [[buffer(0)]],
                                       device const uint* Bp   [[buffer(1)]],
                                       device const bfloat* Bs [[buffer(2)]],
                                       device const bfloat* Bb [[buffer(3)]],
@@ -613,7 +658,11 @@ kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
   uint ns = sg_n * 32u;
   metal::vec<float,8> c0a = float(0), c0b = float(0), c1a = float(0), c1b = float(0);
   for (uint k = 0; k < K; k += BK) {
-    load_b_tile_quant_u4_gs64_vec(Ws, Bp, Bs, Bb, n0, k, N, K, lid);
+    if (BITS == 4) {
+      load_b_tile_quant_u4_gs64_vec(Ws, Bp, Bs, Bb, n0, k, N, K, lid);
+    } else {
+      load_b_tile_quant_u3_gs64_vec(Ws, Bp, Bs, Bb, n0, k, N, K, lid);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     NAX_KK_UNROLL
     for (uint kk = 0; kk < BK; kk += 16u) {
@@ -637,6 +686,11 @@ kernel void gemm_nax_coop_qb_tiled_u4(device const bfloat* A [[buffer(0)]],
   NaxFrag::store_c_masked(c1a, C, m0 + 16u, n0 + ns, N, M);
   NaxFrag::store_c_masked(c1b, C, m0 + 16u, n0 + ns + 16u, N, M);
 }
+#define QB_TILED_UB(NAME, BITS) template [[host_name(#NAME)]] kernel void \
+    gemm_nax_coop_qb_tiled_ub<BITS>(device const bfloat*, device const uint*, \
+    device const bfloat*, device const bfloat*, device float*, constant uint3&, uint2, uint, uint);
+QB_TILED_UB(gemm_nax_coop_qb_tiled_u4, 4u)
+QB_TILED_UB(gemm_nax_coop_qb_tiled_u3, 3u)
 // Variante « bf16×3 » de `gemm_nax_coop_qb_tiled_u4` pour les petites
 // projections de flint : A est lu en f32 et scindé en hi + lo, la tuile B
 // déquantifiée aussi, et chaque pas fait hi·hi + hi·lo + lo·hi (lo·lo, d'ordre

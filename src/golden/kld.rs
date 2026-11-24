@@ -112,6 +112,7 @@ fn external_kld_references_are_consistent() -> TestResult {
         "gemma4_long_1024",
         "gemma4_long_2048",
         "gemma4_long_4100",
+        "mistral7b",
     ]) {
         let reference = load(name)?;
         for (ids, logprobs) in &reference.rows {
@@ -514,3 +515,9 @@ oracle!(
 oracle!(external_kld_gemma3, "gemma3", "SARAGOSSA_GEMMA3_DIR");
 #[cfg(all(target_os = "macos", feature = "metal"))]
 oracle!(external_kld_gemma4, "gemma4", "SARAGOSSA_GEMMA4_DIR");
+#[cfg(all(target_os = "macos", feature = "metal"))]
+oracle!(
+    external_kld_mistral7b,
+    "mistral7b",
+    "SARAGOSSA_MISTRAL7B_DIR"
+);
