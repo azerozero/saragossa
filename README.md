@@ -10,8 +10,9 @@
 **Pure-Rust Metal inference engine for Apple Silicon.** Raw `metal-rs` kernels,
 no Python, no MLX, no CoreML. LLM, speech-to-text and text-to-speech in a single
 binary — usable as a library or behind the OpenAI-compatible HTTP server
-`saragossa serve`. One process can run a full local voice loop: speech-to-text,
-speaker diarization, the LLM and streamed text-to-speech.
+`saragossa serve`. One server exposes every piece of a client-orchestrated local
+voice loop: speech-to-text, the LLM, streamed text-to-speech, plus offline
+speaker diarization of a full recording.
 
 ## Install
 
@@ -151,13 +152,17 @@ tokens. Source: [`campagne-2026-11/21-final`](bench/competitors/data/campagne-20
 (`summary.json`, `freeze.json`, full journal), described in the
 [campaign README](bench/competitors/data/campagne-2026-11/README.md).
 
-Reproduce on your own machine (the harness freezes versions, weights hashes and
-hardware before measuring; set your paths in `local.env` first):
+To rerun the harness on your own machine, see
+[`bench/competitors/README.md`](bench/competitors/README.md#campagne-autonome-une-commande-une-nuit).
+It needs the competing engines, converted checkpoints and drafters installed
+first; it does not install them. A new run measures the current sources and
+whatever configurations are present, so it is a new campaign, not a replay of
+`21-final`:
 
 ```bash
-cp bench/competitors/local.env.example bench/competitors/local.env
-python3 -I -B bench/competitors/campaign.py run runs/mine --dry-run  # check everything, measure nothing
-python3 -I -B bench/competitors/campaign.py run runs/mine            # full campaign, resumable
+cp bench/competitors/local.env.example bench/competitors/local.env  # then edit the paths
+python3 -I -B bench/competitors/campaign.py run runs/mine --dry-run  # path and version checks, no measurement
+python3 -I -B bench/competitors/campaign.py run runs/mine            # measurement, resumable from the same directory
 ```
 
 ### 27B, 4-bit
@@ -196,8 +201,8 @@ Caveats:
   identical. llama.cpp was not measured on the 35B-A3B in this run.
 - This campaign does not test output identity: each request carries its own
   nonce. saragossa's greedy speculative output is checked against its AR decode
-  by separate tests; it matches except at near-ties, with an exact opt-in strict
-  mode (see below).
+  by separate tests, on the models and flags they cover; it matches except at
+  near-ties, with an exact opt-in strict mode (see below).
 - Results hold for this hardware, these models and these prompts; measure on
   your own machine before choosing.
 
