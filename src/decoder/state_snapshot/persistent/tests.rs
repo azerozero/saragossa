@@ -416,6 +416,55 @@ fn hybrid_recurrence_survives_background_publication() {
     );
 }
 
+/// Tour d'agent après redémarrage : le prompt N+1 prolonge le prompt N
+/// persisté sur SSD, sa clé exacte n'y est pas. Le préfixe doit être relu.
+#[test]
+fn process_restart_mtp_extends_shorter_ssd_boundary() {
+    const NAME: &str =
+        "decoder::state_snapshot::persistent::tests::process_restart_mtp_extends_shorter_ssd_boundary";
+    if let Some(phase) = std::env::var_os("SSD_TEST_PHASE") {
+        let root = PathBuf::from(std::env::var_os("SSD_TEST_ROOT").unwrap());
+        configure_prefix_disk_cache(&root.join("cache"), 64 << 20, 0).unwrap();
+        let mut model = CausalDecoder::from_tensors(
+            crate::decoder::tests::test_weights(),
+            CausalDecoderConfig::default(),
+        )
+        .unwrap();
+        super::super::tests::with_tiny_mtp(&mut model).unwrap();
+        let model =
+            model.with_snapshot_sources(SnapshotSources::capture([root.join("weights").as_path()]));
+        let _scope = PrefixDiskSession::enter(Some("session"));
+        let turn: &[usize] = if phase == "turn_n" {
+            &[0, 1, 2, 0]
+        } else {
+            &[0, 1, 2, 0, 1, 2]
+        };
+        let (_, _, _, reused) = model
+            .prefill_cache_state_with_mtp_history(turn, &mut |_| Ok(true))
+            .unwrap();
+        wait(store().unwrap());
+        assert_eq!(reused, if phase == "turn_n" { 0 } else { 4 });
+        return;
+    }
+    let root = private_dir();
+    fs::write(root.path().join("weights"), b"synthetic weights identity").unwrap();
+    for phase in ["turn_n", "turn_n1"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("SSD_TEST_ROOT", root.path())
+            .env("SSD_TEST_PHASE", phase)
+            .env_remove("SARAGOSSA_RUST_STATE_SNAPSHOT")
+            .env_remove("RETI_RUST_STATE_SNAPSHOT")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[test]
 fn process_restart_uses_persistent_hooks() {
     process_oracle(false);

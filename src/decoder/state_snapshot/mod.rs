@@ -882,11 +882,26 @@ impl CausalDecoder {
         block: usize,
         minimum: usize,
     ) -> Result<Option<CausalDecoderPromptState>> {
+        Ok(self
+            .load_persistent_boundary(tokens, block, minimum, SnapshotMode::Ar)?
+            .map(|state| CausalDecoderPromptState::new(state.cache, state.final_state)))
+    }
+
+    /// Frontière persistante la plus longue de `tokens` dans `mode`, multiple
+    /// de `block` et au-delà de `minimum`. Seules les longueurs indexées sont hachées.
+    pub(super) fn load_persistent_boundary(
+        &self,
+        tokens: &[usize],
+        block: usize,
+        minimum: usize,
+        mode: SnapshotMode,
+    ) -> Result<Option<State>> {
         let Some(store) = persistent::store() else {
             return Ok(None);
         };
         for length in store.boundaries(tokens.len(), block, minimum) {
-            if let Some(state) = self.load_persistent_prompt(&tokens[..length])? {
+            let request = self.snapshot_request(&tokens[..length], mode.clone())?;
+            if let Some(state) = self.snapshot_load(&request) {
                 return Ok(Some(state));
             }
         }
