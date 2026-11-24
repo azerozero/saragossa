@@ -575,6 +575,34 @@ static void load_b_tile_quant_ub_gs64_vec(threadgroup bfloat* Ws,
     dst[w] = out;
   }
 }
+static void load_b_tile_quant_gs128(threadgroup bfloat* Ws,
+                                    const device uint* Bp,
+                                    const device bfloat* Bs,
+                                    const device bfloat* Bb,
+                                    uint n0,
+                                    uint k0,
+                                    uint N,
+                                    uint K,
+                                    uint lid,
+                                    uint threads) {
+  constexpr uint BN = 64, BK = 64;
+  uint packed_cols = K / 4u;
+  uint groups = K / 128u;
+  for (uint idx = lid; idx < BN * BK; idx += threads) {
+    uint nl = idx / BK, kl = idx - nl * BK;
+    uint nn = n0 + nl, kk = k0 + kl;
+    bfloat w = bfloat(0.0f);
+    if (nn < N && kk < K) {
+      uint word = Bp[nn * packed_cols + (kk >> 2u)];
+      uint q = (word >> ((kk & 3u) * 8u)) & 0xffu;
+      uint g = kk / 128u;
+      float s = float(Bs[nn * groups + g]);
+      float b = float(Bb[nn * groups + g]);
+      w = bfloat(float(q) * s + b);
+    }
+    Ws[idx] = w;
+  }
+}
 // GEMM NA quantifié tuilé : BM=BN=BK=64, WM=WN=2. Chaque threadgroup dé-quantifie
 // une tuile B u8→bf16 en mémoire threadgroup, puis 4 simdgroups calculent chacun
 // 32x32 de C avec deux fragments M. Zéro matérialisation du poids bf16 global.
