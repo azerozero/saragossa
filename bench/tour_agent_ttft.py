@@ -14,7 +14,8 @@ completion` (prompt_tokens, reused_prefix_tokens, prefill_ms).
 Usage (le pilote prend gpulock par passe, ne jamais l'appeler sous gpulock) :
   tour_agent_ttft.py all  OUT --bin BIN --model DIR --lock-tool tools/gpulock.py
   tour_agent_ttft.py pass OUT --bin BIN --model DIR --case cold|ram|ssd --tokens N
-Une passe est jetée et rejouée si loadavg >= 2 ou si le Mac est sur batterie.
+Une passe est jetée et rejouée si loadavg >= 2 ou si le Mac est sur batterie en fin
+de passe ; après deux rejets, abandon : DONE porte `failed: ...` et le rc est non nul.
 """
 
 import argparse
@@ -183,19 +184,44 @@ def run_pass(args):
     (out / f"{args.case}-{args.tokens}.json").write_text(json.dumps(doc, ensure_ascii=False, indent=1))
 
 
+MAX_REJECTS = 2
+
+
+def pass_valid(path):
+    """Charge et secteur relus en fin de passe : sinon la mesure est faussée."""
+    doc = json.loads(path.read_text())
+    return doc["loadavg_end"] < 2 and doc["ac"]
+
+
+def run_case(args, out, case, tokens):
+    """Joue une passe, la rejoue après au plus MAX_REJECTS rejets ; renvoie l'échec ou None."""
+    path = out / f"{case}-{tokens}.json"
+    # Le verrou est pris ici, par passe ; `pass` ne le rappelle jamais.
+    cmd = [sys.executable, "-I", "-B", args.lock_tool, "run", "--owner", "parking", "--",
+           sys.executable, "-I", "-B", __file__, "pass", str(out), "--bin", args.bin,
+           "--model", args.model, "--case", case, "--tokens", str(tokens)]
+    for attempt in range(MAX_REJECTS + 1):
+        rc = subprocess.run(cmd).returncode
+        if rc != 0:
+            return f"{case}-{tokens}: passe rc={rc}"
+        if pass_valid(path):
+            return None
+        path.rename(path.with_name(f"{case}-{tokens}.rejet{attempt}.json"))
+        print(f"{case}-{tokens}: passe {attempt} rejetée (charge ou batterie)", file=sys.stderr)
+    return f"{case}-{tokens}: {MAX_REJECTS + 1} passes rejetées (charge ou batterie), abandon"
+
+
 def run_all(args):
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    failure = None
     for tokens in (16000, 32000):
         for case in ("cold", "ram", "ssd"):
-            if (out / f"{case}-{tokens}.json").exists():
-                continue
-            # Le verrou est pris ici, par passe ; `pass` ne le rappelle jamais.
-            cmd = [sys.executable, "-I", "-B", args.lock_tool, "run", "--owner", "parking", "--",
-                   sys.executable, "-I", "-B", __file__, "pass", str(out), "--bin", args.bin,
-                   "--model", args.model, "--case", case, "--tokens", str(tokens)]
-            subprocess.run(cmd, check=False)
-    (out / "DONE").write_text("done\n")
+            if failure is None and not (out / f"{case}-{tokens}.json").exists():
+                failure = run_case(args, out, case, tokens)
+    (out / "DONE").write_text(f"failed: {failure}\n" if failure else "ok\n")
+    if failure:
+        sys.exit(failure)
 
 
 def main():
