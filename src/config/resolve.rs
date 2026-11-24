@@ -70,13 +70,16 @@ impl RawModelConfig {
                                 ]
                                 .iter()
                                 .any(|key| {
-                                    // `8` et `8.0` désignent le même facteur.
+                                    // `8` et `8.0` désignent le même facteur ; deux entiers
+                                    // restent comparés exactement, sans passer par f64.
                                     let (a, b) = (existing.get(*key), rope.get(*key));
+                                    let both_int = a.is_some_and(|v| v.is_i64() || v.is_u64())
+                                        && b.is_some_and(|v| v.is_i64() || v.is_u64());
                                     match (
                                         a.and_then(serde_json::Value::as_f64),
                                         b.and_then(serde_json::Value::as_f64),
                                     ) {
-                                        (Some(x), Some(y)) => x != y,
+                                        (Some(x), Some(y)) if !both_int => x != y,
                                         _ => a != b,
                                     }
                                 });

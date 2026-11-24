@@ -721,4 +721,14 @@ fn every_rope_field_mismatch_is_rejected() {
     llama_with_rope(scaling, integer)
         .resolve()
         .expect("invariant: 8 et 8.0 équivalents");
+    let big = |n: &str| {
+        format!(
+            r#"{{"rope_type":"llama3","rope_theta":500000.0,"factor":8.0,"low_freq_factor":1.0,
+        "high_freq_factor":4.0,"original_max_position_embeddings":{n}}}"#
+        )
+    };
+    let err = llama_with_rope(&big("9007199254740992"), &big("9007199254740993"))
+        .resolve()
+        .expect_err("invariant: entiers distincts au-delà de 2^53 refusés");
+    assert!(err.to_string().contains("contradictoires"), "{err}");
 }
