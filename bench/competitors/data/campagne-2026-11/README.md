@@ -1,7 +1,7 @@
 # Competitor benchmark, campaigns of 19, 20 and 21 November 2026, M5 Max 128 GiB
 
 Raw data produced by the harness [`bench/competitors/campaign.py`](../../campaign.py)
-(a self-contained campaign run with a single command). No analysis is published here.
+(a self-contained campaign run with a single command), with methodological notes.
 
 | folder | date | content |
 |---|---|---|
@@ -9,7 +9,7 @@ Raw data produced by the harness [`bench/competitors/campaign.py`](../../campaig
 | `20-sar/` | Nov 20 | saragossa only, `main` d894441; 18 entries, 54 measurements |
 | `20-dfl/` | Nov 20 | saragossa 27B BF16 in AR, MTP and DFlash, `main` 0af2102, after PR #305; 9 entries, 27 measurements |
 | `21-mlx/` | Nov 21 | mlx-lm and mlx-vlm in AR, MTP and DFlash; 27 entries, 81 measurements out of 81 |
-| `21-final/` | Nov 21 | saragossa, mlx and llama.cpp in the same session, `main` 7cb2f3e (PR #309 and #311, built at 12:31); 72 entries, 216 measurements out of 216 |
+| `21-final/` | Nov 21 | saragossa, mlx and llama.cpp in the same session, `main` 7cb2f3e (PR #309 and #311, build finished at 12:55:32 per `freeze.json` and the `saragossa_build` event); 72 entries, 216 measurements out of 216 |
 
 Per folder:
 
@@ -24,10 +24,11 @@ and the battery identifier is removed from `power.source_raw`.
 
 ## Protocol
 
-M5 Max 128 GiB, on AC power, 3 repetitions per cell, greedy decoding
-(temperature 0), 256 generated tokens, prompts of 512, 4096 and 16384 tokens,
-context 20480, load gate `loadavg < 2`, cooldown between entries (45 s, at most
-5 min between models).
+M5 Max 128 GiB, on AC power, 3 planned repetitions per cell, greedy decoding
+(temperature 0), 256 generated tokens, target prompt lengths of 512, 4096 and
+16384 tokens (the longest actual prompt has 16383), context 20480, load gate
+`loadavg < 2`, cooldown before each entry (at least 45 s, then until GPU
+≤ 50 °C, at most 300 s).
 
 ## Prompts
 
@@ -42,21 +43,46 @@ prompt depends on the commit of the sources.
 
 ## Caveats
 
-- n = 3 per cell, no statistical test.
+- n = 3 planned per cell (fewer where runs failed), no statistical test.
 - Different quantizations across engines (MLX 4-bit versus GGUF Q4_K_M, etc.):
   the throughputs do not compare identical weights.
 - Apart from `21-mlx` (mlx) and `21-final` (mlx and llama.cpp), competitors were
   measured only on Nov 19; `20-sar` and `20-dfl` cover saragossa only. `21-final`
   re-measures saragossa, mlx and llama.cpp in the same session.
-- mlx-mtp and mlx-dflash go through mlx-vlm 0.8.0, whose output is not
-  bit-identical to its own AR output, whereas saragossa's is exact by default
-  except for the cases listed in
+- mlx-mtp and mlx-dflash go through mlx-vlm 0.8.0; the mlx AR rows (`mlx-ar`) go
+  through mlx_lm.server. mlx-vlm without a drafter was not measured, so the AR rows
+  do not establish the best non-speculative mlx speed.
+- This campaign does not test greedy identity between AR and speculative outputs:
+  each request gets its own nonce (see Limits), so outputs of different
+  configurations are not compared on identical inputs. saragossa's identity is
+  covered by separate tests, listed in
   [`docs/perf/greedy-identity.md`](../../../../docs/perf/greedy-identity.md).
-- mlx-vlm without a drafter is faster than mlx_lm.server.
 - llama.cpp was not measured on the 35B in `21-final`.
-- TTFT at 512 tokens in BF16 is bimodal.
-- mistral.rs in speculative mode degrades at long context (memory pressure).
-- llmd has neither MTP nor DFlash.
-- `20-dfl/freeze.json` reports battery power: the freeze dates from a first launch
-  stopped by the power gate before any measurement. The resumed run measured on AC
-  power, as the 9 `on_ac: true` entries of the journal show.
+- `19b`, mistral.rs DFlash on the 27B 4-bit: throughput falls with prompt length
+  (medians 28.7, 13.8 and 6.2 tok/s at 512, 4096 and 16384, computed as
+  255 / (time of last non-empty chunk − time of first non-empty chunk)). The cause is not
+  established; the nine measurements record `memory_pressure: normal` before and
+  after.
+- `19b`, llmd: the configuration with `--speculative-drafter-model=native` failed
+  to load on the 27B 4-bit and the 27B BF16 (llmd AR also failed to load on the
+  BF16), and the 35B has no local checkpoint readable by llmd per `freeze.json`.
+  Only llmd AR on the 27B 4-bit was measured; this says nothing general about
+  llmd's speculative support.
+- `20-dfl/freeze.json` reports battery power, while the 9 `entry_start` events
+  of the journal record `on_ac: true`. The freeze was probably written by an
+  earlier launch; that launch is not in the published archives.
+
+## Limits
+
+- Order not counterbalanced: in `21-final`, all competitor entries ran first,
+  then the saragossa entries, after its build.
+- The nonce prefixed to each prompt is derived from the entry (model,
+  configuration, repetition) and the length: inputs differ by a few tokens across
+  configurations.
+- One prompt corpus: a technical review of the repository's Rust sources. No
+  dedicated conversational, multilingual, reasoning or tool-use evaluation; no
+  sampling and no concurrent load.
+- At most 3 observations per cell: medians and spreads are descriptive.
+- The DFlash budget and MTP measurements of PR #314 and #316 are outside this
+  campaign; their raw repetitions are not published here, so they cannot be
+  audited from this folder.
