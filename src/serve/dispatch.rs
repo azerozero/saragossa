@@ -5,7 +5,8 @@
 //! part dans une file bornée vers le thread moteur, seul propriétaire de
 //! [`ServeState`] : l'inférence reste sérielle, seules les E/S sont parallèles,
 //! sauf les lots opt-in (`SARAGOSSA_SERVE_BATCH=1`, voir [`run_engine`]) qui
-//! décodent ensemble plusieurs requêtes chat streamées greedy.
+//! décodent ensemble plusieurs requêtes chat streamées greedy, et les moteurs
+//! opt-in (`--engines N`) qui prennent chacun le job suivant de la même file.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -14,7 +15,7 @@ use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -199,7 +200,11 @@ where
         .map_err(|e| ServeError::io("thread d'accept", e))?;
     // La boucle s'arrête quand l'accept et toutes les connexions ont lâché
     // leur émetteur.
-    let max_streams = if serve_batch_enabled() {
+    let engines = state.engines();
+    // ponytail: lots coupés à plusieurs moteurs (`drain_queue` d'un moteur
+    // viderait la file commune dans sa file locale) ; drainer au plus sa part
+    // si lots et moteurs doivent se combiner.
+    let max_streams = if serve_batch_enabled() && engines == 1 {
         serve_max_streams()
     } else {
         1
@@ -212,10 +217,82 @@ where
             eprintln!("saragossa serve relais: préchargement différé échoué: {error}");
         }
     }
-    run_engine(&queue, state, max_streams);
+    if engines == 1 {
+        run_engine(&queue, state, max_streams);
+    } else {
+        let queue = Arc::new(Mutex::new(queue));
+        let workers = (1..engines)
+            .map(|engine| spawn_engine(engine, state.engine_seed(engine), Arc::clone(&queue)))
+            .collect::<ServeResult<Vec<_>>>()?;
+        eprintln!("saragossa serve engines={engines} (poids partagés)");
+        run_engine(&*queue, state, max_streams);
+        // File fermée : les autres moteurs finissent leur job en cours.
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
     acceptor
         .join()
         .map_err(|_| ServeError::io("thread d'accept", io::Error::other("panique")))?
+}
+
+/// Lance le moteur secondaire `engine` sur son thread : son `ServeState` y est
+/// construit (arènes et pools scratch sont par thread), ses poids viennent du
+/// registre commun.
+fn spawn_engine<S: ServeStream>(
+    engine: usize,
+    seed: super::state::EngineSeed,
+    queue: Arc<Mutex<Receiver<Job<S>>>>,
+) -> ServeResult<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name(format!("saragossa-serve-engine-{engine}"))
+        .spawn(move || {
+            // Une panique hors `guarded` (boucle, construction) abat le process,
+            // comme sur le moteur principal.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut state = seed.build();
+                run_engine(&*queue, &mut state, 1);
+            }));
+            if outcome.is_err() {
+                eprintln!("saragossa serve panique du moteur {engine} hors requête, arrêt");
+                std::process::exit(101);
+            }
+        })
+        .map_err(|e| ServeError::io("thread moteur", e))
+}
+
+/// File de jobs vue d'un moteur : le récepteur seul (un moteur) ou partagé
+/// sous verrou (plusieurs moteurs, chacun prend le job suivant).
+trait JobQueue<J> {
+    fn recv_timeout(&self, timeout: Duration) -> Result<J, RecvTimeoutError>;
+    fn try_recv(&self) -> Option<J>;
+}
+
+impl<J> JobQueue<J> for Receiver<J> {
+    fn recv_timeout(&self, timeout: Duration) -> Result<J, RecvTimeoutError> {
+        Receiver::recv_timeout(self, timeout)
+    }
+
+    fn try_recv(&self) -> Option<J> {
+        Receiver::try_recv(self).ok()
+    }
+}
+
+// ponytail: un seul moteur attend sur le canal, les autres sur le verrou (au
+// plus 250 ms chacun) ; un canal MPMC si l'attente du verrou se voit en latence.
+impl<J> JobQueue<J> for Mutex<Receiver<J>> {
+    fn recv_timeout(&self, timeout: Duration) -> Result<J, RecvTimeoutError> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv_timeout(timeout)
+    }
+
+    fn try_recv(&self) -> Option<J> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv()
+            .ok()
+    }
 }
 
 /// Décharge DFN3 après `serve.idle_unload_secs` sans flux enhance. Il est
@@ -269,7 +346,7 @@ impl<S> Queued<S> {
 /// NOTE: l'admission n'a lieu qu'entre deux générations ; un job arrivé
 /// pendant un lot attend la fin de tout le lot.
 fn run_engine<S: ServeStream>(
-    queue: &Receiver<Job<S>>,
+    queue: &impl JobQueue<Job<S>>,
     state: &mut ServeState,
     max_streams: usize,
 ) {
@@ -286,7 +363,12 @@ fn run_engine<S: ServeStream>(
         let leader = match pending.pop_front() {
             Some(queued) => queued,
             None => match next_job(queue, state) {
-                Some(job) => Queued::new(job, batching(state), state),
+                Some(job) => {
+                    // Un SIGHUP appliqué par un autre moteur pendant l'attente
+                    // vaut avant le routage de ce job.
+                    apply_pending_models(state);
+                    Queued::new(job, batching(state), state)
+                }
                 None => break,
             },
         };
@@ -318,10 +400,15 @@ fn run_engine<S: ServeStream>(
 }
 
 /// Applique la liste de modèles d'un SIGHUP ; entre deux jobs seulement.
+///
+/// Le premier moteur libre prend la liste en attente ; les autres appliquent
+/// la liste qu'il a publiée, au plus tard avant de router leur job suivant.
 fn apply_pending_models(state: &mut ServeState) {
-    if let Some(models) = super::reload::take_pending_models() {
+    let mut seen = state.models_generation();
+    if let Some(models) = super::reload::sync_models(&mut seen) {
         state.set_models(&models);
     }
+    state.set_models_generation(seen);
 }
 
 /// Attend le prochain job en regardant toutes les 250 ms si un SIGHUP a changé
@@ -330,7 +417,7 @@ fn apply_pending_models(state: &mut ServeState) {
 /// Appelé seulement file vide et moteur libre : au bout de
 /// `serve.idle_unload_secs` sans job, les modèles sont déchargés (une fois), et
 /// le job suivant attend leur rechargement sur ce même thread.
-fn next_job<T>(queue: &Receiver<T>, state: &mut ServeState) -> Option<T> {
+fn next_job<T>(queue: &impl JobQueue<T>, state: &mut ServeState) -> Option<T> {
     let idle_since = Instant::now();
     let mut unloaded = false;
     loop {
@@ -341,7 +428,7 @@ fn next_job<T>(queue: &Receiver<T>, state: &mut ServeState) -> Option<T> {
                 let secs = super::reload::idle_unload_secs();
                 if !unloaded && idle_expired(idle_since, Instant::now(), secs) {
                     // Un job arrivé depuis le timeout passe avant tout déchargement.
-                    if let Ok(job) = queue.try_recv() {
+                    if let Some(job) = queue.try_recv() {
                         return Some(job);
                     }
                     state.unload_idle(secs);
@@ -360,15 +447,15 @@ pub(super) fn idle_expired(since: Instant, now: Instant, secs: u64) -> bool {
 
 /// Déplace sans bloquer les jobs déjà en file vers `pending`, jusqu'à `cap`.
 fn drain_queue<J, T>(
-    queue: &Receiver<J>,
+    queue: &impl JobQueue<J>,
     pending: &mut VecDeque<T>,
     cap: usize,
     wrap: impl Fn(J) -> T,
 ) {
     while pending.len() < cap {
         match queue.try_recv() {
-            Ok(job) => pending.push_back(wrap(job)),
-            Err(_) => break,
+            Some(job) => pending.push_back(wrap(job)),
+            None => break,
         }
     }
 }
@@ -471,6 +558,13 @@ fn guarded(state: &mut ServeState, work: impl FnOnce(&mut ServeState)) -> bool {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut *state)));
     if outcome.is_ok() {
         return true;
+    }
+    // Plusieurs moteurs : poids, executors et caches partagés restent vivants
+    // chez les autres, verrous possiblement empoisonnés ; on ne les réutilise
+    // pas, le process s'arrête (le superviseur relance).
+    if state.engines() > 1 {
+        eprintln!("saragossa serve panique d'un moteur à poids partagés, arrêt");
+        std::process::exit(101);
     }
     eprintln!("saragossa serve panique du moteur contenue, modèles invalidés");
     // Un Drop qui paniquerait à son tour ne doit pas tuer le moteur.
@@ -910,6 +1004,62 @@ mod tests {
         drop(tx);
 
         run_engine(&rx, &mut state, 8);
+
+        for client in clients {
+            let answer = response(client);
+            assert!(answer.starts_with("HTTP/1.1 "), "réponse absente: {answer}");
+            assert!(!answer.starts_with("HTTP/1.1 200"));
+        }
+    }
+
+    /// `--engines 3` : les moteurs secondaires et le principal vident la même
+    /// file, chaque job reçoit sa réponse.
+    #[test]
+    fn engines_share_the_queue_and_answer_every_job() {
+        let args = ServeArgs::parse(
+            ["--model", "alpha=/nonexistent/a", "--engines", "3"].map(String::from),
+        )
+        .expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        assert_eq!(state.engines(), 3);
+        let (tx, rx) = sync_channel(8);
+        let body = br#"{"model":"alpha","messages":[]}"#;
+        let raw = [
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+            body,
+        ]
+        .concat();
+        let mut clients = Vec::new();
+        for _ in 0..6 {
+            let (client, server) = tcp_pair();
+            let mut cursor = std::io::Cursor::new(raw.clone());
+            let request = super::super::http::read_request(
+                &mut cursor,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("invariant: requête lisible")
+            .expect("invariant: requête présente");
+            let counter = Arc::new(AtomicUsize::new(0));
+            tx.send(Job {
+                request,
+                stream: server,
+                _bytes: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
+                waiting: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
+            })
+            .expect("invariant: file ouverte");
+            clients.push(client);
+        }
+        drop(tx);
+        let queue = Arc::new(Mutex::new(rx));
+        for engine in 1..state.engines() {
+            spawn_engine(engine, state.engine_seed(engine), Arc::clone(&queue))
+                .expect("invariant: thread moteur lancé");
+        }
+        run_engine(&*queue, &mut state, 1);
 
         for client in clients {
             let answer = response(client);

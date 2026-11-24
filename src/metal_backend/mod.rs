@@ -184,6 +184,7 @@ pub use self::profiling::{
 };
 pub(crate) use self::profiling::{profile_dispatch, profile_dispatch_shape, trace_dispatch_path};
 pub(crate) use self::scratch::install_scratch_namespace;
+pub use self::scratch::set_scratch_engine;
 #[cfg(test)]
 pub(crate) use self::verify_tree::with_verify_strict_override;
 pub(crate) use self::verify_tree::{
@@ -1100,6 +1101,8 @@ struct ScratchBufferKey {
     // Slot de flux (light-batch) : deux flux concurrents qui passent par les
     // mêmes labels reçoivent des buffers DISJOINTS au lieu de s'aliaser.
     namespace: u64,
+    /// Moteur serve (`--engines`) : 0 hors multi-moteur.
+    engine: u32,
 }
 
 #[derive(Debug)]

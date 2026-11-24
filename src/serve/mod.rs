@@ -10,6 +10,13 @@
 //! connexion ne coûte que cette connexion et n'abat plus le process ; une
 //! panique moteur l'abat toujours.
 //!
+//! Moteurs parallèles opt-in (`--engines N`, `SARAGOSSA_SERVE_ENGINES`) : N
+//! threads moteur vident la même file, chacun avec son `ServeState` (KV,
+//! scratch Metal cloisonné, caches de préfixe), sur une seule copie des poids
+//! LLM, Whisper, TTS, diarisation et embeddings (voir `shared`). Les lots y
+//! sont coupés et une panique de requête arrête le process, l'état partagé
+//! n'étant plus sûr.
+//!
 //! Lots opt-in (`SARAGOSSA_SERVE_BATCH=1` avec
 //! `SARAGOSSA_RUST_LIGHTBATCH_MULTI=1`) : quand le moteur prend une requête
 //! chat streamée greedy pour un modèle dense éligible, il y joint les requêtes
@@ -77,6 +84,8 @@ mod relay;
 mod reload;
 #[cfg(feature = "serve")]
 mod responses;
+#[cfg(feature = "serve")]
+mod shared;
 #[cfg(feature = "serve")]
 mod state;
 pub(crate) mod streaming;
@@ -170,7 +179,8 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     reload::set_launch_models(&args.models);
     reload::set_idle_unload_secs(args.idle_unload_secs);
     saragossa::force_resident_full_linear_decode();
-    let mut state = state::ServeState::new(&args);
+    let shared = shared::EngineShared::default();
+    let mut state = state::ServeState::with_shared(&args, shared.clone());
     // NOTE: en relais séquentiel, le moteur précharge après la sortie du parent.
     #[cfg(unix)]
     let deferred = relay::defer_preload(args.preload);

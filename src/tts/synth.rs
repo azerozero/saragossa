@@ -22,12 +22,12 @@ impl TtsModel {
                 top_k: CLONE_SAMPLE_TOP_K,
                 top_p: CLONE_SAMPLE_TOP_P,
                 repetition_penalty: CLONE_SAMPLE_REPETITION_PENALTY,
-                seed: self.seed.unwrap_or_else(clone_sample_seed),
+                seed: self.effective_seed().unwrap_or_else(clone_sample_seed),
             });
         }
         self.generation_config
             .as_ref()
-            .map(|config| config.talker_params(self.seed.unwrap_or(0)))
+            .map(|config| config.talker_params(self.effective_seed().unwrap_or(0)))
     }
 
     fn default_frame_cap(&self, text: &str, max_frames: usize) -> Result<usize> {

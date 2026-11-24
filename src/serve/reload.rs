@@ -86,10 +86,39 @@ pub(super) fn model_ids(launch: &[String]) -> Vec<String> {
 
 /// Liste acceptée que le moteur doit encore appliquer, une seule fois. Elle
 /// devient la liste de `/v1/models` ici, quand le moteur la prend.
+#[cfg(test)]
 pub(super) fn take_pending_models() -> Option<Vec<ServeModelConfig>> {
-    let models = lock(&PENDING).take()?;
+    take_pending_generation().map(|(_, models)| models)
+}
+
+/// Comme [`take_pending_models`], avec la génération que la prise publie.
+fn take_pending_generation() -> Option<(u64, Vec<ServeModelConfig>)> {
+    // Ordre des verrous : PENDING puis MODELS, comme `effective_models`.
+    let mut pending = lock(&PENDING);
+    let models = pending.take()?;
     *lock(&MODELS) = Some(models.clone());
-    Some(models)
+    let generation = APPLIED_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    Some((generation, models))
+}
+
+/// Listes publiées par une prise, que chaque moteur applique une fois.
+static APPLIED_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Liste qu'un moteur ayant appliqué la génération `seen` doit appliquer :
+/// celle qu'il prend en attente, ou la dernière publiée par un autre moteur.
+/// À un seul moteur, c'est exactement [`take_pending_models`].
+pub(super) fn sync_models(seen: &mut u64) -> Option<Vec<ServeModelConfig>> {
+    let mut models = take_pending_generation().map(|(generation, models)| {
+        *seen = generation;
+        models
+    });
+    let models_slot = lock(&MODELS);
+    let generation = APPLIED_GENERATION.load(Ordering::Acquire);
+    if generation != *seen {
+        *seen = generation;
+        models = models_slot.clone().or(models);
+    }
+    models
 }
 
 /// Dernière liste acceptée, appliquée ou non : base du prochain rechargement.
@@ -479,6 +508,18 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(ids, ["a", "p", "b"]);
+
+        // Deux moteurs : le premier prend la liste, le second applique la
+        // liste publiée, une fois chacun.
+        let mut first = APPLIED_GENERATION.load(Ordering::Acquire);
+        let mut second = first;
+        *lock(&PENDING) = Some(launch.to_vec());
+        let len = |models: Option<Vec<ServeModelConfig>>| models.map(|models| models.len());
+        assert_eq!(len(sync_models(&mut first)), Some(2));
+        assert_eq!(model_ids(&[]), ["a", "p"], "publiée par la prise");
+        assert_eq!(len(sync_models(&mut second)), Some(2));
+        assert_eq!(len(sync_models(&mut first)), None);
+        assert_eq!(len(sync_models(&mut second)), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1,6 +1,6 @@
 //! Etat d'inférence longue durée du serveur local.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
@@ -34,6 +34,7 @@ use super::embeddings::EmbeddingsState;
 use super::error::{ServeError, ServeResult};
 use super::mtp;
 use super::protocol::{ChatCompletionRequest, ResponseFormatMode, Usage};
+use super::shared::{EngineShared, SharedWeights};
 use super::streaming::{
     CompletionSink, CompletionStreamEvent, StreamTerminalError, StreamingCompletionStart,
     StreamingTextDetokenizer, TextStop,
@@ -94,9 +95,16 @@ impl ServedCompletion {
 ///
 /// L'état appartient au thread moteur, celui qui l'a construit : les arènes et
 /// pools scratch GPU sont `thread_local`, un décodeur appelé depuis un autre
-/// thread perdrait ses buffers résidents.
+/// thread perdrait ses buffers résidents. Sous `--engines N`, chaque moteur a
+/// le sien ; les poids viennent de `shared`.
 pub(super) struct ServeState {
     engine_thread: ThreadId,
+    /// Poids et sessions communs aux moteurs de `--engines`.
+    shared: EngineShared,
+    /// Arguments du lancement, pour construire les moteurs secondaires.
+    args: Arc<ServeArgs>,
+    /// Dernier rechargement SIGHUP appliqué (moteurs secondaires).
+    models_generation: u64,
     models: Vec<ModelSlot>,
     backend: RuntimeKind,
     max_tokens_cap: usize,
@@ -113,11 +121,45 @@ pub(super) struct ServeState {
     embeddings: EmbeddingsState,
 }
 
+/// Graine `Send` d'un moteur secondaire, construite sur le thread principal.
+pub(super) struct EngineSeed {
+    args: Arc<ServeArgs>,
+    shared: EngineShared,
+    engine: usize,
+}
+
+impl EngineSeed {
+    /// Construit le `ServeState` du moteur sur le thread appelant, qui devient
+    /// son thread moteur.
+    pub(super) fn build(self) -> ServeState {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        saragossa::set_scratch_engine(
+            u32::try_from(self.engine).expect("invariant: --engines borné à 16"),
+        );
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = self.engine;
+        ServeState::for_engine(self.args, self.shared)
+    }
+}
+
 impl ServeState {
     /// Construit l'état à partir des chemins CLI, sans charger les poids.
+    #[cfg(test)]
     pub(super) fn new(args: &ServeArgs) -> Self {
+        Self::with_shared(args, EngineShared::default())
+    }
+
+    /// Construit l'état d'un moteur sur le thread appelant, ses poids venant
+    /// du registre `shared` commun aux moteurs.
+    pub(super) fn with_shared(args: &ServeArgs, shared: EngineShared) -> Self {
+        Self::for_engine(Arc::new(args.clone()), shared)
+    }
+
+    fn for_engine(launch: Arc<ServeArgs>, shared: EngineShared) -> Self {
+        let args = &*launch;
         Self {
             engine_thread: thread::current().id(),
+            models_generation: 0,
             models: args
                 .models
                 .iter()
@@ -126,17 +168,41 @@ impl ServeState {
             backend: args.backend,
             max_tokens_cap: args.max_tokens_cap,
             clock: 0,
-            memory_guard: MemoryGuard::serve(),
+            memory_guard: shared.memory_guard.clone(),
             #[cfg(any(
                 feature = "stt",
                 feature = "tts",
                 feature = "diar",
                 feature = "denoise"
             ))]
-            audio: AudioState::new(args),
+            audio: AudioState::with_shared(args, &shared),
             #[cfg(feature = "embed")]
-            embeddings: EmbeddingsState::new(args),
+            embeddings: EmbeddingsState::new(args, shared.weights.clone()),
+            shared,
+            args: Arc::clone(&launch),
         }
+    }
+
+    /// Moteurs demandés par `--engines`.
+    pub(super) fn engines(&self) -> usize {
+        self.args.engines
+    }
+
+    /// De quoi construire le moteur secondaire `engine` sur son propre thread.
+    pub(super) fn engine_seed(&self, engine: usize) -> EngineSeed {
+        EngineSeed {
+            args: Arc::clone(&self.args),
+            shared: self.shared.clone(),
+            engine,
+        }
+    }
+
+    pub(super) fn models_generation(&self) -> u64 {
+        self.models_generation
+    }
+
+    pub(super) fn set_models_generation(&mut self, generation: u64) {
+        self.models_generation = generation;
     }
 
     /// Renvoie le plafond serveur du budget de génération.
@@ -189,7 +255,7 @@ impl ServeState {
             .find(|slot| slot.id == request.model)
             .ok_or_else(|| ServeError::UnknownModel(request.model.clone()))?;
         if let Some(loaded) = &slot.loaded {
-            return output_parser_for_config(&loaded.assets.config, request);
+            return output_parser_for_config(&loaded.llm.assets.config, request);
         }
         let config = saragossa::ModelConfig::from_file(slot.path.join("config.json"))?;
         output_parser_for_config(&config, request)
@@ -340,7 +406,7 @@ impl ServeState {
             && self.models[index]
                 .loaded
                 .as_ref()
-                .is_some_and(|loaded| loaded.decoder.lightbatch_multi_dense_ready())
+                .is_some_and(|loaded| loaded.llm.decoder.lightbatch_multi_dense_ready())
     }
 
     /// Exécute un lot de complétions chat streamées greedy d'un même modèle.
@@ -453,7 +519,7 @@ impl ServeState {
             .iter()
             .find(|slot| slot.id == model)
             .and_then(|slot| slot.loaded.as_ref())
-            .is_some_and(|loaded| loaded.mtp_active)
+            .is_some_and(|loaded| loaded.llm.mtp_active)
     }
 
     /// Choisit le parseur commun aux API selon la famille réellement chargée.
@@ -471,7 +537,7 @@ impl ServeState {
             .loaded
             .as_ref()
             .ok_or_else(|| ServeError::Http("modèle non chargé".into()))?;
-        output_parser_for_config(&loaded.assets.config, request)
+        output_parser_for_config(&loaded.llm.assets.config, request)
     }
 
     fn ensure_loaded_index(&mut self, index: usize) -> ServeResult<()> {
@@ -480,11 +546,20 @@ impl ServeState {
         if self.models[index].loaded.is_some() {
             return Ok(());
         }
-        let additional = self.models[index].estimated_model_bytes();
+        // Des poids déjà tenus par un autre moteur ne coûtent rien de plus.
+        let additional = if self
+            .shared
+            .weights
+            .is_alive("llm", &self.models[index].path)
+        {
+            0
+        } else {
+            self.models[index].estimated_model_bytes()
+        };
         self.enforce_memory_budget(additional, Some(index))?;
         self.enforce_model_pool_limit(index);
         let started = Instant::now();
-        self.models[index].ensure_loaded()?;
+        self.models[index].ensure_loaded(&self.shared.weights)?;
         eprintln!(
             "saragossa serve loaded model={} in_ms={}",
             self.models[index].id,
@@ -519,7 +594,10 @@ impl ServeState {
         {
             any |= self.embeddings.unload();
         }
-        if !any {
+        // Les purgeables du process servent aussi les autres moteurs : seul le
+        // moteur unique les vide à l'inactivité (la pression mémoire purge
+        // toujours).
+        if !any || self.engines() > 1 {
             return;
         }
         while process_purge_registry()
@@ -680,76 +758,84 @@ impl ModelSlot {
         self.estimated_model_bytes
     }
 
-    fn ensure_loaded(&mut self) -> ServeResult<()> {
+    fn ensure_loaded(&mut self, shared: &SharedWeights) -> ServeResult<()> {
         if self.loaded.is_none() {
-            eprintln!(
-                "saragossa serve loading model={} path={}",
-                self.id,
-                self.path.display()
-            );
-            let preset = saragossa::runtime_preset_for_model_dir(&self.path);
-            let assets = ModelAssets::load_local(&self.path)?;
-            let mut decoder = load_decoder_with_runtime(&assets, self.backend)?;
-            let mtp_active = mtp::active_for(&assets, self.backend);
-            if mtp_active {
-                let path = assets.mtp.path.as_ref().ok_or_else(|| {
-                    ServeError::args(format!(
-                        "modèle {} qualifié MTP sans chemin de sidecar",
-                        self.id
-                    ))
-                })?;
-                decoder = decoder.with_mtp_weights(&assets.mtp)?;
-                eprintln!(
-                    "saragossa serve MTP actif model={} sidecar={} max_draft={}",
-                    self.id,
-                    path.display(),
-                    mtp::max_draft_tokens()
-                );
-            }
-            // Le drafter n'est joignable que par le chemin MTP : inutile sans lui.
-            #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
-            if mtp_active {
-                decoder = decoder.with_dflash_draft_auto(&assets)?;
-                if let Some(draft) = decoder.dflash_draft() {
-                    eprintln!(
-                        "saragossa serve drafter DFlash actif model={} block_size={} quant_bits={:?}",
-                        self.id,
-                        draft.info.block_size,
-                        draft.quant.map(|quant| quant.bits)
-                    );
-                }
-            }
-            warmup::decoder(&mut decoder, &assets, self.backend, &self.id)?;
-            if mtp_active {
-                warmup::mtp_decoder(&decoder, &assets, self.backend, &self.id)?;
-            }
+            let llm = shared.get_or_load("llm", &self.path, || {
+                load_shared_llm(&self.id, &self.path, self.backend)
+            })?;
             self.loaded = Some(LoadedModel {
                 id: self.id.clone(),
-                assets,
-                decoder,
-                preset,
-                mtp_active,
+                llm,
                 json_token_catalog: OnceLock::new(),
                 schema_token_catalog: OnceLock::new(),
                 prefix_cache: BlockAwarePrefixCache::from_runtime_flags(),
             });
         }
-        self.loaded.as_ref().ok_or_else(|| {
-            ServeError::args(format!(
-                "modèle {} non chargé après initialisation",
-                self.id
-            ))
-        })?;
         Ok(())
     }
 }
 
-struct LoadedModel {
-    id: String,
+/// Charge et chauffe les poids d'un modèle LLM ; une fois par process.
+fn load_shared_llm(id: &str, path: &Path, backend: RuntimeKind) -> ServeResult<SharedLlm> {
+    eprintln!(
+        "saragossa serve loading model={} path={}",
+        id,
+        path.display()
+    );
+    let preset = saragossa::runtime_preset_for_model_dir(path);
+    let assets = ModelAssets::load_local(path)?;
+    let mut decoder = load_decoder_with_runtime(&assets, backend)?;
+    let mtp_active = mtp::active_for(&assets, backend);
+    if mtp_active {
+        let path = assets.mtp.path.as_ref().ok_or_else(|| {
+            ServeError::args(format!("modèle {} qualifié MTP sans chemin de sidecar", id))
+        })?;
+        decoder = decoder.with_mtp_weights(&assets.mtp)?;
+        eprintln!(
+            "saragossa serve MTP actif model={} sidecar={} max_draft={}",
+            id,
+            path.display(),
+            mtp::max_draft_tokens()
+        );
+    }
+    // Le drafter n'est joignable que par le chemin MTP : inutile sans lui.
+    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    if mtp_active {
+        decoder = decoder.with_dflash_draft_auto(&assets)?;
+        if let Some(draft) = decoder.dflash_draft() {
+            eprintln!(
+                "saragossa serve drafter DFlash actif model={} block_size={} quant_bits={:?}",
+                id,
+                draft.info.block_size,
+                draft.quant.map(|quant| quant.bits)
+            );
+        }
+    }
+    warmup::decoder(&mut decoder, &assets, backend, id)?;
+    if mtp_active {
+        warmup::mtp_decoder(&decoder, &assets, backend, id)?;
+    }
+    Ok(SharedLlm {
+        assets,
+        decoder,
+        preset,
+        mtp_active,
+    })
+}
+
+/// Poids et métadonnées d'un modèle LLM, partagés entre moteurs par
+/// [`SharedWeights`] : la génération ne prend que `&self`.
+struct SharedLlm {
     assets: ModelAssets,
     decoder: CausalDecoder,
     preset: Option<RuntimePreset>,
     mtp_active: bool,
+}
+
+/// Modèle chargé d'un moteur : poids partagés, caches propres au moteur.
+struct LoadedModel {
+    id: String,
+    llm: Arc<SharedLlm>,
     /// Catalogue des bytes par token, bâti paresseusement à la 1ʳᵉ requête
     /// `json_object`/`json_lines` : un déploiement texte pur ne paie jamais le
     /// décodage du vocab entier ni son étape faillible au chargement.
@@ -833,10 +919,23 @@ fn speculative_log(stats: Option<&saragossa::SpeculativeStats>) -> String {
 }
 
 impl LoadedModel {
+    /// Poids modifiables d'un modèle de test, seul détenteur de son `Arc`.
+    #[cfg(test)]
+    fn llm_mut(&mut self) -> &mut SharedLlm {
+        Arc::get_mut(&mut self.llm).expect("invariant: modèle de test non partagé")
+    }
+
+    #[cfg(test)]
+    fn into_llm(self) -> SharedLlm {
+        Arc::try_unwrap(self.llm)
+            .ok()
+            .expect("invariant: modèle de test non partagé")
+    }
+
     /// Le solo sert-il `request` en MTP ? Même règle en non-stream et stream.
     fn routes_mtp(&self, request: &ChatCompletionRequest, prepared: &PreparedRequest) -> bool {
-        let sampled = mtp::sampled_for(&self.assets.config);
-        self.mtp_active
+        let sampled = mtp::sampled_for(&self.llm.assets.config);
+        self.llm.mtp_active
             && mtp::routes_request(request, prepared.response_format, sampled)
             && mtp::supports_options(&prepared.options, sampled)
     }
@@ -864,8 +963,8 @@ impl LoadedModel {
             // décodeur (longest-prefix + extension). Il by-passe donc les
             // snapshots par blocs de serve pour ces seules requêtes greedy
             // non guidées ; le chemin AR reste strictement inchangé.
-            let mut text_stop = TextStop::new(&self.assets, stop_texts, max_tokens);
-            let output = self.decoder.generate_greedy_mtp_routed(
+            let mut text_stop = TextStop::new(&self.llm.assets, stop_texts, max_tokens);
+            let output = self.llm.decoder.generate_greedy_mtp_routed(
                 prompt_tokens_ids,
                 max_tokens,
                 options,
@@ -893,7 +992,8 @@ impl LoadedModel {
             // TODO: Câbler une annulation non-stream quand serve aura un signal partagé fiable.
             // Sans stop texte, la variante sans callback garde le decode pipeliné.
             let output = if stop_texts.is_empty() {
-                self.decoder
+                self.llm
+                    .decoder
                     .generate_greedy_timed_from_prompt_state_with_options(
                         prompt_state,
                         prefill,
@@ -901,8 +1001,9 @@ impl LoadedModel {
                         options,
                     )?
             } else {
-                let mut text_stop = TextStop::new(&self.assets, stop_texts, max_tokens);
+                let mut text_stop = TextStop::new(&self.llm.assets, stop_texts, max_tokens);
                 let output = self
+                    .llm
                     .decoder
                     .generate_greedy_timed_from_prompt_state_with_options_and_callback(
                         prompt_state,
@@ -972,7 +1073,8 @@ impl LoadedModel {
             on_event(CompletionStreamEvent::Start(&start))?;
         }
 
-        let mut detokenizer = StreamingTextDetokenizer::new(&self.assets, stop_texts, max_tokens);
+        let mut detokenizer =
+            StreamingTextDetokenizer::new(&self.llm.assets, stop_texts, max_tokens);
         let mut stream_error = None;
         let mut stream_started = !use_mtp;
         let mut speculative = None;
@@ -981,7 +1083,7 @@ impl LoadedModel {
             // du décodeur et by-passe les snapshots serve v1. Le callback observe
             // uniquement les tokens committés, puis le detokenizer existant garde
             // l'exacte même politique de stops et de texte visible.
-            let output = self.decoder.generate_greedy_mtp_routed(
+            let output = self.llm.decoder.generate_greedy_mtp_routed(
                 prompt_tokens_ids,
                 max_tokens,
                 options,
@@ -1023,7 +1125,8 @@ impl LoadedModel {
             speculative = Some(output.stats.clone());
             mtp::into_generation_output(output, started.elapsed())
         } else {
-            self.decoder
+            self.llm
+                .decoder
                 .generate_greedy_timed_from_prompt_state_with_options_and_callback(
                     prompt_state
                         .ok_or_else(|| ServeError::args("état de prompt AR absent avant decode"))?,
@@ -1114,7 +1217,7 @@ impl LoadedModel {
         let prompt_tokens = prepared.tokens.len();
         let generated = tokens_to_u32(&output.tokens)?;
         let decoded = strip_empty_think(super::streaming::decode_completion_tokens(
-            &self.assets,
+            &self.llm.assets,
             &generated,
         )?);
         let matched_stop = matched_text_stop(&decoded, &prepared.stop_texts);
@@ -1190,7 +1293,8 @@ impl LoadedModel {
             ..streams[0].options.clone()
         };
         self.drive_batch(streams, sinks, &stop_ids, |on_token| {
-            self.decoder
+            self.llm
+                .decoder
                 .generate_greedy_lightbatch_streaming_counted(
                     &prompts, &budgets, &options, on_token,
                 )
@@ -1214,7 +1318,7 @@ impl LoadedModel {
             .iter()
             .map(|stream| BatchFlux {
                 detokenizer: StreamingTextDetokenizer::new(
-                    &self.assets,
+                    &self.llm.assets,
                     &stream.stop_texts,
                     stream.max_tokens,
                 ),
@@ -1385,7 +1489,7 @@ impl LoadedModel {
     fn stream_bytes_upper(&self, prompt_tokens: usize, max_tokens: usize) -> u64 {
         const F32: u64 = 4;
         const SCRATCH_MARGIN: u64 = 64 << 20;
-        let config = &self.assets.config;
+        let config = &self.llm.assets.config;
         let layers = config.num_hidden_layers as u64;
         let full_layers = (0..config.num_hidden_layers)
             .filter(|layer| config.is_full_attention_layer(*layer))
@@ -1412,7 +1516,11 @@ impl LoadedModel {
 
     fn prompt_encoding(&self, request: &ChatCompletionRequest) -> ServeResult<PromptEncoding> {
         Ok(PromptEncoding {
-            tokens: encode_chat_prompt(&self.assets.config, &self.assets.tokenizer, request)?,
+            tokens: encode_chat_prompt(
+                &self.llm.assets.config,
+                &self.llm.assets.tokenizer,
+                request,
+            )?,
         })
     }
 
@@ -1441,16 +1549,20 @@ impl LoadedModel {
         let started = Instant::now();
         // Plafond flint vérifié avant toute recherche ou construction de
         // blocs : sinon les blocs complets seraient préremplis pour rien.
-        self.decoder
+        self.llm
+            .decoder
             .ensure_prompt_within_prefill_cap(tokens.len())?;
         // NOTE: l'extension en lignes coûte ~2,3× un prefill à froid par token
         // (29k étendus en 127 s contre 32k à froid en 63 s, 27B) : sans prefill
         // résident, un hit qui couvre moins de la moitié des blocs est ignoré.
-        let cheap_extend = self.decoder.prefix_extend_as_cheap_as_cold(tokens.len());
+        let cheap_extend = self
+            .llm
+            .decoder
+            .prefix_extend_as_cheap_as_cold(tokens.len());
         // NOTE: serve utilise les APIs uncached/extend ; le cache interne du
         // décodeur reste hors chemin pour éviter un partage inter-session.
-        if !prefix_blocks_usable(self.assets.config.is_flint(), cheap_extend) {
-            let state = self.decoder.prefill_prompt_state_uncached(tokens)?;
+        if !prefix_blocks_usable(self.llm.assets.config.is_flint(), cheap_extend) {
+            let state = self.llm.decoder.prefill_prompt_state_uncached(tokens)?;
             return Ok((state, 0, started.elapsed()));
         }
 
@@ -1459,6 +1571,7 @@ impl LoadedModel {
         // résident) : elle passe par le prefill résident, comme les mêmes
         // positions d'un prefill à froid, et non par l'extension en lignes.
         let tail = self
+            .llm
             .decoder
             .prefix_resume_align()
             .filter(|(align, _)| cheap_extend && block_tokens % align == 0)
@@ -1477,7 +1590,7 @@ impl LoadedModel {
             } else {
                 full_block_tokens.div_ceil(2).saturating_sub(1)
             });
-        let persistent = self.decoder.load_persistent_prefix(
+        let persistent = self.llm.decoder.load_persistent_prefix(
             &tokens[..full_block_tokens],
             block_tokens,
             minimum,
@@ -1498,9 +1611,15 @@ impl LoadedModel {
         } else if let Some(hit) = hit {
             let hit_kv = kv_allocations(&hit.state);
             let mut state = hit.state;
-            let metal = self.decoder.copy_prompt_state_metal_snapshot(&hit.metal)?;
-            self.decoder.restore_prompt_state_metal(&mut state, metal)?;
-            self.decoder
+            let metal = self
+                .llm
+                .decoder
+                .copy_prompt_state_metal_snapshot(&hit.metal)?;
+            self.llm
+                .decoder
+                .restore_prompt_state_metal(&mut state, metal)?;
+            self.llm
+                .decoder
                 .extend_prompt_state(&mut state, &tokens[hit.tokens..full_block_tokens])?;
             // Prolongement qui a recopié tout le K/V dans un buffer neuf : les
             // blocs de la session qui tiennent l'ancien buffer retiendraient une
@@ -1512,10 +1631,11 @@ impl LoadedModel {
             }
             state
         } else if full_block_tokens > 0 {
-            self.decoder
+            self.llm
+                .decoder
                 .prefill_prompt_state_uncached(&tokens[..full_block_tokens])?
         } else {
-            let state = self.decoder.prefill_prompt_state_uncached(tokens)?;
+            let state = self.llm.decoder.prefill_prompt_state_uncached(tokens)?;
             return Ok((state, 0, started.elapsed()));
         };
 
@@ -1523,11 +1643,13 @@ impl LoadedModel {
             let hash = tokens[..full_block_tokens]
                 .chunks_exact(block_tokens)
                 .fold(root, |hash, block| hash.chain(block, &[]));
-            self.decoder
+            self.llm
+                .decoder
                 .persist_prompt(&tokens[..full_block_tokens], &state)?;
             self.remember_prefix_block(root, hash, full_block_tokens, &state, memory_guard)?;
         }
-        self.decoder
+        self.llm
+            .decoder
             .extend_prompt_state(&mut state, &tokens[full_block_tokens..])?;
 
         Ok((state, reused_prefix_tokens, started.elapsed()))
@@ -1550,7 +1672,8 @@ impl LoadedModel {
             self.remember_prefix_block(root, hash, boundary, &state, memory_guard)?;
         }
         // Une frontière prolongée sera mémorisée une seule fois par l'appelant.
-        self.decoder
+        self.llm
+            .decoder
             .extend_prompt_state(&mut state, &tokens[boundary..])?;
         Ok(state)
     }
@@ -1563,7 +1686,7 @@ impl LoadedModel {
         state: &CausalDecoderPromptState,
         memory_guard: &MemoryGuard,
     ) -> ServeResult<()> {
-        let metal = self.decoder.snapshot_prompt_state_metal(state)?;
+        let metal = self.llm.decoder.snapshot_prompt_state_metal(state)?;
         // Le snapshot partage les segments KV de l'état vivant, déjà en mémoire :
         // un second passage sur le même `seen` ne compte que le reste.
         let mut seen = std::collections::HashSet::new();
@@ -1599,7 +1722,9 @@ impl LoadedModel {
         if let Some(catalog) = self.json_token_catalog.get() {
             return Ok(Arc::clone(catalog));
         }
-        let catalog = Arc::new(JsonTokenCatalog::from_tokenizer(&self.assets.tokenizer)?);
+        let catalog = Arc::new(JsonTokenCatalog::from_tokenizer(
+            &self.llm.assets.tokenizer,
+        )?);
         // En cas de course, `set` échoue et on réutilise la valeur déjà
         // installée (le catalogue est immutable, les deux builds sont égaux).
         let _ = self.json_token_catalog.set(Arc::clone(&catalog));
@@ -1615,7 +1740,8 @@ impl LoadedModel {
         let temperature = request.temperature.unwrap_or(0.0);
         let top_p = request.top_p.unwrap_or_else(|| {
             if temperature > f32::EPSILON {
-                self.preset
+                self.llm
+                    .preset
                     .map(|preset| preset.sampling_top_p)
                     .unwrap_or(1.0)
             } else {
@@ -1624,12 +1750,15 @@ impl LoadedModel {
         });
         let top_k = request.top_k.unwrap_or_else(|| {
             if temperature > f32::EPSILON {
-                self.preset.map(|preset| preset.sampling_top_k).unwrap_or(0)
+                self.llm
+                    .preset
+                    .map(|preset| preset.sampling_top_k)
+                    .unwrap_or(0)
             } else {
                 0
             }
         });
-        let stop_token_ids = self.assets.stop_token_ids();
+        let stop_token_ids = self.llm.assets.stop_token_ids();
         let token_constraint = match response_format {
             ResponseFormatMode::Text => None,
             ResponseFormatMode::JsonSchema => {
@@ -1640,7 +1769,7 @@ impl LoadedModel {
                     .compiled_schema()?;
                 if self.schema_token_catalog.get().is_none() {
                     let catalog = SchemaTokenCatalog::from_tokenizer(
-                        &self.assets.tokenizer,
+                        &self.llm.assets.tokenizer,
                         &stop_token_ids,
                     )?;
                     let _ = self.schema_token_catalog.set(Arc::new(catalog));
@@ -1688,7 +1817,7 @@ impl LoadedModel {
     fn stop_sequences(&self, stop_texts: &[String]) -> ServeResult<Vec<Vec<usize>>> {
         let mut sequences = Vec::new();
         for stop in stop_texts {
-            let ids = self.assets.encode_prompt(stop)?;
+            let ids = self.llm.assets.encode_prompt(stop)?;
             let sequence = tokens_to_usize(&ids)?;
             if !sequence.is_empty() {
                 sequences.push(sequence);
@@ -2176,6 +2305,7 @@ mod tests {
         let guard = MemoryGuard::disabled();
         let make_state = |loaded: &LoadedModel| {
             loaded
+                .llm
                 .decoder
                 .prefill_prompt_state_uncached(&[0, 1])
                 .unwrap()
@@ -2188,6 +2318,7 @@ mod tests {
         assert_eq!(hit.tokens, 2);
         let generate = |state| {
             loaded
+                .llm
                 .decoder
                 .generate_greedy_timed_from_prompt_state_with_options(
                     state,
@@ -2212,6 +2343,60 @@ mod tests {
         );
     }
 
+    /// `serve --engines N` : des moteurs sur leurs threads, partageant le même
+    /// décodeur Metal (poids, executor), rendent en parallèle les tokens greedy
+    /// du moteur unique, requête par requête.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    #[ignore = "requiert un device Metal ; GPU synthétique exécuté par gpu-synthetic.yml"]
+    fn engines_sharing_decoder_match_serial_greedy() {
+        let mut loaded = super::json_tests::tiny_loaded_model();
+        let llm = loaded.llm_mut();
+        let decoder = std::mem::replace(
+            &mut llm.decoder,
+            super::json_tests::tiny_loaded_model().into_llm().decoder,
+        );
+        llm.decoder = decoder
+            .with_metal_runtime()
+            .expect("invariant: runtime Metal attaché");
+        let llm = Arc::clone(&loaded.llm);
+        let prompts: Vec<Vec<usize>> = (0..4)
+            .map(|k| (0..24 + 5 * k).map(|i| (i * 7 + i / 3 + k) % 3).collect())
+            .collect();
+        let greedy = |prompt: &[usize]| {
+            let state = llm.decoder.prefill_prompt_state_uncached(prompt).unwrap();
+            llm.decoder
+                .generate_greedy_timed_from_prompt_state_with_options(
+                    state,
+                    Duration::ZERO,
+                    12,
+                    &GenerationOptions::default(),
+                )
+                .unwrap()
+                .tokens
+        };
+        let serial: Vec<_> = prompts.iter().map(|prompt| greedy(prompt)).collect();
+        let parallel: Vec<Vec<_>> = thread::scope(|scope| {
+            let handles: Vec<_> = prompts
+                .iter()
+                .enumerate()
+                .map(|(engine, prompt)| {
+                    let greedy = &greedy;
+                    scope.spawn(move || {
+                        saragossa::set_scratch_engine(u32::try_from(engine + 1).unwrap());
+                        (0..4).map(|_| greedy(prompt)).collect()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (expected, runs) in serial.iter().zip(&parallel) {
+            for tokens in runs {
+                assert_eq!(tokens, expected);
+            }
+        }
+    }
+
     /// Tour d'agent : au tour N+1 seuls les nouveaux tokens sont préremplis,
     /// la sortie greedy ne dépend pas du cache, et une modification au milieu
     /// de l'historique invalide la réutilisation.
@@ -2220,8 +2405,12 @@ mod tests {
     #[ignore = "requiert un device Metal ; GPU synthétique exécuté par gpu-synthetic.yml"]
     fn agent_turn_prefills_only_new_tokens_and_matches_cold() {
         let mut loaded = super::json_tests::tiny_loaded_model();
-        loaded.decoder = loaded
-            .decoder
+        let llm = loaded.llm_mut();
+        let decoder = std::mem::replace(
+            &mut llm.decoder,
+            super::json_tests::tiny_loaded_model().into_llm().decoder,
+        );
+        llm.decoder = decoder
             .with_metal_runtime()
             .expect("invariant: runtime Metal attaché");
         loaded.prefix_cache = BlockAwarePrefixCache::new(1, 8);
@@ -2231,6 +2420,7 @@ mod tests {
         next.extend([1, 0, 1]);
         let generate = |loaded: &LoadedModel, state| {
             loaded
+                .llm
                 .decoder
                 .generate_greedy_timed_from_prompt_state_with_options(
                     state,
@@ -2254,7 +2444,11 @@ mod tests {
             history.len(),
             "tour N+1 : seul le delta est préérempli"
         );
-        let cold = loaded.decoder.prefill_prompt_state_uncached(&next).unwrap();
+        let cold = loaded
+            .llm
+            .decoder
+            .prefill_prompt_state_uncached(&next)
+            .unwrap();
         assert_eq!(generate(&loaded, state), generate(&loaded, cold));
 
         let mut edited = next.clone();

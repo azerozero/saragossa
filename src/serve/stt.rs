@@ -397,12 +397,34 @@ mod tests {
         let args = ServeArgs::parse(["--model", "a=/x/a", "--backend", "cpu"].map(String::from))
             .expect("args");
         let mut audio = super::super::audio::AudioState::new(&args);
-        let (id, session) = audio.stt_sessions.open("fr".into(), Instant::now());
-        audio.stt_sessions.open.insert(id.clone(), session);
+        let (id, session) = audio
+            .stt_sessions
+            .lock()
+            .expect("invariant: sessions saines")
+            .open("fr".into(), Instant::now());
+        audio
+            .stt_sessions
+            .lock()
+            .expect("invariant: sessions saines")
+            .open
+            .insert(id.clone(), session);
         assert!(!audio.unload_models(), "rien de chargé");
-        assert!(audio.stt_sessions.open.contains_key(&id));
+        assert!(audio
+            .stt_sessions
+            .lock()
+            .expect("invariant: sessions saines")
+            .open
+            .contains_key(&id));
         audio.invalidate();
-        assert!(audio.stt_sessions.open.is_empty(), "panique : tout part");
+        assert!(
+            audio
+                .stt_sessions
+                .lock()
+                .expect("invariant: sessions saines")
+                .open
+                .is_empty(),
+            "panique : tout part"
+        );
     }
 
     #[test]
@@ -460,7 +482,12 @@ mod tests {
         let error = handle_transcription_stream(&mut response, &mut audio, &headers, &[0; 320])
             .expect_err("invariant: STT non configuré refusé");
         assert!(error.to_string().contains("STT non configuré"));
-        assert!(audio.stt_sessions.open.is_empty());
+        assert!(audio
+            .stt_sessions
+            .lock()
+            .expect("invariant: sessions saines")
+            .open
+            .is_empty());
         // Un corps hors limite est refusé avant toute copie ou chargement.
         let huge = vec![0; MAX_CHUNK_SAMPLES * 2 + 2];
         assert!(matches!(

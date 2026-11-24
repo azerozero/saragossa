@@ -14,6 +14,9 @@ const DEFAULT_SOCKET: &str = "/tmp/saragossa-serve.sock";
 const API_KEY_ENV: &str = "SARAGOSSA_API_KEY";
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_TOKENS_CAP: usize = 4096;
+/// Plafond de `--engines` : au-delà, la mémoire par moteur et le partage GPU
+/// rendent le gain illusoire sur une seule machine.
+const MAX_ENGINES: usize = 16;
 
 /// Configuration de lancement du serveur.
 #[derive(Clone, Debug, PartialEq)]
@@ -54,6 +57,8 @@ pub(super) struct ServeArgs {
     pub(super) idle_unload_secs: u64,
     /// Cache persistant opt-in.
     pub(super) prefix_ssd: saragossa::runtime_flags::ServePrefixSsdOptions,
+    /// Moteurs d'inférence parallèles partageant les poids (1 : moteur sériel).
+    pub(super) engines: usize,
 }
 
 /// Modèle exposé par `saragossa serve`.
@@ -147,6 +152,10 @@ impl ServeArgs {
                 .or(profile.serve.idle_unload_secs)
                 .unwrap_or(0);
         let mut prefix_ssd = saragossa::runtime_flags::ServePrefixSsdOptions::from_env()?;
+        let mut engines = match saragossa::runtime_flags::env_var("SARAGOSSA_SERVE_ENGINES") {
+            Some(value) => parse_engines(&value)?,
+            None => 1,
+        };
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -244,6 +253,7 @@ impl ServeArgs {
                             .map_err(ServeError::args)?,
                     );
                 }
+                "--engines" => engines = parse_engines(&next_value(&mut iter, "--engines")?)?,
                 "--idle-unload-secs" => {
                     idle_unload_secs = next_value(&mut iter, "--idle-unload-secs")?
                         .parse()
@@ -280,6 +290,7 @@ impl ServeArgs {
             gpu_share,
             idle_unload_secs,
             prefix_ssd,
+            engines,
         })
     }
 
@@ -292,6 +303,15 @@ impl ServeArgs {
     pub(super) fn add_model(&mut self, model: ServeModelConfig) -> ServeResult<()> {
         upsert_model(&mut self.models, model)
     }
+}
+
+fn parse_engines(value: &str) -> ServeResult<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|engines| (1..=MAX_ENGINES).contains(engines))
+        .ok_or_else(|| ServeError::args(format!("--engines attend un entier de 1 à {MAX_ENGINES}")))
 }
 
 /// Renvoie l'aide concise de `serve`.
@@ -341,7 +361,7 @@ pub(super) fn help_text() -> String {
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
          [--api-key TOKEN (deprecated, use SARAGOSSA_API_KEY)] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
-         {modality_options}[--backend cpu|metal] [--preload] [--max-tok-s R] [--gpu-share 10-100] [--idle-unload-secs N] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
+         {modality_options}[--backend cpu|metal] [--preload] [--max-tok-s R] [--gpu-share 10-100] [--idle-unload-secs N] [--engines N] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
          Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap, serve.max_tok_s, serve.gpu_share and the [[models]] list (id, path) only. See `saragossa config print`.\n\
          Upgrade (Unix): SIGUSR2 starts the same binary path (or --upgrade-binary PATH) with the same arguments on the inherited listening socket, then the old process drains for at most serve.drain_timeout_secs (30) and exits; enhance h2/WebTransport listeners follow. serve.relay_mode=auto|parallel|sequential (auto: sequential only if the memory guard refuses two resident processes).\n\
          SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
@@ -358,6 +378,9 @@ pub(super) fn help_text() -> String {
          SARAGOSSA_RUST_IDLE_UNLOAD_SECS, hot-reloadable, 0 = off, default) drops all \
          models after N idle seconds; the next request reloads them. --preload models \
          are unloaded too.\n\
+         Engines: --engines N (SARAGOSSA_SERVE_ENGINES, 1..={MAX_ENGINES}, default 1) runs N \
+         inference threads on one shared copy of the weights, each with its own KV, \
+         scratch and prefix cache; 1 keeps the serial engine.\n\
          Default transport: Unix socket {DEFAULT_SOCKET} (0600). \\
          --port enables TCP on 127.0.0.1 for grob and requires --api-key \\
          or {API_KEY_ENV}.\n\
@@ -503,6 +526,20 @@ mod tests {
             ServeArgs::parse(["--model", "a=/x/a", "--idle-unload-secs", "90"].map(String::from))
                 .expect("args");
         assert_eq!(on.idle_unload_secs, 90);
+    }
+
+    #[test]
+    fn engines_default_to_one_and_are_bounded() {
+        let parse = |value: &str| {
+            ServeArgs::parse(["--model", "a=/x/a", "--engines", value].map(String::from))
+                .map(|args| args.engines)
+        };
+        let default = ServeArgs::parse(["--model".into(), "a=/x/a".into()]).expect("args");
+        assert_eq!(default.engines, 1);
+        assert_eq!(parse("6").ok(), Some(6));
+        for refused in ["0", "17", "x"] {
+            assert!(parse(refused).is_err(), "{refused}");
+        }
     }
 
     #[test]

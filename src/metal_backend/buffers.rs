@@ -1119,6 +1119,7 @@ impl MetalExecutor {
         options: MTLResourceOptions,
     ) -> Result<metal::Buffer> {
         let namespace = current_scratch_namespace();
+        let engine = current_scratch_engine();
         let mut buffers = self
             .scratch_buffers
             .lock()
@@ -1128,6 +1129,7 @@ impl MetalExecutor {
             len,
             element,
             namespace,
+            engine,
         };
         let len = scratch_len_for_rows(len, |rounded| {
             buffers.entries.contains_key(&key_for(rounded))
@@ -1191,10 +1193,11 @@ impl MetalExecutor {
         ScratchBufferScope {
             executor: self,
             namespace: current_scratch_namespace(),
+            engine: current_scratch_engine(),
         }
     }
 
-    fn release_scratch_namespace(&self, namespace: u64) -> Result<()> {
+    fn release_scratch_namespace(&self, namespace: u64, engine: u32) -> Result<()> {
         let cap_bytes = crate::runtime_flags::scratch_cap_bytes();
         let mut buffers = self
             .scratch_buffers
@@ -1207,7 +1210,7 @@ impl MetalExecutor {
         let before_bytes = buffers.total_bytes;
         let mut volatile_entries = 0_usize;
         for (key, entry) in &mut buffers.entries {
-            if key.namespace == namespace {
+            if key.namespace == namespace && key.engine == engine {
                 // Le scope tombe après le prefill/decode complet. Marquer plus
                 // tôt exposerait au purge un buffer encore référencé par une
                 // command buffer Metal en vol.
@@ -1221,9 +1224,12 @@ impl MetalExecutor {
         let mut evicted_entries = 0_usize;
         let mut evicted_bytes = 0_u64;
         while buffers.total_bytes > cap_bytes {
+            // Seulement les entrées de ce moteur : un autre peut être en pleine
+            // génération sur les siennes. À un seul moteur, toutes sont à lui.
             let Some(lru_key) = buffers
                 .entries
                 .iter()
+                .filter(|(key, _)| key.engine == engine)
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| *key)
             else {
@@ -1267,11 +1273,15 @@ impl MetalExecutor {
 struct ScratchBufferScope<'a> {
     executor: &'a MetalExecutor,
     namespace: u64,
+    engine: u32,
 }
 
 impl Drop for ScratchBufferScope<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.executor.release_scratch_namespace(self.namespace) {
+        if let Err(error) = self
+            .executor
+            .release_scratch_namespace(self.namespace, self.engine)
+        {
             eprintln!(
                 "scratch_cache_trim namespace={} error={error}",
                 self.namespace

@@ -1,6 +1,26 @@
 use super::{add_into, gather_rows_i32, push_rows, PreparedVoiceDesign, TtsCloneContext, TtsModel};
 use crate::{InferError, Result, Tensor};
 
+type VoiceAndSeed = (Option<i32>, Option<u64>);
+
+thread_local! {
+    // Portée de requête de [`TtsModel::request_voice`] ; `None` : champs du modèle.
+    static REQUEST_VOICE: std::cell::Cell<Option<VoiceAndSeed>> = const { std::cell::Cell::new(None) };
+}
+
+/// Garde de [`TtsModel::request_voice`]. `!Send` : restaurée sur son thread.
+#[must_use = "la voix de requête tombe avec la garde"]
+pub struct TtsRequestVoice {
+    previous: Option<VoiceAndSeed>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for TtsRequestVoice {
+    fn drop(&mut self) {
+        REQUEST_VOICE.with(|slot| slot.set(self.previous));
+    }
+}
+
 impl TtsModel {
     /// Fournit une instruction VoiceDesign ou CustomVoice explicite ; sans effet sur le clonage ICL.
     #[must_use]
@@ -13,6 +33,35 @@ impl TtsModel {
     pub fn set_voice(&mut self, voice: Option<&str>) -> Result<()> {
         self.speaker_id = self.assets.model_config.speaker_id(voice)?;
         Ok(())
+    }
+
+    /// Voix et graine d'une requête sur un modèle partagé (`&self`) : jusqu'au
+    /// drop de la garde, les synthèses de ce thread lisent `voice` et `seed` au
+    /// lieu des champs posés par [`Self::set_voice`] et [`Self::set_seed`].
+    ///
+    /// # Errors
+    ///
+    /// Renvoie l'erreur de [`Self::set_voice`] pour une voix inconnue ; aucune
+    /// portée n'est alors installée.
+    pub fn request_voice(&self, voice: Option<&str>, seed: Option<u64>) -> Result<TtsRequestVoice> {
+        let speaker_id = self.assets.model_config.speaker_id(voice)?;
+        let previous = REQUEST_VOICE.with(|slot| slot.replace(Some((speaker_id, seed))));
+        Ok(TtsRequestVoice {
+            previous,
+            _thread_bound: std::marker::PhantomData,
+        })
+    }
+
+    pub(super) fn effective_speaker_id(&self) -> Option<i32> {
+        REQUEST_VOICE
+            .with(std::cell::Cell::get)
+            .map_or(self.speaker_id, |(speaker_id, _)| speaker_id)
+    }
+
+    pub(super) fn effective_seed(&self) -> Option<u64> {
+        REQUEST_VOICE
+            .with(std::cell::Cell::get)
+            .map_or(self.seed, |(_, seed)| seed)
     }
 
     pub(super) fn prepare_inputs(&self, text: &str) -> Result<PreparedVoiceDesign> {
@@ -173,7 +222,7 @@ impl TtsModel {
         let tts_bos = tts_embeds.row_slice(0)?.to_vec();
         let tts_pad = tts_embeds.row_slice(2)?.to_vec();
 
-        let codec_ids = cfg.codec_prompt_ids(self.speaker_id);
+        let codec_ids = cfg.codec_prompt_ids(self.effective_speaker_id());
         let codec_embed = self.codec_embed(&codec_ids)?;
         let codec_len = codec_embed.shape()[0];
         let hidden = self.hidden_dim()?;
