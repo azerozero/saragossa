@@ -1,0 +1,48 @@
+name: Bug report
+description: Something fails, crashes or gives a wrong result.
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: saragossa version
+      description: "`brew list --versions saragossa` for Homebrew, or `git rev-parse --short HEAD` for a source build."
+      placeholder: "saragossa 0.3.39"
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: Model, chip, unified memory and macOS version (Apple menu > About This Mac).
+      placeholder: "MacBook Pro, M4 Pro, 48 GB, macOS 26.1"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Hugging Face id or local directory, and its quantization.
+      placeholder: "mlx-community/Qwen3-4B-4bit"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command, including flags and any SARAGOSSA_* environment variables.
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Full terminal output. Remove tokens and private paths.
+      render: text

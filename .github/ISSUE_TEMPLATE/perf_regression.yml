@@ -1,0 +1,41 @@
+name: Performance regression
+description: A version is slower or uses more memory than an earlier one.
+body:
+  - type: input
+    id: versions
+    attributes:
+      label: Versions compared
+      description: Good and bad version (release tag or commit).
+      placeholder: "good: v0.3.38, bad: v0.3.39"
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: Chip, unified memory, macOS version, power source (AC or battery).
+      placeholder: "M5 Max, 128 GB, macOS 26.1, AC"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      placeholder: "mlx-community/Qwen3-4B-4bit"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Benchmark command
+      description: "The same command run on both versions, e.g. `saragossa bench --model-dir DIR --format json`."
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Numbers
+      description: Results for both versions (prefill and decode tok/s, TTFT, memory), with the number of runs.
+    validations:
+      required: true
