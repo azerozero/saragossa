@@ -125,6 +125,7 @@ fn options(src: &Path, dst: &Path) -> HfConvertOptions {
         verify: false,
         imatrix: None,
         bits_for: Vec::new(),
+        audit_report: None,
     }
 }
 
@@ -416,7 +417,14 @@ fn imatrix_uniform_is_identity_and_bits_for_overrides() {
     let mut opts = options(&src, &weighted);
     opts.imatrix = Some(skewed);
     opts.bits_for = vec![("mlp.up_proj".to_string(), 5)];
+    let report = root.path().join("audit.json");
+    opts.audit_report = Some(report.clone());
     convert_hf(&opts).expect("invariant: imatrix pondérée");
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("invariant: rapport écrit"))
+            .expect("invariant: rapport JSON");
+    assert_eq!(report["weighted"], true);
+    assert!(report["tensors"].is_array());
     let up = "model.language_model.layers.0.mlp.up_proj";
     assert_eq!(
         tensor_bytes(&weighted, SHARDS[0], &format!("{up}.weight")).1,

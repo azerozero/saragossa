@@ -6,6 +6,7 @@
 //! fois, lectures bornées, en-têtes figés avant écriture, reprise par shard de
 //! sortie et par segment n-gram, journal persistant les entrées du manifeste.
 
+mod audit;
 mod hf;
 mod imatrix;
 mod least_squares;
@@ -638,7 +639,7 @@ pub fn convert_qwen4exp(options: &ConvertOptions) -> Result<ConvertReport> {
             .open(&tmp)
             .map_err(|e| io_err(&tmp, e))?;
         file.set_len(size).map_err(|e| io_err(&tmp, e))?;
-        let tensors = write_shard(&source, &inventory.experts, plan, &file, &tmp, &peak)?;
+        let tensors = write_shard(&source, &inventory.experts, plan, &file, &tmp, &peak, None)?;
         file.sync_all().map_err(|e| io_err(&tmp, e))?;
         drop(file);
         std::fs::rename(&tmp, &path).map_err(|e| io_err(&path, e))?;

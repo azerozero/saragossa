@@ -79,6 +79,9 @@ pub struct HfConvertOptions {
     /// `(sous-chaîne, largeur)` : première correspondance, avant `keep_8bit`
     /// (2, 3, 4, 5, 6 ou 8 bits ; la tête MTP reste u4).
     pub bits_for: Vec<(String, usize)>,
+    /// Rapport JSON des colonnes d'entrée qui concentrent l'erreur (voir
+    /// `audit`), pour les shards écrits par cette exécution.
+    pub audit_report: Option<PathBuf>,
 }
 
 /// Bilan de la conversion.
@@ -112,6 +115,10 @@ struct Identity {
     imatrix_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     bits_for: Vec<(String, usize)>,
+    // Moindres carrés avec la grille à zéro et l'importance fictive des petites
+    // colonnes : un journal antérieur (champ absent) n'est pas repris.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    zero_grid: bool,
 }
 
 /// Empreinte complète d'un shard source : une reprise sur d'autres poids de
@@ -382,6 +389,7 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
         keep_bf16: options.keep_bf16.clone(),
         imatrix_sha256: imatrix.as_ref().map(|m| m.sha256.clone()),
         bits_for: options.bits_for.clone(),
+        zero_grid: !options.minmax,
     };
 
     let dst = &options.dst;
@@ -416,6 +424,7 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
 
     let mut written = Vec::new();
     let mut resumed = Vec::new();
+    let mut audits = Vec::new();
     for plan in &plans {
         let path = dst.join(&plan.file);
         let size = shard_size(plan)?;
@@ -433,7 +442,8 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
             .open(&tmp)
             .map_err(|e| io_err(&tmp, e))?;
         file.set_len(size).map_err(|e| io_err(&tmp, e))?;
-        let tensors = write_shard(&source, &BTreeMap::new(), plan, &file, &tmp, &peak)?;
+        let audit = options.audit_report.is_some().then_some(&mut audits);
+        let tensors = write_shard(&source, &BTreeMap::new(), plan, &file, &tmp, &peak, audit)?;
         file.sync_all().map_err(|e| io_err(&tmp, e))?;
         drop(file);
         std::fs::rename(&tmp, &path).map_err(|e| io_err(&path, e))?;
@@ -516,6 +526,18 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
             "tensors": records,
         }),
     )?;
+    if let Some(path) = &options.audit_report {
+        write_json(
+            path,
+            &serde_json::json!({
+                "hot_share": super::audit::HOT_SHARE,
+                "small_ratio": super::audit::SMALL_RATIO,
+                "weighted": imatrix.is_some(),
+                "units_resumed": &resumed,
+                "tensors": audits,
+            }),
+        )?;
+    }
     // La config en dernier : sans elle, la sortie n'est pas chargeable.
     write_json(
         &dst.join("config.json"),

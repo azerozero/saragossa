@@ -65,9 +65,10 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> CliResult<()> {
     Ok(())
 }
 
-const HF_USAGE: &str = "usage: saragossa convert <dossier bf16 HF> <sortie> [--bits 4|8] [--minmax] [--keep-8bit motif,…] [--keep-bf16 motif,…] [--bits-for motif=N,…] [--imatrix <fichier>] [--verify]\n\
+const HF_USAGE: &str = "usage: saragossa convert <dossier bf16 HF> <sortie> [--bits 4|8] [--minmax] [--keep-8bit motif,…] [--keep-bf16 motif,…] [--bits-for motif=N,…] [--imatrix <fichier>] [--audit-report <json>] [--verify]\n\
 défaut : u4 gs64 aux moindres carrés ; un motif est une sous-chaîne du nom de tenseur HF ;\n\
---imatrix pondère les moindres carrés par E[x²] (format tools/quant/imatrix.py)";
+--imatrix pondère les moindres carrés par E[x²] (format tools/quant/imatrix.py) ;\n\
+--audit-report écrit les colonnes d'entrée qui concentrent l'erreur pondérée ou à |w| anormalement petit";
 
 fn patterns(value: &str) -> Vec<String> {
     value
@@ -89,6 +90,7 @@ pub(crate) fn run_hf(args: impl Iterator<Item = String>) -> CliResult<()> {
         verify: false,
         imatrix: None,
         bits_for: Vec::new(),
+        audit_report: None,
     };
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -117,6 +119,9 @@ pub(crate) fn run_hf(args: impl Iterator<Item = String>) -> CliResult<()> {
                         ))
                     })?);
                 }
+            }
+            "--audit-report" => {
+                options.audit_report = Some(PathBuf::from(value("--audit-report")?));
             }
             "--verify" => options.verify = true,
             "--help" | "-h" => {

@@ -42,6 +42,13 @@ en fit uniforme ; un autre linéaire sans vecteur est refusé. Des poids tous
 égaux redonnent exactement la sortie sans imatrix. `--bits-for motif=N,…`
 (2 à 8 bits, première correspondance) sert aux recettes mixtes. Recettes
 mesurées : [docs/perf/convert-recettes.md](../../docs/perf/convert-recettes.md).
+Chaque groupe essaie aussi une « grille à zéro » (biais −k·s, k entier), gardée
+seulement si elle réduit l'erreur. Sans imatrix, les colonnes dont |w| moyen
+est sous 0,1 fois la médiane des colonnes (au plus 16 par bloc de lignes)
+reçoivent une importance fictive de 1e4 : signature poids seuls des
+super-activations à poids quasi nuls. `--audit-report FICHIER.json` liste, par
+tenseur, les colonnes qui portent plus de 10 % de l'erreur `E[x²]·δ²` (avec
+imatrix) et ces petites colonnes.
 Corpus de calibration publiable : `calib_corpus.py` (splits train de
 no_robots et aya_dataset), disjonction contrôlée par `calib_disjoint.py`.
 
