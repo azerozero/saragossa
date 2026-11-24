@@ -319,23 +319,48 @@ fn enhance_without_model_returns_clear_error() {
 
 #[cfg(any(feature = "ws", feature = "h2", feature = "webtransport"))]
 #[test]
-fn idle_dfn3_is_unloaded_without_breaking_a_cloned_arc() {
+fn idle_dfn3_waits_for_the_end_of_the_stream() {
     let service = EnhanceService::new(None);
     *service.model.lock().unwrap() = Some(super::test_support::model());
     let start = Instant::now();
-    let held = service.model().unwrap();
-    let later = start + Duration::from_secs(120);
-    assert!(!service.unload_idle(0, later), "0 : désactivé");
+    let at = |secs| move || start + Duration::from_secs(secs);
+    assert!(!service.unload_idle(0, at(600)), "0 : désactivé");
     let slot = Reservation::acquire(&service.active, 1, enhance_max_streams()).unwrap();
-    assert!(!service.unload_idle(60, later), "flux actif : on garde");
+    let held = service.model().unwrap();
+    assert!(!service.unload_idle(60, at(120)), "flux actif : on garde");
     drop(slot);
-    assert!(!service.unload_idle(60, later + Duration::from_secs(59)));
-    assert!(service.unload_idle(60, later + Duration::from_secs(60)));
+    // Fin du flux datée au premier passage qui ne le voit plus (t = 200).
+    assert!(!service.unload_idle(60, at(200)));
+    assert!(!service.unload_idle(60, at(259)));
+    assert!(service.unload_idle(60, at(260)));
     assert!(service.model.lock().unwrap().is_none());
     // L'Arc déjà cloné reste utilisable après le vidage du slot.
     let _stream = DenoiseStream::new(&held);
-    assert!(
-        !service.unload_idle(60, later + Duration::from_secs(600)),
-        "déjà vide"
-    );
+    assert!(!service.unload_idle(60, at(900)), "déjà vide");
+}
+
+#[cfg(any(feature = "ws", feature = "h2", feature = "webtransport"))]
+#[test]
+fn idle_dfn3_keeps_a_model_whose_loading_outlasted_the_delay() {
+    let service = EnhanceService::new(Some(PathBuf::from("lent.safetensors")));
+    // Chemin h2 : réservation, puis chargement plus long que le délai d'1 s.
+    let slot = Reservation::acquire(&service.active, 1, enhance_max_streams()).unwrap();
+    let held = thread::scope(|scope| {
+        let loader = scope.spawn(|| {
+            service.model_with(|_| {
+                thread::sleep(Duration::from_millis(1500));
+                Ok(super::test_support::model())
+            })
+        });
+        thread::sleep(Duration::from_millis(200));
+        // Bloqué derrière le chargement ; l'horloge est lue après.
+        assert!(!service.unload_idle(1, Instant::now));
+        loader.join().unwrap().unwrap()
+    });
+    // Flux bref après un long chargement : aucun déchargement immédiat.
+    drop((held, slot));
+    assert!(!service.unload_idle(1, Instant::now));
+    assert!(!service.unload_idle(1, Instant::now));
+    thread::sleep(Duration::from_millis(1100));
+    assert!(service.unload_idle(1, Instant::now));
 }

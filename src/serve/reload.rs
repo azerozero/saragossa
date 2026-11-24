@@ -384,21 +384,22 @@ mod tests {
         let file = dir.join("p.toml");
         std::fs::write(&file, "[serve]\nidle_unload_secs = 60\n").expect("écriture");
         let path = file.to_str().expect("utf8").to_string();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                IDLE_UNLOAD_SECS.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = Reset;
         for name in [
             "SARAGOSSA_RUST_IDLE_UNLOAD_SECS",
             "RETI_RUST_IDLE_UNLOAD_SECS",
         ] {
-            struct Reset(&'static str);
-            impl Drop for Reset {
-                fn drop(&mut self) {
-                    std::env::remove_var(self.0);
-                    IDLE_UNLOAD_SECS.store(0, Ordering::Relaxed);
-                }
-            }
-            let _reset = Reset(name);
-            std::env::set_var(name, "7");
-            reload(Some(&path), &[], &[], &Profile::default(), &[]).expect(name);
+            super::super::args::with_env(name, "7", || {
+                reload(Some(&path), &[], &[], &Profile::default(), &[]).expect(name);
+            });
             assert_eq!(idle_unload_secs(), 7, "{name} prime sur le profil rechargé");
+            IDLE_UNLOAD_SECS.store(0, Ordering::Relaxed);
         }
     }
 

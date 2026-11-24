@@ -29,8 +29,8 @@ pub(super) struct EnhanceService {
     path: Option<PathBuf>,
     model: Mutex<Option<Arc<DeepFilterNet3>>>,
     active: Arc<AtomicUsize>,
-    // Dernier usage vu : prise du modèle ou flux actif observé par `unload_idle`.
-    last_used: Mutex<Instant>,
+    // Dernier usage vu, et flux en cours au dernier passage de `unload_idle`.
+    usage: Mutex<(Instant, bool)>,
     #[cfg(feature = "webtransport")]
     certificate: Mutex<Option<certificate::CertificateInfo>>,
 }
@@ -41,7 +41,7 @@ impl EnhanceService {
             path,
             model: Mutex::new(None),
             active: Arc::new(AtomicUsize::new(0)),
-            last_used: Mutex::new(Instant::now()),
+            usage: Mutex::new((Instant::now(), false)),
             #[cfg(feature = "webtransport")]
             certificate: Mutex::new(None),
         }
@@ -54,38 +54,57 @@ impl EnhanceService {
             .map_err(|_| ServeError::args("verrou certificat indisponible"))
     }
     fn model(&self) -> ServeResult<Arc<DeepFilterNet3>> {
+        self.model_with(|path| Ok(Arc::new(DeepFilterNet3::load(path)?)))
+    }
+
+    fn model_with(
+        &self,
+        load: impl FnOnce(&std::path::Path) -> ServeResult<Arc<DeepFilterNet3>>,
+    ) -> ServeResult<Arc<DeepFilterNet3>> {
         let mut loaded = self
             .model
             .lock()
             .map_err(|_| ServeError::args("verrou DFN3 indisponible"))?;
-        if let Ok(mut last) = self.last_used.lock() {
-            *last = Instant::now();
+        let model = match loaded.as_ref() {
+            Some(model) => Arc::clone(model),
+            None => {
+                let path = self.path.as_ref().ok_or_else(|| {
+                    ServeError::args(
+                        "endpoint enhance non configuré: --enhance-model <dfn3.safetensors> requis",
+                    )
+                })?;
+                let model = load(path)?;
+                *loaded = Some(Arc::clone(&model));
+                model
+            }
+        };
+        // Horodaté après un chargement éventuel : il ne compte pas comme inactivité.
+        if let Ok(mut usage) = self.usage.lock() {
+            usage.0 = usage.0.max(Instant::now());
         }
-        if let Some(model) = loaded.as_ref() {
-            return Ok(Arc::clone(model));
-        }
-        let path = self.path.as_ref().ok_or_else(|| {
-            ServeError::args(
-                "endpoint enhance non configuré: --enhance-model <dfn3.safetensors> requis",
-            )
-        })?;
-        let model = Arc::new(DeepFilterNet3::load(path)?);
-        *loaded = Some(Arc::clone(&model));
         Ok(model)
     }
 
     /// Vide le slot DFN3 après `secs` sans flux (0 : jamais) ; vrai s'il était
     /// chargé. Un flux qui a déjà cloné l'`Arc` le garde, le suivant recharge.
-    pub(super) fn unload_idle(&self, secs: u64, now: Instant) -> bool {
-        // Même ordre de verrous que `model` : slot puis horodatage.
-        let (Ok(mut model), Ok(mut last)) = (self.model.lock(), self.last_used.lock()) else {
+    ///
+    /// `clock` est lu sous les verrous, pour qu'une attente derrière un
+    /// chargement ne date pas l'usage dans le passé. Un flux tient sa
+    /// réservation jusqu'au bout ; sa fin est datée au premier passage qui ne
+    /// la voit plus, jamais avant.
+    pub(super) fn unload_idle(&self, secs: u64, clock: impl Fn() -> Instant) -> bool {
+        // Même ordre de verrous que `model_with` : slot puis usage.
+        let (Ok(mut model), Ok(mut usage)) = (self.model.lock(), self.usage.lock()) else {
             return false;
         };
-        if self.active.load(Ordering::Acquire) > 0 {
-            *last = now;
+        let now = clock();
+        let busy = self.active.load(Ordering::Acquire) > 0;
+        let (last, was_busy) = *usage;
+        if busy || was_busy {
+            *usage = (last.max(now), busy);
             return false;
         }
-        super::dispatch::idle_expired(*last, now, secs) && model.take().is_some()
+        super::dispatch::idle_expired(last, now, secs) && model.take().is_some()
     }
 
     pub(super) fn handle<S: ServeStream>(

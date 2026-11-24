@@ -67,6 +67,34 @@ pub(super) struct ServeModelConfig {
     pub(super) hf_repo: Option<String>,
 }
 
+// `parse_with` lit l'environnement : chaque appel de test prend la lecture,
+// [`with_env`] l'écriture. Le fil qui tient l'écriture lit sans verrou.
+#[cfg(test)]
+static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+#[cfg(test)]
+thread_local!(static ENV_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+/// Exécute `f` avec `name=value`, à l'abri des autres `parse_with` de test,
+/// puis restaure la valeur d'origine, même sur panique.
+#[cfg(test)]
+pub(super) fn with_env<R>(name: &'static str, value: &str, f: impl FnOnce() -> R) -> R {
+    struct Restore(&'static str, Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+            ENV_OWNER.set(false);
+        }
+    }
+    let _write = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
+    let _restore = Restore(name, std::env::var_os(name));
+    ENV_OWNER.set(true);
+    std::env::set_var(name, value);
+    f()
+}
+
 impl ServeArgs {
     /// Parse les options sans profil.
     #[cfg(test)]
@@ -79,6 +107,8 @@ impl ServeArgs {
         profile: &Profile,
         args: impl IntoIterator<Item = String>,
     ) -> ServeResult<Self> {
+        #[cfg(test)]
+        let _env = (!ENV_OWNER.get()).then(|| ENV_LOCK.read().unwrap_or_else(|e| e.into_inner()));
         let mut host = DEFAULT_HOST.to_string();
         let mut port = None;
         let mut socket = PathBuf::from(DEFAULT_SOCKET);
@@ -467,10 +497,6 @@ mod tests {
 
     #[test]
     fn idle_unload_secs_defaults_to_off_and_parses() {
-        // Un test de `reload` pose la variable d'environnement sous ce verrou.
-        let _serial = super::super::reload::TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let off = ServeArgs::parse(["--model".into(), "a=/x/a".into()]).expect("args");
         assert_eq!(off.idle_unload_secs, 0);
         let on =
