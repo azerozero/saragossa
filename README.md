@@ -14,7 +14,13 @@ binary — usable as a library or behind the OpenAI-compatible HTTP server
 voice loop: speech-to-text, the LLM, streamed text-to-speech, plus offline
 speaker diarization of a full recording.
 
+Decode on an M5 Max, 35B-A3B 4-bit, 512-token prompt: **169.7 tok/s** with MTP
+vs 153.9 for mlx-vlm 0.8.0 with MTP (median of 3). It also loses cells, such as
+the 27B 4-bit at 4096 and 16384 tokens: see [Performance](#performance).
+
 ## Install
+
+Not published on crates.io; install via Homebrew or from source.
 
 ### Homebrew (Apple Silicon)
 
@@ -278,7 +284,7 @@ saragossa diarize --model-dir DIR [--format rttm|json] [--cpu] audio.wav
 
 ## Library usage
 
-Add the crate and drive the engine directly. The main entry points are
+Add the crate as a git dependency (`saragossa = { git = "https://github.com/azerozero/saragossa" }`) and drive the engine directly. The main entry points are
 `qwen_loader` (LLM), `whisper` (STT), `tts` (TTS) and `text_embedder`
 (embeddings); [`src/lib.rs`](src/lib.rs) lists the public API.
 
