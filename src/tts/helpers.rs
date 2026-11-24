@@ -206,4 +206,29 @@ mod row_table_tests {
         assert!(table.gather_i32(&[]).is_err());
         Ok(())
     }
+
+    // Oracle indépendant : le lecteur historique, sur les 65 536 motifs
+    // (zéros signés, sous-normaux, infinis et NaN compris).
+    #[test]
+    fn bf16_rows_match_safetensor_reader_on_every_pattern() -> Result<()> {
+        let bits: Vec<u16> = (0..=u16::MAX).collect();
+        let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let want =
+            crate::safetensor::bytes_to_dense_f32(&bytes, safetensors::Dtype::BF16, "motifs")?;
+        let table = RowTable::Bf16 {
+            rows: 256,
+            cols: 256,
+            bits,
+        };
+        let ids: Vec<i32> = (0..256).collect();
+        let got = table.gather_i32(&ids)?;
+        assert_eq!(got.data().len(), want.len());
+        let same = got
+            .data()
+            .iter()
+            .zip(&want)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(same, "conversion bf16 différente du lecteur safetensors");
+        Ok(())
+    }
 }
