@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.35](https://github.com/azerozero/saragossa/compare/v0.3.34...v0.3.35) - 2026-11-24
+
+### Added
+
+- *(loader)* refuse sliding_window inférieur au contexte pour Llama et Mistral
+- *(loader)* RoPE llama3, templates Llama 3 et Mistral, oracle KL Mistral 7B
+
+### Fixed
+
+- *(config)* entier RoPE non représentable en f64 comparé tel quel
+- *(config)* entiers RoPE comparés exactement, sans passer par f64
+- *(config)* facteurs RoPE comparés numériquement (8 et 8.0 équivalents)
+- *(test)* helper rope sans rms_norm_eps manquant, flottants JSON, liste golden llama31
+- *(config)* rope_parameters remplace rope_scaling nul, biais cohérents, sliding_window refusé, système Mistral en loop.last
+
+### Other
+
+- Merge pull request #339 from azerozero/feat/llama-mistral
+- *(loader)* helpers de test sans collision de noms
+- *(llama)* rétablit les tests de main, date par version, oracle RoPE llama3 et configs de familles
+- fusionne origin/main dans feat/llama-mistral
+
 ## [0.3.34](https://github.com/azerozero/saragossa/compare/v0.3.33...v0.3.34) - 2026-11-23
 
 ### Fixed
