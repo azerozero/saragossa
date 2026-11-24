@@ -6739,7 +6739,7 @@ fn mtp_d2_u4_draft_head_matches_ar_synthetic() -> Result<()> {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
+pub(super) fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
     mtp_synthetic_model_with(|_| Ok(()))
 }
 

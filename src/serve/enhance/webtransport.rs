@@ -203,7 +203,7 @@ pub(super) async fn session(conn: quinn::Connection, front: Arc<Front>) -> Serve
         Ok(config) => config,
         Err(_) => return reject(request, http::StatusCode::BAD_REQUEST).await,
     };
-    let Some(slot) = Reservation::acquire(&front.enhance.active, 1, enhance_max_streams()) else {
+    let Some(slot) = front.enhance.reserve() else {
         return reject(request, http::StatusCode::SERVICE_UNAVAILABLE).await;
     };
     let loader = Arc::clone(&front);

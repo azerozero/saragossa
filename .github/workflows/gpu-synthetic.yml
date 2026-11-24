@@ -58,7 +58,9 @@ jobs:
           # L'absence de device Metal fait échouer le job via les tests obligatoires.
           # Conserver les #[ignore] jusqu’à trois passages CI stables.
           tests=(
+            serve::state::tests::agent_turn_prefills_only_new_tokens_and_matches_cold
             qwen_loader::flint_tests::synthetic_flint_resident_decode_without_fast_math_matches_cpu_oracle
+            qwen_loader::flint_tests::synthetic_flint_greedy_identical_after_unload_and_reload
             decode_resident::rope_tests::rope_decode_matches_common_cpu_at_long_positions
             decode_resident::rope_tests::rope_append_matches_common_cpu_at_long_positions
             decode_resident::rope_tests::rope_rows_matches_common_cpu_at_long_positions
@@ -122,6 +124,7 @@ jobs:
             decoder::tests::mtp_fixed_depths_match_ar_synthetic
             decoder::tests::mtp_d2_u4_draft_head_matches_ar_synthetic
             decoder::tests::gpu_share_keeps_greedy_output_synthetic
+            decoder::state_snapshot::persistent::tests::process_restart_mtp_aligned_resume_matches_cold_greedy_synthetic
             decoder::tests::llama3_rope_metal_matches_cpu_oracle
             qwen_loader::flint_tests::synthetic_flint_kl_reference_roundtrip
           )

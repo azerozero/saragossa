@@ -483,7 +483,58 @@ impl ServeState {
         let additional = self.models[index].estimated_model_bytes();
         self.enforce_memory_budget(additional, Some(index))?;
         self.enforce_model_pool_limit(index);
-        self.models[index].ensure_loaded()
+        let started = Instant::now();
+        self.models[index].ensure_loaded()?;
+        eprintln!(
+            "saragossa serve loaded model={} in_ms={}",
+            self.models[index].id,
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    /// Décharge tous les modèles (poids, arènes, KV, caches de préfixe en RAM)
+    /// après `secs` secondes d'inactivité ; le prochain job les recharge. LLM,
+    /// STT, TTS, diarisation et embeddings sont déchargés ; les sessions STT
+    /// survivent (sans poids) et le cache de préfixe SSD reste sur disque. Les
+    /// modèles `--preload` ne sont pas exemptés.
+    pub(super) fn unload_idle(&mut self, secs: u64) {
+        self.assert_engine_thread();
+        let started = Instant::now();
+        let before = process_footprint_bytes();
+        let mut any = self.loaded_count() > 0;
+        for slot in &mut self.models {
+            slot.loaded = None;
+        }
+        #[cfg(any(
+            feature = "stt",
+            feature = "tts",
+            feature = "diar",
+            feature = "denoise"
+        ))]
+        {
+            any |= self.audio.unload_models();
+        }
+        #[cfg(feature = "embed")]
+        {
+            any |= self.embeddings.unload();
+        }
+        if !any {
+            return;
+        }
+        while process_purge_registry()
+            .lock()
+            .ok()
+            .and_then(|mut registry| registry.purge_one(&mut (), PurgePressure::Warn))
+            .is_some()
+        {}
+        let freed = before
+            .zip(process_footprint_bytes())
+            .map(|(before, after)| before.saturating_sub(after));
+        eprintln!(
+            "saragossa serve unloaded idle_secs={secs} in_ms={} freed_bytes={freed:?}",
+            started.elapsed().as_millis()
+        );
     }
 
     fn enforce_model_pool_limit(&mut self, protected: usize) {
@@ -2158,6 +2209,62 @@ mod tests {
         assert!(
             loaded.prefix_cache.match_prefix(root, &[0, 1, 2]).is_none(),
             "la frontière intermédiaire ne doit pas déclencher de snapshot"
+        );
+    }
+
+    /// Tour d'agent : au tour N+1 seuls les nouveaux tokens sont préremplis,
+    /// la sortie greedy ne dépend pas du cache, et une modification au milieu
+    /// de l'historique invalide la réutilisation.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    #[ignore = "requiert un device Metal ; GPU synthétique exécuté par gpu-synthetic.yml"]
+    fn agent_turn_prefills_only_new_tokens_and_matches_cold() {
+        let mut loaded = super::json_tests::tiny_loaded_model();
+        loaded.decoder = loaded
+            .decoder
+            .with_metal_runtime()
+            .expect("invariant: runtime Metal attaché");
+        loaded.prefix_cache = BlockAwarePrefixCache::new(1, 8);
+        let guard = MemoryGuard::disabled();
+        let history: Vec<usize> = (0..40).map(|i| (i * 7 + i / 3) % 2).collect();
+        let mut next = history.clone();
+        next.extend([1, 0, 1]);
+        let generate = |loaded: &LoadedModel, state| {
+            loaded
+                .decoder
+                .generate_greedy_timed_from_prompt_state_with_options(
+                    state,
+                    Duration::ZERO,
+                    6,
+                    &GenerationOptions::default(),
+                )
+                .unwrap()
+                .tokens
+        };
+
+        let (_, reused, _) = loaded
+            .prefill_prompt_state(&history, Some("agent"), &guard)
+            .unwrap();
+        assert_eq!(reused, 0, "tour N à froid");
+        let (state, reused, _) = loaded
+            .prefill_prompt_state(&next, Some("agent"), &guard)
+            .unwrap();
+        assert_eq!(
+            reused,
+            history.len(),
+            "tour N+1 : seul le delta est préérempli"
+        );
+        let cold = loaded.decoder.prefill_prompt_state_uncached(&next).unwrap();
+        assert_eq!(generate(&loaded, state), generate(&loaded, cold));
+
+        let mut edited = next.clone();
+        edited[history.len() / 2] ^= 1;
+        let (_, reused, _) = loaded
+            .prefill_prompt_state(&edited, Some("agent"), &guard)
+            .unwrap();
+        assert_eq!(
+            reused, 0,
+            "historique modifié : le cache ne doit pas servir"
         );
     }
 
