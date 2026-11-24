@@ -27,7 +27,7 @@ and the battery identifier is removed from `power.source_raw`.
 M5 Max 128 GiB, on AC power, 3 planned repetitions per cell, greedy decoding
 (temperature 0), 256 generated tokens, target prompt lengths of 512, 4096 and
 16384 tokens (the longest actual prompt has 16383), context 20480, load gate
-`loadavg < 2`, cooldown before each entry (at least 45 s, then until GPU
+`loadavg < 2`, cooldown between entries (at least 45 s, then until GPU
 ≤ 50 °C, at most 300 s).
 
 ## Prompts
