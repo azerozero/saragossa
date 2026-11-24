@@ -7,7 +7,7 @@ use tokenizers::Tokenizer;
 pub struct TtsModel {
     pub assets: TtsAssets,
     pub(super) tokenizer: Tokenizer,
-    pub(super) text_embedding: Tensor,
+    pub(super) text_embedding: super::helpers::RowTable,
     pub(super) codec_embedding: Tensor,
     pub(super) text_projection_fc1: crate::Linear,
     pub(super) text_projection_fc2: crate::Linear,

@@ -231,7 +231,7 @@ impl TtsModel {
     }
 
     pub(super) fn text_embed(&self, ids: &[i32]) -> Result<Tensor> {
-        let raw = gather_rows_i32(&self.text_embedding, ids)?;
+        let raw = self.text_embedding.gather_i32(ids)?;
         self.text_projection_fc2
             .forward(&crate::silu(&self.text_projection_fc1.forward(&raw)?))
     }
