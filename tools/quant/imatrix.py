@@ -55,18 +55,25 @@ def calibration_chunks(tokenizer, text, samples=128, length=512, chat=False):
 
 
 def language_modules(model):
-    """Modules quantifiables gs64 ; noms issus de named_modules, sans renommage."""
+    """Modules quantifiables gs64 ; noms issus de named_modules, sans renommage.
+
+    Un modèle multimodal (Qwen) range le langage sous `language_model.` et ses
+    tours vision ailleurs : seul ce préfixe est gardé. Un modèle texte seul
+    (Llama, Mistral) n'a pas ce préfixe : tous ses modules sont du langage.
+    """
     result = {}
-    for name, module in model.named_modules():
+    named = list(model.named_modules())
+    prefix = "language_model." if any(n.startswith("language_model.") for n, _ in named) else ""
+    for name, module in named:
         w = getattr(module, "weight", None)
-        if (name.startswith("language_model.") and w is not None and w.ndim in (2, 3)
+        if (name.startswith(prefix) and w is not None and w.ndim in (2, 3)
                 and (hasattr(module, "to_quantized") or hasattr(module, "scales"))):
             columns = (module.scales.shape[-1] * module.group_size
                        if hasattr(module, "scales") else w.shape[-1])
             if columns % 64 == 0:
                 result[name] = module
     if not result:
-        raise ValueError("aucun module language_model quantifiable ; vérifier la version de mlx-lm")
+        raise ValueError("aucun module de langage quantifiable ; vérifier la version de mlx-lm")
     return result
 
 
@@ -227,6 +234,29 @@ def _self_check():
         a(1)
         derived(2)
     assert seen == [("base", 1), ("derived", 2)]
+    class Weight:
+        def __init__(self, *shape):
+            self.shape, self.ndim = shape, len(shape)
+    class Lin:
+        def __init__(self, cols):
+            self.weight = Weight(8, cols)
+        def to_quantized(self):
+            pass
+    class Model:
+        def __init__(self, names):
+            self.names = names
+        def named_modules(self):
+            return [(n, Lin(64)) for n in self.names] + [("model.norm", object())]
+    # Multimodal : la tour vision est exclue ; texte seul (Mistral) : tout est gardé.
+    vlm = Model(["language_model.model.layers.0.mlp.down_proj", "vision_tower.blocks.0.qkv"])
+    assert list(language_modules(vlm)) == ["language_model.model.layers.0.mlp.down_proj"]
+    text = Model(["model.layers.0.mlp.down_proj", "lm_head"])
+    assert list(language_modules(text)) == ["model.layers.0.mlp.down_proj", "lm_head"]
+    try:
+        language_modules(Model([]))
+        raise AssertionError("modèle sans module accepté")
+    except ValueError:
+        pass
     assert importance_for({}, "language_model.model.embed_tokens", 64) is None
     try:
         importance_for({}, "language_model.lm_head", 64)
