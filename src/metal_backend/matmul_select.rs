@@ -10,6 +10,7 @@ pub(super) enum AffineMatmulKernel {
     Qmm8,
     QmmNaFusedTiledU4,
     QmmNaFusedTiledU4Align64,
+    QmmNaFusedTiledU3,
     FastQmvU4,
     FastQmvU4Align64,
     FastQmvU2,
@@ -216,6 +217,11 @@ impl MetalExecutor {
             AffineMatmulKernel::FastQmvU4
         } else if can_use_fast_affine_qmv_u2_buffers(batch, in_dim, out_dim, group_size, bits) {
             AffineMatmulKernel::FastQmvU2
+        } else if !strict
+            && self.na_gemm_coop_qb_tiled_u3.is_some()
+            && can_use_qmm_na_fused_tiled_u3_buffers(batch, in_dim, out_dim, group_size, bits)
+        {
+            AffineMatmulKernel::QmmNaFusedTiledU3
         } else if can_use_fast_affine_qmv_u3_buffers(batch, in_dim, out_dim, group_size, bits) {
             AffineMatmulKernel::FastQmvU3
         } else if can_use_fast_affine_qmv_u5_buffers(batch, in_dim, out_dim, group_size, bits) {
@@ -296,7 +302,14 @@ impl MetalExecutor {
             AffineMatmulKernel::FastQmvU4
         } else if can_use_fast_affine_qmv_u2(batch, in_dim, weight) {
             AffineMatmulKernel::FastQmvU2
+        } else if !strict
+            && self.na_gemm_coop_qb_tiled_u3.is_some()
+            && can_use_qmm_na_fused_tiled_u3(batch, in_dim, weight)
+        {
+            AffineMatmulKernel::QmmNaFusedTiledU3
         } else if can_use_fast_affine_qmv_u3(batch, in_dim, weight) {
+            // NOTE: sous le plancher du GEMM tuilé, le u3 garde le qmv f32 (en
+            // lignes dès 3), comme le sélecteur résident : pas de bf16 ici.
             AffineMatmulKernel::FastQmvU3
         } else if !strict
             && self.na_gemm_bf16.is_some()

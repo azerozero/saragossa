@@ -43,6 +43,7 @@ fn templates_match_all_36_transformers_references() {
         "gemma4",
         "mistral7b",
         "mistral7b_tail",
+        "llama31",
     ] {
         let bytes = std::fs::read(root.join(format!("{model}.bin"))).expect("fixture");
         let header: serde_json::Value = serde_json::from_slice(

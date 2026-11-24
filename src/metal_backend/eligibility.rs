@@ -277,6 +277,15 @@ pub(super) fn qmvt_small_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMVT_SMALL", true))
 }
 
+/// qmv u3/u5/u6 en R lignes (`affine_qmv_fast_rows_u*_gs64_f32_r*`) dès 3 lignes
+/// servies par le qmv aligné : vérification MTP/DFlash (u5/u6 n'ont pas de
+/// skinny), mode strict et replis du prefill. Mêmes bits que le qmv mono.
+/// Kill-switch `SARAGOSSA_RUST_QMV_ROWS=0` (qmv répliqué).
+pub(super) fn qmv_rows_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::runtime_flags::env_flag("SARAGOSSA_RUST_QMV_ROWS", true))
+}
+
 pub(super) fn can_use_qmvt(
     batch: usize,
     in_dim: usize,
@@ -568,6 +577,42 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_buffers(
         && bits == 4
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
+}
+
+/// GEMM NA tuilé u3 gs64 (`gemm_nax_coop_qb_tiled_u3`) : mêmes formes et même
+/// plancher que le u4 par défaut. Sous le plancher, le qmv u3 f32 (en lignes
+/// dès 3) reste servi, comme au sélecteur résident.
+pub(super) fn can_use_qmm_na_fused_tiled_u3_buffers(
+    batch: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    bits: usize,
+) -> bool {
+    qmm_na_fused_tiled_enabled()
+        && batch >= qmm_na_min_batch()
+        && out_dim % 64 == 0
+        && in_dim.min(out_dim) >= QMM_NA_U4_DEFAULT_MIN_DIM
+        && bits == FAST_QMV_U3_BITS
+        && group_size == FAST_QMV_GROUP_SIZE
+        && in_dim % 512 == 0
+}
+
+pub(super) fn can_use_qmm_na_fused_tiled_u3(
+    batch: usize,
+    in_dim: usize,
+    weight: &AffineQuantizedTensor,
+) -> bool {
+    let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
+        return false;
+    };
+    can_use_qmm_na_fused_tiled_u3_buffers(
+        batch,
+        in_dim,
+        out_dim,
+        weight.group_size(),
+        weight.bits(),
+    ) && matches!(weight.shape(), [_, weight_in_dim] if *weight_in_dim == in_dim)
 }
 
 pub(super) fn can_use_qmm_na_fused_tiled_u4(

@@ -910,6 +910,7 @@ impl MetalExecutor {
         let na_gemm_coop_qb_tiled = compile_na("gemm_nax_coop_qb_tiled");
         let na_gemm_coop_qb_tiled_gs128 = compile_na("gemm_nax_coop_qb_tiled_gs128");
         let na_gemm_coop_qb_tiled_u4 = compile_na("gemm_nax_coop_qb_tiled_u4");
+        let na_gemm_coop_qb_tiled_u3 = compile_na("gemm_nax_coop_qb_tiled_u3");
         let na_gemm_coop_qb_tiled_u4_x3 = compile_na("gemm_nax_coop_qb_tiled_u4_x3");
         let na_gemm_coop_qb_tiled_u4_x4 = compile_na("gemm_nax_coop_qb_tiled_u4_x4");
         let na_gemm_bf16_nt_tiled_x2 = compile_na("gemm_nax_bf16_nt_tiled_x2");
@@ -1146,6 +1147,7 @@ impl MetalExecutor {
             na_gemm_coop_qb_tiled,
             na_gemm_coop_qb_tiled_gs128,
             na_gemm_coop_qb_tiled_u4,
+            na_gemm_coop_qb_tiled_u3,
             na_gemm_coop_qb_tiled_u4_x3,
             na_gemm_coop_qb_tiled_u4_x4,
             na_gemm_bf16_nt_tiled_x2,

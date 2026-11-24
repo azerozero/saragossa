@@ -668,7 +668,7 @@ fn llama_with_rope(scaling: &str, rope_parameters: &str) -> RawModelConfig {
     serde_json::from_str(&format!(
         r#"{{"model_type":"llama","hidden_size":64,"num_hidden_layers":2,
         "num_attention_heads":4,"num_key_value_heads":2,"intermediate_size":128,
-        "vocab_size":100,"rope_scaling":{scaling},"rope_parameters":{rope_parameters}}}"#
+        "vocab_size":100,"rms_norm_eps":0.000001,"rope_scaling":{scaling},"rope_parameters":{rope_parameters}}}"#
     ))
     .expect("invariant: JSON valide")
 }
@@ -703,17 +703,36 @@ fn contradictory_rope_scaling_and_parameters_are_rejected() {
 
 #[test]
 fn every_rope_field_mismatch_is_rejected() {
-    let scaling = |high: f64| {
-        format!(
-            r#"{{"rope_type":"llama3","factor":8.0,"low_freq_factor":1.0,"high_freq_factor":{high},
-            "original_max_position_embeddings":8192}}"#
-        )
-    };
-    let err = llama_with_rope(&scaling(4.0), &format!(r#"{{"rope_theta":500000.0,"rope_type":"llama3","factor":8.0,"low_freq_factor":1.0,"high_freq_factor":2.0,"original_max_position_embeddings":8192}}"#))
+    let scaling = r#"{"rope_type":"llama3","factor":8.0,"low_freq_factor":1.0,
+        "high_freq_factor":4.0,"original_max_position_embeddings":8192}"#;
+    let divergent = r#"{"rope_theta":500000.0,"rope_type":"llama3","factor":8.0,
+        "low_freq_factor":1.0,"high_freq_factor":2.0,"original_max_position_embeddings":8192}"#;
+    let same = r#"{"rope_theta":500000.0,"rope_type":"llama3","factor":8.0,
+        "low_freq_factor":1.0,"high_freq_factor":4.0,"original_max_position_embeddings":8192}"#;
+    let err = llama_with_rope(scaling, divergent)
         .resolve()
         .expect_err("invariant: high_freq_factor divergent refusé");
     assert!(err.to_string().contains("contradictoires"), "{err}");
-    llama_with_rope(&scaling(4.0), &format!(r#"{{"rope_theta":500000.0,"rope_type":"llama3","factor":8.0,"low_freq_factor":1.0,"high_freq_factor":4.0,"original_max_position_embeddings":8192}}"#))
+    llama_with_rope(scaling, same)
         .resolve()
         .expect("invariant: scalings identiques acceptés");
+    let integer = r#"{"rope_theta":500000.0,"rope_type":"llama3","factor":8,
+        "low_freq_factor":1,"high_freq_factor":4,"original_max_position_embeddings":8192}"#;
+    llama_with_rope(scaling, integer)
+        .resolve()
+        .expect("invariant: 8 et 8.0 équivalents");
+    let big = |n: &str| {
+        format!(
+            r#"{{"rope_type":"llama3","rope_theta":500000.0,"factor":8.0,"low_freq_factor":1.0,
+        "high_freq_factor":4.0,"original_max_position_embeddings":{n}}}"#
+        )
+    };
+    let err = llama_with_rope(&big("9007199254740992"), &big("9007199254740993"))
+        .resolve()
+        .expect_err("invariant: entiers distincts au-delà de 2^53 refusés");
+    assert!(err.to_string().contains("contradictoires"), "{err}");
+    let err = llama_with_rope(&big("9007199254740993"), &big("9007199254740992.0"))
+        .resolve()
+        .expect_err("invariant: entier non représentable et flottant voisin refusés");
+    assert!(err.to_string().contains("contradictoires"), "{err}");
 }
