@@ -193,10 +193,24 @@ def pass_calm(path):
     return doc["loadavg_end"] < 2 and doc["ac"]
 
 
+EXPECTED = {"cold": ["a_cold"], "ram": ["n_warmup", "b_ram", "d_ram_edit"],
+            "ssd": ["n_warmup", "c_ssd", "d_ssd_edit"]}
+
+
 def pass_failed(path):
-    """Renvoie le premier tour en échec (statut HTTP/SSE), ou None."""
-    doc = json.loads(path.read_text())
-    return next((r["label"] for r in doc["results"] if r.get("status") != "ok"), None)
+    """Renvoie la cause d'échec (JSON illisible, tour manquant ou en échec), ou None."""
+    try:
+        doc = json.loads(path.read_text())
+        labels = [r["label"] for r in doc["results"]]
+        failed = next((r["label"] for r in doc["results"] if r.get("status") != "ok"), None)
+        expected = EXPECTED[doc["case"]]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return f"JSON invalide ({exc})"
+    if failed is not None:
+        return f"tour {failed} en échec"
+    if labels != expected:
+        return f"tours {labels} au lieu de {expected}"
+    return None
 
 
 def run_case(args, out, case, tokens):
@@ -210,8 +224,8 @@ def run_case(args, out, case, tokens):
         rc = subprocess.run(cmd).returncode
         if rc != 0:
             return f"{case}-{tokens}: passe rc={rc}"
-        if (label := pass_failed(path)) is not None:
-            return f"{case}-{tokens}: tour {label} en échec"
+        if (cause := pass_failed(path)) is not None:
+            return f"{case}-{tokens}: {cause}"
         if pass_calm(path):
             return None
         path.rename(path.with_name(f"{case}-{tokens}.rejet{attempt}.json"))
@@ -222,6 +236,8 @@ def run_case(args, out, case, tokens):
 def run_all(args):
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    # Un ancien DONE ne doit pas survivre à une campagne interrompue.
+    (out / "DONE").unlink(missing_ok=True)
     failure = None
     for tokens in (16000, 32000):
         for case in ("cold", "ram", "ssd"):
