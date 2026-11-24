@@ -316,3 +316,26 @@ fn enhance_without_model_returns_clear_error() {
     assert!(error.to_string().contains("enhance non configuré"));
     assert!(headers(&mut BufReader::new(client)).starts_with("HTTP/1.1 400"));
 }
+
+#[cfg(any(feature = "ws", feature = "h2", feature = "webtransport"))]
+#[test]
+fn idle_dfn3_is_unloaded_without_breaking_a_cloned_arc() {
+    let service = EnhanceService::new(None);
+    *service.model.lock().unwrap() = Some(super::test_support::model());
+    let start = Instant::now();
+    let held = service.model().unwrap();
+    let later = start + Duration::from_secs(120);
+    assert!(!service.unload_idle(0, later), "0 : désactivé");
+    let slot = Reservation::acquire(&service.active, 1, enhance_max_streams()).unwrap();
+    assert!(!service.unload_idle(60, later), "flux actif : on garde");
+    drop(slot);
+    assert!(!service.unload_idle(60, later + Duration::from_secs(59)));
+    assert!(service.unload_idle(60, later + Duration::from_secs(60)));
+    assert!(service.model.lock().unwrap().is_none());
+    // L'Arc déjà cloné reste utilisable après le vidage du slot.
+    let _stream = DenoiseStream::new(&held);
+    assert!(
+        !service.unload_idle(60, later + Duration::from_secs(600)),
+        "déjà vide"
+    );
+}

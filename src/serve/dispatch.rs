@@ -189,6 +189,8 @@ where
         Arc::clone(&dispatcher.front),
         Arc::clone(&dispatcher.connections),
     )?;
+    #[cfg(feature = "denoise")]
+    spawn_enhance_reaper(Arc::downgrade(&dispatcher.front))?;
     // NOTE: thread détaché plutôt que scope : une panique moteur doit tuer le
     // process comme avant, pas attendre un accept qui ne finit jamais.
     let acceptor = thread::Builder::new()
@@ -214,6 +216,27 @@ where
     acceptor
         .join()
         .map_err(|_| ServeError::io("thread d'accept", io::Error::other("panique")))?
+}
+
+/// Décharge DFN3 après `serve.idle_unload_secs` sans flux enhance. Il est
+/// servi hors du thread moteur (h2, webtransport) : `next_job` ne le voit pas.
+/// Le thread s'arrête quand `Front` est libéré.
+#[cfg(feature = "denoise")]
+fn spawn_enhance_reaper(front: std::sync::Weak<Front>) -> ServeResult<()> {
+    thread::Builder::new()
+        .name("saragossa-serve-enhance-idle".to_string())
+        .spawn(move || {
+            while let Some(front) = front.upgrade() {
+                let secs = super::reload::idle_unload_secs();
+                if front.enhance.unload_idle(secs, Instant::now()) {
+                    eprintln!("saragossa serve unloaded enhance idle_secs={secs}");
+                }
+                drop(front);
+                thread::sleep(Duration::from_millis(250));
+            }
+        })
+        .map(drop)
+        .map_err(|e| ServeError::io("thread d'inactivité enhance", e))
 }
 
 /// Job en attente du moteur, avec le modèle visé s'il est admissible à un
@@ -332,7 +355,7 @@ fn next_job<T>(queue: &Receiver<T>, state: &mut ServeState) -> Option<T> {
 }
 
 /// Le délai d'inactivité `secs` (0 : désactivé) est-il écoulé entre `since` et `now` ?
-fn idle_expired(since: Instant, now: Instant, secs: u64) -> bool {
+pub(super) fn idle_expired(since: Instant, now: Instant, secs: u64) -> bool {
     secs > 0 && now.saturating_duration_since(since) >= Duration::from_secs(secs)
 }
 

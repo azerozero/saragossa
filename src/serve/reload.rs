@@ -204,7 +204,12 @@ fn reload(
     // `env_var` relit le profil installé au lancement : au rechargement, la
     // valeur du nouveau profil gagne, sauf CLI ou variable d'environnement.
     let pinned = cli.iter().any(|a| a == "--idle-unload-secs")
-        || std::env::var_os("SARAGOSSA_RUST_IDLE_UNLOAD_SECS").is_some();
+        || [
+            "SARAGOSSA_RUST_IDLE_UNLOAD_SECS",
+            "RETI_RUST_IDLE_UNLOAD_SECS",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
     set_idle_unload_secs(if pinned {
         args.idle_unload_secs
     } else {
@@ -369,6 +374,32 @@ mod tests {
         write("[serve]\n");
         reload(Some(&path), &[], &[], &second, &[]).expect("0");
         assert_eq!(idle_unload_secs(), 0, "60 puis 0 : le nouveau profil gagne");
+    }
+
+    #[test]
+    fn idle_unload_env_pins_the_delay_under_both_names() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("saragossa-idle-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dossier temporaire");
+        let file = dir.join("p.toml");
+        std::fs::write(&file, "[serve]\nidle_unload_secs = 60\n").expect("écriture");
+        let path = file.to_str().expect("utf8").to_string();
+        for name in [
+            "SARAGOSSA_RUST_IDLE_UNLOAD_SECS",
+            "RETI_RUST_IDLE_UNLOAD_SECS",
+        ] {
+            struct Reset(&'static str);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    std::env::remove_var(self.0);
+                    IDLE_UNLOAD_SECS.store(0, Ordering::Relaxed);
+                }
+            }
+            let _reset = Reset(name);
+            std::env::set_var(name, "7");
+            reload(Some(&path), &[], &[], &Profile::default(), &[]).expect(name);
+            assert_eq!(idle_unload_secs(), 7, "{name} prime sur le profil rechargé");
+        }
     }
 
     #[test]

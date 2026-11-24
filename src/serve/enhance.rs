@@ -8,8 +8,9 @@ use saragossa::denoise::{DeepFilterNet3, DenoiseStream, StreamResampler, SAMPLE_
 use saragossa::runtime_flags::{enhance_idle_timeout, enhance_max_streams};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[cfg(any(feature = "h2", feature = "webtransport"))]
 pub(super) mod async_io;
@@ -28,6 +29,8 @@ pub(super) struct EnhanceService {
     path: Option<PathBuf>,
     model: Mutex<Option<Arc<DeepFilterNet3>>>,
     active: Arc<AtomicUsize>,
+    // Dernier usage vu : prise du modèle ou flux actif observé par `unload_idle`.
+    last_used: Mutex<Instant>,
     #[cfg(feature = "webtransport")]
     certificate: Mutex<Option<certificate::CertificateInfo>>,
 }
@@ -38,6 +41,7 @@ impl EnhanceService {
             path,
             model: Mutex::new(None),
             active: Arc::new(AtomicUsize::new(0)),
+            last_used: Mutex::new(Instant::now()),
             #[cfg(feature = "webtransport")]
             certificate: Mutex::new(None),
         }
@@ -54,6 +58,9 @@ impl EnhanceService {
             .model
             .lock()
             .map_err(|_| ServeError::args("verrou DFN3 indisponible"))?;
+        if let Ok(mut last) = self.last_used.lock() {
+            *last = Instant::now();
+        }
         if let Some(model) = loaded.as_ref() {
             return Ok(Arc::clone(model));
         }
@@ -65,6 +72,20 @@ impl EnhanceService {
         let model = Arc::new(DeepFilterNet3::load(path)?);
         *loaded = Some(Arc::clone(&model));
         Ok(model)
+    }
+
+    /// Vide le slot DFN3 après `secs` sans flux (0 : jamais) ; vrai s'il était
+    /// chargé. Un flux qui a déjà cloné l'`Arc` le garde, le suivant recharge.
+    pub(super) fn unload_idle(&self, secs: u64, now: Instant) -> bool {
+        // Même ordre de verrous que `model` : slot puis horodatage.
+        let (Ok(mut model), Ok(mut last)) = (self.model.lock(), self.last_used.lock()) else {
+            return false;
+        };
+        if self.active.load(Ordering::Acquire) > 0 {
+            *last = now;
+            return false;
+        }
+        super::dispatch::idle_expired(*last, now, secs) && model.take().is_some()
     }
 
     pub(super) fn handle<S: ServeStream>(

@@ -467,6 +467,10 @@ mod tests {
 
     #[test]
     fn idle_unload_secs_defaults_to_off_and_parses() {
+        // Un test de `reload` pose la variable d'environnement sous ce verrou.
+        let _serial = super::super::reload::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let off = ServeArgs::parse(["--model".into(), "a=/x/a".into()]).expect("args");
         assert_eq!(off.idle_unload_secs, 0);
         let on =
