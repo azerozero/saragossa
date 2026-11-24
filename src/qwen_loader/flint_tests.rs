@@ -445,6 +445,28 @@ fn synthetic_flint_resident_decode_matches_cpu_oracle() {
     );
 }
 
+/// Déchargement d'inactivité : le décodeur est abandonné (poids, arènes, KV)
+/// puis rechargé ; la sortie greedy résidente reste identique au bit.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "GPU synthétique : exécuté par gpu-synthetic.yml"]
+fn synthetic_flint_greedy_identical_after_unload_and_reload() {
+    let load_gpu = || {
+        load(flint_tensors(true))
+            .expect("invariant: flint synthétique")
+            .with_metal_runtime()
+            .expect("invariant: runtime Metal attaché")
+    };
+    let prompt = [1, 2, 3];
+    let model = load_gpu();
+    let before = model.generate_greedy(&prompt, 8).expect("greedy avant");
+    drop(model);
+    let after = load_gpu()
+        .generate_greedy(&prompt, 8)
+        .expect("greedy après");
+    assert_eq!(before, after, "greedy différent après rechargement");
+}
+
 /// Même oracle synthétique, toutes les compilations du runtime sans fast-math.
 #[cfg(all(target_os = "macos", feature = "metal"))]
 #[test]

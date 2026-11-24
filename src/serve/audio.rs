@@ -163,27 +163,39 @@ impl AudioState {
     /// Abandonne les modèles et sessions chargés (après une panique du moteur) ;
     /// ils se rechargent à la prochaine requête.
     pub(super) fn invalidate(&mut self) {
+        self.unload_models();
         #[cfg(feature = "stt")]
         {
-            self.stt.model = None;
+            self.stt_sessions = super::stt::SttSessions::default();
+        }
+    }
+
+    /// Libère les modèles audio, pas les sessions STT : elles ne portent pas de
+    /// poids et un client peut les reprendre avant leur TTL. Vrai si un modèle
+    /// était chargé.
+    pub(super) fn unload_models(&mut self) -> bool {
+        let mut was_loaded = false;
+        #[cfg(feature = "stt")]
+        {
+            was_loaded |= self.stt.model.take().is_some();
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
-                self.stt.metal = None;
+                was_loaded |= self.stt.metal.take().is_some();
             }
-            self.stt_sessions = super::stt::SttSessions::default();
         }
         #[cfg(feature = "diar")]
         {
-            self.diar.model = None;
+            was_loaded |= self.diar.model.take().is_some();
             #[cfg(all(target_os = "macos", feature = "metal"))]
             {
-                self.diar.metal = None;
+                was_loaded |= self.diar.metal.take().is_some();
             }
         }
         #[cfg(feature = "tts")]
         {
-            self.tts.model = None;
+            was_loaded |= self.tts.model.take().is_some();
         }
+        was_loaded
     }
 
     #[cfg(feature = "denoise")]

@@ -26,7 +26,7 @@
 //!
 //! SIGHUP relit le profil (`--profile`/`--config`, `--set` compris) et n'applique
 //! que `serve.read_timeout_secs`, `serve.max_tokens_cap`, `serve.max_tok_s`,
-//! `serve.gpu_share` et la liste `[[models]]` ;
+//! `serve.gpu_share`, `serve.idle_unload_secs` et la liste `[[models]]` ;
 //! tout autre changement ou chemin de modèle illisible est refusé en bloc (voir
 //! `reload`).
 //!
@@ -168,6 +168,7 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         saragossa::set_gpu_share(share);
     }
     reload::set_launch_models(&args.models);
+    reload::set_idle_unload_secs(args.idle_unload_secs);
     saragossa::force_resident_full_linear_decode();
     let mut state = state::ServeState::new(&args);
     // NOTE: en relais séquentiel, le moteur précharge après la sortie du parent.

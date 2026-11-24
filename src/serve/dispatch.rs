@@ -189,6 +189,8 @@ where
         Arc::clone(&dispatcher.front),
         Arc::clone(&dispatcher.connections),
     )?;
+    #[cfg(feature = "denoise")]
+    let _reaper = spawn_enhance_reaper(Arc::downgrade(&dispatcher.front))?;
     // NOTE: thread détaché plutôt que scope : une panique moteur doit tuer le
     // process comme avant, pas attendre un accept qui ne finit jamais.
     let acceptor = thread::Builder::new()
@@ -214,6 +216,26 @@ where
     acceptor
         .join()
         .map_err(|_| ServeError::io("thread d'accept", io::Error::other("panique")))?
+}
+
+/// Décharge DFN3 après `serve.idle_unload_secs` sans flux enhance. Il est
+/// servi hors du thread moteur (h2, webtransport) : `next_job` ne le voit pas.
+/// Le thread s'arrête quand `Front` est libéré.
+#[cfg(feature = "denoise")]
+fn spawn_enhance_reaper(front: std::sync::Weak<Front>) -> ServeResult<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("saragossa-serve-enhance-idle".to_string())
+        .spawn(move || {
+            while let Some(front) = front.upgrade() {
+                let secs = super::reload::idle_unload_secs();
+                if front.enhance.unload_idle(secs, Instant::now) {
+                    eprintln!("saragossa serve unloaded enhance idle_secs={secs}");
+                }
+                drop(front);
+                thread::sleep(Duration::from_millis(250));
+            }
+        })
+        .map_err(|e| ServeError::io("thread d'inactivité enhance", e))
 }
 
 /// Job en attente du moteur, avec le modèle visé s'il est admissible à un
@@ -304,14 +326,36 @@ fn apply_pending_models(state: &mut ServeState) {
 
 /// Attend le prochain job en regardant toutes les 250 ms si un SIGHUP a changé
 /// les modèles ; `None` quand tous les émetteurs ont lâché.
-fn next_job<S>(queue: &Receiver<Job<S>>, state: &mut ServeState) -> Option<Job<S>> {
+///
+/// Appelé seulement file vide et moteur libre : au bout de
+/// `serve.idle_unload_secs` sans job, les modèles sont déchargés (une fois), et
+/// le job suivant attend leur rechargement sur ce même thread.
+fn next_job<T>(queue: &Receiver<T>, state: &mut ServeState) -> Option<T> {
+    let idle_since = Instant::now();
+    let mut unloaded = false;
     loop {
         match queue.recv_timeout(Duration::from_millis(250)) {
             Ok(job) => return Some(job),
-            Err(RecvTimeoutError::Timeout) => apply_pending_models(state),
+            Err(RecvTimeoutError::Timeout) => {
+                apply_pending_models(state);
+                let secs = super::reload::idle_unload_secs();
+                if !unloaded && idle_expired(idle_since, Instant::now(), secs) {
+                    // Un job arrivé depuis le timeout passe avant tout déchargement.
+                    if let Ok(job) = queue.try_recv() {
+                        return Some(job);
+                    }
+                    state.unload_idle(secs);
+                    unloaded = true;
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => return None,
         }
     }
+}
+
+/// Le délai d'inactivité `secs` (0 : désactivé) est-il écoulé entre `since` et `now` ?
+pub(super) fn idle_expired(since: Instant, now: Instant, secs: u64) -> bool {
+    secs > 0 && now.saturating_duration_since(since) >= Duration::from_secs(secs)
 }
 
 /// Déplace sans bloquer les jobs déjà en file vers `pending`, jusqu'à `cap`.
@@ -550,6 +594,8 @@ impl<S: ServeStream> Connection<S> {
 pub(super) struct Reservation {
     counter: Arc<AtomicUsize>,
     amount: usize,
+    // Horodatage repoussé à la libération, avant de rendre la part.
+    released_at: Option<Arc<std::sync::Mutex<Instant>>>,
 }
 
 impl Reservation {
@@ -564,6 +610,7 @@ impl Reservation {
                     return Some(Self {
                         counter: Arc::clone(counter),
                         amount,
+                        released_at: None,
                     })
                 }
                 Err(current) => count = current,
@@ -572,8 +619,22 @@ impl Reservation {
     }
 }
 
+impl Reservation {
+    /// Date la libération dans `at` (au plus tard des dates vues).
+    #[cfg(feature = "denoise")]
+    pub(super) fn stamped(mut self, at: &Arc<std::sync::Mutex<Instant>>) -> Self {
+        self.released_at = Some(Arc::clone(at));
+        self
+    }
+}
+
 impl Drop for Reservation {
     fn drop(&mut self) {
+        if let Some(at) = &self.released_at {
+            if let Ok(mut at) = at.lock() {
+                *at = at.max(Instant::now());
+            }
+        }
         self.counter.fetch_sub(self.amount, Ordering::AcqRel);
     }
 }
@@ -674,6 +735,52 @@ mod tests {
             .read_to_string(&mut response)
             .expect("invariant: réponse lisible avant le timeout");
         response
+    }
+
+    #[cfg(feature = "denoise")]
+    #[test]
+    fn enhance_reaper_stops_when_front_is_dropped() {
+        let front = Arc::new(Front::new(None, Vec::new()));
+        let reaper = spawn_enhance_reaper(Arc::downgrade(&front)).expect("thread");
+        drop(front);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !reaper.is_finished() {
+            assert!(Instant::now() < deadline, "le thread survit à Front");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // Boucle réelle : un job arrivé après le délai d'inactivité est servi, la
+    // boucle ne reste pas bloquée par le déchargement.
+    #[test]
+    fn next_job_serves_a_job_sent_after_the_idle_delay() {
+        let _serial = super::super::reload::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let args = super::super::args::ServeArgs::parse(
+            ["--model", "a=/x/a", "--backend", "cpu"].map(String::from),
+        )
+        .expect("args");
+        let mut state = ServeState::new(&args);
+        super::super::reload::set_idle_unload_secs(1);
+        let (tx, rx) = std::sync::mpsc::channel::<u8>();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            tx.send(7).expect("invariant: récepteur vivant");
+        });
+        assert_eq!(next_job(&rx, &mut state), Some(7));
+        super::super::reload::set_idle_unload_secs(0);
+        sender.join().expect("invariant: émetteur");
+    }
+
+    #[test]
+    fn idle_expiry_follows_the_injected_clock() {
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        assert!(!idle_expired(t0, at(1000), 0), "0 = désactivé");
+        assert!(!idle_expired(t0, at(59), 60));
+        assert!(idle_expired(t0, at(60), 60));
+        assert!(!idle_expired(at(10), t0, 5), "horloge à rebours");
     }
 
     #[test]
