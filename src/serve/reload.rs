@@ -1,7 +1,8 @@
 //! Rechargement SIGHUP des limites sûres à chaud et de la liste des modèles.
 //!
 //! Chaud : `serve.read_timeout_secs` (nouvelles connexions),
-//! `serve.max_tokens_cap` (prochaine requête), `serve.max_tok_s` et
+//! `serve.max_tokens_cap` (prochaine requête), `serve.idle_unload_secs`
+//! (prochain tour d'attente du moteur), `serve.max_tok_s` et
 //! `serve.gpu_share` (prochain token ou command buffer) et `[[models]]` : la liste
 //! acceptée sert `/v1/models` aussitôt, le thread moteur l'applique entre deux
 //! requêtes (`ServeState::set_models`), donc une requête en cours finit sur son
@@ -26,6 +27,18 @@ use super::args::{config_from_entry, ServeArgs, ServeModelConfig};
 // 0 = aucune valeur rechargée : on garde celle du lancement.
 static READ_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
 static MAX_TOKENS_CAP: AtomicUsize = AtomicUsize::new(0);
+// Délai d'inactivité avant déchargement, 0 = jamais ; écrit au lancement puis par SIGHUP.
+static IDLE_UNLOAD_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Délai d'inactivité courant en secondes (0 : déchargement désactivé).
+pub(super) fn idle_unload_secs() -> u64 {
+    IDLE_UNLOAD_SECS.load(Ordering::Relaxed)
+}
+
+/// Publie le délai d'inactivité du lancement.
+pub(super) fn set_idle_unload_secs(secs: u64) {
+    IDLE_UNLOAD_SECS.store(secs, Ordering::Relaxed);
+}
 
 /// Timeout de lecture courant, `launch` tant qu'aucun rechargement n'a eu lieu.
 pub(super) fn read_timeout(launch: Duration) -> Duration {
@@ -188,6 +201,7 @@ fn reload(
     let diff = diff_models(current_models, &models);
     READ_TIMEOUT_SECS.store(args.read_timeout.as_secs(), Ordering::Relaxed);
     MAX_TOKENS_CAP.store(args.max_tokens_cap, Ordering::Relaxed);
+    set_idle_unload_secs(args.idle_unload_secs);
     if changed.contains(&"serve.max_tok_s") {
         saragossa::set_decode_max_tokens_per_s(args.max_tok_s);
     }

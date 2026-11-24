@@ -50,6 +50,8 @@ pub(super) struct ServeArgs {
     pub(super) max_tok_s: Option<f64>,
     /// Part de GPU et de CPU visée (1 à 100), rechargeable à chaud.
     pub(super) gpu_share: Option<u8>,
+    /// Délai sans requête avant déchargement des modèles (0 : jamais), rechargeable à chaud.
+    pub(super) idle_unload_secs: u64,
     /// Cache persistant opt-in.
     pub(super) prefix_ssd: saragossa::runtime_flags::ServePrefixSsdOptions,
 }
@@ -109,6 +111,11 @@ impl ServeArgs {
             .or(profile.serve.max_tok_s);
         // invariant: `Profile::validate` borne `serve.gpu_share` à 10..=100.
         let mut gpu_share = profile.serve.gpu_share.map(|v| v as u8);
+        let mut idle_unload_secs =
+            saragossa::runtime_flags::env_var("SARAGOSSA_RUST_IDLE_UNLOAD_SECS")
+                .and_then(|v| v.trim().parse().ok())
+                .or(profile.serve.idle_unload_secs)
+                .unwrap_or(0);
         let mut prefix_ssd = saragossa::runtime_flags::ServePrefixSsdOptions::from_env()?;
         let mut iter = args.into_iter();
 
@@ -207,6 +214,11 @@ impl ServeArgs {
                             .map_err(ServeError::args)?,
                     );
                 }
+                "--idle-unload-secs" => {
+                    idle_unload_secs = next_value(&mut iter, "--idle-unload-secs")?
+                        .parse()
+                        .map_err(|_| ServeError::args("--idle-unload-secs attend un entier"))?;
+                }
                 "--help" | "-h" => return Err(ServeError::args(help_text())),
                 other => return Err(ServeError::args(format!("argument serve inconnu: {other}"))),
             }
@@ -236,6 +248,7 @@ impl ServeArgs {
             max_tokens_cap,
             max_tok_s,
             gpu_share,
+            idle_unload_secs,
             prefix_ssd,
         })
     }
@@ -298,7 +311,7 @@ pub(super) fn help_text() -> String {
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
          [--api-key TOKEN (deprecated, use SARAGOSSA_API_KEY)] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
-         {modality_options}[--backend cpu|metal] [--preload] [--max-tok-s R] [--gpu-share 10-100] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
+         {modality_options}[--backend cpu|metal] [--preload] [--max-tok-s R] [--gpu-share 10-100] [--idle-unload-secs N] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
          Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap, serve.max_tok_s, serve.gpu_share and the [[models]] list (id, path) only. See `saragossa config print`.\n\
          Upgrade (Unix): SIGUSR2 starts the same binary path (or --upgrade-binary PATH) with the same arguments on the inherited listening socket, then the old process drains for at most serve.drain_timeout_secs (30) and exits; enhance h2/WebTransport listeners follow. serve.relay_mode=auto|parallel|sequential (auto: sequential only if the memory guard refuses two resident processes).\n\
          SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
@@ -311,6 +324,10 @@ pub(super) fn help_text() -> String {
          --model-35b registers reti-35b.\n\
          {modality_help}Safety defaults: --read-timeout-secs {DEFAULT_READ_TIMEOUT_SECS}, \\
          --max-tokens-cap {DEFAULT_MAX_TOKENS_CAP}.\n\
+         Idle unload: --idle-unload-secs N (serve.idle_unload_secs, \
+         SARAGOSSA_RUST_IDLE_UNLOAD_SECS, hot-reloadable, 0 = off, default) drops all \
+         models after N idle seconds; the next request reloads them. --preload models \
+         are unloaded too.\n\
          Default transport: Unix socket {DEFAULT_SOCKET} (0600). \\
          --port enables TCP on 127.0.0.1 for grob and requires --api-key \\
          or {API_KEY_ENV}.\n\
@@ -447,6 +464,16 @@ fn parse_positive_usize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_unload_secs_defaults_to_off_and_parses() {
+        let off = ServeArgs::parse(["--model".into(), "a=/x/a".into()]).expect("args");
+        assert_eq!(off.idle_unload_secs, 0);
+        let on =
+            ServeArgs::parse(["--model", "a=/x/a", "--idle-unload-secs", "90"].map(String::from))
+                .expect("args");
+        assert_eq!(on.idle_unload_secs, 90);
+    }
 
     #[test]
     fn profile_sets_defaults_and_cli_wins() {

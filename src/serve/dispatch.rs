@@ -304,14 +304,32 @@ fn apply_pending_models(state: &mut ServeState) {
 
 /// Attend le prochain job en regardant toutes les 250 ms si un SIGHUP a changé
 /// les modèles ; `None` quand tous les émetteurs ont lâché.
+///
+/// Appelé seulement file vide et moteur libre : au bout de
+/// `serve.idle_unload_secs` sans job, les modèles sont déchargés (une fois), et
+/// le job suivant attend leur rechargement sur ce même thread.
 fn next_job<S>(queue: &Receiver<Job<S>>, state: &mut ServeState) -> Option<Job<S>> {
+    let idle_since = Instant::now();
+    let mut unloaded = false;
     loop {
         match queue.recv_timeout(Duration::from_millis(250)) {
             Ok(job) => return Some(job),
-            Err(RecvTimeoutError::Timeout) => apply_pending_models(state),
+            Err(RecvTimeoutError::Timeout) => {
+                apply_pending_models(state);
+                let secs = super::reload::idle_unload_secs();
+                if !unloaded && idle_expired(idle_since, Instant::now(), secs) {
+                    state.unload_idle(secs);
+                    unloaded = true;
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => return None,
         }
     }
+}
+
+/// Le délai d'inactivité `secs` (0 : désactivé) est-il écoulé entre `since` et `now` ?
+fn idle_expired(since: Instant, now: Instant, secs: u64) -> bool {
+    secs > 0 && now.saturating_duration_since(since) >= Duration::from_secs(secs)
 }
 
 /// Déplace sans bloquer les jobs déjà en file vers `pending`, jusqu'à `cap`.
@@ -674,6 +692,16 @@ mod tests {
             .read_to_string(&mut response)
             .expect("invariant: réponse lisible avant le timeout");
         response
+    }
+
+    #[test]
+    fn idle_expiry_follows_the_injected_clock() {
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        assert!(!idle_expired(t0, at(1000), 0), "0 = désactivé");
+        assert!(!idle_expired(t0, at(59), 60));
+        assert!(idle_expired(t0, at(60), 60));
+        assert!(!idle_expired(at(10), t0, 5), "horloge à rebours");
     }
 
     #[test]

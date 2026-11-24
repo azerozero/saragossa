@@ -483,7 +483,41 @@ impl ServeState {
         let additional = self.models[index].estimated_model_bytes();
         self.enforce_memory_budget(additional, Some(index))?;
         self.enforce_model_pool_limit(index);
-        self.models[index].ensure_loaded()
+        let started = Instant::now();
+        self.models[index].ensure_loaded()?;
+        eprintln!(
+            "saragossa serve loaded model={} in_ms={}",
+            self.models[index].id,
+            started.elapsed().as_millis()
+        );
+        Ok(())
+    }
+
+    /// Décharge tous les modèles (poids, arènes, KV, caches de préfixe en RAM)
+    /// après `secs` secondes d'inactivité ; le prochain job les recharge. Passe
+    /// par `invalidate_models`, comme la reprise après panique : le cache de
+    /// préfixe SSD reste sur disque. Les modèles `--preload` ne sont pas exemptés.
+    pub(super) fn unload_idle(&mut self, secs: u64) {
+        self.assert_engine_thread();
+        if self.loaded_count() == 0 {
+            return;
+        }
+        let started = Instant::now();
+        let before = process_footprint_bytes();
+        self.invalidate_models();
+        while process_purge_registry()
+            .lock()
+            .ok()
+            .and_then(|mut registry| registry.purge_one(&mut (), PurgePressure::Warn))
+            .is_some()
+        {}
+        let freed = before
+            .zip(process_footprint_bytes())
+            .map(|(before, after)| before.saturating_sub(after));
+        eprintln!(
+            "saragossa serve unloaded idle_secs={secs} in_ms={} freed_bytes={freed:?}",
+            started.elapsed().as_millis()
+        );
     }
 
     fn enforce_model_pool_limit(&mut self, protected: usize) {

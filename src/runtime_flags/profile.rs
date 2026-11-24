@@ -38,11 +38,12 @@ pub const PRESETS: [(&str, &str); 2] = [
 ];
 
 /// Clés qu'un rechargement SIGHUP peut appliquer sans redémarrage.
-pub const HOT_KEYS: [&str; 4] = [
+pub const HOT_KEYS: [&str; 5] = [
     "serve.read_timeout_secs",
     "serve.max_tokens_cap",
     "serve.max_tok_s",
     "serve.gpu_share",
+    "serve.idle_unload_secs",
 ];
 
 /// Erreur de lecture ou de validation d'un profil.
@@ -104,6 +105,9 @@ pub struct ServeSection {
     pub max_tok_s: Option<f64>,
     /// Équivalent de `--gpu-share` : part de GPU et de CPU visée, 10 à 100.
     pub gpu_share: Option<u64>,
+    /// Équivalent de `--idle-unload-secs` : décharge les modèles après ce délai
+    /// sans requête (0 ou absent : jamais).
+    pub idle_unload_secs: Option<u64>,
     /// Délai max de vidage de l'ancien processus après un relais SIGUSR2.
     pub drain_timeout_secs: Option<u64>,
     /// Relais SIGUSR2 : `auto` (défaut), `parallel` ou `sequential`.
@@ -296,6 +300,12 @@ impl Profile {
                 s.max_tok_s.map(|v| v.to_string()),
             ),
             r("serve.gpu_share", None, "100", num(s.gpu_share)),
+            r(
+                "serve.idle_unload_secs",
+                Some("SARAGOSSA_RUST_IDLE_UNLOAD_SECS"),
+                "0",
+                num(s.idle_unload_secs),
+            ),
             r(
                 "serve.drain_timeout_secs",
                 None,
