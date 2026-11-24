@@ -187,10 +187,16 @@ def run_pass(args):
 MAX_REJECTS = 2
 
 
-def pass_valid(path):
+def pass_calm(path):
     """Charge et secteur relus en fin de passe : sinon la mesure est faussée."""
     doc = json.loads(path.read_text())
     return doc["loadavg_end"] < 2 and doc["ac"]
+
+
+def pass_failed(path):
+    """Renvoie le premier tour en échec (statut HTTP/SSE), ou None."""
+    doc = json.loads(path.read_text())
+    return next((r["label"] for r in doc["results"] if r.get("status") != "ok"), None)
 
 
 def run_case(args, out, case, tokens):
@@ -204,7 +210,9 @@ def run_case(args, out, case, tokens):
         rc = subprocess.run(cmd).returncode
         if rc != 0:
             return f"{case}-{tokens}: passe rc={rc}"
-        if pass_valid(path):
+        if (label := pass_failed(path)) is not None:
+            return f"{case}-{tokens}: tour {label} en échec"
+        if pass_calm(path):
             return None
         path.rename(path.with_name(f"{case}-{tokens}.rejet{attempt}.json"))
         print(f"{case}-{tokens}: passe {attempt} rejetée (charge ou batterie)", file=sys.stderr)
@@ -217,7 +225,10 @@ def run_all(args):
     failure = None
     for tokens in (16000, 32000):
         for case in ("cold", "ram", "ssd"):
-            if failure is None and not (out / f"{case}-{tokens}.json").exists():
+            path = out / f"{case}-{tokens}.json"
+            # Une mesure reprise d'un dossier existant passe les mêmes contrôles.
+            done = path.exists() and pass_failed(path) is None and pass_calm(path)
+            if failure is None and not done:
                 failure = run_case(args, out, case, tokens)
     (out / "DONE").write_text(f"failed: {failure}\n" if failure else "ok\n")
     if failure:
