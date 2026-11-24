@@ -1318,6 +1318,8 @@ mod tests {
             vocab_size: 248_320,
             eos_token_ids: Vec::new(),
             tie_word_embeddings: false,
+            attention_bias: false,
+            mlp_bias: false,
             quantization: Option::<QuantConfig>::None,
             full_attention_interval: None,
             attn_output_gate: None,

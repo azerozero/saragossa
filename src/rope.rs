@@ -50,9 +50,130 @@ pub(crate) fn inv_freq(frequency_dim: usize, theta: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Paramètres du `rope_scaling` de type `llama3` (Llama 3.1, 3.2, 3.3).
+///
+/// Ils ne changent que la table des fréquences : les positions restent brutes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Llama3RopeScaling {
+    /// Facteur d'étirement des basses fréquences.
+    pub factor: f32,
+    /// Facteur fixant la longueur d'onde basse (`contexte / low`).
+    pub low_freq_factor: f32,
+    /// Facteur fixant la longueur d'onde haute (`contexte / high`).
+    pub high_freq_factor: f32,
+    /// Contexte d'entraînement d'origine.
+    pub original_max_position_embeddings: f32,
+}
+
+impl Llama3RopeScaling {
+    /// Clé exacte des caches de fréquences et de rotations.
+    pub(crate) fn key(self) -> [u32; 4] {
+        [
+            self.factor.to_bits(),
+            self.low_freq_factor.to_bits(),
+            self.high_freq_factor.to_bits(),
+            self.original_max_position_embeddings.to_bits(),
+        ]
+    }
+}
+
+/// Table des fréquences d'une couche, avec le scaling `llama3` éventuel.
+///
+/// Sans scaling, renvoie exactement [`inv_freq`]. Avec scaling, suit en f32
+/// l'ordre des opérations de `_compute_llama3_parameters` de transformers :
+/// les longueurs d'onde courtes restent, les longues sont divisées par
+/// `factor`, l'entre-deux est interpolé.
+pub(crate) fn inv_freq_scaled(
+    frequency_dim: usize,
+    theta: f32,
+    scaling: Option<Llama3RopeScaling>,
+) -> Vec<f32> {
+    let Some(scaling) = scaling else {
+        return inv_freq(frequency_dim, theta);
+    };
+    // NOTE: `powf` f32 de la libm s'écarte de 1 à 2 ulp du `pow` de torch
+    // (paires 3 et 16 en d64) ; la puissance f64 arrondie en f32 retrouve ses
+    // bits. La table par défaut garde `powf` pour l'identité des autres modèles.
+    let base = (0..frequency_dim / 2).map(|pair| {
+        let exponent = (2 * pair) as f32 / frequency_dim as f32;
+        1.0 / f64::from(theta).powf(f64::from(exponent)) as f32
+    });
+    let old_context = scaling.original_max_position_embeddings;
+    let low_freq_wavelen = old_context / scaling.low_freq_factor;
+    let high_freq_wavelen = old_context / scaling.high_freq_factor;
+    // NOTE: transformers convertit le scalaire Python 2π en f32 avant la division.
+    let two_pi = (2.0 * std::f64::consts::PI) as f32;
+    base.map(|frequency| {
+        let wavelen = two_pi / frequency;
+        let llama = if wavelen > low_freq_wavelen {
+            frequency / scaling.factor
+        } else {
+            frequency
+        };
+        if wavelen < high_freq_wavelen || wavelen > low_freq_wavelen {
+            return llama;
+        }
+        let smooth = (old_context / wavelen - scaling.low_freq_factor)
+            / (scaling.high_freq_factor - scaling.low_freq_factor);
+        (1.0 - smooth) * llama / scaling.factor + smooth * llama
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::inv_freq;
+    use super::{inv_freq, inv_freq_scaled, Llama3RopeScaling};
+
+    fn llama3(factor: f32) -> Llama3RopeScaling {
+        Llama3RopeScaling {
+            factor,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 8192.0,
+        }
+    }
+
+    /// Bits f32 de `ROPE_INIT_FUNCTIONS["llama3"]` de transformers 5.22.2
+    /// (torch 2.15.0, CPU), θ = 500 000 : Llama 3.2 1B (d64, ×32) puis
+    /// Llama 3.2 3B / 3.1 8B (d128, ×8). Script : tools/goldens/rope_llama3.py.
+    const TRANSFORMERS_D64_X32: [u32; 32] = [
+        0x3f800000, 0x3f29e1c6, 0x3ee177bc, 0x3e959ee3, 0x3e4693b0, 0x3e03c6a0, 0x3daee4ad,
+        0x3d681e67, 0x3d1a08c8, 0x3ccc6f49, 0x3c87a9c3, 0x3c340d6d, 0x3beef74f, 0x3b9e9402,
+        0x3b527720, 0x3aa9279b, 0x39e13620, 0x38cb98f7, 0x37a3418d, 0x3758ac81, 0x370fc8f8,
+        0x36bed4f4, 0x367d45c3, 0x3628126b, 0x35df10c4, 0x359406cb, 0x35447610, 0x35025f34,
+        0x34ad07a7, 0x3465a54d, 0x341864a7, 0x33ca41b0,
+    ];
+    const TRANSFORMERS_D128_X8: [u32; 64] = [
+        0x3f800000, 0x3f508ac1, 0x3f29e1c6, 0x3f0a6384, 0x3ee177bc, 0x3eb7ab7d, 0x3e959ee3,
+        0x3e73c461, 0x3e4693b0, 0x3e21c3a0, 0x3e03c6a0, 0x3dd6b19c, 0x3daee4ad, 0x3d8e7898,
+        0x3d681e67, 0x3d3d1684, 0x3d1a08c8, 0x3cfaf53f, 0x3ccc6f49, 0x3ca68939, 0x3c87a9c3,
+        0x3c5d06ec, 0x3c340d6d, 0x3c12ac7f, 0x3beef74f, 0x3bc2aa76, 0x3b9e9402, 0x3b812e35,
+        0x3b527720, 0x3b0dfd06, 0x3ab3d11d, 0x3a60979e, 0x3a0995d2, 0x39a3f108, 0x393b2dd2,
+        0x38c86886, 0x38a3418d, 0x3884fdbf, 0x3858ac81, 0x38308199, 0x380fc8f8, 0x37ea426f,
+        0x37bed4f4, 0x379b7475, 0x377d45c3, 0x374e51f5, 0x3728126b, 0x3708ea0f, 0x36df10c4,
+        0x36b5b687, 0x369406cb, 0x36712b80, 0x36447610, 0x36200a69, 0x36025f34, 0x35d46808,
+        0x35ad07a7, 0x358cf400, 0x3565a54d, 0x353b12c7, 0x351864a7, 0x34f848c2, 0x34ca41b0,
+        0x34a4c2ff,
+    ];
+
+    #[test]
+    fn llama3_table_matches_transformers_bits() {
+        for (dim, factor, expected) in [
+            (64, 32.0, &TRANSFORMERS_D64_X32[..]),
+            (128, 8.0, &TRANSFORMERS_D128_X8[..]),
+        ] {
+            let table = inv_freq_scaled(dim, 500_000.0, Some(llama3(factor)));
+            let bits: Vec<u32> = table.iter().map(|f| f.to_bits()).collect();
+            assert_eq!(bits, expected, "d{dim} x{factor}");
+        }
+    }
+
+    #[test]
+    fn unscaled_table_is_the_default_table() {
+        for dim in [0, 64, 128, 256] {
+            assert_eq!(inv_freq_scaled(dim, 1.0e6, None), inv_freq(dim, 1.0e6));
+        }
+    }
 
     #[test]
     fn frequencies_cover_full_partial_and_no_rotation() {

@@ -135,6 +135,8 @@ impl ModelAssets {
             "<|endofprompt|>",
             crate::chat_template::GEMMA_END_OF_TURN,
             crate::chat_template::GEMMA4_END_OF_TURN,
+            crate::chat_template::LLAMA3_EOT,
+            crate::chat_template::LLAMA3_EOM,
         ] {
             if let Some(id) = self
                 .tokenizer
@@ -457,17 +459,49 @@ mod tests {
         assert_eq!(assets.stop_token_ids(), vec![1, 3]);
     }
 
+    #[test]
+    fn stop_ids_include_llama3_eot_eom() {
+        let tmp = tempfile::tempdir().expect("invariant: tempdir");
+        write_config(
+            tmp.path(),
+            r#"{
+                "model_type":"llama",
+                "hidden_size":4,
+                "num_hidden_layers":1,
+                "num_attention_heads":2,
+                "num_key_value_heads":2,
+                "intermediate_size":8,
+                "rms_norm_eps":0.000001,
+                "rope_theta":10000.0,
+                "vocab_size":5,
+                "eos_token_id":1
+            }"#,
+        );
+        save_vocab_tokenizer(
+            &tmp.path().join("tokenizer.json"),
+            r#"{"<unk>":0,"<eos>":1,"bonjour":2,"<|eot_id|>":3,"<|eom_id|>":4}"#,
+        );
+        write_safetensors(&tmp.path().join("model.safetensors"), "dummy.weight");
+
+        let assets = ModelAssets::load_local_with_mtp(tmp.path(), None)
+            .expect("invariant: assets chargeables");
+        assert_eq!(assets.stop_token_ids(), vec![1, 3, 4]);
+    }
+
     fn save_gemma_test_tokenizer(path: &Path) {
+        save_vocab_tokenizer(
+            path,
+            r#"{"<unk>":0,"<eos>":1,"bonjour":2,"<end_of_turn>":3}"#,
+        );
+    }
+
+    fn save_vocab_tokenizer(path: &Path, vocab: &str) {
         use tokenizers::models::wordlevel::WordLevel;
         use tokenizers::pre_tokenizers::whitespace::Whitespace;
         use tokenizers::Tokenizer;
 
         let vocab_path = path.with_file_name("gemma-test-vocab.json");
-        std::fs::write(
-            &vocab_path,
-            r#"{"<unk>":0,"<eos>":1,"bonjour":2,"<end_of_turn>":3}"#,
-        )
-        .expect("invariant: écriture vocab tokenizer");
+        std::fs::write(&vocab_path, vocab).expect("invariant: écriture vocab tokenizer");
         let vocab_path = vocab_path
             .to_str()
             .expect("invariant: chemin vocab UTF-8")

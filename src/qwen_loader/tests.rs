@@ -279,6 +279,7 @@ fn rejects_unsupported_rope_scaling_type_for_gemma() {
         rope_type: Some("yarn".to_string()),
         legacy_type: None,
         factor: Some(8.0),
+        ..Default::default()
     });
 
     let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
@@ -298,6 +299,7 @@ fn rejects_linear_rope_scaling_without_usable_factor() {
         rope_type: Some("linear".to_string()),
         legacy_type: None,
         factor: Some(0.0),
+        ..Default::default()
     });
 
     let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
@@ -306,23 +308,90 @@ fn rejects_linear_rope_scaling_without_usable_factor() {
     assert!(err.to_string().contains("facteur"));
 }
 
-#[test]
-fn ignores_non_linear_rope_scaling_outside_gemma() {
-    // Statu quo Llama 3.2 : type `llama3` non implémenté mais le chargement
-    // générique reste accepté (scaling ignoré, comme avant ce chantier).
+fn load_with_rope_scaling(scaling: crate::RopeScalingConfig) -> Result<CausalDecoder> {
     let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
     write_safetensors(tmp.path(), "model.", "lm_head.", None);
     let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
         .expect("invariant: catalog chargeable");
     let mut config = test_config();
-    config.rope_scaling = Some(crate::RopeScalingConfig {
-        rope_type: Some("llama3".to_string()),
-        legacy_type: None,
-        factor: Some(32.0),
-    });
-
+    config.rope_scaling = Some(scaling);
     load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
-        .expect("invariant: llama3 hors Gemma toléré");
+}
+
+fn llama3_scaling() -> crate::RopeScalingConfig {
+    crate::RopeScalingConfig {
+        rope_type: Some("llama3".to_string()),
+        factor: Some(32.0),
+        low_freq_factor: Some(1.0),
+        high_freq_factor: Some(4.0),
+        original_max_position_embeddings: Some(8192),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn llama3_rope_scaling_reaches_the_decoder_config() {
+    load_with_rope_scaling(llama3_scaling()).expect("invariant: llama3 accepté");
+    let mut config = test_config();
+    config.rope_scaling = Some(llama3_scaling());
+    let decoder = crate::CausalDecoderConfig::from(&config);
+    let llama3 = decoder
+        .rope_llama3
+        .expect("invariant: scaling llama3 transmis");
+    assert_eq!(llama3.factor, 32.0);
+    assert_eq!(llama3.original_max_position_embeddings, 8192.0);
+    assert_eq!(decoder.rope_position_scale, None);
+}
+
+#[test]
+fn rejects_unimplemented_or_invalid_rope_scaling() {
+    for kind in ["yarn", "longrope", "dynamic", "mrope"] {
+        let err = load_with_rope_scaling(crate::RopeScalingConfig {
+            rope_type: Some(kind.to_string()),
+            factor: Some(4.0),
+            ..Default::default()
+        })
+        .expect_err("invariant: type non implémenté refusé");
+        assert!(err.to_string().contains("non supporté"), "{kind}: {err}");
+    }
+    let invalid = [
+        crate::RopeScalingConfig {
+            factor: None,
+            ..llama3_scaling()
+        },
+        crate::RopeScalingConfig {
+            high_freq_factor: Some(1.0),
+            ..llama3_scaling()
+        },
+        crate::RopeScalingConfig {
+            original_max_position_embeddings: Some(0),
+            ..llama3_scaling()
+        },
+        crate::RopeScalingConfig {
+            legacy_type: Some("linear".to_string()),
+            ..llama3_scaling()
+        },
+    ];
+    for scaling in invalid {
+        let err = load_with_rope_scaling(scaling).expect_err("invariant: llama3 invalide refusé");
+        assert!(err.to_string().contains("rope_scaling"), "{err}");
+    }
+}
+
+#[test]
+fn rejects_declared_bias_without_tensors() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_safetensors(tmp.path(), "model.", "lm_head.", None);
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    for field in ["attention_bias", "mlp_bias"] {
+        let mut config = test_config();
+        config.attention_bias = field == "attention_bias";
+        config.mlp_bias = field == "mlp_bias";
+        let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+            .expect_err("invariant: biais annoncé absent refusé");
+        assert!(err.to_string().contains(field), "{err}");
+    }
 }
 
 #[test]
@@ -1090,4 +1159,84 @@ fn accepts_micro_modes_and_checks_overrides() -> Result<()> {
         assert_eq!(micro_mode_for(&quant, "model.proj.weight")?, None);
     }
     Ok(())
+}
+
+#[test]
+fn rejects_llama_family_sliding_window_set() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    write_safetensors(tmp.path(), "model.", "lm_head.", None);
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    let load = |window: Option<usize>| {
+        let mut config = test_config();
+        config.model_type = "mistral".to_string();
+        config.max_position_embeddings = Some(32768);
+        config.sliding_window = window;
+        load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+    };
+    let err = load(Some(4096)).expect_err("invariant: fenêtre courte refusée");
+    assert!(err.to_string().contains("sliding_window"), "{err}");
+    load(None).expect("invariant: sliding_window null accepté (Mistral v0.3)");
+    let err = load(Some(32768)).expect_err("invariant: fenêtre égale au contexte refusée");
+    assert!(err.to_string().contains("sliding_window"), "{err}");
+}
+
+#[test]
+fn rejects_partial_bias_tensors() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    let bias = TensorFixture::f32(vec![2], vec![0.0, 0.0]);
+    write_safetensors(
+        tmp.path(),
+        "model.",
+        "lm_head.",
+        Some(("model.layers.0.self_attn.q_proj.bias", bias)),
+    );
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    // Annoncé mais seul q_proj en porte un ; non annoncé mais présent (Mistral).
+    for (declared, model_type) in [(true, "qwen3"), (false, "mistral")] {
+        let mut config = test_config();
+        config.model_type = model_type.to_string();
+        config.attention_bias = declared;
+        let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+            .expect_err("invariant: biais partiel refusé");
+        assert!(err.to_string().contains("attention_bias"), "{err}");
+    }
+}
+
+#[test]
+fn rejects_llama3_scaling_with_qk_norm() {
+    let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
+    let norm = TensorFixture::ones(vec![2]);
+    write_safetensors(
+        tmp.path(),
+        "model.",
+        "lm_head.",
+        Some(("model.layers.0.self_attn.q_norm.weight", norm)),
+    );
+    let catalog = WeightCatalog::from_shards(&[tmp.path().to_path_buf()])
+        .expect("invariant: catalog chargeable");
+    let mut config = test_config();
+    config.rope_scaling = Some(llama3_scaling());
+    let err = load_causal_decoder_from_shards(&config, &[tmp.path().to_path_buf()], &catalog)
+        .expect_err("invariant: llama3 avec QK-norm refusé");
+    assert!(err.to_string().contains("QK-norm"), "{err}");
+}
+
+/// Les `config.json` réels des familles goldens (Qwen dense et MoE, Gemma 3 et 4)
+/// traversent la résolution et la validation du scaling RoPE sans erreur.
+#[test]
+fn supported_family_configs_still_resolve() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/configs");
+    for name in ["qwen_dense", "qwen_moe", "gemma3", "gemma4"] {
+        let text = std::fs::read_to_string(root.join(format!("{name}.json")))
+            .expect("invariant: fixture de config");
+        let raw: crate::RawModelConfig =
+            serde_json::from_str(&text).expect("invariant: JSON de config");
+        let config = raw
+            .resolve()
+            .unwrap_or_else(|error| panic!("{name}: resolve: {error}"));
+        validate_rope_scaling(&config)
+            .unwrap_or_else(|error| panic!("{name}: validate_rope_scaling: {error}"));
+    }
 }

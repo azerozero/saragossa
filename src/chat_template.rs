@@ -1,9 +1,14 @@
-//! Rendu des templates de chat (ChatML Qwen, tours Gemma, flint) du backend Rust pur.
+//! Rendu des templates de chat (ChatML Qwen, Gemma, flint, Llama 3, Mistral) du backend Rust pur.
 
 pub mod canonical_json;
 mod gemma4;
 mod python_json;
 pub use gemma4::render_gemma4_chat_with_tools;
+mod llama;
+pub use llama::{
+    llama3_today, render_llama3_chat, render_llama_or_mistral_chat, render_mistral_chat,
+    LLAMA3_BOS, LLAMA3_EOM, LLAMA3_EOT, LLAMA3_FIXED_DATE,
+};
 mod qwen;
 pub use qwen::{render_qwen_chatml_profile, render_qwen_chatml_with_tools, QwenProfile};
 
@@ -135,6 +140,9 @@ pub enum TemplateError {
     /// Gemma 3 exige l'alternance user/assistant après le système optionnel.
     #[error("Conversation roles must alternate user/assistant/user/assistant/...")]
     RoleAlternation,
+    /// Rôle (ou appel d'outil) que le template de la famille ne rend pas.
+    #[error("rôle {0} non supporté par ce template")]
+    UnsupportedRole(String),
 }
 
 /// Rend des messages au format chat Gemma (`<start_of_turn>…<end_of_turn>`).

@@ -1,0 +1,26 @@
+{
+  "dtype": "utf8",
+  "shape": [
+    933
+  ],
+  "source": {
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "path": "${SARAGOSSA_MISTRAL7B_DIR}",
+    "snapshot": "c170c708c41dac9275d15a8fff4eca08d52bab71",
+    "sha256": {
+      "config.json": "affafc6478ec0fd07a32f0ca57aa2fc57743f4d17d6730f86a96ac24d1507f99",
+      "tokenizer.json": "e553af6fff7d7ad76e830608b218c5c0b0822998d5a1a96099a74cd3c1cb1a49",
+      "tokenizer_config.json": "0533dec9cfe319163801b6618d0f3ec9cfa126b6288e3df5deca6e32acb09cd2",
+      "generation_config.json": "b4669f1b8f4185324bd9b12a69e85a1ad2289bc48111ef739cfaaea3bba6b0a9"
+    },
+    "versions": {
+      "transformers": "5.22.2",
+      "tokenizers": "0.23.3",
+      "jinja2": "3.1.6"
+    }
+  },
+  "tolerance": "exact UTF-8",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-23",
+  "payload_sha256": "07f14afe81ba7e2d56ade3c3c39e58d0ce6e36c9458fff3e2ceb93b97ce6d630"
+}
