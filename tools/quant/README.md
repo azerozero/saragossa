@@ -57,7 +57,7 @@ La KL top-64 est mesurée dans mlx-lm contre la référence f32 `kld/mistral7b` 
 
 - **Constat.** Le u4 LS de `convert` donne 0,188, contre 0,175 pour `mlx_lm.convert` q4, au même débit de 4,50 bpw.
 - **Cause probable.** Passer le seul module `layers.1.mlp.down_proj` en 8 bits fait tomber la KL de 0,188 à 0,156 : ce module porte une part importante de l'écart. Dans ce module, la colonne d'entrée 7310 est une super-activation : son E[x²] vaut 2290, contre environ 2e-5 ailleurs, et elle porte 89 % de l'erreur E[x²]·δ² du module (0,325 sur 0,365, contre 0,089 chez MLX). Ses poids sont quasi nuls. Le lien entre cette erreur pondérée et la KL n'est pas mesuré directement.
-- **Pourquoi MLX s'en sort mieux.** Sa grille contient le zéro exact (biais = q0·s), et 3921 de ces 4096 poids reviennent exactement à 0. Notre LS déplace le biais : seulement 680 reviennent à 0, et les autres prennent un bruit que la super-activation amplifie.
+- **Hypothèse expliquant l'avantage de MLX.** Sa grille contient le zéro exact (biais = q0·s), et 3921 de ces 4096 poids reviennent exactement à 0. Notre LS déplace le biais : seulement 680 reviennent à 0, et les autres prennent un bruit que la super-activation pourrait amplifier.
 - **Le bord exact des super-poids ne suffit pas.** Forcer le bord exact pour les groupes à plus de 50× la médiane de ligne (9 groupes du module) laisse la KL à 0,1883 et l'erreur pondérée du module inchangée. Cette expérience est conservée hors de main.
 - **Recettes**, avec `--bits-for` et `--imatrix` de la branche `feat/convert-imatrix` :
 
