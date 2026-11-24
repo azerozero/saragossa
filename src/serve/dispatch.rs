@@ -308,7 +308,7 @@ fn apply_pending_models(state: &mut ServeState) {
 /// Appelé seulement file vide et moteur libre : au bout de
 /// `serve.idle_unload_secs` sans job, les modèles sont déchargés (une fois), et
 /// le job suivant attend leur rechargement sur ce même thread.
-fn next_job<S>(queue: &Receiver<Job<S>>, state: &mut ServeState) -> Option<Job<S>> {
+fn next_job<T>(queue: &Receiver<T>, state: &mut ServeState) -> Option<T> {
     let idle_since = Instant::now();
     let mut unloaded = false;
     loop {
@@ -318,6 +318,10 @@ fn next_job<S>(queue: &Receiver<Job<S>>, state: &mut ServeState) -> Option<Job<S
                 apply_pending_models(state);
                 let secs = super::reload::idle_unload_secs();
                 if !unloaded && idle_expired(idle_since, Instant::now(), secs) {
+                    // Un job arrivé depuis le timeout passe avant tout déchargement.
+                    if let Ok(job) = queue.try_recv() {
+                        return Some(job);
+                    }
                     state.unload_idle(secs);
                     unloaded = true;
                 }
@@ -692,6 +696,29 @@ mod tests {
             .read_to_string(&mut response)
             .expect("invariant: réponse lisible avant le timeout");
         response
+    }
+
+    // Boucle réelle : un job arrivé après le délai d'inactivité est servi, la
+    // boucle ne reste pas bloquée par le déchargement.
+    #[test]
+    fn next_job_serves_a_job_sent_after_the_idle_delay() {
+        let _serial = super::super::reload::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let args = super::super::args::ServeArgs::parse(
+            ["--model", "a=/x/a", "--backend", "cpu"].map(String::from),
+        )
+        .expect("args");
+        let mut state = ServeState::new(&args);
+        super::super::reload::set_idle_unload_secs(1);
+        let (tx, rx) = std::sync::mpsc::channel::<u8>();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            tx.send(7).expect("invariant: récepteur vivant");
+        });
+        assert_eq!(next_job(&rx, &mut state), Some(7));
+        super::super::reload::set_idle_unload_secs(0);
+        sender.join().expect("invariant: émetteur");
     }
 
     #[test]

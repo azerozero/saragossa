@@ -494,17 +494,34 @@ impl ServeState {
     }
 
     /// Décharge tous les modèles (poids, arènes, KV, caches de préfixe en RAM)
-    /// après `secs` secondes d'inactivité ; le prochain job les recharge. Passe
-    /// par `invalidate_models`, comme la reprise après panique : le cache de
-    /// préfixe SSD reste sur disque. Les modèles `--preload` ne sont pas exemptés.
+    /// après `secs` secondes d'inactivité ; le prochain job les recharge. LLM,
+    /// STT, TTS, diarisation et embeddings sont déchargés ; les sessions STT
+    /// survivent (sans poids) et le cache de préfixe SSD reste sur disque. Les
+    /// modèles `--preload` ne sont pas exemptés.
     pub(super) fn unload_idle(&mut self, secs: u64) {
         self.assert_engine_thread();
-        if self.loaded_count() == 0 {
-            return;
-        }
         let started = Instant::now();
         let before = process_footprint_bytes();
-        self.invalidate_models();
+        let mut any = self.loaded_count() > 0;
+        for slot in &mut self.models {
+            slot.loaded = None;
+        }
+        #[cfg(any(
+            feature = "stt",
+            feature = "tts",
+            feature = "diar",
+            feature = "denoise"
+        ))]
+        {
+            any |= self.audio.unload_models();
+        }
+        #[cfg(feature = "embed")]
+        {
+            any |= self.embeddings.unload();
+        }
+        if !any {
+            return;
+        }
         while process_purge_registry()
             .lock()
             .ok()

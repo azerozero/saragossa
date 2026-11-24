@@ -201,7 +201,15 @@ fn reload(
     let diff = diff_models(current_models, &models);
     READ_TIMEOUT_SECS.store(args.read_timeout.as_secs(), Ordering::Relaxed);
     MAX_TOKENS_CAP.store(args.max_tokens_cap, Ordering::Relaxed);
-    set_idle_unload_secs(args.idle_unload_secs);
+    // `env_var` relit le profil installé au lancement : au rechargement, la
+    // valeur du nouveau profil gagne, sauf CLI ou variable d'environnement.
+    let pinned = cli.iter().any(|a| a == "--idle-unload-secs")
+        || std::env::var_os("SARAGOSSA_RUST_IDLE_UNLOAD_SECS").is_some();
+    set_idle_unload_secs(if pinned {
+        args.idle_unload_secs
+    } else {
+        next.serve.idle_unload_secs.unwrap_or(0)
+    });
     if changed.contains(&"serve.max_tok_s") {
         saragossa::set_decode_max_tokens_per_s(args.max_tok_s);
     }
@@ -340,6 +348,29 @@ mod tests {
     }
 
     // Un seul test touche aux listes globales MODELS et PENDING.
+    #[test]
+    fn idle_unload_secs_follows_the_reloaded_profile() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                IDLE_UNLOAD_SECS.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = Reset;
+        let dir = std::env::temp_dir().join(format!("saragossa-idle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dossier temporaire");
+        let file = dir.join("p.toml");
+        let path = file.to_str().expect("utf8").to_string();
+        let write = |text: &str| std::fs::write(&file, text).expect("écriture");
+        write("[serve]\nidle_unload_secs = 60\n");
+        let (second, _, _) = reload(Some(&path), &[], &[], &Profile::default(), &[]).expect("60");
+        assert_eq!(idle_unload_secs(), 60);
+        write("[serve]\n");
+        reload(Some(&path), &[], &[], &second, &[]).expect("0");
+        assert_eq!(idle_unload_secs(), 0, "60 puis 0 : le nouveau profil gagne");
+    }
+
     #[test]
     fn model_list_is_atomic_and_applied_by_the_engine() {
         let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

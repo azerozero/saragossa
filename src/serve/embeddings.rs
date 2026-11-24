@@ -35,6 +35,11 @@ impl EmbeddingsState {
         self.model = None;
     }
 
+    /// Libère le modèle ; vrai s'il était chargé.
+    pub(super) fn unload(&mut self) -> bool {
+        self.model.take().is_some()
+    }
+
     /// Construit l'état embeddings depuis le chemin CLI, sans charger les poids.
     pub(super) fn new(args: &ServeArgs) -> Self {
         Self {

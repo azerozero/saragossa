@@ -390,6 +390,21 @@ mod tests {
     use super::super::args::ServeArgs;
     use super::*;
 
+    // Le déchargement d'inactivité libère les modèles mais garde les sessions :
+    // une pause plus longue que le délai ne doit pas rendre « session inconnue ».
+    #[test]
+    fn idle_unload_keeps_stt_sessions() {
+        let args = ServeArgs::parse(["--model", "a=/x/a", "--backend", "cpu"].map(String::from))
+            .expect("args");
+        let mut audio = super::super::audio::AudioState::new(&args);
+        let (id, session) = audio.stt_sessions.open("fr".into(), Instant::now());
+        audio.stt_sessions.open.insert(id.clone(), session);
+        assert!(!audio.unload_models(), "rien de chargé");
+        assert!(audio.stt_sessions.open.contains_key(&id));
+        audio.invalidate();
+        assert!(audio.stt_sessions.open.is_empty(), "panique : tout part");
+    }
+
     #[test]
     fn sse_events_follow_openai_transcript_format() -> ServeResult<()> {
         assert_eq!(
