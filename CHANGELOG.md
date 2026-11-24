@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.39](https://github.com/azerozero/saragossa/compare/v0.3.38...v0.3.39) - 2026-11-24
+
+### Other
+
+- *(bench)* refroidissement entre les entrées, pas avant la première
+- *(bench)* réserves de la campagne de novembre et coût du mode strict
+- *(tts)* conversion bf16 comparée au lecteur safetensors sur tous les motifs
+- *(tts)* table text_embedding gardée en bf16
+- *(stt)* encodeur Whisper sans copie f32 GPU sous NA
+
 ## [0.3.38](https://github.com/azerozero/saragossa/compare/v0.3.37...v0.3.38) - 2026-11-24
 
 ### Fixed
