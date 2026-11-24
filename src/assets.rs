@@ -477,7 +477,7 @@ mod tests {
                 "eos_token_id":1
             }"#,
         );
-        save_test_tokenizer(
+        save_vocab_tokenizer(
             &tmp.path().join("tokenizer.json"),
             r#"{"<unk>":0,"<eos>":1,"bonjour":2,"<|eot_id|>":3,"<|eom_id|>":4}"#,
         );
@@ -489,13 +489,13 @@ mod tests {
     }
 
     fn save_gemma_test_tokenizer(path: &Path) {
-        save_test_tokenizer(
+        save_vocab_tokenizer(
             path,
             r#"{"<unk>":0,"<eos>":1,"bonjour":2,"<end_of_turn>":3}"#,
         );
     }
 
-    fn save_test_tokenizer(path: &Path, vocab: &str) {
+    fn save_vocab_tokenizer(path: &Path, vocab: &str) {
         use tokenizers::models::wordlevel::WordLevel;
         use tokenizers::pre_tokenizers::whitespace::Whitespace;
         use tokenizers::Tokenizer;

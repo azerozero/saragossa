@@ -900,7 +900,7 @@ pub(super) struct TensorFixture {
 }
 
 impl TensorFixture {
-    fn f32(shape: Vec<usize>, values: Vec<f32>) -> Self {
+    pub(super) fn f32(shape: Vec<usize>, values: Vec<f32>) -> Self {
         Self {
             dtype: Dtype::F32,
             shape,
