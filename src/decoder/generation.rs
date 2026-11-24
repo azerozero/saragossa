@@ -4255,6 +4255,22 @@ impl CausalDecoder {
             eprintln!("state_snapshot refusé : historique MTP absent; prefill normal");
         }
         if prefix_cache_enabled() {
+            // Après redémarrage ou éviction RAM, le tour suivant d'un agent
+            // prolonge le prompt : sa clé exacte n'est jamais sur SSD. La
+            // frontière alignée la plus longue passe par le cache RAM, qui la
+            // prolonge comme un hit mémoire.
+            // ponytail: un hit RAM plus court, consulté avant, reste préféré.
+            let (align, tail) = self.prefix_align_policy(prompt.len()).unwrap_or((1, 0));
+            let shorter = &prompt[..prompt.len().saturating_sub(tail.max(1))];
+            if let Some(state) =
+                self.load_persistent_boundary(shorter, align, 0, SnapshotMode::MtpCommitted)?
+            {
+                if let Some(history) = state.history.filter(super::mtp_history::compatible) {
+                    let boundary = &prompt[..state.cache.position];
+                    let pair = (state.cache, state.final_state);
+                    self.prefix_cache_put(boundary, &pair, Some(&history), None)?;
+                }
+            }
             if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt, on_final_state)? {
                 if hit.2.len() == prompt.len().saturating_sub(1) {
                     self.snapshot_save(&snapshot, &hit.0, &hit.1, Some(&hit.2), None);
