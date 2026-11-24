@@ -5772,32 +5772,41 @@ impl CausalDecoder {
     ///
     /// # Errors
     ///
-    /// Refuse un prompt vide, une architecture sans prefill batché ou un
-    /// prefill découpé en morceaux (`SARAGOSSA_RUST_PREFILL_CHUNK`).
+    /// Refuse, avant tout calcul, un prompt vide, une architecture sans prefill
+    /// batché ou un prefill découpé en morceaux (`SARAGOSSA_RUST_PREFILL_CHUNK`).
     #[cfg(feature = "devtools")]
-    pub fn teacher_forced_logits(&self, prompt: &[usize]) -> Result<Vec<Vec<f32>>> {
+    pub fn teacher_forced_logits(&self, prompt: &[usize]) -> Result<Tensor> {
         if prompt.is_empty() || !self.can_prefill_batched() {
             return Err(InferError::Config(
                 "teacher forcing: prompt vide ou prefill batché indisponible".into(),
             ));
         }
-        let (_, hidden, _) = self.prefill_cache_state_batched_per_op(prompt)?;
-        if hidden.as_matrix()?.0 != prompt.len() {
+        let chunk_size = prefill_chunk_size();
+        if chunk_size > 0 && chunk_size < prompt.len() {
             return Err(InferError::Config(
                 "teacher forcing: prefill en morceaux, désactiver SARAGOSSA_RUST_PREFILL_CHUNK"
                     .into(),
             ));
         }
+        let (_, hidden, _) = self.prefill_cache_state_batched_per_op(prompt)?;
         let states = rms_norm(&hidden, &self.final_norm, self.config.rms_eps)?;
         let logits = self
             .lm_head
             .forward_with_runtime(&states, self.forward_runtime())?;
-        (0..prompt.len())
-            .map(|row| {
-                let row = Tensor::row(logits.row_slice(row)?.to_vec())?;
-                Ok(self.finalize_logits(&row)?.into_data())
-            })
-            .collect()
+        let shape = logits.shape().to_vec();
+        if shape.first() != Some(&prompt.len()) {
+            return Err(InferError::Dimension(
+                "teacher forcing: une ligne de logits par position attendue".into(),
+            ));
+        }
+        // Même softcapping que `finalize_logits`, en place sur la matrice [T, V].
+        let mut data = logits.into_data();
+        if let Some(softcap) = self.config.final_logit_softcapping.filter(|c| *c > 0.0) {
+            for value in &mut data {
+                *value = (*value / softcap).tanh() * softcap;
+            }
+        }
+        Tensor::from_vec(shape, data)
     }
 
     fn prefill_cache_state_batched_chunked(

@@ -525,7 +525,9 @@ formule `Σ p·(ln(p+1e-9) − ln(q+1e-9))`, calculée en f64 au lieu du f32 MLX
 Les logits viennent du prefill batché du moteur et non de mlx-lm : la parité de
 bout en bout sur un vrai modèle n'est pas encore mesurée. `paired.py` et
 `kl_eval.py` restent la référence d'ici là. Le prefill en morceaux
-(`SARAGOSSA_RUST_PREFILL_CHUNK`) est refusé.
+(`SARAGOSSA_RUST_PREFILL_CHUNK`) est refusé. Les logits `[T, V]` f32 de la référence restent
+en mémoire pour tous les prompts (4·V·ΣT octets, ~120 Mo pour le jeu figé
+avec V = 248k) ; ceux du candidat sont comparés puis libérés prompt par prompt.
 
 ## Modèles publiés avec ces outils
 

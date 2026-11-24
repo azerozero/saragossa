@@ -280,12 +280,12 @@ fn synthetic_flint_teacher_forced_logits_match_prefix_forwards() {
     let rows = model
         .teacher_forced_logits(&prompt)
         .expect("invariant: teacher forcing CPU");
-    assert_eq!(rows.len(), prompt.len());
-    for (end, row) in rows.iter().enumerate() {
+    assert_eq!(rows.shape(), &[prompt.len(), VOCAB]);
+    for end in 0..prompt.len() {
+        let row = rows.row_slice(end).expect("invariant: ligne");
         let oracle = model
             .next_logits(&prompt[..=end])
             .expect("invariant: forward du préfixe");
-        assert_eq!(row.len(), VOCAB);
         for (got, want) in row.iter().zip(oracle.data()) {
             assert!(
                 (got - want).abs() < 1.0e-4,

@@ -76,19 +76,23 @@ pub(crate) fn run_kl_eval(args: impl Iterator<Item = String>) -> CliResult<()> {
         }
     }
     let prompts = kl_eval::load_prompts(prompts.as_deref())?;
+    // Seuls les logits de la référence restent en mémoire (4·V·ΣT octets) ;
+    // ceux du candidat sont comparés puis libérés prompt par prompt.
     println!("[1/2] forward référence {}...", reference.display());
-    let reference_logits = logits_for(&reference, &prompts, backend)?;
+    let mut reference_logits = Vec::with_capacity(prompts.len());
+    for_each_logits(&reference, &prompts, backend, |_, logits| {
+        reference_logits.push(logits);
+        Ok(())
+    })?;
     println!("[2/2] forward candidat {}...", candidate.display());
-    let candidate_logits = logits_for(&candidate, &prompts, backend)?;
     let (mut divergences, mut agreements) = (Vec::new(), Vec::new());
-    for (index, (reference, candidate)) in
-        reference_logits.iter().zip(&candidate_logits).enumerate()
-    {
-        let (divergence, agreement) = kl_eval::kl_and_agreement(reference, candidate)?;
+    for_each_logits(&candidate, &prompts, backend, |index, logits| {
+        let (divergence, agreement) = kl_eval::kl_and_agreement(&reference_logits[index], &logits)?;
         println!("prompt {index}: KL={divergence:.4}  accord_top1={agreement:.3}");
         divergences.push(divergence);
         agreements.push(agreement);
-    }
+        Ok(())
+    })?;
     let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
     println!(
         "\nmoyenne: KL={:.4}  accord_top1={:.3}",
@@ -99,25 +103,25 @@ pub(crate) fn run_kl_eval(args: impl Iterator<Item = String>) -> CliResult<()> {
     Ok(())
 }
 
-/// Logits `[prompt][position][vocab]` d'un modèle, libéré avant le suivant :
-/// un bf16 de 27B et son quantifié ne tiennent pas ensemble en mémoire.
-fn logits_for(
+/// Logits `[T, V]` de chaque prompt, passés à `visit` dans l'ordre ; le
+/// modèle est libéré avant le suivant : un bf16 de 27B et son quantifié ne
+/// tiennent pas ensemble en mémoire.
+fn for_each_logits(
     model_dir: &std::path::Path,
     prompts: &[String],
     backend: RuntimeKind,
-) -> CliResult<Vec<Vec<Vec<f32>>>> {
+    mut visit: impl FnMut(usize, saragossa::Tensor) -> CliResult<()>,
+) -> CliResult<()> {
     let assets = ModelAssets::load_local(model_dir)?;
     let decoder = load_decoder_with_runtime(&assets, backend)?;
-    prompts
-        .iter()
-        .map(|prompt| {
-            // Comme `tokenizer.encode` de mlx-lm : tokens spéciaux (BOS) inclus.
-            let ids: Vec<usize> = assets
-                .encode_prompt_with_special(prompt)?
-                .into_iter()
-                .map(|id| id as usize)
-                .collect();
-            Ok(decoder.teacher_forced_logits(&ids)?)
-        })
-        .collect()
+    for (index, prompt) in prompts.iter().enumerate() {
+        // Comme `tokenizer.encode` de mlx-lm : tokens spéciaux (BOS) inclus.
+        let ids: Vec<usize> = assets
+            .encode_prompt_with_special(prompt)?
+            .into_iter()
+            .map(|id| id as usize)
+            .collect();
+        visit(index, decoder.teacher_forced_logits(&ids)?)?;
+    }
+    Ok(())
 }

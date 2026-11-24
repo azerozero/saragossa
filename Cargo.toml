@@ -72,7 +72,7 @@ toml = { version = "1", default-features = false, features = ["parse", "serde"] 
 # Déjà présent via reqwest : `compression_ratio` Whisper (zlib, comme OpenAI).
 flate2 = { version = "1", optional = true }
 # preserve_order : ordre des questions de `decision` (déjà activé par llguidance).
-serde_json = { version = "1", features = ["raw_value", "preserve_order", "float_roundtrip"] }
+serde_json = { version = "1", features = ["raw_value", "preserve_order"] }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 rayon = "1"
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }

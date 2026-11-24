@@ -5,16 +5,15 @@
 //! de CPython (MT19937, `randrange` par rejet) et les sommes reproduisent
 //! `sum()` de CPython ≥ 3.12 (compensation de Neumaier) : la sortie est
 //! identique bit à bit à `paired.py` sous Python ≥ 3.12. Python ≤ 3.11 somme
-//! sans compensation et peut différer au dernier ULP. La lecture JSON exige
-//! la feature `float_roundtrip` de serde_json : sans elle, un flottant lu peut
-//! s'écarter d'un ULP de celui de `json.loads`.
+//! sans compensation et peut différer au dernier ULP. Les nombres sont relus
+//! depuis leur texte JSON pour un arrondi exact, comme `json.loads`.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 use crate::{InferError, Result};
 
@@ -136,40 +135,46 @@ struct Scores {
     reference: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ScoreFile {
+    prompts: BTreeMap<String, BTreeMap<String, Box<RawValue>>>,
+    ref_sha256: Option<String>,
+}
+
 fn load(path: &Path, metric: &str) -> Result<Scores> {
     let bytes = fs::read(path).map_err(|source| InferError::Io {
         path: path.into(),
         source,
     })?;
-    let data: Value = serde_json::from_slice(&bytes).map_err(|source| InferError::Json {
+    let data: ScoreFile = serde_json::from_slice(&bytes).map_err(|source| InferError::Json {
         path: path.into(),
         source,
     })?;
-    let where_ = || path.display().to_string();
     let prompts = data
-        .get("prompts")
-        .and_then(Value::as_object)
-        .ok_or_else(|| invalid(format!("{}: champ prompts absent", where_())))?
-        .iter()
+        .prompts
+        .into_iter()
         .map(|(id, entry)| {
-            let value = entry.get(metric).and_then(Value::as_f64);
-            let category = entry.get("category").and_then(Value::as_str);
+            // Texte brut et `str::parse` (arrondi exact, comme `json.loads`) :
+            // le parseur par défaut de serde_json peut s'écarter d'un ULP.
+            let value = entry
+                .get(metric)
+                .and_then(|raw| raw.get().parse::<f64>().ok());
+            let category = entry
+                .get("category")
+                .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok());
             match (value, category) {
-                (Some(value), Some(category)) if value.is_finite() => {
-                    Ok((id.clone(), (value, category.to_string())))
-                }
+                (Some(value), Some(category)) if value.is_finite() => Ok((id, (value, category))),
                 _ => Err(invalid(format!(
                     "{}: prompt {id} sans {metric} fini ou sans catégorie",
-                    where_()
+                    path.display()
                 ))),
             }
         })
         .collect::<Result<_>>()?;
-    let reference = data
-        .get("ref_sha256")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    Ok(Scores { prompts, reference })
+    Ok(Scores {
+        prompts,
+        reference: data.ref_sha256,
+    })
 }
 
 struct Aligned {
@@ -358,6 +363,7 @@ pub fn to_json(value: &impl Serialize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use std::path::PathBuf;
 
     fn write(dir: &Path, name: &str, values: &[f64], sha: &str) -> PathBuf {
@@ -447,7 +453,10 @@ mod tests {
         let candidate = write(dir, "cand.json", &values(-0.002, 0.005), "s");
         let out = diff(&candidate, &reference, "kl_mean").expect("invariant: diff");
         let expected = include_str!("paired_fixture_diff.json");
-        assert_eq!(to_json(&out).expect("invariant: JSON"), expected.trim_end());
+        assert_eq!(
+            to_json(&out).expect("invariant: JSON"),
+            expected.replace("\r\n", "\n").trim_end()
+        );
         let cells = [
             write(dir, "00.json", &values(0.0, 0.004), "s"),
             write(dir, "01.json", &values(0.001, 0.003), "s"),
@@ -460,7 +469,10 @@ mod tests {
         )
         .expect("invariant: factoriel");
         let expected = include_str!("paired_fixture_factorial.json");
-        assert_eq!(to_json(&out).expect("invariant: JSON"), expected.trim_end());
+        assert_eq!(
+            to_json(&out).expect("invariant: JSON"),
+            expected.replace("\r\n", "\n").trim_end()
+        );
     }
 
     #[test]

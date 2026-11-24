@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 
 use super::kl_ref::{normalize, top1};
-use crate::{InferError, Result};
+use crate::{InferError, Result, Tensor};
 
 /// Jeu figé de `kl_eval.py` : changer les prompts change les valeurs de KL.
 pub const DEFAULT_PROMPTS: [&str; 5] = [
@@ -63,20 +63,19 @@ fn probabilities(logits: &[f32]) -> Result<Vec<f64>> {
 }
 
 /// KL(référence ‖ candidat) moyenne et accord top-1 sur les positions d'un
-/// prompt, à partir des logits bruts `[T][V]` des deux modèles.
+/// prompt, à partir des logits bruts `[T, V]` des deux modèles.
 ///
 /// # Errors
 ///
-/// Refuse des positions ou vocabulaires différents et des logits non finis.
-pub fn kl_and_agreement(reference: &[Vec<f32>], candidate: &[Vec<f32>]) -> Result<(f64, f64)> {
-    if reference.is_empty() || reference.len() != candidate.len() {
-        return Err(invalid("nombre de positions différent ou nul"));
+/// Refuse des formes différentes ou vides et des logits non finis.
+pub fn kl_and_agreement(reference: &Tensor, candidate: &Tensor) -> Result<(f64, f64)> {
+    let (positions, _) = reference.as_matrix()?;
+    if positions == 0 || reference.shape() != candidate.shape() {
+        return Err(invalid("formes [T, V] différentes ou vides"));
     }
     let (mut divergence, mut agreement) = (0.0, 0.0);
-    for (reference, candidate) in reference.iter().zip(candidate) {
-        if reference.len() != candidate.len() {
-            return Err(invalid("vocabulaires différents"));
-        }
+    for row in 0..positions {
+        let (reference, candidate) = (reference.row_slice(row)?, candidate.row_slice(row)?);
         let p = probabilities(reference)?;
         let q = probabilities(candidate)?;
         divergence += p
@@ -86,20 +85,24 @@ pub fn kl_and_agreement(reference: &[Vec<f32>], candidate: &[Vec<f32>]) -> Resul
             .sum::<f64>();
         agreement += f64::from(top1(reference) == top1(candidate));
     }
-    let positions = reference.len() as f64;
-    Ok((divergence / positions, agreement / positions))
+    Ok((divergence / positions as f64, agreement / positions as f64))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn matrix(rows: &[&[f32]]) -> Tensor {
+        let data = rows.iter().flat_map(|row| row.iter().copied()).collect();
+        Tensor::from_vec([rows.len(), rows[0].len()], data).expect("invariant: matrice")
+    }
+
     /// Valeurs de `kl_and_agreement` de `kl_eval.py` réécrit en Python pur
     /// (f64, `math.exp`/`math.log`), sur deux positions et quatre classes.
     #[test]
     fn parity_with_kl_eval_formula() {
-        let reference = vec![vec![1.0, 2.0, 0.5, -1.0], vec![0.0, 0.0, 3.0, 1.0]];
-        let candidate = vec![vec![1.2, 1.8, 0.4, -0.5], vec![0.1, 0.0, 2.5, 1.5]];
+        let reference = matrix(&[&[1.0, 2.0, 0.5, -1.0], &[0.0, 0.0, 3.0, 1.0]]);
+        let candidate = matrix(&[&[1.2, 1.8, 0.4, -0.5], &[0.1, 0.0, 2.5, 1.5]]);
         let (kl, agreement) =
             kl_and_agreement(&reference, &candidate).expect("invariant: métriques");
         assert!((kl - 0.043_577_677_686_705_035).abs() < 1e-15, "{kl}");
@@ -107,18 +110,17 @@ mod tests {
         let (same, agreement) =
             kl_and_agreement(&reference, &reference).expect("invariant: identité");
         assert_eq!((same, agreement), (0.0, 1.0));
-        let swapped = vec![vec![2.0, 1.0, 0.5, -1.0], reference[1].clone()];
+        let swapped = matrix(&[&[2.0, 1.0, 0.5, -1.0], &[0.0, 0.0, 3.0, 1.0]]);
         let (_, agreement) = kl_and_agreement(&reference, &swapped).expect("invariant: accord");
         assert_eq!(agreement, 0.5);
     }
 
     #[test]
     fn rejects_mismatched_shapes_and_non_finite_logits() {
-        let row = vec![0.0_f32, 1.0];
-        assert!(kl_and_agreement(&[], &[]).is_err());
-        assert!(kl_and_agreement(std::slice::from_ref(&row), &[]).is_err());
-        assert!(kl_and_agreement(std::slice::from_ref(&row), &[vec![0.0]]).is_err());
-        assert!(kl_and_agreement(&[row], &[vec![f32::NAN, 0.0]]).is_err());
+        let row = matrix(&[&[0.0, 1.0]]);
+        assert!(kl_and_agreement(&row, &matrix(&[&[0.0]])).is_err());
+        assert!(kl_and_agreement(&row, &matrix(&[&[0.0, 1.0], &[0.0, 1.0]])).is_err());
+        assert!(kl_and_agreement(&row, &matrix(&[&[f32::NAN, 0.0]])).is_err());
     }
 
     #[test]
