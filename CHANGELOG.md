@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.36](https://github.com/azerozero/saragossa/compare/v0.3.35...v0.3.36) - 2026-11-24
+
+### Added
+
+- *(devtools)* portage Rust de paired.py et kl_eval.py
+
+### Fixed
+
+- *(devtools)* lecture exacte locale à paired et kl-eval borné en mémoire
+- *(serve)* le prefill MTP relit la frontière SSD la plus longue
+
+### Other
+
+- Merge pull request #347 from azerozero/feat/quant-rs-paired-kl
+- *(bench)* JSON tronqué, tours attendus et DONE périmé contrôlés
+- Merge remote-tracking branch 'origin/main' into test/tour-agent-ttft
+- *(bench)* tours en échec et mesures reprises refusées
+- *(perf)* l'édition de contrôle porte sur le milieu du prompt
+- *(bench)* passe invalide rejouée, abandon explicite après deux rejets
+- *(serve)* reprise SSD MTP identique au prefill à froid
+- *(perf)* TTFT d'un tour d'agent avec cache de préfixe
+- *(bench)* TTFT d'un tour d'agent avec cache de préfixe RAM et SSD
+- *(serve)* tour d'agent, seul le delta est prérempli et la sortie égale le froid
+
 ## [0.3.35](https://github.com/azerozero/saragossa/compare/v0.3.34...v0.3.35) - 2026-11-24
 
 ### Added
