@@ -731,4 +731,8 @@ fn every_rope_field_mismatch_is_rejected() {
         .resolve()
         .expect_err("invariant: entiers distincts au-delà de 2^53 refusés");
     assert!(err.to_string().contains("contradictoires"), "{err}");
+    let err = llama_with_rope(&big("9007199254740993"), &big("9007199254740992.0"))
+        .resolve()
+        .expect_err("invariant: entier non représentable et flottant voisin refusés");
+    assert!(err.to_string().contains("contradictoires"), "{err}");
 }

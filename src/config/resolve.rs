@@ -70,16 +70,23 @@ impl RawModelConfig {
                                 ]
                                 .iter()
                                 .any(|key| {
-                                    // `8` et `8.0` désignent le même facteur ; deux entiers
-                                    // restent comparés exactement, sans passer par f64.
+                                    // `8` et `8.0` désignent le même facteur. Un entier que
+                                    // f64 n'a pas exactement reste comparé tel quel.
+                                    let exact_f64 = |v: Option<&serde_json::Value>| {
+                                        let v = v?;
+                                        let x = v.as_f64()?;
+                                        let exact = match (v.as_i64(), v.as_u64()) {
+                                            (Some(i), _) => {
+                                                x as i64 == i && x.abs() < 2f64.powi(53)
+                                            }
+                                            (None, Some(u)) => x as u64 == u && x < 2f64.powi(53),
+                                            _ => true,
+                                        };
+                                        exact.then_some(x)
+                                    };
                                     let (a, b) = (existing.get(*key), rope.get(*key));
-                                    let both_int = a.is_some_and(|v| v.is_i64() || v.is_u64())
-                                        && b.is_some_and(|v| v.is_i64() || v.is_u64());
-                                    match (
-                                        a.and_then(serde_json::Value::as_f64),
-                                        b.and_then(serde_json::Value::as_f64),
-                                    ) {
-                                        (Some(x), Some(y)) if !both_int => x != y,
+                                    match (exact_f64(a), exact_f64(b)) {
+                                        (Some(x), Some(y)) => x != y,
                                         _ => a != b,
                                     }
                                 });
