@@ -121,14 +121,12 @@ pub(super) fn zero_grid(
         }
         let s = s as f32;
         // Zéro exact : k = 2^t·impair ; échelle à 8 − bits(impair) bits
-        // significatifs, produit k·s exact sur les 8 bits du bf16.
+        // significatifs (au moins 1 : une puissance de deux décale seulement
+        // l'impair, même à 8 bits), produit k·s exact sur les 8 bits du bf16.
         let odd = (k as u32) >> (k as u32).trailing_zeros().min(31);
-        let p = 8 - (32 - odd.leading_zeros());
-        let exact = (p >= 1).then(|| round_significand(s, p));
-        for scale in [Some(bf16_value(bf16_bits(s))), exact]
-            .into_iter()
-            .flatten()
-        {
+        let p = 8_u32.saturating_sub(32 - odd.leading_zeros()).max(1);
+        let exact = round_significand(s, p);
+        for scale in [bf16_value(bf16_bits(s)), exact] {
             let bias = -(k as f32 * scale);
             if let Some(cand) = eval(scale, bias, q) {
                 if best.is_none_or(|(_, e)| cand.2 < e) {
@@ -447,7 +445,8 @@ mod tests {
 
     /// Sans grille à zéro retenue, chaque groupe sort identique au bit près ;
     /// quand elle l'est, l'erreur baisse strictement et un code restitue 0
-    /// (au demi-ulp bf16 du biais près).
+    /// (au demi-ulp bf16 du biais près, exactement sur la branche « zéro
+    /// exact », qui doit être retenue au moins une fois).
     #[test]
     fn zero_grid_changes_only_groups_it_improves() {
         let data: Vec<f32> = (0..64 * 256)
@@ -468,7 +467,7 @@ mod tests {
             let (d0, p0, s0, b0) = run(false);
             let (d1, p1, s1, b1) = run(true);
             let words = 2 * bits;
-            let (mut same, mut changed) = (0, 0);
+            let (mut same, mut changed, mut exact) = (0, 0, 0);
             for (g, values) in data.chunks(64).enumerate() {
                 let range = g * 64..(g + 1) * 64;
                 let err = |d: &[f32]| -> f64 {
@@ -495,8 +494,14 @@ mod tests {
                     (k * s + b).abs() <= b.abs() / 256.0,
                     "{bits} bits, groupe {g}"
                 );
+                // Branche « zéro exact » : le code k restitue 0 au bit près.
+                if k * s + b == 0.0 && d1[range.clone()].contains(&0.0) {
+                    exact += 1;
+                }
             }
             assert!(same > 0, "{bits} bits : {changed} groupes changés");
+            assert!(changed > 0, "{bits} bits : grille à zéro jamais retenue");
+            assert!(exact > 0, "{bits} bits : zéro exact jamais restitué");
         }
     }
 }
