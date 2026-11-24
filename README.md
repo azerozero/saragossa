@@ -10,7 +10,8 @@
 **Pure-Rust Metal inference engine for Apple Silicon.** Raw `metal-rs` kernels,
 no Python, no MLX, no CoreML. LLM, speech-to-text and text-to-speech in a single
 binary — usable as a library or behind the OpenAI-compatible HTTP server
-`saragossa serve`.
+`saragossa serve`. One process can run a full local voice loop: speech-to-text,
+speaker diarization, the LLM and streamed text-to-speech.
 
 ## Install
 
@@ -150,6 +151,15 @@ tokens. Source: [`campagne-2026-11/21-final`](bench/competitors/data/campagne-20
 (`summary.json`, `freeze.json`, full journal), described in the
 [campaign README](bench/competitors/data/campagne-2026-11/README.md).
 
+Reproduce on your own machine (the harness freezes versions, weights hashes and
+hardware before measuring; set your paths in `local.env` first):
+
+```bash
+cp bench/competitors/local.env.example bench/competitors/local.env
+python3 -I -B bench/competitors/campaign.py run runs/mine --dry-run  # check everything, measure nothing
+python3 -I -B bench/competitors/campaign.py run runs/mine            # full campaign, resumable
+```
+
 ### 27B, 4-bit
 
 | engine | 512 | 4096 | 16384 |
@@ -184,9 +194,10 @@ Caveats:
 - llama.cpp runs GGUF weights (Q4_K_M for the 4-bit row, a BF16 GGUF for the
   BF16 row), not the MLX weights the other engines load, so the weights are not
   identical. llama.cpp was not measured on the 35B-A3B in this run.
-- The `mlx-vlm` 0.8.0 MTP and DFlash outputs are not bit-identical to its own
-  AR output; saragossa's greedy speculative output matches its AR decode except
-  at near-ties, with an exact opt-in strict mode (see below).
+- This campaign does not test output identity: each request carries its own
+  nonce. saragossa's greedy speculative output is checked against its AR decode
+  by separate tests; it matches except at near-ties, with an exact opt-in strict
+  mode (see below).
 - Results hold for this hardware, these models and these prompts; measure on
   your own machine before choosing.
 
