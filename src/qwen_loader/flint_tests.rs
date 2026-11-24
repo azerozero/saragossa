@@ -271,6 +271,34 @@ fn router_defaults_to_sigmoid_for_flint_only() {
     assert!(config.router_score().is_err());
 }
 
+/// Chaque ligne du teacher forcing égale le forward sans cache du préfixe.
+#[cfg(feature = "devtools")]
+#[test]
+fn synthetic_flint_teacher_forced_logits_match_prefix_forwards() {
+    let model = load(flint_tensors(true)).expect("invariant: flint synthétique chargeable");
+    let prompt = [1, 2, 3, 4];
+    let rows = model
+        .teacher_forced_logits(&prompt)
+        .expect("invariant: teacher forcing CPU");
+    assert_eq!(rows.len(), prompt.len());
+    for (end, row) in rows.iter().enumerate() {
+        let oracle = model
+            .next_logits(&prompt[..=end])
+            .expect("invariant: forward du préfixe");
+        assert_eq!(row.len(), VOCAB);
+        for (got, want) in row.iter().zip(oracle.data()) {
+            assert!(
+                (got - want).abs() < 1.0e-4,
+                "position {end}: {got} != {want}"
+            );
+        }
+    }
+    let (kl, agreement) =
+        crate::devtools::kl_eval::kl_and_agreement(&rows, &rows).expect("invariant: KL identité");
+    assert_eq!((kl, agreement), (0.0, 1.0));
+    assert!(model.teacher_forced_logits(&[]).is_err());
+}
+
 #[test]
 fn synthetic_flint_loads_and_generates_on_cpu() {
     let model = load(flint_tensors(true)).expect("invariant: flint synthétique chargeable");

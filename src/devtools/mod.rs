@@ -2,8 +2,10 @@
 
 pub mod convert;
 pub mod dflash;
+pub mod kl_eval;
 pub mod kl_ref;
 pub(crate) mod layer_dump;
+pub mod paired;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 mod pairwise;
 

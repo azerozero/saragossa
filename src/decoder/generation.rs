@@ -5766,6 +5766,40 @@ impl CausalDecoder {
         Ok((cache, hidden, final_state))
     }
 
+    /// Logits finalisés de chaque position du prompt (teacher forcing) :
+    /// la ligne `i` prédit le token `i + 1`. Prefill batché per-op en un seul
+    /// morceau, sans cache de préfixe ni chemin résident.
+    ///
+    /// # Errors
+    ///
+    /// Refuse un prompt vide, une architecture sans prefill batché ou un
+    /// prefill découpé en morceaux (`SARAGOSSA_RUST_PREFILL_CHUNK`).
+    #[cfg(feature = "devtools")]
+    pub fn teacher_forced_logits(&self, prompt: &[usize]) -> Result<Vec<Vec<f32>>> {
+        if prompt.is_empty() || !self.can_prefill_batched() {
+            return Err(InferError::Config(
+                "teacher forcing: prompt vide ou prefill batché indisponible".into(),
+            ));
+        }
+        let (_, hidden, _) = self.prefill_cache_state_batched_per_op(prompt)?;
+        if hidden.as_matrix()?.0 != prompt.len() {
+            return Err(InferError::Config(
+                "teacher forcing: prefill en morceaux, désactiver SARAGOSSA_RUST_PREFILL_CHUNK"
+                    .into(),
+            ));
+        }
+        let states = rms_norm(&hidden, &self.final_norm, self.config.rms_eps)?;
+        let logits = self
+            .lm_head
+            .forward_with_runtime(&states, self.forward_runtime())?;
+        (0..prompt.len())
+            .map(|row| {
+                let row = Tensor::row(logits.row_slice(row)?.to_vec())?;
+                Ok(self.finalize_logits(&row)?.into_data())
+            })
+            .collect()
+    }
+
     fn prefill_cache_state_batched_chunked(
         &self,
         prompt: &[usize],
