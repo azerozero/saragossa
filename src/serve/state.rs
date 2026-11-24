@@ -2155,6 +2155,62 @@ mod tests {
         );
     }
 
+    /// Tour d'agent : au tour N+1 seuls les nouveaux tokens sont préremplis,
+    /// la sortie greedy ne dépend pas du cache, et une modification au milieu
+    /// de l'historique invalide la réutilisation.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    #[ignore = "requiert un device Metal ; GPU synthétique exécuté par gpu-synthetic.yml"]
+    fn agent_turn_prefills_only_new_tokens_and_matches_cold() {
+        let mut loaded = super::json_tests::tiny_loaded_model();
+        loaded.decoder = loaded
+            .decoder
+            .with_metal_runtime()
+            .expect("invariant: runtime Metal attaché");
+        loaded.prefix_cache = BlockAwarePrefixCache::new(1, 8);
+        let guard = MemoryGuard::disabled();
+        let history: Vec<usize> = (0..40).map(|i| (i * 7 + i / 3) % 2).collect();
+        let mut next = history.clone();
+        next.extend([1, 0, 1]);
+        let generate = |loaded: &LoadedModel, state| {
+            loaded
+                .decoder
+                .generate_greedy_timed_from_prompt_state_with_options(
+                    state,
+                    Duration::ZERO,
+                    6,
+                    &GenerationOptions::default(),
+                )
+                .unwrap()
+                .tokens
+        };
+
+        let (_, reused, _) = loaded
+            .prefill_prompt_state(&history, Some("agent"), &guard)
+            .unwrap();
+        assert_eq!(reused, 0, "tour N à froid");
+        let (state, reused, _) = loaded
+            .prefill_prompt_state(&next, Some("agent"), &guard)
+            .unwrap();
+        assert_eq!(
+            reused,
+            history.len(),
+            "tour N+1 : seul le delta est préérempli"
+        );
+        let cold = loaded.decoder.prefill_prompt_state_uncached(&next).unwrap();
+        assert_eq!(generate(&loaded, state), generate(&loaded, cold));
+
+        let mut edited = next.clone();
+        edited[history.len() / 2] ^= 1;
+        let (_, reused, _) = loaded
+            .prefill_prompt_state(&edited, Some("agent"), &guard)
+            .unwrap();
+        assert_eq!(
+            reused, 0,
+            "historique modifié : le cache ne doit pas servir"
+        );
+    }
+
     #[test]
     fn usize_to_u64_saturating_keeps_small_values() {
         assert_eq!(usize_to_u64_saturating(42), 42);
