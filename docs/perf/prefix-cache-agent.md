@@ -10,7 +10,7 @@ Modèle : Qwen3.8-27B 4 bits, M5 Max. Mesure : `prefill_ms` du tour N+1
 | 16k | cache RAM | 0,30 s | prompt N |
 | 16k | cache SSD, avant correctif | 19,7 s | 0 |
 | 16k | cache SSD, après correctif | 1,87 s | 15232 |
-| 16k | édition en tête du prompt | 20,6 à 21,8 s | 0 (attendu) |
+| 16k | édition au milieu du prompt | 20,6 à 21,8 s | 0 (attendu) |
 | 32k | froid | 45,1 s | 0 |
 | 32k | cache RAM | 0,44 s | prompt N |
 | 32k | cache SSD, après correctif | non re-mesuré | |
