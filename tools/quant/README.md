@@ -51,6 +51,26 @@ Sans `--imatrix`, `mixed_quant.py --target-bpw` classe en espace des poids
 remplit un template imatrix sans pondération. Résultats de la campagne ≤ 4,2 bpw :
 [docs/perf/quant-campagne-42bpw.md](../../docs/perf/quant-campagne-42bpw.md).
 
+### Mistral-7B v0.3 : la LS perd contre `mx.quantize`
+
+La KL top-64 est mesurée dans mlx-lm contre la référence f32 `kld/mistral7b` sur 2048 positions. saragossa trouve la même valeur, à 2e-4 près.
+
+- **Constat.** Le u4 LS de `convert` donne 0,188, contre 0,175 pour `mlx_lm.convert` q4, au même débit de 4,50 bpw.
+- **Cause.** Presque toute la perte vient de `layers.1.mlp.down_proj`, et plus précisément de sa colonne d'entrée 7310. Cette colonne est une super-activation : son E[x²] vaut 2290, contre environ 2e-5 ailleurs, et elle porte 89 % de l'erreur pondérée du module. Ses poids sont quasi nuls.
+- **Pourquoi MLX s'en sort mieux.** Sa grille contient le zéro exact (biais = q0·s), et 3921 de ces 4096 poids reviennent exactement à 0. Notre LS déplace le biais : seulement 680 reviennent à 0, et les autres prennent un bruit que la super-activation amplifie.
+- **Les super-poids n'y sont pour rien.** Forcer le bord exact pour les groupes à plus de 50× la médiane de ligne ne change rien (KL 0,1883). Cette expérience est conservée hors de main.
+- **Recettes**, avec `--bits-for` et `--imatrix` de la branche `feat/convert-imatrix` :
+
+  | recette | bpw | KL |
+  |---|---|---|
+  | `--bits-for layers.1.mlp.down_proj=8` | 4,53 | 0,156 |
+  | `--imatrix` | 4,50 | 0,126 |
+  | `--imatrix --bits-for v_proj=8` | 4,57 | 0,112 |
+
+  L'imatrix se capture avec `imatrix.py`, qui accepte les modèles sans préfixe `language_model.`.
+
+Piste non mesurée : un candidat LS « zéro exact » (contrainte b = −k·s) pour les colonnes à |w| anormalement petit, comme recette sans corpus.
+
 ## Qwen3.8-27B : alternative GPTQ à 4,2 bpw
 
 GPTQ collecte `H = XᵀX / N` sur les entrées BF16, puis quantifie colonne par
