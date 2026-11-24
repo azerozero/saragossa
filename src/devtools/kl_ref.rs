@@ -231,7 +231,7 @@ fn log_softmax(logits: &[f32]) -> Result<Vec<f32>> {
         .collect()
 }
 
-fn normalize(values: &[f32]) -> Result<Vec<f64>> {
+pub(super) fn normalize(values: &[f32]) -> Result<Vec<f64>> {
     if values.is_empty() || values.iter().any(|x| !x.is_finite()) {
         return Err(invalid("distribution vide ou non finie"));
     }
@@ -247,7 +247,7 @@ fn normalize(values: &[f32]) -> Result<Vec<f64>> {
         .collect())
 }
 
-fn top1(values: &[f32]) -> usize {
+pub(super) fn top1(values: &[f32]) -> usize {
     // Premier indice en cas d'égalité, comme l'argmax greedy du moteur.
     values
         .iter()

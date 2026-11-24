@@ -7,7 +7,7 @@ fabriquer des poids, pas à les exécuter.
 | Fichier | Rôle |
 |---|---|
 | `mixed_quant.py` | Alloue deux largeurs de bits par couche selon la sensibilité, écrit un modèle MLX |
-| `kl_eval.py` | Mesure KL(bf16 ‖ quantifié) et l'accord top-1, en teacher forcing |
+| `kl_eval.py` | Mesure KL(bf16 ‖ quantifié) et l'accord top-1, en teacher forcing (portage : `saragossa kl-eval`) |
 | `test_allocation.py` | Tests de la logique d'allocation, sans dépendance à MLX |
 | `convert_ls.py` | Re-quantifie en affine gs64 (3/4/5/6/8 bits, selon le template) par moindres carrés, éventuellement pondérés par l'imatrix |
 | `gptq.py` | Quantification de second ordre, Hessienne complète par module/expert, mêmes largeurs et format que le template |
@@ -20,7 +20,7 @@ fabriquer des poids, pas à les exécuter.
 | `tokenizer_sidecar.py` | Recopie `tokenizer.json` de la source à l'identique et refuse une regex de pré-tokenizer réécrite par transformers (`test_tokenizer_sidecar.py`) |
 | `chat_kl.py` | KL en régime chat contre les poids officiels bf16 (référence transformers, candidat mlx-lm) ; `--prompts`, `--json` par prompt, `--full-vocab`, `--reverse` |
 | `prompt_sets.py` | Ensembles figés `sets/selection.json` et `sets/validation.json` (aveugle), disjonction et SHA-256 |
-| `paired.py` | Différences appariées par prompt, IC 95 % bootstrap, plan factoriel 2×2 |
+| `paired.py` | Différences appariées par prompt, IC 95 % bootstrap, plan factoriel 2×2 (portage : `saragossa paired`) |
 | `audit_bytes.py` | bpw langage et total depuis les en-têtes safetensors, refus au-delà d'une limite |
 
 ## Conversion native, sans Python
@@ -502,6 +502,32 @@ Conserver le même vocabulaire et la même correspondance token/id entre modèle
 du token imposé) et `mean_abs_delta_p` (moyenne absolue sur les entrées `[n, vocab]`). Les log-probabilités f32 des deux côtés sont
 renormalisées en f64 pour les métriques. La KL couvre tout le vocabulaire ;
 ce format est propre au moteur, sans compatibilité binaire llama.cpp.
+
+## Portages Rust de `paired.py` et `kl_eval.py`
+
+Avec la feature `devtools` (active par défaut) :
+
+```bash
+saragossa paired diff CANDIDAT.json REFERENCE.json [--metric kl_mean]
+saragossa paired factorial A0F0.json A0F1.json A1F0.json A1F1.json
+saragossa kl-eval --reference MODELE-bf16 --candidate MODELE-quantifie [--prompts F] [--backend cpu|metal]
+```
+
+`paired` lit les mêmes JSON (`chat_kl.py eval --json`) et rend le même JSON
+que `paired.py` : générateur MT19937 de `random.Random(0)`, sommes compensées
+comme `sum()` de Python ≥ 3.12. Sur la fixture de
+`src/devtools/paired.rs`, la sortie est identique octet pour octet à
+`python3.13 paired.py`. Python 3.9 somme sans compensation et diffère au
+dernier ULP. Une valeur non finie est refusée au chargement.
+
+`kl-eval` garde les prompts figés, la tokenisation avec tokens spéciaux et la
+formule `Σ p·(ln(p+1e-9) − ln(q+1e-9))`, calculée en f64 au lieu du f32 MLX.
+Les logits viennent du prefill batché du moteur et non de mlx-lm : la parité de
+bout en bout sur un vrai modèle n'est pas encore mesurée. `paired.py` et
+`kl_eval.py` restent la référence d'ici là. Le prefill en morceaux
+(`SARAGOSSA_RUST_PREFILL_CHUNK`) est refusé. Les logits `[T, V]` f32 de la référence restent
+en mémoire pour tous les prompts (4·V·ΣT octets, ~120 Mo pour le jeu figé
+avec V = 248k) ; ceux du candidat sont comparés puis libérés prompt par prompt.
 
 ## Modèles publiés avec ces outils
 
