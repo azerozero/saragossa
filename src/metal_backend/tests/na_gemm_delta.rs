@@ -337,17 +337,31 @@ fn na_gemm_src_compiles() -> Result<()> {
             });
         // Chaque noyau littéral doit donner un pipeline : un `None` du runtime
         // ferait retomber son chemin en f32 sans erreur.
-        let names: Vec<&str> = NA_GEMM_SRC
+        let literal = |name: &&str| {
+            name.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        };
+        let mut names: Vec<&str> = NA_GEMM_SRC
             .split("kernel void ")
-            .skip(1)
-            .filter_map(|rest| rest.split('(').next())
+            .collect::<Vec<_>>()
+            .windows(2)
+            // NOTE: un noyau `template <…>` n'existe dans la bibliothèque que
+            // sous les `host_name` de ses instanciations, vérifiées ci-dessous.
+            .filter(|pair| !pair[0].trim_end().ends_with('>'))
+            .filter_map(|pair| pair[1].split('(').next())
             .map(str::trim)
             // Les noyaux générés par macro (`NAME`, `##BM`) n'ont pas de nom littéral.
-            .filter(|name| {
-                name.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-            })
+            .filter(literal)
             .collect();
+        // Instanciations par macro en tête de ligne : `MACRO(nom_du_noyau, …)`.
+        names.extend(
+            NA_GEMM_SRC
+                .lines()
+                .filter(|line| line.starts_with(|c: char| c.is_ascii_uppercase()))
+                .filter_map(|line| line.split_once('(')?.1.split([',', ')']).next())
+                .map(str::trim)
+                .filter(|name| name.starts_with("gemm_") && literal(name)),
+        );
         assert!(names.contains(&"gemm_nax"), "analyse des noyaux NA vide");
         for name in names {
             let function = library
