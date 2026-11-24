@@ -10,6 +10,12 @@ use super::*;
 use std::ffi::c_void;
 
 impl MetalExecutor {
+    /// Vrai si l'encodeur Whisper résident passe ses projections par le GEMM
+    /// NA bf16 : leurs poids f32 GPU sont alors inutiles.
+    pub(crate) fn whisper_encoder_na_available(&self) -> bool {
+        self.na_gemm_bf16.is_some() && super::whisper_bf16_gemm_enabled()
+    }
+
     /// Encode une LayerNorm ligne par ligne : `out = (x-µ)/σ · weight + bias`.
     #[allow(
         clippy::too_many_arguments,
@@ -544,8 +550,7 @@ impl MetalExecutor {
         // Chemin bf16 matmul2d NA (`SARAGOSSA_STT_BF16`) : opérandes lhs convertis bf16,
         // poids déjà cachés en bf16 (`weight_na`). Accumulation f32 → transcription
         // préservée (vérifié golden). Sinon : GEMM dense f32 byte-identique.
-        let na = self.na_gemm_bf16.is_some()
-            && super::whisper_bf16_gemm_enabled()
+        let na = self.whisper_encoder_na_available()
             && enc.layers.iter().all(|l| {
                 l.q.weight_na.is_some()
                     && l.k.weight_na.is_some()
@@ -613,7 +618,15 @@ impl MetalExecutor {
                 #[cfg(feature = "diar")]
                 (Some(qkv), false) => {
                     let n3 = 3 * dim;
-                    self.encode_dense_gemm(encoder, &normed, &qkv.weight, &qkv_buf, seq, n3, dim)?;
+                    self.encode_dense_gemm(
+                        encoder,
+                        &normed,
+                        qkv.f32_weight()?,
+                        &qkv_buf,
+                        seq,
+                        n3,
+                        dim,
+                    )?;
                     self.encode_proj_bias(encoder, &qkv_buf, qkv.bias.as_ref(), seq, n3)?;
                     self.encode_split_qkv(encoder, &qkv_buf, [&q, &k, &v], seq, dim)?;
                 }
@@ -839,7 +852,7 @@ impl MetalExecutor {
                 .ok_or_else(|| InferError::Config("encodeur NA: weight_na manquant".to_string()))?;
             self.encode_na_gemm(encoder, lhs_bf16, wna, out, m, n, k)
         } else {
-            self.encode_dense_gemm(encoder, lhs_f32, &proj.weight, out, m, n, k)
+            self.encode_dense_gemm(encoder, lhs_f32, proj.f32_weight()?, out, m, n, k)
         }
     }
 
@@ -865,7 +878,7 @@ impl MetalExecutor {
                 );
             }
         }
-        self.encode_dense_qmv(encoder, lhs, &proj.weight, out, 0, 1, out_dim, in_dim)
+        self.encode_dense_qmv(encoder, lhs, proj.f32_weight()?, out, 0, 1, out_dim, in_dim)
     }
 
     /// QMV d'une projection d'attention decode : poids bf16 en opt-in
@@ -899,7 +912,7 @@ impl MetalExecutor {
         self.encode_dense_qmv(
             encoder,
             lhs,
-            &proj.weight,
+            proj.f32_weight()?,
             out,
             out_offset,
             1,
@@ -1284,12 +1297,22 @@ pub(crate) struct WhisperResidentNorm {
 
 /// Poids GPU d'une projection dense Whisper (biais optionnel).
 pub(crate) struct WhisperResidentProj {
-    pub weight: Buffer,
+    /// Poids f32 row-major `[N,K]` ; `None` quand le GEMM NA bf16 le remplace
+    /// toujours (encodeur), pour ne pas garder une copie GPU jamais lue.
+    pub weight: Option<Buffer>,
     pub bias: Option<Buffer>,
     /// Poids transposé bf16 `rhs^T [K,N]` pour le GEMM NA (Some si `SARAGOSSA_STT_BF16`).
     pub weight_na: Option<Buffer>,
     /// Poids bf16 row-major `[N,K]` pour le QMV decode M=1.
     pub weight_bf16: Option<Buffer>,
+}
+
+impl WhisperResidentProj {
+    fn f32_weight(&self) -> Result<&Buffer> {
+        self.weight
+            .as_ref()
+            .ok_or_else(|| InferError::Config("projection Whisper sans poids f32".to_string()))
+    }
 }
 
 /// Poids GPU d'une couche encodeur Whisper.

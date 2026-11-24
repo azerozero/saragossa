@@ -36,8 +36,7 @@ impl TtsModel {
         let q_bits = usize::try_from(assets.model_config.quantization.bits)
             .map_err(|_| InferError::Config("bits TTS négatif".to_string()))?;
 
-        let text_embedding =
-            talker_header.read_dense_tensor("talker.model.text_embedding.weight")?;
+        let text_embedding = talker_header.read_row_table("talker.model.text_embedding.weight")?;
         let codec_embedding =
             talker_header.read_dense_tensor("talker.model.codec_embedding.weight")?;
         let text_projection_fc1 = read_linear_layer(
@@ -82,9 +81,9 @@ impl TtsModel {
             // vocabulaire complet, comme pour le code predictor ci-dessous.
             DecoderTensor::Dense(
                 if crate::runtime_flags::tts_compact_talker_embedding_enabled() {
-                    Tensor::zeros(vec![1, text_embedding.as_matrix()?.1])?
+                    Tensor::zeros(vec![1, text_embedding.cols()?])?
                 } else {
-                    text_embedding.clone()
+                    text_embedding.to_tensor()?
                 },
             ),
         );
