@@ -440,6 +440,26 @@ fn imatrix_uniform_is_identity_and_bits_for_overrides() {
     };
     assert_ne!(lm_head(&weighted), lm_head(&plain));
 
+    // Un rapport dans la source ou la sortie est refusé avant toute écriture.
+    let before = std::fs::read(src.join(SHARDS[0])).expect("invariant: shard source");
+    for report in [
+        src.join(SHARDS[0]),
+        weighted.join("model.safetensors.index.json"),
+        weighted.join(".convert").join("audit.json"),
+    ] {
+        let mut opts = options(&src, &weighted);
+        opts.audit_report = Some(report.clone());
+        assert!(
+            convert_hf(&opts).is_err(),
+            "rapport accepté : {}",
+            report.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read(src.join(SHARDS[0])).expect("invariant: shard source"),
+        before
+    );
+
     let missing = root.path().join("missing.safetensors");
     serialize_to_file(Vec::<(&str, TensorView<'_>)>::new(), None, &missing)
         .expect("invariant: imatrix vide");

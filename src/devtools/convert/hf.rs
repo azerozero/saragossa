@@ -31,8 +31,8 @@ use super::plan::{
 };
 use super::rules::GROUP_SIZE;
 use super::{
-    check_done, check_shard, json_err, read_json, refuse_in_place, sha256_bytes, sync_dir,
-    write_atomic, write_json, DestLock, OutputFile, ShardRecord, JOURNAL,
+    check_done, check_shard, json_err, read_json, refuse_in_place, resolved, sha256_bytes,
+    sync_dir, write_atomic, write_json, DestLock, OutputFile, ShardRecord, JOURNAL,
 };
 use crate::assets::is_mtp_key;
 use crate::{InferError, Result};
@@ -369,6 +369,18 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
         ));
     }
     refuse_in_place(&options.src, &options.dst)?;
+    if let Some(report) = &options.audit_report {
+        // Le rapport et son temporaire `*.tmp-write` remplacent leur cible :
+        // dans la source ou la sortie, ils écraseraient un shard, l'index, le
+        // tokenizer ou le journal. Refusé avant toute conversion.
+        let at = resolved(report)?;
+        if at.starts_with(resolved(&options.src)?) || at.starts_with(resolved(&options.dst)?) {
+            return Err(InferError::Config(format!(
+                "--audit-report {} : hors des dossiers source et destination attendu",
+                report.display()
+            )));
+        }
+    }
     let imatrix = options.imatrix.as_deref().map(Imatrix::load).transpose()?;
     let config_path = options.src.join("config.json");
     let src_config = read_json(&config_path)?;
