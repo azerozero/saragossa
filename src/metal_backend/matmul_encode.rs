@@ -413,7 +413,33 @@ impl MetalExecutor {
         )
     }
 
-    pub(super) fn encode_affine_qmm_na_fused_tiled_u3_buffers(
+    /// Pipeline du GEMM tuilé u3/u5/u6, `None` hors de ces largeurs ou sans NA.
+    pub(super) fn qmm_na_fused_tiled_ub_pipeline(
+        &self,
+        bits: usize,
+    ) -> Option<(&ComputePipelineState, &'static str, &'static str)> {
+        let (pso, label, profile_label) = match bits {
+            3 => (
+                &self.na_gemm_coop_qb_tiled_u3,
+                "gemm_nax_coop_qb_tiled_u3",
+                "qmm_na_fused_tiled_u3_gs64",
+            ),
+            5 => (
+                &self.na_gemm_coop_qb_tiled_u5,
+                "gemm_nax_coop_qb_tiled_u5",
+                "qmm_na_fused_tiled_u5_gs64",
+            ),
+            6 => (
+                &self.na_gemm_coop_qb_tiled_u6,
+                "gemm_nax_coop_qb_tiled_u6",
+                "qmm_na_fused_tiled_u6_gs64",
+            ),
+            _ => return None,
+        };
+        pso.as_ref().map(|pso| (pso, label, profile_label))
+    }
+
+    pub(super) fn encode_affine_qmm_na_fused_tiled_ub_buffers(
         &self,
         encoder: &ComputeCommandEncoderRef,
         lhs_buffer: &BufferRef,
@@ -427,7 +453,11 @@ impl MetalExecutor {
         batch: usize,
         in_dim: usize,
         out_dim: usize,
+        bits: usize,
     ) -> Result<()> {
+        let (pso, label, profile_label) = self
+            .qmm_na_fused_tiled_ub_pipeline(bits)
+            .ok_or_else(|| InferError::Config(format!("GEMM tuilé u{bits} : NA indisponible")))?;
         self.encode_affine_qmm_na_fused_tiled_u4_pipeline(
             encoder,
             lhs_buffer,
@@ -441,9 +471,9 @@ impl MetalExecutor {
             batch,
             in_dim,
             out_dim,
-            self.na_gemm_coop_qb_tiled_u3.as_ref(),
-            "gemm_nax_coop_qb_tiled_u3",
-            "qmm_na_fused_tiled_u3_gs64",
+            Some(pso),
+            label,
+            profile_label,
         )
     }
 

@@ -19,7 +19,7 @@ const EXEMPT: &[(&str, &str)] = &[
     ("dense_bf16_prefill_x1_forced_outside_scope", "na"),
     ("tts_qmm_na_dequant_scope_controls_selection", "na"),
     ("qmm_u56_prefill_matches_bf16_cpu_and_routes", "na"),
-    ("qmm_u3_tiled_prefill_matches_bf16_cpu_and_routes", "na"),
+    ("qmm_ub_tiled_prefill_matches_bf16_cpu_and_routes", "na"),
     ("affine_offsets_fast_kernels_bit_exact", "na"),
     ("affine_offsets_natural_selection_and_standalone", "na"),
     (

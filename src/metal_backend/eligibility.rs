@@ -579,10 +579,11 @@ pub(super) fn can_use_qmm_na_fused_tiled_u4_buffers(
         && in_dim % 512 == 0
 }
 
-/// GEMM NA tuilé u3 gs64 (`gemm_nax_coop_qb_tiled_u3`) : mêmes formes et même
-/// plancher que le u4 par défaut. Sous le plancher, le qmv u3 f32 (en lignes
-/// dès 3) reste servi, comme au sélecteur résident.
-pub(super) fn can_use_qmm_na_fused_tiled_u3_buffers(
+/// GEMM NA tuilé u3/u5/u6 gs64 (`gemm_nax_coop_qb_tiled_u{3,5,6}`) : mêmes
+/// formes et même plancher que le u4 par défaut, aux deux sélecteurs. Sous le
+/// plancher, le qmv f32 (en lignes dès 3) reste servi. Le prefill résident
+/// u5/u6, sans déquantification bf16, passait sinon par le qmv à M = 1024.
+pub(super) fn can_use_qmm_na_fused_tiled_ub_buffers(
     batch: usize,
     in_dim: usize,
     out_dim: usize,
@@ -593,12 +594,13 @@ pub(super) fn can_use_qmm_na_fused_tiled_u3_buffers(
         && batch >= qmm_na_min_batch()
         && out_dim % 64 == 0
         && in_dim.min(out_dim) >= QMM_NA_U4_DEFAULT_MIN_DIM
-        && bits == FAST_QMV_U3_BITS
+        // NOTE: u5/u6 suivent la portée bf16 du prefill (TTS : qmv par défaut).
+        && (bits == 3 || (matches!(bits, 5 | 6) && crate::runtime_flags::qmm_na_dequant_allowed()))
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
 }
 
-pub(super) fn can_use_qmm_na_fused_tiled_u3(
+pub(super) fn can_use_qmm_na_fused_tiled_ub(
     batch: usize,
     in_dim: usize,
     weight: &AffineQuantizedTensor,
@@ -606,7 +608,7 @@ pub(super) fn can_use_qmm_na_fused_tiled_u3(
     let Some(out_dim) = fast_affine_qmv_out_dim(weight) else {
         return false;
     };
-    can_use_qmm_na_fused_tiled_u3_buffers(
+    can_use_qmm_na_fused_tiled_ub_buffers(
         batch,
         in_dim,
         out_dim,
