@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.38](https://github.com/azerozero/saragossa/compare/v0.3.37...v0.3.38) - 2026-11-24
+
+### Fixed
+
+- *(test)* garde NA, noms vérifiés depuis les demandes de l'hôte
+- *(test)* garde NA, noyaux template vérifiés sous leurs host_name
+
 ## [0.3.37](https://github.com/azerozero/saragossa/compare/v0.3.36...v0.3.37) - 2026-11-24
 
 ### Added
