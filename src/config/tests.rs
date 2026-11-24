@@ -716,4 +716,9 @@ fn every_rope_field_mismatch_is_rejected() {
     llama_with_rope(scaling, same)
         .resolve()
         .expect("invariant: scalings identiques acceptés");
+    let integer = r#"{"rope_theta":500000.0,"rope_type":"llama3","factor":8,
+        "low_freq_factor":1,"high_freq_factor":4,"original_max_position_embeddings":8192}"#;
+    llama_with_rope(scaling, integer)
+        .resolve()
+        .expect("invariant: 8 et 8.0 équivalents");
 }

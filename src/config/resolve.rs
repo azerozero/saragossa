@@ -69,7 +69,17 @@ impl RawModelConfig {
                                     "original_max_position_embeddings",
                                 ]
                                 .iter()
-                                .any(|key| existing.get(*key) != rope.get(*key));
+                                .any(|key| {
+                                    // `8` et `8.0` désignent le même facteur.
+                                    let (a, b) = (existing.get(*key), rope.get(*key));
+                                    match (
+                                        a.and_then(serde_json::Value::as_f64),
+                                        b.and_then(serde_json::Value::as_f64),
+                                    ) {
+                                        (Some(x), Some(y)) => x != y,
+                                        _ => a != b,
+                                    }
+                                });
                             if differs {
                                 return Err(InferError::Config(
                                     "rope_scaling et rope_parameters contradictoires".to_string(),
