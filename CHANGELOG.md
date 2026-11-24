@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.37](https://github.com/azerozero/saragossa/compare/v0.3.36...v0.3.37) - 2026-11-24
+
+### Added
+
+- *(serve)* décharge les modèles après une période d'inactivité
+
+### Fixed
+
+- *(serve)* date la fin d'un flux enhance à la libération de sa réservation
+- *(serve)* date l'inactivité DFN3 sous verrou et à la fin du flux
+- *(serve)* décharge DFN3 inactif et respecte l'alias RETI au SIGHUP
+- *(serve)* corrige le déchargement d'inactivité après revue
+
+### Other
+
+- Merge pull request #342 from azerozero/feat/serve-idle-unload
+- *(serve)* échéance DFN3 comptée depuis la fin réelle du flux
+
 ## [0.3.36](https://github.com/azerozero/saragossa/compare/v0.3.35...v0.3.36) - 2026-11-24
 
 ### Added
