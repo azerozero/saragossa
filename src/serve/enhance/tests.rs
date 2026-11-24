@@ -356,7 +356,9 @@ fn idle_dfn3_counts_from_a_stream_ended_between_two_passes() {
         !service.unload_idle(1, at(1_020)),
         "0,78 s d'inactivité seulement"
     );
-    assert!(service.unload_idle(1, at(1_400)));
+    // L'échéance se compte depuis la fin réelle du flux, quel que soit l'ordonnanceur.
+    let ended = *service.usage.lock().unwrap();
+    assert!(service.unload_idle(1, move || ended + Duration::from_millis(1_000)));
 }
 
 #[cfg(any(feature = "ws", feature = "h2", feature = "webtransport"))]
