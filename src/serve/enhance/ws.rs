@@ -18,7 +18,7 @@ impl EnhanceService {
         {
             return send_error(socket, 403, "origine WebSocket non loopback refusée");
         }
-        let Some(_slot) = Reservation::acquire(&self.active, 1, enhance_max_streams()) else {
+        let Some(_slot) = self.reserve() else {
             return send_error(socket, 503, "trop de flux enhance simultanés");
         };
         socket.configure(enhance_idle_timeout())?;

@@ -29,8 +29,8 @@ pub(super) struct EnhanceService {
     path: Option<PathBuf>,
     model: Mutex<Option<Arc<DeepFilterNet3>>>,
     active: Arc<AtomicUsize>,
-    // Dernier usage vu, et flux en cours au dernier passage de `unload_idle`.
-    usage: Mutex<(Instant, bool)>,
+    // Dernier usage : prise du modèle ou fin d'un flux (drop de sa réservation).
+    usage: Arc<Mutex<Instant>>,
     #[cfg(feature = "webtransport")]
     certificate: Mutex<Option<certificate::CertificateInfo>>,
 }
@@ -41,7 +41,7 @@ impl EnhanceService {
             path,
             model: Mutex::new(None),
             active: Arc::new(AtomicUsize::new(0)),
-            usage: Mutex::new((Instant::now(), false)),
+            usage: Arc::new(Mutex::new(Instant::now())),
             #[cfg(feature = "webtransport")]
             certificate: Mutex::new(None),
         }
@@ -80,7 +80,7 @@ impl EnhanceService {
         };
         // Horodaté après un chargement éventuel : il ne compte pas comme inactivité.
         if let Ok(mut usage) = self.usage.lock() {
-            usage.0 = usage.0.max(Instant::now());
+            *usage = usage.max(Instant::now());
         }
         Ok(model)
     }
@@ -90,21 +90,24 @@ impl EnhanceService {
     ///
     /// `clock` est lu sous les verrous, pour qu'une attente derrière un
     /// chargement ne date pas l'usage dans le passé. Un flux tient sa
-    /// réservation jusqu'au bout ; sa fin est datée au premier passage qui ne
-    /// la voit plus, jamais avant.
+    /// réservation ([`Self::reserve`]) jusqu'au bout, qui date sa fin.
     pub(super) fn unload_idle(&self, secs: u64, clock: impl Fn() -> Instant) -> bool {
         // Même ordre de verrous que `model_with` : slot puis usage.
-        let (Ok(mut model), Ok(mut usage)) = (self.model.lock(), self.usage.lock()) else {
+        let (Ok(mut model), Ok(usage)) = (self.model.lock(), self.usage.lock()) else {
             return false;
         };
         let now = clock();
-        let busy = self.active.load(Ordering::Acquire) > 0;
-        let (last, was_busy) = *usage;
-        if busy || was_busy {
-            *usage = (last.max(now), busy);
-            return false;
-        }
-        super::dispatch::idle_expired(last, now, secs) && model.take().is_some()
+        // La réservation date sa fin avant de rendre sa part : `active == 0`
+        // vu sous ce verrou implique un horodatage à jour.
+        self.active.load(Ordering::Acquire) == 0
+            && super::dispatch::idle_expired(*usage, now, secs)
+            && model.take().is_some()
+    }
+
+    /// Réserve un flux ; sa libération date le dernier usage.
+    pub(super) fn reserve(&self) -> Option<Reservation> {
+        Reservation::acquire(&self.active, 1, enhance_max_streams())
+            .map(|slot| slot.stamped(&self.usage))
     }
 
     pub(super) fn handle<S: ServeStream>(
@@ -115,7 +118,7 @@ impl EnhanceService {
     ) -> ServeResult<()> {
         // Même réservation RAII que les connexions : aucun état évincé
         // pendant un flux actif, place rendue à chaque sortie, erreur comprise.
-        let Some(_slot) = Reservation::acquire(&self.active, 1, enhance_max_streams()) else {
+        let Some(_slot) = self.reserve() else {
             return send_error(socket, 503, "trop de flux enhance simultanés");
         };
         socket.configure(enhance_idle_timeout())?;

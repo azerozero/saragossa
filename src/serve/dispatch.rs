@@ -594,6 +594,8 @@ impl<S: ServeStream> Connection<S> {
 pub(super) struct Reservation {
     counter: Arc<AtomicUsize>,
     amount: usize,
+    // Horodatage repoussé à la libération, avant de rendre la part.
+    released_at: Option<Arc<std::sync::Mutex<Instant>>>,
 }
 
 impl Reservation {
@@ -608,6 +610,7 @@ impl Reservation {
                     return Some(Self {
                         counter: Arc::clone(counter),
                         amount,
+                        released_at: None,
                     })
                 }
                 Err(current) => count = current,
@@ -616,8 +619,22 @@ impl Reservation {
     }
 }
 
+impl Reservation {
+    /// Date la libération dans `at` (au plus tard des dates vues).
+    #[cfg(feature = "denoise")]
+    pub(super) fn stamped(mut self, at: &Arc<std::sync::Mutex<Instant>>) -> Self {
+        self.released_at = Some(Arc::clone(at));
+        self
+    }
+}
+
 impl Drop for Reservation {
     fn drop(&mut self) {
+        if let Some(at) = &self.released_at {
+            if let Ok(mut at) = at.lock() {
+                *at = at.max(Instant::now());
+            }
+        }
         self.counter.fetch_sub(self.amount, Ordering::AcqRel);
     }
 }
