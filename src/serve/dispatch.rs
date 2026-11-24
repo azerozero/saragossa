@@ -31,6 +31,7 @@ use super::http::{
     batch_chat, configure_tcp_stream, handle_batch, handle_job, read_body, read_head,
     read_or_reject, reply_on_error, route_front, send_error, send_route_error, HttpRequest,
 };
+use super::shared::{SttOrder, SttTicket};
 use super::state::ServeState;
 
 /// Contexte figé au démarrage, lu par les threads de connexion sans toucher à
@@ -80,6 +81,8 @@ struct Job<S> {
     stream: S,
     _bytes: Reservation,
     waiting: Reservation,
+    /// Tour d'un morceau STT streamé, émis à la prise dans une file commune.
+    turn: Option<SttTicket>,
 }
 
 /// Plafonds de la façade d'E/S.
@@ -220,7 +223,7 @@ where
     if engines == 1 {
         run_engine(&queue, state, max_streams);
     } else {
-        let queue = Arc::new(Mutex::new(queue));
+        let queue = Arc::new(SharedJobs::new(queue, state.stt_order()));
         let workers = (1..engines)
             .map(|engine| spawn_engine(engine, state.engine_seed(engine), Arc::clone(&queue)))
             .collect::<ServeResult<Vec<_>>>()?;
@@ -242,7 +245,7 @@ where
 fn spawn_engine<S: ServeStream>(
     engine: usize,
     seed: super::state::EngineSeed,
-    queue: Arc<Mutex<Receiver<Job<S>>>>,
+    queue: Arc<SharedJobs<S>>,
 ) -> ServeResult<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("saragossa-serve-engine-{engine}"))
@@ -278,20 +281,53 @@ impl<J> JobQueue<J> for Receiver<J> {
     }
 }
 
-// ponytail: un seul moteur attend sur le canal, les autres sur le verrou (au
-// plus 250 ms chacun) ; un canal MPMC si l'attente du verrou se voit en latence.
-impl<J> JobQueue<J> for Mutex<Receiver<J>> {
-    fn recv_timeout(&self, timeout: Duration) -> Result<J, RecvTimeoutError> {
-        self.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .recv_timeout(timeout)
+/// File commune à plusieurs moteurs : chacun prend le job suivant sous verrou ;
+/// un morceau STT streamé y reçoit son tour dans l'ordre d'arrivée.
+///
+/// ponytail: un seul moteur attend sur le canal, les autres sur le verrou,
+/// leur maintenance (SIGHUP, inactivité) étant retardée d'autant ; un canal
+/// MPMC si cette attente se voit en latence.
+struct SharedJobs<S> {
+    rx: Mutex<Receiver<Job<S>>>,
+    stt_order: Arc<SttOrder>,
+}
+
+impl<S> SharedJobs<S> {
+    fn new(rx: Receiver<Job<S>>, stt_order: Arc<SttOrder>) -> Self {
+        Self {
+            rx: Mutex::new(rx),
+            stt_order,
+        }
     }
 
-    fn try_recv(&self) -> Option<J> {
-        self.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .try_recv()
-            .ok()
+    fn take(&self, recv: impl FnOnce(&Receiver<Job<S>>) -> Option<Job<S>>) -> Option<Job<S>> {
+        let rx = self
+            .rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut job = recv(&rx)?;
+        if job.request.method == "POST" && job.request.route() == STT_STREAM_ROUTE {
+            job.turn = Some(self.stt_order.issue());
+        }
+        Some(job)
+    }
+}
+
+const STT_STREAM_ROUTE: &str = "/v1/audio/transcriptions/stream";
+
+impl<S> JobQueue<Job<S>> for SharedJobs<S> {
+    fn recv_timeout(&self, timeout: Duration) -> Result<Job<S>, RecvTimeoutError> {
+        let mut failure = RecvTimeoutError::Timeout;
+        self.take(|rx| {
+            rx.recv_timeout(timeout)
+                .map_err(|error| failure = error)
+                .ok()
+        })
+        .ok_or(failure)
+    }
+
+    fn try_recv(&self) -> Option<Job<S>> {
+        self.take(|rx| rx.try_recv().ok())
     }
 }
 
@@ -491,8 +527,9 @@ fn run_batch<S: ServeStream>(batch: Vec<Queued<S>>, state: &mut ServeState) {
                 stream,
                 _bytes,
                 waiting,
+                turn,
             } = queued.job;
-            drop(waiting);
+            drop((waiting, turn));
             (stream, request, _bytes)
         })
         .collect();
@@ -585,14 +622,18 @@ fn run_job<S: ServeStream>(job: Job<S>, state: &mut ServeState) {
         mut stream,
         _bytes,
         waiting,
+        turn,
     } = job;
     drop(waiting);
+    state.set_stt_turn(turn);
     let mut sent = Sent::new(&mut stream);
     let ok = guarded(state, |state| {
         if let Err(error) = handle_job(&mut sent, state, &request) {
             eprintln!("saragossa serve request error: {error}");
         }
     });
+    // Le tour STT passe au morceau suivant, servi ou non.
+    state.set_stt_turn(None);
     if !ok {
         sent.reply_500();
     }
@@ -665,6 +706,7 @@ impl<S: ServeStream> Connection<S> {
             stream,
             _bytes: bytes,
             waiting,
+            turn: None,
         };
         match self.jobs.try_send(job) {
             Ok(()) => Ok(()),
@@ -997,6 +1039,7 @@ mod tests {
                 stream: server,
                 _bytes: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
                 waiting: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
+                turn: None,
             })
             .expect("invariant: file ouverte");
             clients.push(client);
@@ -1049,12 +1092,13 @@ mod tests {
                 stream: server,
                 _bytes: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
                 waiting: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
+                turn: None,
             })
             .expect("invariant: file ouverte");
             clients.push(client);
         }
         drop(tx);
-        let queue = Arc::new(Mutex::new(rx));
+        let queue = Arc::new(SharedJobs::new(rx, state.stt_order()));
         for engine in 1..state.engines() {
             spawn_engine(engine, state.engine_seed(engine), Arc::clone(&queue))
                 .expect("invariant: thread moteur lancé");

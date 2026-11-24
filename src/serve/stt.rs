@@ -427,6 +427,24 @@ mod tests {
         );
     }
 
+    // Une panique sous le verrou des sessions ne les condamne pas : la
+    // récupération du moteur les remet à neuf.
+    #[test]
+    fn invalidate_recovers_poisoned_sessions() {
+        let args = ServeArgs::parse(["--model", "a=/x/a", "--backend", "cpu"].map(String::from))
+            .expect("args");
+        let mut audio = super::super::audio::AudioState::new(&args);
+        let sessions = std::sync::Arc::clone(&audio.stt_sessions);
+        let _ = std::thread::spawn(move || {
+            let _guard = sessions.lock();
+            panic!("panique sous le verrou des sessions");
+        })
+        .join();
+        assert!(audio.stt_sessions.is_poisoned());
+        audio.invalidate();
+        assert!(!audio.stt_sessions.is_poisoned());
+    }
+
     #[test]
     fn sse_events_follow_openai_transcript_format() -> ServeResult<()> {
         assert_eq!(

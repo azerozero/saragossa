@@ -152,9 +152,14 @@ impl ServeArgs {
                 .or(profile.serve.idle_unload_secs)
                 .unwrap_or(0);
         let mut prefix_ssd = saragossa::runtime_flags::ServePrefixSsdOptions::from_env()?;
+        // invariant: `Profile::validate` borne `serve.engines` à 1..=16.
         let mut engines = match saragossa::runtime_flags::env_var("SARAGOSSA_SERVE_ENGINES") {
             Some(value) => parse_engines(&value)?,
-            None => 1,
+            None => profile
+                .serve
+                .engines
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(1),
         };
         let mut iter = args.into_iter();
 
@@ -378,9 +383,10 @@ pub(super) fn help_text() -> String {
          SARAGOSSA_RUST_IDLE_UNLOAD_SECS, hot-reloadable, 0 = off, default) drops all \
          models after N idle seconds; the next request reloads them. --preload models \
          are unloaded too.\n\
-         Engines: --engines N (SARAGOSSA_SERVE_ENGINES, 1..={MAX_ENGINES}, default 1) runs N \
-         inference threads on one shared copy of the weights, each with its own KV, \
-         scratch and prefix cache; 1 keeps the serial engine.\n\
+         Engines: --engines N (serve.engines, SARAGOSSA_SERVE_ENGINES, 1..={MAX_ENGINES}, \
+         default 1, not hot-reloadable) runs N inference threads on one shared copy of the \
+         weights, each with its own KV, scratch and block prefix cache (the decoder's MTP \
+         prefix cache and the TTS prefill memo stay shared); 1 keeps the serial engine.\n\
          Default transport: Unix socket {DEFAULT_SOCKET} (0600). \\
          --port enables TCP on 127.0.0.1 for grob and requires --api-key \\
          or {API_KEY_ENV}.\n\

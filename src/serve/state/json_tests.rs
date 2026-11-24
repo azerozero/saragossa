@@ -498,7 +498,7 @@ fn write_empty_safetensors_header(path: &Path) {
     fs::write(path, bytes).expect("invariant: safetensors test écrit");
 }
 
-fn tiny_weights() -> HashMap<String, Tensor> {
+pub(super) fn tiny_weights() -> HashMap<String, Tensor> {
     let mut tensors = HashMap::new();
     tensors.insert(
         "embed_tokens.weight".to_string(),

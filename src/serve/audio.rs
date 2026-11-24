@@ -74,7 +74,7 @@ const TTS_NOT_CONFIGURED: &str =
     "endpoint TTS non configuré: relancez saragossa serve avec --tts-model <dir>";
 
 /// Etat audio d'un moteur : slots STT/TTS chargés à la demande, poids
-/// partagés entre moteurs par [`SharedWeights`].
+/// partagés entre moteurs par le registre `SharedWeights`.
 pub(super) struct AudioState {
     #[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
     shared: SharedWeights,
@@ -93,6 +93,10 @@ pub(super) struct AudioState {
     /// deux moteurs.
     #[cfg(feature = "stt")]
     pub(super) stt_sessions: Arc<Mutex<super::stt::SttSessions>>,
+    /// Tour du morceau STT streamé en cours (moteurs multiples), attendu avant
+    /// de toucher aux sessions.
+    #[cfg(feature = "stt")]
+    pub(super) stt_turn: Option<super::shared::SttTicket>,
 }
 
 /// Modèle audio et son exécuteur Metal, partagés entre moteurs : l'exécuteur
@@ -180,7 +184,7 @@ impl AudioState {
         Self::with_shared(args, &super::shared::EngineShared::default())
     }
 
-    /// Comme [`Self::new`], sur les poids et sessions communs aux moteurs.
+    /// Construit l'état audio d'un moteur sur les poids et sessions communs.
     pub(super) fn with_shared(args: &ServeArgs, shared: &super::shared::EngineShared) -> Self {
         #[cfg(not(any(feature = "stt", feature = "tts", feature = "diar")))]
         let _ = shared;
@@ -210,6 +214,8 @@ impl AudioState {
             enhance_path: args.enhance_model.clone(),
             #[cfg(feature = "stt")]
             stt_sessions: Arc::clone(&shared.stt_sessions),
+            #[cfg(feature = "stt")]
+            stt_turn: None,
         }
     }
 
@@ -220,8 +226,14 @@ impl AudioState {
         // NOTE: les sessions sont communes aux moteurs : une panique les vide
         // pour tous, comme le faisait le moteur unique.
         #[cfg(feature = "stt")]
-        if let Ok(mut sessions) = self.stt_sessions.lock() {
-            *sessions = super::stt::SttSessions::default();
+        {
+            // Empoisonnées par la panique elle-même : remises à neuf.
+            *self
+                .stt_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                super::stt::SttSessions::default();
+            self.stt_sessions.clear_poison();
         }
     }
 
@@ -279,6 +291,9 @@ impl AudioState {
         ) -> ServeResult<T>,
     ) -> ServeResult<T> {
         let loaded = self.ensure_stt_loaded()?;
+        if let Some(turn) = &self.stt_turn {
+            turn.wait_turn();
+        }
         let mut sessions = self
             .stt_sessions
             .lock()

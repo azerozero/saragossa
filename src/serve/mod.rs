@@ -12,10 +12,12 @@
 //!
 //! Moteurs parallèles opt-in (`--engines N`, `SARAGOSSA_SERVE_ENGINES`) : N
 //! threads moteur vident la même file, chacun avec son `ServeState` (KV,
-//! scratch Metal cloisonné, caches de préfixe), sur une seule copie des poids
-//! LLM, Whisper, TTS, diarisation et embeddings (voir `shared`). Les lots y
-//! sont coupés et une panique de requête arrête le process, l'état partagé
-//! n'étant plus sûr.
+//! scratch Metal cloisonné, cache de préfixe par blocs), sur une seule copie
+//! des poids LLM, Whisper, TTS, diarisation et embeddings (voir `shared`) ; le
+//! cache de préfixe MTP du décodeur, le mémo de prefill TTS et la garde
+//! mémoire restent communs, les morceaux STT streamés gardent leur ordre
+//! d'arrivée. Les lots y sont coupés et une panique de requête arrête le
+//! process, l'état partagé n'étant plus sûr.
 //!
 //! Lots opt-in (`SARAGOSSA_SERVE_BATCH=1` avec
 //! `SARAGOSSA_RUST_LIGHTBATCH_MULTI=1`) : quand le moteur prend une requête

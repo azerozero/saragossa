@@ -112,6 +112,8 @@ pub struct ServeSection {
     pub drain_timeout_secs: Option<u64>,
     /// Relais SIGUSR2 : `auto` (défaut), `parallel` ou `sequential`.
     pub relay_mode: Option<String>,
+    /// Équivalent de `--engines` : moteurs à poids partagés, 1 à 16.
+    pub engines: Option<u64>,
 }
 
 /// Section `[enhance]`.
@@ -207,6 +209,9 @@ impl Profile {
             .is_none_or(|v| v.is_finite() && v > 0.0)
         {
             return Err(err("serve.max_tok_s", "doit être un flottant > 0"));
+        }
+        if !self.serve.engines.is_none_or(|v| (1..=16).contains(&v)) {
+            return Err(err("serve.engines", "doit être dans 1..=16"));
         }
         if !self.serve.gpu_share.is_none_or(|v| (10..=100).contains(&v)) {
             return Err(err("serve.gpu_share", "doit être dans 10..=100"));
@@ -313,6 +318,12 @@ impl Profile {
                 num(s.drain_timeout_secs),
             ),
             r("serve.relay_mode", None, "auto", s.relay_mode.clone()),
+            r(
+                "serve.engines",
+                Some("SARAGOSSA_SERVE_ENGINES"),
+                "1",
+                num(s.engines),
+            ),
             r(
                 "enhance.max_streams",
                 Some("SARAGOSSA_ENHANCE_MAX_STREAMS"),

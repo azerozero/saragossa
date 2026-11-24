@@ -34,7 +34,7 @@ use super::embeddings::EmbeddingsState;
 use super::error::{ServeError, ServeResult};
 use super::mtp;
 use super::protocol::{ChatCompletionRequest, ResponseFormatMode, Usage};
-use super::shared::{EngineShared, SharedWeights};
+use super::shared::EngineShared;
 use super::streaming::{
     CompletionSink, CompletionStreamEvent, StreamTerminalError, StreamingCompletionStart,
     StreamingTextDetokenizer, TextStop,
@@ -195,6 +195,21 @@ impl ServeState {
             shared: self.shared.clone(),
             engine,
         }
+    }
+
+    /// Ordre des morceaux STT streamés, commun aux moteurs.
+    pub(super) fn stt_order(&self) -> Arc<super::shared::SttOrder> {
+        Arc::clone(&self.shared.stt_order)
+    }
+
+    /// Pose (ou rend, avec `None`) le tour STT du job en cours.
+    pub(super) fn set_stt_turn(&mut self, turn: Option<super::shared::SttTicket>) {
+        #[cfg(feature = "stt")]
+        {
+            self.audio.stt_turn = turn;
+        }
+        #[cfg(not(feature = "stt"))]
+        drop(turn);
     }
 
     pub(super) fn models_generation(&self) -> u64 {
@@ -546,20 +561,20 @@ impl ServeState {
         if self.models[index].loaded.is_some() {
             return Ok(());
         }
-        // Des poids déjà tenus par un autre moteur ne coûtent rien de plus.
-        let additional = if self
-            .shared
-            .weights
-            .is_alive("llm", &self.models[index].path)
-        {
-            0
-        } else {
-            self.models[index].estimated_model_bytes()
-        };
-        self.enforce_memory_budget(additional, Some(index))?;
         self.enforce_model_pool_limit(index);
         let started = Instant::now();
-        self.models[index].ensure_loaded(&self.shared.weights)?;
+        let weights = self.shared.weights.clone();
+        let path = self.models[index].path.clone();
+        // Des poids déjà tenus par un autre moteur sont rattachés sans
+        // admission ; sinon admission et chargement se font sous le verrou du
+        // registre, à l'abri d'un chargement concurrent.
+        let llm = weights.get_or_load("llm", &path, || {
+            let additional = self.models[index].estimated_model_bytes();
+            self.enforce_memory_budget(additional, Some(index))?;
+            let slot = &self.models[index];
+            load_shared_llm(&slot.id, &slot.path, slot.backend)
+        })?;
+        self.models[index].attach(llm);
         eprintln!(
             "saragossa serve loaded model={} in_ms={}",
             self.models[index].id,
@@ -758,20 +773,15 @@ impl ModelSlot {
         self.estimated_model_bytes
     }
 
-    fn ensure_loaded(&mut self, shared: &SharedWeights) -> ServeResult<()> {
-        if self.loaded.is_none() {
-            let llm = shared.get_or_load("llm", &self.path, || {
-                load_shared_llm(&self.id, &self.path, self.backend)
-            })?;
-            self.loaded = Some(LoadedModel {
-                id: self.id.clone(),
-                llm,
-                json_token_catalog: OnceLock::new(),
-                schema_token_catalog: OnceLock::new(),
-                prefix_cache: BlockAwarePrefixCache::from_runtime_flags(),
-            });
-        }
-        Ok(())
+    /// Rattache au slot des poids chargés ou partagés ; caches neufs.
+    fn attach(&mut self, llm: Arc<SharedLlm>) {
+        self.loaded = Some(LoadedModel {
+            id: self.id.clone(),
+            llm,
+            json_token_catalog: OnceLock::new(),
+            schema_token_catalog: OnceLock::new(),
+            prefix_cache: BlockAwarePrefixCache::from_runtime_flags(),
+        });
     }
 }
 
@@ -824,7 +834,7 @@ fn load_shared_llm(id: &str, path: &Path, backend: RuntimeKind) -> ServeResult<S
 }
 
 /// Poids et métadonnées d'un modèle LLM, partagés entre moteurs par
-/// [`SharedWeights`] : la génération ne prend que `&self`.
+/// le registre `SharedWeights` : la génération ne prend que `&self`.
 struct SharedLlm {
     assets: ModelAssets,
     decoder: CausalDecoder,
@@ -2350,22 +2360,62 @@ mod tests {
     #[test]
     #[ignore = "requiert un device Metal ; GPU synthétique exécuté par gpu-synthetic.yml"]
     fn engines_sharing_decoder_match_serial_greedy() {
-        let mut loaded = super::json_tests::tiny_loaded_model();
-        let llm = loaded.llm_mut();
-        let decoder = std::mem::replace(
-            &mut llm.decoder,
-            super::json_tests::tiny_loaded_model().into_llm().decoder,
+        // Tête et attention non triviales : les tokens dépendent du prefill
+        // et du KV, un aliasing entre moteurs changerait la sortie.
+        let mut weights = super::json_tests::tiny_weights();
+        let mut set = |name: &str, shape: Vec<usize>, values: Vec<f32>| {
+            weights.insert(
+                name.to_string(),
+                saragossa::Tensor::from_vec(shape, values).unwrap(),
+            );
+        };
+        set(
+            "lm_head.weight",
+            vec![3, 2],
+            vec![1.0, -1.0, -1.0, 1.1, 0.4, 0.3],
         );
-        llm.decoder = decoder
+        set(
+            "layers.0.self_attn.q_proj.weight",
+            vec![2, 2],
+            vec![0.9, -0.4, 0.3, 1.2],
+        );
+        set(
+            "layers.0.self_attn.k_proj.weight",
+            vec![2, 2],
+            vec![1.1, 0.5, -0.6, 0.8],
+        );
+        set(
+            "layers.0.self_attn.v_proj.weight",
+            vec![2, 2],
+            vec![-0.7, 1.3, 0.9, 0.2],
+        );
+        set(
+            "layers.0.self_attn.o_proj.weight",
+            vec![2, 2],
+            vec![1.4, -0.9, 0.6, 1.0],
+        );
+        let decoder = CausalDecoder::from_tensors(weights, Default::default())
+            .unwrap()
             .with_metal_runtime()
             .expect("invariant: runtime Metal attaché");
+        let mut loaded = super::json_tests::tiny_loaded_model();
+        loaded.llm_mut().decoder = decoder;
         let llm = Arc::clone(&loaded.llm);
         let prompts: Vec<Vec<usize>> = (0..4)
             .map(|k| (0..24 + 5 * k).map(|i| (i * 7 + i / 3 + k) % 3).collect())
             .collect();
+        // Bits de l'état final du prefill (sensibles à tout le contexte) puis
+        // tokens greedy : une corruption du prefill ou du KV se voit.
         let greedy = |prompt: &[usize]| {
             let state = llm.decoder.prefill_prompt_state_uncached(prompt).unwrap();
-            llm.decoder
+            let bits: Vec<u32> = state
+                .final_state()
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            let tokens = llm
+                .decoder
                 .generate_greedy_timed_from_prompt_state_with_options(
                     state,
                     Duration::ZERO,
@@ -2373,17 +2423,22 @@ mod tests {
                     &GenerationOptions::default(),
                 )
                 .unwrap()
-                .tokens
+                .tokens;
+            (bits, tokens)
         };
         let serial: Vec<_> = prompts.iter().map(|prompt| greedy(prompt)).collect();
+        let distinct: std::collections::HashSet<_> = serial.iter().collect();
+        assert!(distinct.len() > 1, "sorties indiscernables : {serial:?}");
+        let start = std::sync::Barrier::new(prompts.len());
         let parallel: Vec<Vec<_>> = thread::scope(|scope| {
             let handles: Vec<_> = prompts
                 .iter()
                 .enumerate()
                 .map(|(engine, prompt)| {
-                    let greedy = &greedy;
+                    let (greedy, start) = (&greedy, &start);
                     scope.spawn(move || {
                         saragossa::set_scratch_engine(u32::try_from(engine + 1).unwrap());
+                        start.wait();
                         (0..4).map(|_| greedy(prompt)).collect()
                     })
                 })

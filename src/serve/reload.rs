@@ -91,7 +91,7 @@ pub(super) fn take_pending_models() -> Option<Vec<ServeModelConfig>> {
     take_pending_generation().map(|(_, models)| models)
 }
 
-/// Comme [`take_pending_models`], avec la génération que la prise publie.
+/// Prend la liste en attente avec la génération que la prise publie.
 fn take_pending_generation() -> Option<(u64, Vec<ServeModelConfig>)> {
     // Ordre des verrous : PENDING puis MODELS, comme `effective_models`.
     let mut pending = lock(&PENDING);
@@ -106,7 +106,7 @@ static APPLIED_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Liste qu'un moteur ayant appliqué la génération `seen` doit appliquer :
 /// celle qu'il prend en attente, ou la dernière publiée par un autre moteur.
-/// À un seul moteur, c'est exactement [`take_pending_models`].
+/// À un seul moteur, c'est exactement l'ancienne prise unique.
 pub(super) fn sync_models(seen: &mut u64) -> Option<Vec<ServeModelConfig>> {
     let mut models = take_pending_generation().map(|(generation, models)| {
         *seen = generation;
