@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.40](https://github.com/azerozero/saragossa/compare/v0.3.39...v0.3.40) - 2026-11-25
+
+### Added
+
+- *(serve)* caches des poids partagés coupés à plusieurs moteurs
+- *(serve)* moteurs parallèles à poids partagés (--engines N)
+
+### Fixed
+
+- *(serve)* mémo TTS consulté seulement avec la feature tts
+- *(serve)* relecture multi-moteur, alias, voix TTS et cache SSD
+- *(serve)* admission, ordre STT et récupération des moteurs partagés
+
+### Other
+
+- *(github)* masquage des secrets et reproduction complète dans les modèles d'issue
+- *(readme)* un chiffre de la campagne 21-final au premier écran, crates.io non publié
+- *(github)* modèles d'issue pour bug, demande de modèle et régression de perf
+- *(readme)* boucle vocale orchestrée par le client, prérequis du bench, portée des tests d'identité
+- *(readme)* commande de reproduction du bench, chaîne vocale en tête, identité non testée par la campagne
+- *(fuzz)* feature stt activée pour les cibles wire_audio
+- *(fuzz)* Cargo.lock du fuzz aligné sur les dépendances actuelles du crate
+- *(fuzz,mutants)* installer cargo-fuzz avec le stable figé et découper les mutations en tiers
+
 ## [0.3.39](https://github.com/azerozero/saragossa/compare/v0.3.38...v0.3.39) - 2026-11-24
 
 ### Other
