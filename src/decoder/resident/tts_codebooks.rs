@@ -56,6 +56,20 @@ impl TtsCodebookWeights {
     }
 }
 
+/// Couche relevant de la trame TTS fusionnée : le noyau applique toujours la
+/// QK-norm, n'a pas de norme de V et ne code que SwiGLU. Une couche sans
+/// QK-norm (Llama, Mistral) garde le chemin général au lieu d'échouer à
+/// l'encodage.
+pub(in crate::decoder) fn tts_cp_fused_layer_eligible(
+    attention: &FullAttention,
+    mlp: &GatedMlp,
+) -> bool {
+    attention.q_norm.is_some()
+        && attention.k_norm.is_some()
+        && !attention.value_norm
+        && matches!(mlp.activation(), crate::mlp::Activation::Silu)
+}
+
 impl CausalDecoder {
     /// Résout les poids du code predictor pour [`Self::decode_tts_codebooks_resident`].
     ///
@@ -199,7 +213,7 @@ impl CausalDecoder {
             let Some(v_proj) = attention.v_proj.as_ref() else {
                 return Ok(None);
             };
-            if attention.value_norm || !matches!(mlp.activation(), crate::mlp::Activation::Silu) {
+            if !tts_cp_fused_layer_eligible(attention, mlp) {
                 return Ok(None);
             }
             let (gate_proj, up_proj, down_proj) = mlp.projections();
@@ -491,6 +505,11 @@ impl CausalDecoder {
                 "poids full-attn dense résidents absents couche {index} (trame TTS)"
             )));
         };
+        let (Some(q_norm), Some(k_norm)) = (resolved.q_norm.as_ref(), resolved.k_norm.as_ref())
+        else {
+            // Sans QK-norm (Llama, Mistral) : le chemin général encode la couche.
+            return Ok(false);
+        };
         if resolved.pre_feedforward_norm.is_some()
             || resolved.parallel_moe.is_some()
             || resolved.sigmoid_moe.is_some()
@@ -506,14 +525,8 @@ impl CausalDecoder {
             rope_frequencies: &resolved.rope_frequencies,
             input_norm: &resolved.input_norm,
             qkv_proj,
-            q_norm: resolved
-                .q_norm
-                .as_ref()
-                .ok_or_else(|| InferError::Config("q_norm absent (trame TTS)".to_string()))?,
-            k_norm: resolved
-                .k_norm
-                .as_ref()
-                .ok_or_else(|| InferError::Config("k_norm absent (trame TTS)".to_string()))?,
+            q_norm,
+            k_norm,
             o_proj: &resolved.o_proj,
             post_norm: &resolved.post_norm,
             gate_proj: &resolved.gate_proj,

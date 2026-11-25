@@ -288,7 +288,10 @@ impl DecoderLayer {
             }
             FeedForward::Dense(mlp) => {
                 let (gate_proj, up_proj, down_proj) = mlp.projections();
-                gate_proj.bias().is_none() && up_proj.bias().is_none() && down_proj.bias().is_none()
+                gate_proj.bias().is_none()
+                    && up_proj.bias().is_none()
+                    && down_proj.bias().is_none()
+                    && self.resident_dense_activation_ok(mlp)
             }
         };
         if !mlp_supported {
@@ -309,6 +312,18 @@ impl DecoderLayer {
             // Linear-attn : chemin résident conv/ssm déjà éprouvé (phases 1a/1b).
             AttentionBlock::Linear(_) => true,
         }
+    }
+
+    /// Le tail dense résident fige l'activation : GeGLU avec les normes FFN
+    /// Gemma, SwiGLU sinon. Toute autre paire reste au per-op.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn resident_dense_activation_ok(&self, mlp: &crate::GatedMlp) -> bool {
+        let expected = if self.pre_feedforward_norm.is_some() {
+            crate::Activation::GeluTanh
+        } else {
+            crate::Activation::Silu
+        };
+        mlp.activation() == expected
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]

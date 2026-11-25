@@ -68,6 +68,7 @@ jobs:
             decode_resident::rope_tests::rope_prefill_matches_common_cpu_at_long_positions
             decode_resident::rope_tests::rope_prefill_and_decode_keys_are_bit_identical
             decode_resident::rope_tests::rope_only_rotates_without_norm
+            decode_resident::rope_tests::rope_only_llama3_tables_rotate_at_long_positions
             decode_resident::rows_tree_tests::rope_rows_tree_rotates_at_depth
             decode_resident::rows_tree_tests::compact_tree_rows_matches_cpu_and_refuses_invalid_paths
             decode_resident::rows_tree_tests::full_attn_rows_tree_node_matches_path_chain_bits
@@ -127,6 +128,8 @@ jobs:
             decoder::tests::gpu_share_keeps_greedy_output_synthetic
             decoder::state_snapshot::persistent::tests::process_restart_mtp_aligned_resume_matches_cold_greedy_synthetic
             decoder::tests::llama3_rope_metal_matches_cpu_oracle
+            decoder::tests::lookup_greedy_falls_back_without_output_gate
+            decoder::tests::resident_llama3_rope_matches_cpu_oracle
             qwen_loader::flint_tests::synthetic_flint_kl_reference_roundtrip
           )
 

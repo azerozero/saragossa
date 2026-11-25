@@ -503,3 +503,131 @@ fn rope_only_rotates_without_norm() -> Result<()> {
     }
     Ok(())
 }
+
+/// RoPE seule sur tables llama3 (Llama 3.2 1B d64 ×32, Llama 3.1 8B d128 ×8) :
+/// les noyaux decode et lignes lisent la table scalée du cache Metal, autour du
+/// contexte d'origine 8192 et aux positions longues. Le cache sépare les
+/// entrées par facteur et rend la même poignée pour la même clé.
+#[test]
+#[ignore = "GPU Metal requis : échoue explicitement sans device"]
+fn rope_only_llama3_tables_rotate_at_long_positions() -> Result<()> {
+    use crate::rope::{inv_freq_scaled, Llama3RopeScaling};
+    let state = gpu_state()?;
+    let executor = MetalExecutor::new()?;
+    let theta = 500_000.0;
+    let llama3 = |factor| Llama3RopeScaling {
+        factor,
+        low_freq_factor: 1.0,
+        high_freq_factor: 4.0,
+        original_max_position_embeddings: 8192.0,
+    };
+    let x32 = executor.rope_frequencies_scaled(theta, 64, Some(llama3(32.0)))?;
+    let x8 = executor.rope_frequencies_scaled(theta, 64, Some(llama3(8.0)))?;
+    let plain = executor.rope_frequencies_scaled(theta, 64, None)?;
+    assert_eq!(
+        executor
+            .rope_frequencies_scaled(theta, 64, Some(llama3(32.0)))?
+            .gpu_address(),
+        x32.gpu_address(),
+        "même clé, même table"
+    );
+    let read = |buffer: &metal::Buffer| crate::metal_backend::read_f32_buffer(buffer, 32);
+    let (t32, t8, t1) = (read(&x32)?, read(&x8)?, read(&plain)?);
+    assert_eq!(t32, inv_freq_scaled(64, theta, Some(llama3(32.0))));
+    assert_eq!(t8, inv_freq_scaled(64, theta, Some(llama3(8.0))));
+    assert_eq!(t1, inv_freq_scaled(64, theta, None));
+    assert_ne!(t32, t8, "clés de cache séparées par facteur");
+    for (head_dim, factor) in [(64, 32.0), (128, 8.0)] {
+        let scaling = llama3(factor);
+        let table = inv_freq_scaled(head_dim, theta, Some(scaling));
+        let base = inv_freq_scaled(head_dim, theta, None);
+        // Bandes : hautes fréquences intactes (à l'ulp de `powf` près), basses
+        // divisées par le facteur, interpolées entre les deux.
+        let (mut high, mut low, mut mid) = (0, 0, 0);
+        for (&scaled, &plain) in table.iter().zip(&base) {
+            let ratio = plain / scaled;
+            if (ratio - 1.0).abs() < 1.0e-6 {
+                high += 1;
+            } else if (ratio - factor).abs() < 1.0e-4 * factor {
+                low += 1;
+            } else {
+                assert!(ratio > 1.0 && ratio < factor, "d{head_dim} ratio {ratio}");
+                mid += 1;
+            }
+        }
+        assert!(
+            high > 0 && low > 0 && mid > 0,
+            "d{head_dim}: {high}/{mid}/{low}"
+        );
+        let frequencies = executor.rope_frequencies_scaled(theta, head_dim, Some(scaling))?;
+        let width = HEADS * head_dim;
+        let (input, _) = data(head_dim, ROWS);
+        let input_gpu = lease_with(&state, &input)?;
+        let decode = state.scratch().lease(width, GpuElement::F32)?;
+        let rows = state.scratch().lease(ROWS * width, GpuElement::F32)?;
+        for start in [8190_usize, 8191, 8192, 32_767, 131_071] {
+            let command = state.queue().new_command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            state.encode_rms_norm_rope_decode(
+                encoder,
+                input_gpu.tensor().buffer(),
+                None,
+                decode.tensor().buffer(),
+                HEADS,
+                head_dim,
+                head_dim,
+                &frequencies,
+                start,
+                1.0e-6,
+            )?;
+            state.encode_rms_norm_rope_decode_rows(
+                encoder,
+                state.rows_kernels()?,
+                input_gpu.tensor().buffer(),
+                0,
+                width,
+                None,
+                rows.tensor().buffer(),
+                width,
+                HEADS,
+                head_dim,
+                head_dim,
+                &frequencies,
+                start,
+                ROWS,
+                1.0e-6,
+            )?;
+            encoder.end_encoding();
+            commit_and_wait(command)?;
+            let actual = read_f32(rows.tensor());
+            for row in 0..ROWS {
+                let position = start + row;
+                let rotate = |table: &[f32]| -> Vec<f32> {
+                    input[row * width..(row + 1) * width]
+                        .chunks_exact(head_dim)
+                        .flat_map(|head| {
+                            let mut out = head.to_vec();
+                            let half = head_dim / 2;
+                            for (pair, &frequency) in table.iter().enumerate() {
+                                let (sin, cos) = (position as f32 * frequency).sin_cos();
+                                out[pair] = head[pair] * cos - head[pair + half] * sin;
+                                out[pair + half] = head[pair] * sin + head[pair + half] * cos;
+                            }
+                            out
+                        })
+                        .collect()
+                };
+                let expected = rotate(&table);
+                let label = format!("llama3 d{head_dim} ×{factor} pos={position}");
+                let got = &actual[row * width..(row + 1) * width];
+                assert_precise(got, &expected, &label);
+                if row == 0 {
+                    assert_precise(&read_f32(decode.tensor()), &expected, &label);
+                }
+                // Témoin : la table non scalée s'écarte nettement à ces positions.
+                assert!(error(got, &rotate(&base)) > 1.0e-3, "{label}: témoin");
+            }
+        }
+    }
+    Ok(())
+}

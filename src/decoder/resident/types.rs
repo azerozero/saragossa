@@ -128,6 +128,9 @@ pub(super) fn resident_full_layer_unsupported_reason(layer: &DecoderLayer) -> Op
             {
                 return Some("MLP dense biaisé".to_string());
             }
+            if !layer.resident_dense_activation_ok(mlp) {
+                return Some("activation MLP incompatible avec le tail résident".to_string());
+            }
         }
     }
     match &layer.attention {
