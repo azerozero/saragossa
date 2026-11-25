@@ -2323,7 +2323,11 @@ pub fn disable_shared_model_caches() {
 /// actif ?
 #[must_use]
 pub fn shared_model_caches_active() -> bool {
-    prefix_cache_enabled() || tts_prefill_cache_enabled()
+    #[cfg(feature = "tts")]
+    let tts = tts_prefill_cache_enabled();
+    #[cfg(not(feature = "tts"))]
+    let tts = false;
+    prefix_cache_enabled() || tts
 }
 
 /// Autorise `QmmNaDequant` dans le talker et le code_predictor TTS.
