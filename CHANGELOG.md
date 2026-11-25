@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.41](https://github.com/azerozero/saragossa/compare/v0.3.40...v0.3.41) - 2026-11-25
+
+### Added
+
+- *(devtools)* p99 de KL et arène bf16 optionnelle pour --kl-record/--kl-compare
+
+### Other
+
+- *(perf)* précise la couverture et les limites du KV q8 en contexte long
+- *(perf)* résultats du KV q8 par défaut en contexte long, critère non rempli
+- Merge remote-tracking branch 'origin/main' into perf/kv8-long-context
+- *(perf)* pré-enregistre le critère du KV q8 par défaut en contexte long
+
 ## [0.3.40](https://github.com/azerozero/saragossa/compare/v0.3.39...v0.3.40) - 2026-11-25
 
 ### Added
