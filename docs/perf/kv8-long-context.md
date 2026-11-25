@@ -74,8 +74,12 @@ par la vitesse, la mémoire et l'identité ; la KL à 64k est prise comme borne.
 
 Machine : M5 Max, Qwen3.8-27B 4 bits, prompts code/prose du dépôt. Données brutes :
 71 lignes de `results.jsonl` de la campagne (~/scratchpad/kv8). Seules les passes
-valides sont enregistrées ; les passes jetées par la porte `loadavg < 2` sont
-rejouées et n'apparaissent pas.
+valides sont enregistrées en vitesse ; les passes jetées par la porte
+`loadavg < 2` sont rejouées et n'apparaissent pas (KL, identité et mémoire ne
+sont pas soumises à cette porte). Tailles réelles : 32 605 / 65 358 / 130 884 /
+261 956 tokens, soit un peu sous 32 768 / 65 536 / 131 072 / 262 144. Le binaire
+est antérieur au merge de origin/main ; son SHA n'est pas enregistré. KL :
+`SARAGOSSA_KL_KV_BF16=1` est requis pour une référence bf16.
 
 ### Qualité (KL contre bf16, 64 pas forcés)
 
@@ -89,7 +93,7 @@ rejouées et n'apparaissent pas.
 Q1 et Q2 passent largement. Q3 échoue à 64k (63/64 = 98,4 % < 99 %, les deux
 prompts) ; il passe à 32k.
 
-### Vitesse (ABBA, médiane des rapports q8/bf16 par bloc ; decode tok/s)
+### Vitesse (ABBA, médiane des rapports q8/bf16 par bloc ABBA, choix d'agrégation postérieur au critère (rapport des médianes globales : mêmes décisions) ; decode tok/s)
 
 | Contexte | Mode | bf16 | q8 | Rapport (blocs) | TTFT q8/bf16 |
 |---|---|---|---|---|---|
@@ -114,7 +118,7 @@ M2 échoue : le pic q8 est plus haut que bf16 (+39 % à 128k), pas plus bas. M1
 
 ### Identité (md5 de la sortie, KV q8, 200 tokens)
 
-MTP = AR sur code-32k, prose-32k et code-128k : I1 passe.
+MTP = AR sur code-32k, prose-32k et code-128k : identiques. I1 est donc passant à 32k et seulement partiel à 128k (prose-128k non testé).
 
 ### Application du critère
 
@@ -123,11 +127,11 @@ MTP = AR sur code-32k, prose-32k et code-128k : I1 passe.
 | Q1, Q2 | passe | passe | non mesurable |
 | Q3 | passe | échoue (98,4 %) | non mesurable |
 | M1 | non relevé | non relevé | non relevé |
-| M2 | n/a | échoue | échoue (+39 %) |
-| V1 AR | passe | n/a | passe |
-| V1 MTP | échoue (0,923) | n/a | échoue (0,728) |
-| V2 | échoue en AR (1,046) | n/a | passe (1,010) |
-| I1 | passe | n/a | passe |
+| M2 (défini à 128k) | n/a | +28 % (observé) | échoue (+39 %) |
+| V1 AR | passe | non mesuré | passe |
+| V1 MTP | échoue (0,923) | non mesuré | échoue (0,728) |
+| V2 | échoue en AR (1,046) | non mesuré | passe (1,010) |
+| I1 | passe | non mesuré | partiel (code seul) |
 
 Ni N = 32768 (V1 MTP, V2, Q3 à 64k) ni N = 65536 (Q3 à 64k, V1 MTP à 128k, M2)
 ne sont atteints.
@@ -136,13 +140,17 @@ ne sont atteints.
 
 Aucun défaut ne change : q8 reste opt-in (`SARAGOSSA_RUST_KV_QUANT=8`), rapport
 seul. Les causes sont mesurées : le decode MTP perd 8 % à 32k et 27 % à 128k, et
-le pic mémoire monte au lieu de baisser (le prefill garde un KV bf16 en plus de
+le pic mémoire monte au lieu de baisser (cause non isolée ; hypothèse : le prefill garde un KV bf16 en plus de
 l'arène q8).
 
 ## Limites
 
-- 128k : 2 blocs ABBA au lieu de 3 (la porte de charge a jeté des passes) ; KL
+- 128k : 2 blocs ABBA au lieu de 3 ; KL
   non mesurée au-delà de 64k (plafond de `--kl-record`).
+- Les identités comparent le texte imprimé (md5 de stdout), pas les identifiants de tokens.
+- Q2 : p99 par prompt de 64 pas (donc le maximum), pas sur les 128 pas agrégés ; tous les maxima restent sous 5e-3.
+- « TTFT » = `prefill_ms` des métriques, pas un premier token mesuré séparément.
+- Les 2 blocs à 128k sont programmés dans le script, pas seulement un effet de la porte de charge.
 - Q3 repose sur 64 pas : un seul pas divergent donne 98,4 %.
 - M1 non relevé ; le critère n'est pas rejoué avec ce seul point.
 - Une seule machine, un seul modèle ; corpus du dépôt à la place du corpus Rust stdlib.
