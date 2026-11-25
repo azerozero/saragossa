@@ -7962,14 +7962,26 @@ fn resident_llama3_rope_matches_cpu_oracle() -> Result<()> {
         let (mut worst, mut witness, mut scale) = (0.0_f32, 0.0_f32, 1.0_f32);
         for &token in &feed {
             let expected = cpu.next_final_state_cached(&mut cpu_cache, token)?;
-            let actual = metal.next_final_state_cached(&mut gpu_cache, token)?;
+            // Pas résident complet (arène, RoPE GPU), sans repli per-op.
+            let actual = metal
+                .next_final_states_resident_verify(
+                    &mut gpu_cache,
+                    &[token],
+                    crate::decoder::ResidentVerifyHead::Skip,
+                    false,
+                    None,
+                    None,
+                )?
+                .ok_or_else(|| InferError::Config("pas résident indisponible".into()))?
+                .states;
+            let actual = actual.row_slice(0)?;
             let unscaled = plain.next_final_state_cached(&mut plain_cache, token)?;
-            for ((e, a), u) in expected
-                .data()
-                .iter()
-                .zip(actual.data())
-                .zip(unscaled.data())
-            {
+            assert_eq!(actual.len(), expected.data().len());
+            assert!(
+                actual.iter().all(|value| value.is_finite()),
+                "sortie non finie"
+            );
+            for ((e, a), u) in expected.data().iter().zip(actual).zip(unscaled.data()) {
                 scale = scale.max(e.abs());
                 worst = worst.max((e - a).abs());
                 witness = witness.max((e - u).abs());
