@@ -38,6 +38,10 @@ use crate::assets::is_mtp_key;
 use crate::{InferError, Result};
 
 const FORMAT: &str = "saragossa-convert-hf/1";
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
 const MANIFEST: &str = "convert_manifest.json";
 /// Fichiers annexes recopiés à l'octet ; seul `tokenizer.json` est obligatoire
 /// (jamais régénéré : voir `tools/quant/tokenizer_sidecar.py`).
@@ -115,10 +119,11 @@ struct Identity {
     imatrix_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     bits_for: Vec<(String, usize)>,
-    // Moindres carrés avec la grille à zéro et l'importance fictive des petites
-    // colonnes : un journal antérieur (champ absent) n'est pas repris.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    zero_grid: bool,
+    // Révision des moindres carrés (1 : grille à zéro, importance fictive des
+    // petites colonnes réservée aux conversions sans imatrix) : un journal
+    // d'une autre révision (champ absent = 0) n'est pas repris.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    ls_revision: u32,
 }
 
 /// Empreinte complète d'un shard source : une reprise sur d'autres poids de
@@ -373,9 +378,26 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
     if let Some(report) = &options.audit_report {
         // Le rapport et son temporaire `*.tmp-write` remplacent leur cible :
         // dans la source ou la sortie, ils écraseraient un shard, l'index, le
-        // tokenizer ou le journal. Refusé avant toute conversion.
-        let at = resolved(report)?;
-        if at.starts_with(resolved(&options.src)?) || at.starts_with(resolved(&options.dst)?) {
+        // tokenizer ou le journal. Refusé avant toute conversion. Chaque chemin
+        // est testé résolu (cible d'un lien, que `File::create` suit) et comme
+        // entrée de son dossier résolu (que `rename` remplace).
+        let roots = [resolved(&options.src)?, resolved(&options.dst)?];
+        let mut spots = Vec::new();
+        for path in [report.clone(), report.with_extension("tmp-write")] {
+            spots.push(resolved(&path)?);
+            if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                spots.push(resolved(parent)?.join(name));
+            }
+        }
+        if spots
+            .iter()
+            .any(|spot| roots.iter().any(|root| spot.starts_with(root)))
+        {
             return Err(InferError::Config(format!(
                 "--audit-report {} : hors des dossiers source et destination attendu",
                 report.display()
@@ -402,7 +424,7 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
         keep_bf16: options.keep_bf16.clone(),
         imatrix_sha256: imatrix.as_ref().map(|m| m.sha256.clone()),
         bits_for: options.bits_for.clone(),
-        zero_grid: !options.minmax,
+        ls_revision: u32::from(!options.minmax),
     };
 
     let dst = &options.dst;

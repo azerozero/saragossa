@@ -455,6 +455,26 @@ fn imatrix_uniform_is_identity_and_bits_for_overrides() {
             report.display()
         );
     }
+    // Lien sortant de la source : `rename` remplacerait le lien lui-même.
+    #[cfg(unix)]
+    {
+        let outside = root.path().join("outside.json");
+        std::fs::write(&outside, "{}").expect("invariant: cible extérieure");
+        let link = src.join("linked.json");
+        std::os::unix::fs::symlink(&outside, &link).expect("invariant: lien");
+        let mut opts = options(&src, &weighted);
+        opts.audit_report = Some(link);
+        assert!(convert_hf(&opts).is_err(), "lien de la source accepté");
+        // Temporaire extérieur liant vers un shard source.
+        std::os::unix::fs::symlink(src.join(SHARDS[0]), root.path().join("trap.tmp-write"))
+            .expect("invariant: lien");
+        let mut opts = options(&src, &weighted);
+        opts.audit_report = Some(root.path().join("trap.json"));
+        assert!(
+            convert_hf(&opts).is_err(),
+            "temporaire lié à la source accepté"
+        );
+    }
     assert_eq!(
         std::fs::read(src.join(SHARDS[0])).expect("invariant: shard source"),
         before
