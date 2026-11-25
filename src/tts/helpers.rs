@@ -53,6 +53,77 @@ pub(super) fn repeat_frame_stop_tripped(repeat_run: usize, threshold: usize) -> 
     threshold > 0 && repeat_run >= threshold
 }
 
+/// Table d'embedding consultée ligne à ligne sur CPU.
+///
+/// Une table bf16 reste en bf16 et n'est élargie qu'à la lecture des lignes
+/// demandées : l'élargissement est exact, la mémoire résidente est divisée
+/// par deux (622 Mo au lieu de 1,24 Go pour le vocabulaire Qwen3-TTS).
+#[derive(Debug)]
+pub(super) enum RowTable {
+    F32(Tensor),
+    Bf16 {
+        rows: usize,
+        cols: usize,
+        bits: Vec<u16>,
+    },
+}
+
+impl RowTable {
+    pub(super) fn cols(&self) -> Result<usize> {
+        match self {
+            Self::F32(tensor) => Ok(tensor.as_matrix()?.1),
+            Self::Bf16 { cols, .. } => Ok(*cols),
+        }
+    }
+
+    pub(super) fn capacity_bytes(&self) -> usize {
+        match self {
+            Self::F32(tensor) => tensor.capacity_bytes(),
+            Self::Bf16 { bits, .. } => bits.capacity() * size_of::<u16>(),
+        }
+    }
+
+    pub(super) fn to_tensor(&self) -> Result<Tensor> {
+        match self {
+            Self::F32(tensor) => Ok(tensor.clone()),
+            Self::Bf16 { rows, cols, bits } => Tensor::from_vec(
+                vec![*rows, *cols],
+                bits.iter().map(|&b| bf16_to_f32(b)).collect(),
+            ),
+        }
+    }
+
+    pub(super) fn gather_i32(&self, ids: &[i32]) -> Result<Tensor> {
+        let (rows, cols, bits) = match self {
+            Self::F32(tensor) => return gather_rows_i32(tensor, ids),
+            Self::Bf16 { rows, cols, bits } => (*rows, *cols, bits),
+        };
+        if ids.is_empty() {
+            return Err(InferError::Dimension("séquence de tokens vide".to_string()));
+        }
+        let mut out = Vec::with_capacity(ids.len() * cols);
+        for id in ids {
+            let row = usize::try_from(*id)
+                .map_err(|_| InferError::Dimension(format!("id embedding négatif: {id}")))?;
+            if row >= rows {
+                return Err(InferError::Dimension(format!(
+                    "token id {row} hors vocab {rows}"
+                )));
+            }
+            out.extend(
+                bits[row * cols..(row + 1) * cols]
+                    .iter()
+                    .map(|&b| bf16_to_f32(b)),
+            );
+        }
+        Tensor::from_vec(vec![ids.len(), cols], out)
+    }
+}
+
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
 pub(super) fn gather_rows_i32(table: &Tensor, ids: &[i32]) -> Result<Tensor> {
     let mut rows = Vec::with_capacity(ids.len());
     for id in ids {
@@ -101,4 +172,63 @@ pub(super) fn clone_sample_seed() -> u64 {
     crate::runtime_flags::env_var("SARAGOSSA_TTS_CLONE_SAMPLE_SEED")
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod row_table_tests {
+    use super::*;
+
+    #[test]
+    fn bf16_rows_match_widened_f32_table_bitwise() -> Result<()> {
+        let bits: Vec<u16> = vec![0x3f80, 0xbf00, 0x7f7f, 0x0001, 0x4049, 0xc2f7];
+        let table = RowTable::Bf16 {
+            rows: 3,
+            cols: 2,
+            bits: bits.clone(),
+        };
+        let dense = RowTable::F32(table.to_tensor()?);
+        for ids in [&[2, 0, 1][..], &[1, 1]] {
+            let got = table.gather_i32(ids)?;
+            let want = dense.gather_i32(ids)?;
+            assert_eq!(got.shape(), want.shape());
+            let same = got
+                .data()
+                .iter()
+                .zip(want.data())
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(same, "lignes bf16 différentes pour {ids:?}");
+        }
+        assert_eq!(table.to_tensor()?.data()[0], 1.0);
+        assert_eq!(table.cols()?, 2);
+        assert_eq!(table.capacity_bytes(), bits.capacity() * 2);
+        assert!(table.gather_i32(&[3]).is_err());
+        assert!(table.gather_i32(&[-1]).is_err());
+        assert!(table.gather_i32(&[]).is_err());
+        Ok(())
+    }
+
+    // Oracle indépendant : le lecteur historique, sur les 65 536 motifs
+    // (zéros signés, sous-normaux, infinis et NaN compris).
+    #[test]
+    fn bf16_rows_match_safetensor_reader_on_every_pattern() -> Result<()> {
+        let bits: Vec<u16> = (0..=u16::MAX).collect();
+        let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let want =
+            crate::safetensor::bytes_to_dense_f32(&bytes, safetensors::Dtype::BF16, "motifs")?;
+        let table = RowTable::Bf16 {
+            rows: 256,
+            cols: 256,
+            bits,
+        };
+        let ids: Vec<i32> = (0..256).collect();
+        let got = table.gather_i32(&ids)?;
+        assert_eq!(got.data().len(), want.len());
+        let same = got
+            .data()
+            .iter()
+            .zip(&want)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(same, "conversion bf16 différente du lecteur safetensors");
+        Ok(())
+    }
 }

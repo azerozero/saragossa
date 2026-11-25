@@ -1,0 +1,24 @@
+name: Model or feature request
+description: Ask for a new model family, format, endpoint or option.
+labels: ["enhancement"]
+body:
+  - type: input
+    id: what
+    attributes:
+      label: Model or feature
+      description: For a model, the Hugging Face id and architecture (from config.json).
+      placeholder: "org/Model-7B, architecture: LlamaForCausalLM"
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Use case
+      description: What you want to run, and what blocks you today.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround
+      description: Another engine or option you use today, if any.

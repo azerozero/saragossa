@@ -90,10 +90,10 @@ fn count_equals_messages_and_chat_usage_for_every_family_with_and_without_tools(
             assert_eq!(state.loaded_count(), 0);
             assert_eq!(state.clock, 0);
             let mut loaded = super::json_tests::tiny_loaded_model();
-            loaded.assets.config =
+            loaded.llm_mut().assets.config =
                 saragossa::ModelConfig::from_file(dir.path().join("config.json"))
                     .expect("invariant: config synthétique");
-            loaded.assets.tokenizer =
+            loaded.llm_mut().assets.tokenizer =
                 saragossa::RustTokenizer::from_file(dir.path().join("tokenizer.json"))
                     .expect("invariant: tokenizer synthétique");
             let request: ChatCompletionRequest =
@@ -134,7 +134,7 @@ fn count_equals_messages_and_chat_usage_for_every_family_with_and_without_tools(
                         },
                     ),
                 };
-                let tokenizer = &loaded.assets.tokenizer;
+                let tokenizer = &loaded.llm.assets.tokenizer;
                 let expected = if family == "gemma3" {
                     let ids = tokenizer
                         .encode_with_special_tokens(&rendered)

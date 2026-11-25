@@ -59,6 +59,7 @@ jobs:
           # Conserver les #[ignore] jusqu’à trois passages CI stables.
           tests=(
             serve::state::tests::agent_turn_prefills_only_new_tokens_and_matches_cold
+            serve::state::tests::engines_sharing_decoder_match_serial_greedy
             qwen_loader::flint_tests::synthetic_flint_resident_decode_without_fast_math_matches_cpu_oracle
             qwen_loader::flint_tests::synthetic_flint_greedy_identical_after_unload_and_reload
             decode_resident::rope_tests::rope_decode_matches_common_cpu_at_long_positions

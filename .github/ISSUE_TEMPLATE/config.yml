@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and help
+    url: https://github.com/azerozero/saragossa/discussions
+    about: Usage questions, setup help and benchmark results go to Discussions.
+  - name: Security vulnerability
+    url: https://github.com/azerozero/saragossa/security/policy
+    about: Report vulnerabilities privately, as described in SECURITY.md.

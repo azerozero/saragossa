@@ -1,0 +1,44 @@
+name: Performance regression
+description: A version is slower or uses more memory than an earlier one.
+body:
+  - type: markdown
+    attributes:
+      value: "Mask secrets in every field (API keys, tokens, private paths)."
+  - type: input
+    id: versions
+    attributes:
+      label: Versions compared
+      description: Good and bad version (release tag or commit).
+      placeholder: "good: v0.3.38, bad: v0.3.39"
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: OS and version, chip or CPU, memory, backend (metal or cpu), power source (AC or battery).
+      placeholder: "macOS 26.1, M5 Max, 128 GB, metal, AC"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and quantization
+      placeholder: "mlx-community/Qwen3-4B-4bit"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Benchmark command and settings
+      description: "The same command run on both versions, e.g. `saragossa bench --model-dir DIR --format json`, plus every SARAGOSSA_* variable or config file set for each run."
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Numbers
+      description: "Results for both versions (prefill and decode tok/s, TTFT) and the number of runs. Memory is optional: say how it was measured (tool, metric such as peak RSS, unit)."
+    validations:
+      required: true
