@@ -44,7 +44,8 @@
 //! que `serve.read_timeout_secs`, `serve.max_tokens_cap`, `serve.max_tok_s`,
 //! `serve.gpu_share`, `serve.idle_unload_secs` et la liste `[[models]]` ;
 //! tout autre changement ou chemin de modèle illisible est refusé en bloc (voir
-//! `reload`).
+//! `reload`). `--auto-yield` (opt-in, macOS) baisse `gpu_share` tant que
+//! l'utilisateur se sert du Mac (voir `auto_yield`).
 //!
 //! SIGUSR2 relaie sans coupure vers le binaire du même chemin (ou
 //! `--upgrade-binary PATH`) : l'enfant hérite de la socket d'écoute, puis
@@ -66,6 +67,8 @@ mod args;
 ))]
 #[cfg(feature = "serve")]
 mod audio;
+#[cfg(feature = "serve")]
+mod auto_yield;
 #[cfg(feature = "serve")]
 mod cache;
 #[cfg(feature = "serve")]
@@ -183,7 +186,10 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         saragossa::set_decode_max_tokens_per_s(Some(rate));
     }
     if let Some(share) = args.gpu_share {
-        saragossa::set_gpu_share(share);
+        auto_yield::set_configured(share);
+    }
+    if let Some(config) = args.auto_yield {
+        auto_yield::spawn(config);
     }
     reload::set_launch_models(&args.models);
     reload::set_idle_unload_secs(args.idle_unload_secs);

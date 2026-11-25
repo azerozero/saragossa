@@ -55,6 +55,8 @@ pub(super) struct ServeArgs {
     pub(super) gpu_share: Option<u8>,
     /// Délai sans requête avant déchargement des modèles (0 : jamais), rechargeable à chaud.
     pub(super) idle_unload_secs: u64,
+    /// Cédage automatique du GPU quand l'utilisateur se sert du Mac (`None` : off).
+    pub(super) auto_yield: Option<super::auto_yield::AutoYield>,
     /// Cache persistant opt-in.
     pub(super) prefix_ssd: saragossa::runtime_flags::ServePrefixSsdOptions,
     /// Moteurs d'inférence parallèles partageant les poids (1 : moteur sériel).
@@ -151,6 +153,10 @@ impl ServeArgs {
                 .and_then(|v| v.trim().parse().ok())
                 .or(profile.serve.idle_unload_secs)
                 .unwrap_or(0);
+        let mut auto_yield = saragossa::runtime_flags::env_flag(
+            "SARAGOSSA_SERVE_AUTO_YIELD",
+            profile.serve.auto_yield.unwrap_or(false),
+        );
         let mut prefix_ssd = saragossa::runtime_flags::ServePrefixSsdOptions::from_env()?;
         // invariant: `Profile::validate` borne `serve.engines` à 1..=16.
         // Validé après la CLI : `--engines` l'emporte sur un environnement invalide.
@@ -261,6 +267,7 @@ impl ServeArgs {
                         .parse()
                         .map_err(|_| ServeError::args("--idle-unload-secs attend un entier"))?;
                 }
+                "--auto-yield" => auto_yield = true,
                 "--help" | "-h" => return Err(ServeError::args(help_text())),
                 other => return Err(ServeError::args(format!("argument serve inconnu: {other}"))),
             }
@@ -306,6 +313,11 @@ impl ServeArgs {
             max_tok_s,
             gpu_share,
             idle_unload_secs,
+            // invariant: `Profile::validate` borne la part à 10..=100 et le délai à > 0.
+            auto_yield: auto_yield.then(|| super::auto_yield::AutoYield {
+                share: profile.serve.auto_yield_share.unwrap_or(25) as u8,
+                idle: Duration::from_secs(profile.serve.auto_yield_idle_secs.unwrap_or(60)),
+            }),
             prefix_ssd,
             engines,
         })
@@ -378,8 +390,8 @@ pub(super) fn help_text() -> String {
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
          [--api-key TOKEN (deprecated, use SARAGOSSA_API_KEY)] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
-         {modality_options}[--backend cpu|metal] [--preload] [--max-tok-s R] [--gpu-share 10-100] [--idle-unload-secs N] [--engines N] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
-         Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap, serve.max_tok_s, serve.gpu_share and the [[models]] list (id, path) only. See `saragossa config print`.\n\
+         {modality_options}[--backend cpu|metal] [--preload] [--max-tok-s R] [--gpu-share 10-100] [--auto-yield] [--idle-unload-secs N] [--engines N] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
+         Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap, serve.max_tok_s, serve.gpu_share, serve.idle_unload_secs and the [[models]] list (id, path) only. See `saragossa config print`.\n\
          Upgrade (Unix): SIGUSR2 starts the same binary path (or --upgrade-binary PATH) with the same arguments on the inherited listening socket, then the old process drains for at most serve.drain_timeout_secs (30) and exits; enhance h2/WebTransport listeners follow. serve.relay_mode=auto|parallel|sequential (auto: sequential only if the memory guard refuses two resident processes).\n\
          SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
          --prefix-cache-ssd-priority-tokens 4096 (0 disables priority).\n\
@@ -395,6 +407,10 @@ pub(super) fn help_text() -> String {
          SARAGOSSA_RUST_IDLE_UNLOAD_SECS, hot-reloadable, 0 = off, default) drops all \
          models after N idle seconds; the next request reloads them. --preload models \
          are unloaded too.\n\
+         Auto yield (macOS, opt-in): --auto-yield (serve.auto_yield, SARAGOSSA_SERVE_AUTO_YIELD) \
+         lowers the GPU share to serve.auto_yield_share (25) while keyboard or mouse input \
+         is seen, and restores the configured share after serve.auto_yield_idle_secs (60) \
+         idle seconds; output tokens are unchanged, only timing.\n\
          Engines: --engines N (serve.engines, SARAGOSSA_SERVE_ENGINES, 1..={MAX_ENGINES}, \
          default 1, not hot-reloadable) runs N inference threads on one shared copy of the \
          weights, each with its own KV, scratch and block prefix cache; 1 keeps the serial \
@@ -549,6 +565,49 @@ mod tests {
             ServeArgs::parse(["--model", "a=/x/a", "--idle-unload-secs", "90"].map(String::from))
                 .expect("args");
         assert_eq!(on.idle_unload_secs, 90);
+    }
+
+    #[test]
+    fn auto_yield_is_off_by_default_and_set_by_cli_env_or_profile() {
+        use super::super::auto_yield::AutoYield;
+        let base = ["--model", "a=/x/a"].map(String::from);
+        let off = ServeArgs::parse(base.clone()).expect("args");
+        assert_eq!(off.auto_yield, None, "défaut inchangé");
+        let default = Some(AutoYield {
+            share: 25,
+            idle: Duration::from_secs(60),
+        });
+        let mut cli = base.to_vec();
+        cli.push("--auto-yield".into());
+        assert_eq!(ServeArgs::parse(cli).expect("cli").auto_yield, default);
+        with_env("SARAGOSSA_SERVE_AUTO_YIELD", "1", || {
+            assert_eq!(
+                ServeArgs::parse(base.clone()).expect("env").auto_yield,
+                default
+            );
+        });
+        let profile = saragossa::runtime_flags::Profile::parse(
+            "[serve]\nauto_yield = true\nauto_yield_share = 40\nauto_yield_idle_secs = 9\n",
+        )
+        .expect("profil");
+        let tuned = Some(AutoYield {
+            share: 40,
+            idle: Duration::from_secs(9),
+        });
+        let parsed = ServeArgs::parse_with(&profile, base.to_vec()).expect("profil");
+        assert_eq!(parsed.auto_yield, tuned);
+        with_env("SARAGOSSA_SERVE_AUTO_YIELD", "0", || {
+            let parsed = ServeArgs::parse_with(&profile, base.to_vec()).expect("env 0");
+            assert_eq!(
+                parsed.auto_yield, None,
+                "l'environnement prime sur le profil"
+            );
+        });
+        for bad in ["auto_yield_share = 5", "auto_yield_idle_secs = 0"] {
+            assert!(
+                saragossa::runtime_flags::Profile::parse(&format!("[serve]\n{bad}\n")).is_err()
+            );
+        }
     }
 
     #[test]

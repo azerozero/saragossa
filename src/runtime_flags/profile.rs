@@ -108,6 +108,13 @@ pub struct ServeSection {
     /// Équivalent de `--idle-unload-secs` : décharge les modèles après ce délai
     /// sans requête (0 ou absent : jamais).
     pub idle_unload_secs: Option<u64>,
+    /// Équivalent de `--auto-yield` : baisse `gpu_share` tant que l'utilisateur
+    /// se sert du Mac (clavier, souris).
+    pub auto_yield: Option<bool>,
+    /// Part de GPU pendant le cédage automatique, 10 à 100 (défaut 25).
+    pub auto_yield_share: Option<u64>,
+    /// Secondes d'inactivité avant de rendre la part configurée (défaut 60).
+    pub auto_yield_idle_secs: Option<u64>,
     /// Délai max de vidage de l'ancien processus après un relais SIGUSR2.
     pub drain_timeout_secs: Option<u64>,
     /// Relais SIGUSR2 : `auto` (défaut), `parallel` ou `sequential`.
@@ -216,6 +223,16 @@ impl Profile {
         if !self.serve.gpu_share.is_none_or(|v| (10..=100).contains(&v)) {
             return Err(err("serve.gpu_share", "doit être dans 10..=100"));
         }
+        if !self
+            .serve
+            .auto_yield_share
+            .is_none_or(|v| (10..=100).contains(&v))
+        {
+            return Err(err("serve.auto_yield_share", "doit être dans 10..=100"));
+        }
+        if self.serve.auto_yield_idle_secs == Some(0) {
+            return Err(err("serve.auto_yield_idle_secs", "doit être > 0"));
+        }
         if let Some(backend) = &self.engine.backend {
             if !matches!(backend.as_str(), "cpu" | "metal") {
                 return Err(err("engine.backend", "attendu \"cpu\" ou \"metal\""));
@@ -310,6 +327,24 @@ impl Profile {
                 Some("SARAGOSSA_RUST_IDLE_UNLOAD_SECS"),
                 "0",
                 num(s.idle_unload_secs),
+            ),
+            r(
+                "serve.auto_yield",
+                Some("SARAGOSSA_SERVE_AUTO_YIELD"),
+                "false",
+                s.auto_yield.map(|v| v.to_string()),
+            ),
+            r(
+                "serve.auto_yield_share",
+                None,
+                "25",
+                num(s.auto_yield_share),
+            ),
+            r(
+                "serve.auto_yield_idle_secs",
+                None,
+                "60",
+                num(s.auto_yield_idle_secs),
             ),
             r(
                 "serve.drain_timeout_secs",
