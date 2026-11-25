@@ -15,11 +15,13 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use super::error::ServeResult;
 
 type Slot = Weak<dyn Any + Send + Sync>;
+/// (famille, chemin, alias).
+type SlotKey = (&'static str, PathBuf, String);
 
 /// Registre clonable (un `Arc` interne) : un par process serve.
 #[derive(Clone, Default)]
 pub(super) struct SharedWeights {
-    slots: Arc<Mutex<HashMap<(&'static str, PathBuf), Slot>>>,
+    slots: Arc<Mutex<HashMap<SlotKey, Slot>>>,
 }
 
 impl SharedWeights {
@@ -29,7 +31,8 @@ impl SharedWeights {
     /// celle d'un autre moteur.
     ///
     /// La clé est le chemin tel que donné : preset et profil de kernels se
-    /// déduisent du chemin, deux alias d'un même dossier restent distincts.
+    /// déduisent du chemin, deux chemins vers un même dossier restent
+    /// distincts.
     ///
     /// ponytail: verrou global tenu pendant le chargement (un moteur qui veut
     /// un autre modèle attend) ; verrou par clé si les chargements concurrents
@@ -44,12 +47,29 @@ impl SharedWeights {
         path: &Path,
         load: impl FnOnce() -> ServeResult<T>,
     ) -> ServeResult<Arc<T>> {
+        self.get_or_load_alias(kind, path, "", load)
+    }
+
+    /// Comme [`Self::get_or_load`], une instance par `alias` : deux modèles
+    /// servis sous deux noms gardent chacun leur décodeur et ses caches
+    /// internes, comme avant le partage ; seuls les moteurs se la partagent.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie l'erreur de `load`.
+    pub(super) fn get_or_load_alias<T: Send + Sync + 'static>(
+        &self,
+        kind: &'static str,
+        path: &Path,
+        alias: &str,
+        load: impl FnOnce() -> ServeResult<T>,
+    ) -> ServeResult<Arc<T>> {
         // Une panique pendant `load` n'a rien inséré : la table reste cohérente.
         let mut slots = self
             .slots
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let key = (kind, path.to_path_buf());
+        let key = (kind, path.to_path_buf(), alias.to_string());
         if let Some(shared) = slots.get(&key).and_then(Weak::upgrade) {
             if let Ok(shared) = shared.downcast::<T>() {
                 return Ok(shared);
@@ -180,6 +200,9 @@ mod tests {
         // Autre famille sur le même chemin : chargement distinct.
         let other = shared.get_or_load("tts", path, || Ok(9_u32))?;
         assert_eq!(*other, 9);
+        // Deux alias d'un même dossier : deux instances.
+        let alias = shared.get_or_load_alias("llm", path, "b", || Ok(11_u32))?;
+        assert_eq!(*alias, 11);
         drop((first, second));
         let reloaded = shared.get_or_load("llm", path, || {
             loads += 1;

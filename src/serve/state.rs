@@ -568,7 +568,8 @@ impl ServeState {
         // Des poids déjà tenus par un autre moteur sont rattachés sans
         // admission ; sinon admission et chargement se font sous le verrou du
         // registre, à l'abri d'un chargement concurrent.
-        let llm = weights.get_or_load("llm", &path, || {
+        let alias = self.models[index].id.clone();
+        let llm = weights.get_or_load_alias("llm", &path, &alias, || {
             let additional = self.models[index].estimated_model_bytes();
             self.enforce_memory_budget(additional, Some(index))?;
             let slot = &self.models[index];

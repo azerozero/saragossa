@@ -32,7 +32,6 @@ pub use config::{
 };
 pub use constants::CLONE_GENERATION_HARD_CAP as TTS_GENERATION_HARD_CAP;
 pub use constants::DEFAULT_INSTRUCT;
-pub use inputs::TtsRequestVoice;
 pub use model::{TtsForwardOutput, TtsModel, TtsPayloadSummary, TtsStopReason, TtsSynthesisOutput};
 pub(crate) use payload::SafetensorPayload;
 

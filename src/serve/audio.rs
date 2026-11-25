@@ -436,7 +436,7 @@ impl SpeechSynthesis for AudioState {
         self.tts.seed = seed;
         // La résolution valide la voix sans toucher au modèle partagé ; la
         // portée effective est posée autour de chaque synthèse.
-        match model.request_voice(voice, seed) {
+        match model.with_request_voice(voice, seed, || ()) {
             Ok(_) => {
                 self.tts.voice = voice.map(str::to_owned);
                 Ok(None)
@@ -447,7 +447,7 @@ impl SpeechSynthesis for AudioState {
                 };
                 // Le défaut est résolu à nouveau pour ne pas conserver la voix
                 // d'une requête précédente. Un défaut invalide reste une erreur.
-                drop(model.request_voice(None, seed)?);
+                model.with_request_voice(None, seed, || ())?;
                 self.tts.voice = None;
                 eprintln!("saragossa serve TTS: {cause} ; repli sur serena");
                 Ok(Some(requested.to_owned()))
@@ -457,8 +457,9 @@ impl SpeechSynthesis for AudioState {
 
     fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput> {
         let (model, voice, seed) = self.tts_with_voice()?;
-        let _voice = model.request_voice(voice.as_deref(), seed)?;
-        Ok(model.synthesize_default(text, max_frames)?)
+        Ok(model.with_request_voice(voice.as_deref(), seed, || {
+            model.synthesize_default(text, max_frames)
+        })??)
     }
 
     fn stream_sample_rate(&mut self) -> ServeResult<u32> {
@@ -472,8 +473,9 @@ impl SpeechSynthesis for AudioState {
         on_audio: &mut dyn FnMut(&[f32]) -> saragossa::Result<()>,
     ) -> ServeResult<TtsSynthesisOutput> {
         let (model, voice, seed) = self.tts_with_voice()?;
-        let _voice = model.request_voice(voice.as_deref(), seed)?;
-        Ok(model.synthesize_default_streaming(text, max_frames, on_audio)?)
+        Ok(model.with_request_voice(voice.as_deref(), seed, || {
+            model.synthesize_default_streaming(text, max_frames, on_audio)
+        })??)
     }
 }
 

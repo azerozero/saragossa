@@ -22,7 +22,12 @@ mémoire système = anonyme + wired + compressé (`vm_stat`).
 | 4 | 12 / 13 Go | 67,4 Go | 3,52 / 3,87 s | 0,587 / 0,642 | 46 |
 | 6 | 13 / 15 Go | 68,8 Go | 5,26 / 5,57 s | 0,854 / 0,949 | 32 |
 
-« Avant » : binaire sans `--engines`, même session. Identité : à chaque tour,
+« Avant » : binaire de la PR #352 (bb61467, sans `--engines`) ; « 1 » à « 6 » :
+binaire 47b417f de cette branche avec `--engines N`, même session, même
+environnement (`SARAGOSSA_RUST_PREFIX_CACHE=0`, `SARAGOSSA_RUST_MMAP_WEIGHTS=1`,
+sidecar MTP officiel), clips FLEURS fr 0, 1, 2, 4 répétés, graine TTS 7.
+Chaque chaîne enregistre par tour la transcription, la réponse et le SHA-256
+du PCM reçu. Identité : à chaque tour,
 transcription, réponse et hash du PCM sont identiques entre N=1 et l'ancien
 binaire, et entre chaque N et N=1. À N=6, un trou de lecture de 0,36 s apparaît
 (p95 `tts_rtf` 0,95).
@@ -42,4 +47,5 @@ mémoire système) : environ +16 Go par chaîne (62,8 → 78,9 → 94,7 Go, coup
   diarisation et du codec TTS est partagée entre moteurs (les arènes decode ont
   déjà la leur). Prochaine étape : une file par moteur.
 - Coupés dès N > 1 : cache de préfixe interne du décodeur, mémo de prefill TTS,
-  lots ; STT streamée sérialisée entre moteurs.
+  lots ; `--prefix-cache-ssd-dir` refusé ; STT streamée sérialisée entre
+  moteurs.

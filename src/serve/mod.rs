@@ -15,8 +15,9 @@
 //! scratch Metal cloisonné, cache de préfixe par blocs), sur une seule copie
 //! des poids LLM, Whisper, TTS, diarisation et embeddings (voir `shared`) ; la
 //! garde mémoire est commune. Dès N > 1 : le cache de préfixe interne du
-//! décodeur (MTP, DFlash, SSD) et le mémo de prefill TTS, portés par les poids
-//! partagés, sont coupés ; les lots aussi ; une panique de requête arrête le
+//! décodeur (MTP, DFlash) et le mémo de prefill TTS, portés par les poids
+//! partagés, sont coupés, le cache SSD (singleton du process) est refusé ; les
+//! lots aussi ; une panique de requête arrête le
 //! process, l'état partagé n'étant plus sûr. Limites connues : la file de
 //! commandes Metal d'un modèle (prefill, Whisper, diarisation, codec TTS) est
 //! partagée, le premier son croît donc à peu près linéairement avec N ; les

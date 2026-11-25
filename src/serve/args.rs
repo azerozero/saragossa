@@ -153,14 +153,9 @@ impl ServeArgs {
                 .unwrap_or(0);
         let mut prefix_ssd = saragossa::runtime_flags::ServePrefixSsdOptions::from_env()?;
         // invariant: `Profile::validate` borne `serve.engines` à 1..=16.
-        let mut engines = match saragossa::runtime_flags::env_var("SARAGOSSA_SERVE_ENGINES") {
-            Some(value) => parse_engines(&value)?,
-            None => profile
-                .serve
-                .engines
-                .and_then(|v| usize::try_from(v).ok())
-                .unwrap_or(1),
-        };
+        // Validé après la CLI : `--engines` l'emporte sur un environnement invalide.
+        let engines_env = saragossa::runtime_flags::env_var("SARAGOSSA_SERVE_ENGINES");
+        let mut engines_cli = None;
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -258,7 +253,9 @@ impl ServeArgs {
                             .map_err(ServeError::args)?,
                     );
                 }
-                "--engines" => engines = parse_engines(&next_value(&mut iter, "--engines")?)?,
+                "--engines" => {
+                    engines_cli = Some(parse_engines(&next_value(&mut iter, "--engines")?)?);
+                }
                 "--idle-unload-secs" => {
                     idle_unload_secs = next_value(&mut iter, "--idle-unload-secs")?
                         .parse()
@@ -268,6 +265,15 @@ impl ServeArgs {
                 other => return Err(ServeError::args(format!("argument serve inconnu: {other}"))),
             }
         }
+        let engines = match (engines_cli, engines_env) {
+            (Some(engines), _) => engines,
+            (None, Some(value)) => parse_engines(&value)?,
+            (None, None) => profile
+                .serve
+                .engines
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(1),
+        };
         // La CLI gagne : une entrée TOML de même id est ignorée.
         for entry in &profile.models {
             if !models.iter().any(|model| model.id == entry.id) {
@@ -275,6 +281,12 @@ impl ServeArgs {
             }
         }
         prefix_ssd.bytes()?;
+        if engines > 1 && prefix_ssd.directory.is_some() {
+            // Le cache SSD est un singleton du process, partagé par les moteurs.
+            return Err(ServeError::args(
+                "--prefix-cache-ssd-dir est incompatible avec --engines > 1 (cache commun aux moteurs)",
+            ));
+        }
         validate_tcp_args(&host, port, api_key.as_deref())?;
         Ok(Self {
             host,
@@ -386,9 +398,9 @@ pub(super) fn help_text() -> String {
          Engines: --engines N (serve.engines, SARAGOSSA_SERVE_ENGINES, 1..={MAX_ENGINES}, \
          default 1, not hot-reloadable) runs N inference threads on one shared copy of the \
          weights, each with its own KV, scratch and block prefix cache; 1 keeps the serial \
-         engine. With N > 1 the decoder's internal prefix cache (MTP/DFlash/SSD) and the TTS \
-         prefill memo are disabled, request batching is off and a request panic stops the \
-         process. Limits: one Metal command queue per model is shared (first sound grows \
+         engine. With N > 1 the decoder's internal prefix cache (MTP/DFlash) and the TTS \
+         prefill memo are disabled, --prefix-cache-ssd-dir is refused, request batching is \
+         off and a request panic stops the process. Limits: one Metal command queue per model is shared (first sound grows \
          about linearly with N), streamed STT chunks are serialized across engines, a model \
          load holds the weight registry lock, a derived weight may be built twice on the \
          first concurrent call. See docs/perf/serve-multi-moteur.md.\n\
@@ -551,6 +563,27 @@ mod tests {
         for refused in ["0", "17", "x"] {
             assert!(parse(refused).is_err(), "{refused}");
         }
+        // CLI > environnement, même invalide ; sans CLI, l'environnement compte.
+        with_env("SARAGOSSA_SERVE_ENGINES", "17", || {
+            assert_eq!(parse("2").ok(), Some(2));
+            assert!(ServeArgs::parse(["--model".into(), "a=/x/a".into()]).is_err());
+        });
+        let ssd = ServeArgs::parse(
+            [
+                "--model",
+                "a=/x/a",
+                "--engines",
+                "2",
+                "--prefix-cache-ssd-dir",
+                "/tmp/x",
+            ]
+            .map(String::from),
+        );
+        assert!(ssd.is_err_and(|e| e.to_string().contains("incompatible")));
+        with_env("SARAGOSSA_SERVE_ENGINES", "3", || {
+            let args = ServeArgs::parse(["--model".into(), "a=/x/a".into()]).expect("args");
+            assert_eq!(args.engines, 3);
+        });
     }
 
     #[test]

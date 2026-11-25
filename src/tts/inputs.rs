@@ -1,23 +1,25 @@
 use super::{add_into, gather_rows_i32, push_rows, PreparedVoiceDesign, TtsCloneContext, TtsModel};
 use crate::{InferError, Result, Tensor};
 
-type VoiceAndSeed = (Option<i32>, Option<u64>);
+/// Voix et graine d'une requête, rattachées à l'adresse du modèle visé.
+#[derive(Clone, Copy)]
+struct RequestVoice {
+    model: usize,
+    speaker_id: Option<i32>,
+    seed: Option<u64>,
+}
 
 thread_local! {
-    // Portée de requête de [`TtsModel::request_voice`] ; `None` : champs du modèle.
-    static REQUEST_VOICE: std::cell::Cell<Option<VoiceAndSeed>> = const { std::cell::Cell::new(None) };
+    // Portée de [`TtsModel::with_request_voice`] ; `None` : champs du modèle.
+    static REQUEST_VOICE: std::cell::Cell<Option<RequestVoice>> = const { std::cell::Cell::new(None) };
 }
 
-/// Garde de [`TtsModel::request_voice`]. `!Send` : restaurée sur son thread.
-#[must_use = "la voix de requête tombe avec la garde"]
-pub struct TtsRequestVoice {
-    previous: Option<VoiceAndSeed>,
-    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
-}
+/// Restaure la portée précédente, y compris si la synthèse panique.
+struct RestoreVoice(Option<RequestVoice>);
 
-impl Drop for TtsRequestVoice {
+impl Drop for RestoreVoice {
     fn drop(&mut self) {
-        REQUEST_VOICE.with(|slot| slot.set(self.previous));
+        REQUEST_VOICE.with(|slot| slot.set(self.0));
     }
 }
 
@@ -35,33 +37,49 @@ impl TtsModel {
         Ok(())
     }
 
-    /// Voix et graine d'une requête sur un modèle partagé (`&self`) : jusqu'au
-    /// drop de la garde, les synthèses de ce thread lisent `voice` et `seed` au
-    /// lieu des champs posés par [`Self::set_voice`] et [`Self::set_seed`].
+    /// Exécute `run` avec la voix et la graine d'une requête sur un modèle
+    /// partagé (`&self`) : pendant `run`, les synthèses de **ce** modèle sur ce
+    /// thread lisent `voice` et `seed` au lieu des champs posés par
+    /// [`Self::set_voice`] et [`Self::set_seed`] ; les autres modèles gardent
+    /// les leurs. La portée précédente est restaurée au retour.
     ///
     /// # Errors
     ///
-    /// Renvoie l'erreur de [`Self::set_voice`] pour une voix inconnue ; aucune
-    /// portée n'est alors installée.
-    pub fn request_voice(&self, voice: Option<&str>, seed: Option<u64>) -> Result<TtsRequestVoice> {
+    /// Renvoie l'erreur de [`Self::set_voice`] pour une voix inconnue, sans
+    /// exécuter `run`.
+    pub fn with_request_voice<R>(
+        &self,
+        voice: Option<&str>,
+        seed: Option<u64>,
+        run: impl FnOnce() -> R,
+    ) -> Result<R> {
         let speaker_id = self.assets.model_config.speaker_id(voice)?;
-        let previous = REQUEST_VOICE.with(|slot| slot.replace(Some((speaker_id, seed))));
-        Ok(TtsRequestVoice {
-            previous,
-            _thread_bound: std::marker::PhantomData,
-        })
+        let scope = RequestVoice {
+            model: self.identity(),
+            speaker_id,
+            seed,
+        };
+        let _restore = RestoreVoice(REQUEST_VOICE.with(|slot| slot.replace(Some(scope))));
+        Ok(run())
+    }
+
+    fn identity(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    fn request_voice(&self) -> Option<RequestVoice> {
+        REQUEST_VOICE
+            .with(std::cell::Cell::get)
+            .filter(|scope| scope.model == self.identity())
     }
 
     pub(super) fn effective_speaker_id(&self) -> Option<i32> {
-        REQUEST_VOICE
-            .with(std::cell::Cell::get)
-            .map_or(self.speaker_id, |(speaker_id, _)| speaker_id)
+        self.request_voice()
+            .map_or(self.speaker_id, |scope| scope.speaker_id)
     }
 
     pub(super) fn effective_seed(&self) -> Option<u64> {
-        REQUEST_VOICE
-            .with(std::cell::Cell::get)
-            .map_or(self.seed, |(_, seed)| seed)
+        self.request_voice().map_or(self.seed, |scope| scope.seed)
     }
 
     pub(super) fn prepare_inputs(&self, text: &str) -> Result<PreparedVoiceDesign> {

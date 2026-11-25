@@ -2312,7 +2312,7 @@ static SHARED_MODEL_CACHES_OFF: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// `serve --engines N` (N > 1) : coupe le cache de préfixe interne du décodeur
-/// (MTP, DFlash, SSD) et le mémo de prefill TTS. Ils vivent dans les poids
+/// (MTP, DFlash) et le mémo de prefill TTS. Ils vivent dans les poids
 /// partagés : un moteur changerait les reprises, donc le chemin numérique, d'un
 /// autre. Irréversible, à appeler avant la première requête.
 pub fn disable_shared_model_caches() {
