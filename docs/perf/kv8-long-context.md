@@ -69,3 +69,81 @@ par la vitesse, la mémoire et l'identité ; la KL à 64k est prise comme borne.
 - Mémoire : `/usr/bin/time -l` (`peak memory footprint`) sur un decode de 16
   tokens à 64k, 128k, 256k, pour bf16, q8, k8v4.
 - Aucune tolérance n'est élargie, aucun golden n'est régénéré.
+
+## Résultats
+
+Machine : M5 Max, Qwen3.8-27B 4 bits, prompts code/prose du dépôt. Données brutes :
+71 lignes de `results.jsonl` de la campagne (~/scratchpad/kv8). Seules les passes
+valides sont enregistrées ; les passes jetées par la porte `loadavg < 2` sont
+rejouées et n'apparaissent pas.
+
+### Qualité (KL contre bf16, 64 pas forcés)
+
+| Contexte | Prompt | KL moy. q8 | KL p99 q8 | Top-1 q8 | KL moy. k8v4 |
+|---|---|---|---|---|---|
+| 32k | code | 1,4e-5 | 1,2e-4 | 100 % | 1,3e-3 |
+| 32k | prose | 1,2e-5 | 1,6e-4 | 100 % | 2,0e-3 |
+| 64k | code | 1,4e-5 | 1,9e-4 | 98,4 % | 1,2e-3 |
+| 64k | prose | 1,9e-5 | 2,9e-4 | 98,4 % | 1,0e-3 |
+
+Q1 et Q2 passent largement. Q3 échoue à 64k (63/64 = 98,4 % < 99 %, les deux
+prompts) ; il passe à 32k.
+
+### Vitesse (ABBA, médiane des rapports q8/bf16 par bloc ; decode tok/s)
+
+| Contexte | Mode | bf16 | q8 | Rapport (blocs) | TTFT q8/bf16 |
+|---|---|---|---|---|---|
+| 32k | AR | 28,39 | 28,64 | 1,011 (1,008-1,012, 3 blocs) | 1,046 |
+| 32k | MTP | 43,28 | 39,99 | 0,923 (0,908-0,931, 3 blocs) | 1,012 |
+| 128k | AR | 20,48 | 21,12 | 1,029 (1,028-1,031, 2 blocs) | 1,010 |
+| 128k | MTP | 32,27 | 23,51 | 0,728 (0,728-0,729, 2 blocs) | 1,007 |
+
+Pas d'IC formel : 2 à 3 blocs, on donne l'étendue min-max. Aucun bloc ne
+chevauche le seuil 0,98 en MTP.
+
+### Mémoire (pic `peak memory footprint`, decode de 16 tokens, Gio)
+
+| Contexte | bf16 | q8 | q8/bf16 | k8v4 |
+|---|---|---|---|---|
+| 64k | 20,9 | 26,8 | 1,28 | 26,4 |
+| 128k | 27,0 | 37,6 | 1,39 | 38,0 |
+| 256k | 32,7 | 58,7 | 1,80 | 56,5 |
+
+M2 échoue : le pic q8 est plus haut que bf16 (+39 % à 128k), pas plus bas. M1
+(taille analytique de l'arène) n'a pas été relevé par la campagne : non évalué.
+
+### Identité (md5 de la sortie, KV q8, 200 tokens)
+
+MTP = AR sur code-32k, prose-32k et code-128k : I1 passe.
+
+### Application du critère
+
+| Condition | 32k | 64k | 128k |
+|---|---|---|---|
+| Q1, Q2 | passe | passe | non mesurable |
+| Q3 | passe | échoue (98,4 %) | non mesurable |
+| M1 | non relevé | non relevé | non relevé |
+| M2 | n/a | échoue | échoue (+39 %) |
+| V1 AR | passe | n/a | passe |
+| V1 MTP | échoue (0,923) | n/a | échoue (0,728) |
+| V2 | échoue en AR (1,046) | n/a | passe (1,010) |
+| I1 | passe | n/a | passe |
+
+Ni N = 32768 (V1 MTP, V2, Q3 à 64k) ni N = 65536 (Q3 à 64k, V1 MTP à 128k, M2)
+ne sont atteints.
+
+## Verdict
+
+Aucun défaut ne change : q8 reste opt-in (`SARAGOSSA_RUST_KV_QUANT=8`), rapport
+seul. Les causes sont mesurées : le decode MTP perd 8 % à 32k et 27 % à 128k, et
+le pic mémoire monte au lieu de baisser (le prefill garde un KV bf16 en plus de
+l'arène q8).
+
+## Limites
+
+- 128k : 2 blocs ABBA au lieu de 3 (la porte de charge a jeté des passes) ; KL
+  non mesurée au-delà de 64k (plafond de `--kl-record`).
+- Q3 repose sur 64 pas : un seul pas divergent donne 98,4 %.
+- M1 non relevé ; le critère n'est pas rejoué avec ce seul point.
+- Une seule machine, un seul modèle ; corpus du dépôt à la place du corpus Rust stdlib.
+- Le pic mémoire inclut le prefill ; la réduction du KV seul n'est pas isolée.
