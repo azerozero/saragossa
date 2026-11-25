@@ -230,8 +230,9 @@ impl Profile {
         {
             return Err(err("serve.auto_yield_share", "doit être dans 10..=100"));
         }
-        if self.serve.auto_yield_idle_secs == Some(0) {
-            return Err(err("serve.auto_yield_idle_secs", "doit être > 0"));
+        // En deçà, le seuil d'activité de 5 s du cédage l'emporterait.
+        if self.serve.auto_yield_idle_secs.is_some_and(|v| v < 5) {
+            return Err(err("serve.auto_yield_idle_secs", "doit être >= 5"));
         }
         if let Some(backend) = &self.engine.backend {
             if !matches!(backend.as_str(), "cpu" | "metal") {
@@ -534,6 +535,9 @@ impl Resolved {
         for row in self.profile.rows() {
             // Nom canonique puis alias hérité ; vide ou invalide = ignoré ici.
             let valid = |v: &String| {
+                if row.default == "false" {
+                    return super::env_flag_value(v).is_some();
+                }
                 v.parse::<u64>()
                     .is_ok_and(|n| n > 0 || row.key == "memory.headroom_bytes")
             };

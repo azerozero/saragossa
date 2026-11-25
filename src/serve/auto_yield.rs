@@ -1,8 +1,9 @@
 //! Cédage automatique du GPU (`--auto-yield`, `serve.auto_yield`, opt-in).
 //!
 //! Un thread lit chaque seconde le temps écoulé depuis la dernière entrée
-//! clavier ou souris de la session (`CGEventSourceSecondsSinceLastEventType`,
-//! même source que `HIDIdleTime`). Entrée de moins de [`ACTIVE`] : la part de
+//! clavier ou souris matérielle (`CGEventSourceSecondsSinceLastEventType` sur
+//! la source HID, celle de `HIDIdleTime` : les événements synthétiques ne
+//! comptent pas). Entrée de moins de [`ACTIVE`] : la part de
 //! GPU tombe à `serve.auto_yield_share` ; après `serve.auto_yield_idle_secs`
 //! sans entrée, la part configurée revient. Entre les deux seuils l'état ne
 //! bouge pas (hystérésis). Seul le rapport cyclique change (sommeil après
@@ -22,7 +23,9 @@ pub(super) struct AutoYield {
 }
 
 /// En deçà de ce délai depuis la dernière entrée, l'utilisateur est actif.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const ACTIVE: Duration = Duration::from_secs(5);
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const POLL: Duration = Duration::from_secs(1);
 
 struct State {
@@ -57,6 +60,7 @@ pub(super) fn set_configured(share: u8) {
 }
 
 /// Cède dès une entrée récente, rend après `idle` sans entrée, sinon garde l'état.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn next_state(config: AutoYield, yielding: bool, since_input: Duration) -> bool {
     if since_input < ACTIVE {
         true
@@ -68,6 +72,7 @@ fn next_state(config: AutoYield, yielding: bool, since_input: Duration) -> bool 
 }
 
 /// Un tour du thread, horloge injectée : `Some(état)` si l'état a basculé.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn step(config: AutoYield, since_input: Duration) -> Option<bool> {
     let mut state = lock();
     state.low = config.share;
@@ -119,7 +124,7 @@ pub(super) fn spawn(config: AutoYield) {
     }
 }
 
-/// Temps écoulé depuis la dernière entrée clavier ou souris de la session.
+/// Temps écoulé depuis la dernière entrée clavier ou souris matérielle.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn since_input() -> Duration {
@@ -127,9 +132,9 @@ fn since_input() -> Duration {
     unsafe extern "C" {
         fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
     }
-    // kCGEventSourceStateCombinedSessionState = 0, kCGAnyInputEventType = !0.
+    // kCGEventSourceStateHIDSystemState = 1, kCGAnyInputEventType = !0.
     // SAFETY: fonction C sans pointeur ni état partagé côté appelant.
-    let secs = unsafe { CGEventSourceSecondsSinceLastEventType(0, u32::MAX) };
+    let secs = unsafe { CGEventSourceSecondsSinceLastEventType(1, u32::MAX) };
     // NOTE: sans session graphique la valeur est absurde : traitée comme inactif.
     Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
 }

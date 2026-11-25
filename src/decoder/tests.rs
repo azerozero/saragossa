@@ -6683,23 +6683,35 @@ fn gpu_share_keeps_greedy_output_synthetic() -> Result<()> {
     assert_eq!(throttled, normal, "le bridage ne doit changer aucun token");
     // Bascule à chaud pendant la génération, comme le cédage automatique de
     // `serve` : la part change entre deux command buffers, pas les tokens.
-    let done = std::sync::atomic::AtomicBool::new(false);
-    let toggled = std::thread::scope(|scope| {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (done, flips) = (AtomicBool::new(false), AtomicUsize::new(0));
+    // Arrête la bascule même si la génération panique, sinon le scope attend.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let (toggled, during) = std::thread::scope(|scope| {
         scope.spawn(|| {
-            let mut low = false;
-            while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                low = !low;
-                crate::set_gpu_duty_share(if low { 10 } else { 100 });
+            while !done.load(Ordering::Relaxed) {
+                let n = flips.fetch_add(1, Ordering::Relaxed);
+                crate::set_gpu_duty_share(if n % 2 == 0 { 10 } else { 100 });
                 std::thread::sleep(std::time::Duration::from_millis(3));
             }
         });
+        let _stop = Stop(&done);
+        let before = flips.load(Ordering::Relaxed);
         let out = run(100);
-        done.store(true, std::sync::atomic::Ordering::Relaxed);
-        out
-    })?;
+        (out, flips.load(Ordering::Relaxed) - before)
+    });
     crate::set_gpu_duty_share(100);
+    assert!(
+        during >= 4,
+        "la part doit basculer pendant la génération ({during})"
+    );
     assert_eq!(
-        toggled, normal,
+        toggled?, normal,
         "la bascule à chaud ne doit changer aucun token"
     );
     Ok(())

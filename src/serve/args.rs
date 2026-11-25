@@ -313,7 +313,7 @@ impl ServeArgs {
             max_tok_s,
             gpu_share,
             idle_unload_secs,
-            // invariant: `Profile::validate` borne la part à 10..=100 et le délai à > 0.
+            // invariant: `Profile::validate` borne la part à 10..=100 et le délai à >= 5.
             auto_yield: auto_yield.then(|| super::auto_yield::AutoYield {
                 share: profile.serve.auto_yield_share.unwrap_or(25) as u8,
                 idle: Duration::from_secs(profile.serve.auto_yield_idle_secs.unwrap_or(60)),
@@ -603,7 +603,7 @@ mod tests {
                 "l'environnement prime sur le profil"
             );
         });
-        for bad in ["auto_yield_share = 5", "auto_yield_idle_secs = 0"] {
+        for bad in ["auto_yield_share = 5", "auto_yield_idle_secs = 4"] {
             assert!(
                 saragossa::runtime_flags::Profile::parse(&format!("[serve]\n{bad}\n")).is_err()
             );
