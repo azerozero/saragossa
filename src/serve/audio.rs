@@ -51,8 +51,14 @@ use super::args::ServeArgs;
 use super::error::{ServeError, ServeResult};
 #[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
 use super::http::write_headers;
+#[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
+use super::shared::SharedWeights;
 #[cfg(any(feature = "stt", feature = "diar"))]
 use crate::RuntimeKind;
+#[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
+use std::sync::Arc;
+#[cfg(feature = "stt")]
+use std::sync::Mutex;
 
 /// Budget minimal conservé pour les clauses courtes.
 #[cfg(feature = "tts")]
@@ -67,8 +73,11 @@ const STT_NOT_CONFIGURED: &str =
 const TTS_NOT_CONFIGURED: &str =
     "endpoint TTS non configuré: relancez saragossa serve avec --tts-model <dir>";
 
-/// Etat audio du serveur : slots STT/TTS chargés à la demande.
+/// Etat audio d'un moteur : slots STT/TTS chargés à la demande, poids
+/// partagés entre moteurs par le registre `SharedWeights`.
 pub(super) struct AudioState {
+    #[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
+    shared: SharedWeights,
     #[cfg(any(feature = "stt", feature = "diar"))]
     backend: RuntimeKind,
     #[cfg(feature = "stt")]
@@ -79,31 +88,71 @@ pub(super) struct AudioState {
     tts: TtsSlot,
     #[cfg(feature = "denoise")]
     enhance_path: Option<PathBuf>,
-    /// Sessions STT à entrée incrémentale, indépendantes du modèle chargé.
+    /// Sessions STT à entrée incrémentale, indépendantes du modèle chargé et
+    /// communes aux moteurs : deux morceaux d'une session peuvent tomber sur
+    /// deux moteurs.
     #[cfg(feature = "stt")]
-    pub(super) stt_sessions: super::stt::SttSessions,
+    pub(super) stt_sessions: Arc<Mutex<super::stt::SttSessions>>,
+    /// Tour du morceau STT streamé en cours (moteurs multiples), attendu avant
+    /// de toucher aux sessions.
+    #[cfg(feature = "stt")]
+    pub(super) stt_turn: Option<super::shared::SttTicket>,
+}
+
+/// Modèle audio et son exécuteur Metal, partagés entre moteurs : l'exécuteur
+/// garde les poids GPU dérivés, le scratch y est cloisonné par moteur.
+#[cfg(any(feature = "stt", feature = "diar"))]
+struct AudioModel<M> {
+    model: M,
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    metal: Option<MetalExecutor>,
+}
+
+#[cfg(any(feature = "stt", feature = "diar"))]
+impl<M> AudioModel<M> {
+    fn load(model: M, backend: RuntimeKind) -> ServeResult<Self> {
+        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        let _ = backend;
+        Ok(Self {
+            model,
+            #[cfg(all(target_os = "macos", feature = "metal"))]
+            metal: if backend == RuntimeKind::Metal {
+                Some(MetalExecutor::new()?)
+            } else {
+                None
+            },
+        })
+    }
+
+    fn forward_runtime(&self) -> ForwardRuntime<'_> {
+        #[cfg(all(target_os = "macos", feature = "metal"))]
+        if let Some(metal) = self.metal.as_ref() {
+            return ForwardRuntime::metal(metal);
+        }
+        ForwardRuntime::cpu()
+    }
 }
 
 #[cfg(feature = "diar")]
 struct DiarSlot {
     path: Option<PathBuf>,
-    model: Option<saragossa::diarization::DiarizationModel>,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    metal: Option<MetalExecutor>,
+    model: Option<Arc<AudioModel<saragossa::diarization::DiarizationModel>>>,
 }
 
 #[cfg(feature = "stt")]
 struct SttSlot {
     path: Option<PathBuf>,
-    model: Option<WhisperModel>,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
-    metal: Option<MetalExecutor>,
+    model: Option<Arc<AudioModel<WhisperModel>>>,
 }
 
 #[cfg(feature = "tts")]
 struct TtsSlot {
     path: Option<PathBuf>,
-    model: Option<TtsModel>,
+    model: Option<Arc<TtsModel>>,
+    /// Voix (après repli) et graine de la requête en cours, posées par
+    /// `configure_voice` et installées en portée autour de chaque synthèse.
+    voice: Option<String>,
+    seed: Option<u64>,
 }
 
 // Seule la synthèse est substituable : les tests conservent le choix WAV/PCM
@@ -130,33 +179,43 @@ pub(super) trait SpeechSynthesis {
 
 impl AudioState {
     /// Construit l'état audio depuis les chemins CLI, sans charger les poids.
+    #[cfg(test)]
     pub(super) fn new(args: &ServeArgs) -> Self {
+        Self::with_shared(args, &super::shared::EngineShared::default())
+    }
+
+    /// Construit l'état audio d'un moteur sur les poids et sessions communs.
+    pub(super) fn with_shared(args: &ServeArgs, shared: &super::shared::EngineShared) -> Self {
+        #[cfg(not(any(feature = "stt", feature = "tts", feature = "diar")))]
+        let _ = shared;
         Self {
+            #[cfg(any(feature = "stt", feature = "tts", feature = "diar"))]
+            shared: shared.weights.clone(),
             #[cfg(any(feature = "stt", feature = "diar"))]
             backend: args.backend,
             #[cfg(feature = "stt")]
             stt: SttSlot {
                 path: args.stt_model.clone(),
                 model: None,
-                #[cfg(all(target_os = "macos", feature = "metal"))]
-                metal: None,
             },
             #[cfg(feature = "diar")]
             diar: DiarSlot {
                 path: args.diar_model.clone(),
                 model: None,
-                #[cfg(all(target_os = "macos", feature = "metal"))]
-                metal: None,
             },
             #[cfg(feature = "tts")]
             tts: TtsSlot {
                 path: args.tts_model.clone(),
                 model: None,
+                voice: None,
+                seed: None,
             },
             #[cfg(feature = "denoise")]
             enhance_path: args.enhance_model.clone(),
             #[cfg(feature = "stt")]
-            stt_sessions: super::stt::SttSessions::default(),
+            stt_sessions: Arc::clone(&shared.stt_sessions),
+            #[cfg(feature = "stt")]
+            stt_turn: None,
         }
     }
 
@@ -164,9 +223,17 @@ impl AudioState {
     /// ils se rechargent à la prochaine requête.
     pub(super) fn invalidate(&mut self) {
         self.unload_models();
+        // NOTE: les sessions sont communes aux moteurs : une panique les vide
+        // pour tous, comme le faisait le moteur unique.
         #[cfg(feature = "stt")]
         {
-            self.stt_sessions = super::stt::SttSessions::default();
+            // Empoisonnées par la panique elle-même : remises à neuf.
+            *self
+                .stt_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                super::stt::SttSessions::default();
+            self.stt_sessions.clear_poison();
         }
     }
 
@@ -178,18 +245,10 @@ impl AudioState {
         #[cfg(feature = "stt")]
         {
             was_loaded |= self.stt.model.take().is_some();
-            #[cfg(all(target_os = "macos", feature = "metal"))]
-            {
-                was_loaded |= self.stt.metal.take().is_some();
-            }
         }
         #[cfg(feature = "diar")]
         {
             was_loaded |= self.diar.model.take().is_some();
-            #[cfg(all(target_os = "macos", feature = "metal"))]
-            {
-                was_loaded |= self.diar.metal.take().is_some();
-            }
         }
         #[cfg(feature = "tts")]
         {
@@ -215,6 +274,10 @@ impl AudioState {
 
     /// Comme [`Self::with_stt`], en prêtant aussi les sessions incrémentales.
     ///
+    /// ponytail: le verrou des sessions est tenu pendant l'inférence du
+    /// morceau (STT streamé sérialisé entre moteurs) ; sortir la session du
+    /// verrou si plusieurs flux STT incrémentaux doivent avancer en parallèle.
+    ///
     /// # Errors
     ///
     /// Renvoie une erreur si le modèle STT n'est pas configuré, ou celle de `use_model`.
@@ -227,14 +290,15 @@ impl AudioState {
             &mut super::stt::SttSessions,
         ) -> ServeResult<T>,
     ) -> ServeResult<T> {
-        self.ensure_stt_loaded()?;
-        let runtime = self.stt.forward_runtime(self.backend);
-        let model = self
-            .stt
-            .model
-            .as_ref()
-            .ok_or_else(|| ServeError::args("modèle STT absent après chargement"))?;
-        use_model(model, runtime, &mut self.stt_sessions)
+        let loaded = self.ensure_stt_loaded()?;
+        if let Some(turn) = &self.stt_turn {
+            turn.wait_turn();
+        }
+        let mut sessions = self
+            .stt_sessions
+            .lock()
+            .map_err(|_| ServeError::args("sessions STT empoisonnées"))?;
+        use_model(&loaded.model, loaded.forward_runtime(), &mut sessions)
     }
 
     /// Charge Whisper si besoin, puis prête le modèle et son runtime.
@@ -247,20 +311,14 @@ impl AudioState {
         &mut self,
         use_model: impl FnOnce(&WhisperModel, ForwardRuntime<'_>) -> ServeResult<T>,
     ) -> ServeResult<T> {
-        self.ensure_stt_loaded()?;
-        let runtime = self.stt.forward_runtime(self.backend);
-        let model = self
-            .stt
-            .model
-            .as_ref()
-            .ok_or_else(|| ServeError::args("modèle STT absent après chargement"))?;
-        use_model(model, runtime)
+        let loaded = self.ensure_stt_loaded()?;
+        use_model(&loaded.model, loaded.forward_runtime())
     }
 
     #[cfg(feature = "stt")]
-    fn ensure_stt_loaded(&mut self) -> ServeResult<()> {
-        if self.stt.model.is_some() {
-            return Ok(());
+    fn ensure_stt_loaded(&mut self) -> ServeResult<Arc<AudioModel<WhisperModel>>> {
+        if let Some(loaded) = &self.stt.model {
+            return Ok(Arc::clone(loaded));
         }
         let path = self
             .stt
@@ -273,22 +331,21 @@ impl AudioState {
                 path.display()
             )));
         }
-        eprintln!("saragossa serve loading STT model path={}", path.display());
-        let model = WhisperModel::from_model_dir(&path)?;
-        // L'exécuteur Metal reste vivant dans le slot : `ForwardRuntime::metal`
-        // emprunte cette référence à chaque transcription.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
-        if self.backend == RuntimeKind::Metal && self.stt.metal.is_none() {
-            self.stt.metal = Some(MetalExecutor::new()?);
-        }
         #[cfg(not(all(target_os = "macos", feature = "metal")))]
         if self.backend == RuntimeKind::Metal {
             return Err(ServeError::args(
                 "backend metal STT indisponible dans ce build — recompile avec --features metal",
             ));
         }
-        self.stt.model = Some(model);
-        Ok(())
+        let backend = self.backend;
+        // L'exécuteur Metal vit avec le modèle : `ForwardRuntime::metal`
+        // l'emprunte à chaque transcription.
+        let loaded = self.shared.get_or_load("stt", &path, || {
+            eprintln!("saragossa serve loading STT model path={}", path.display());
+            AudioModel::load(WhisperModel::from_model_dir(&path)?, backend)
+        })?;
+        self.stt.model = Some(Arc::clone(&loaded));
+        Ok(loaded)
     }
 
     /// Diarise des échantillons mono 16 kHz avec son exécuteur Metal.
@@ -301,49 +358,45 @@ impl AudioState {
         &mut self,
         samples: &[f32],
     ) -> ServeResult<Vec<saragossa::diarization::SpeakerSegment>> {
-        if self.diar.model.is_none() {
-            let path = self.diar.path.clone().ok_or_else(|| {
-                ServeError::args(
-                    "endpoint diarisation non configuré: relancez saragossa serve avec --diar-model <dir>",
-                )
-            })?;
-            eprintln!(
-                "saragossa serve loading diarization model path={}",
-                path.display()
-            );
-            let model = saragossa::diarization::DiarizationModel::from_model_dir(&path)?;
-            #[cfg(all(target_os = "macos", feature = "metal"))]
-            if self.backend == RuntimeKind::Metal && self.diar.metal.is_none() {
-                self.diar.metal = Some(MetalExecutor::new()?);
+        let loaded = match &self.diar.model {
+            Some(loaded) => Arc::clone(loaded),
+            None => {
+                let path = self.diar.path.clone().ok_or_else(|| {
+                    ServeError::args(
+                        "endpoint diarisation non configuré: relancez saragossa serve avec --diar-model <dir>",
+                    )
+                })?;
+                #[cfg(not(all(target_os = "macos", feature = "metal")))]
+                if self.backend == RuntimeKind::Metal {
+                    return Err(ServeError::args(
+                        "backend metal diarisation indisponible — recompiler avec --features metal",
+                    ));
+                }
+                let backend = self.backend;
+                let loaded = self.shared.get_or_load("diar", &path, || {
+                    eprintln!(
+                        "saragossa serve loading diarization model path={}",
+                        path.display()
+                    );
+                    AudioModel::load(
+                        saragossa::diarization::DiarizationModel::from_model_dir(&path)?,
+                        backend,
+                    )
+                })?;
+                self.diar.model = Some(Arc::clone(&loaded));
+                loaded
             }
-            self.diar.model = Some(model);
-        }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
-        let runtime = self
-            .diar
-            .metal
-            .as_ref()
-            .map_or_else(ForwardRuntime::cpu, ForwardRuntime::metal);
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
-        let runtime = if self.backend == RuntimeKind::Metal {
-            return Err(ServeError::args(
-                "backend metal diarisation indisponible — recompiler avec --features metal",
-            ));
-        } else {
-            ForwardRuntime::cpu()
         };
-        let model = self
-            .diar
+        Ok(loaded
             .model
-            .as_ref()
-            .ok_or_else(|| ServeError::args("modèle de diarisation absent après chargement"))?;
-        Ok(model.diarize(samples, runtime)?.segments)
+            .diarize(samples, loaded.forward_runtime())?
+            .segments)
     }
 
     #[cfg(feature = "tts")]
-    fn ensure_tts_loaded(&mut self) -> ServeResult<()> {
-        if self.tts.model.is_some() {
-            return Ok(());
+    fn ensure_tts_loaded(&mut self) -> ServeResult<Arc<TtsModel>> {
+        if let Some(model) = &self.tts.model {
+            return Ok(Arc::clone(model));
         }
         let path = self
             .tts
@@ -356,10 +409,19 @@ impl AudioState {
                 path.display()
             )));
         }
-        eprintln!("saragossa serve loading TTS model path={}", path.display());
-        let model = TtsModel::load_local(&path)?;
-        self.tts.model = Some(model);
-        Ok(())
+        let model = self.shared.get_or_load("tts", &path, || {
+            eprintln!("saragossa serve loading TTS model path={}", path.display());
+            Ok(TtsModel::load_local(&path)?)
+        })?;
+        self.tts.model = Some(Arc::clone(&model));
+        Ok(model)
+    }
+
+    /// Modèle TTS chargé, avec la voix et la graine de la requête en portée.
+    #[cfg(feature = "tts")]
+    fn tts_with_voice(&mut self) -> ServeResult<(Arc<TtsModel>, Option<String>, Option<u64>)> {
+        let model = self.ensure_tts_loaded()?;
+        Ok((model, self.tts.voice.clone(), self.tts.seed))
     }
 }
 
@@ -370,22 +432,23 @@ impl SpeechSynthesis for AudioState {
         voice: Option<&str>,
         seed: Option<u64>,
     ) -> ServeResult<Option<String>> {
-        self.ensure_tts_loaded()?;
-        let model = self
-            .tts
-            .model
-            .as_mut()
-            .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
-        model.set_seed(seed);
-        match model.set_voice(voice) {
-            Ok(()) => Ok(None),
+        let model = self.ensure_tts_loaded()?;
+        self.tts.seed = seed;
+        // La résolution valide la voix sans toucher au modèle partagé ; la
+        // portée effective est posée autour de chaque synthèse.
+        match model.with_request_voice(voice, seed, || ()) {
+            Ok(_) => {
+                self.tts.voice = voice.map(str::to_owned);
+                Ok(None)
+            }
             Err(cause) => {
                 let Some(requested) = voice else {
                     return Err(cause.into());
                 };
                 // Le défaut est résolu à nouveau pour ne pas conserver la voix
                 // d'une requête précédente. Un défaut invalide reste une erreur.
-                model.set_voice(None)?;
+                model.with_request_voice(None, seed, || ())?;
+                self.tts.voice = None;
                 eprintln!("saragossa serve TTS: {cause} ; repli sur serena");
                 Ok(Some(requested.to_owned()))
             }
@@ -393,23 +456,14 @@ impl SpeechSynthesis for AudioState {
     }
 
     fn synthesize(&mut self, text: &str, max_frames: usize) -> ServeResult<TtsSynthesisOutput> {
-        self.ensure_tts_loaded()?;
-        let model = self
-            .tts
-            .model
-            .as_ref()
-            .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
-        Ok(model.synthesize_default(text, max_frames)?)
+        let (model, voice, seed) = self.tts_with_voice()?;
+        Ok(model.with_request_voice(voice.as_deref(), seed, || {
+            model.synthesize_default(text, max_frames)
+        })??)
     }
 
     fn stream_sample_rate(&mut self) -> ServeResult<u32> {
-        self.ensure_tts_loaded()?;
-        let model = self
-            .tts
-            .model
-            .as_ref()
-            .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
-        Ok(model.sample_rate())
+        Ok(self.ensure_tts_loaded()?.sample_rate())
     }
 
     fn synthesize_streaming(
@@ -418,30 +472,10 @@ impl SpeechSynthesis for AudioState {
         max_frames: usize,
         on_audio: &mut dyn FnMut(&[f32]) -> saragossa::Result<()>,
     ) -> ServeResult<TtsSynthesisOutput> {
-        let model = self
-            .tts
-            .model
-            .as_ref()
-            .ok_or_else(|| ServeError::args("modèle TTS absent après chargement"))?;
-        Ok(model.synthesize_default_streaming(text, max_frames, on_audio)?)
-    }
-}
-
-#[cfg(feature = "stt")]
-impl SttSlot {
-    fn forward_runtime(&self, backend: RuntimeKind) -> ForwardRuntime<'_> {
-        match backend {
-            RuntimeKind::Cpu => ForwardRuntime::cpu(),
-            RuntimeKind::Metal => {
-                #[cfg(all(target_os = "macos", feature = "metal"))]
-                {
-                    if let Some(metal) = self.metal.as_ref() {
-                        return ForwardRuntime::metal(metal);
-                    }
-                }
-                ForwardRuntime::cpu()
-            }
-        }
+        let (model, voice, seed) = self.tts_with_voice()?;
+        Ok(model.with_request_voice(voice.as_deref(), seed, || {
+            model.synthesize_default_streaming(text, max_frames, on_audio)
+        })??)
     }
 }
 

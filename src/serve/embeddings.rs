@@ -11,6 +11,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,14 +20,16 @@ use saragossa::{TextEmbedError, TextEmbedder, DEFAULT_TEXT_EMBED_REPO};
 use super::args::ServeArgs;
 use super::error::{ServeError, ServeResult};
 use super::http::send_json;
+use super::shared::SharedWeights;
 
 const EMBED_NOT_CONFIGURED: &str =
     "endpoint embeddings non configuré: relancez saragossa serve avec --embed-model <dir>";
 
 /// Etat embeddings du serveur : modèle e5-small chargé à la demande.
 pub(super) struct EmbeddingsState {
+    shared: SharedWeights,
     path: Option<PathBuf>,
-    model: Option<TextEmbedder>,
+    model: Option<Arc<TextEmbedder>>,
 }
 
 impl EmbeddingsState {
@@ -41,8 +44,9 @@ impl EmbeddingsState {
     }
 
     /// Construit l'état embeddings depuis le chemin CLI, sans charger les poids.
-    pub(super) fn new(args: &ServeArgs) -> Self {
+    pub(super) fn new(args: &ServeArgs, shared: SharedWeights) -> Self {
         Self {
+            shared,
             path: args.embed_model.clone(),
             model: None,
         }
@@ -77,11 +81,13 @@ impl EmbeddingsState {
                 path.display()
             )));
         }
-        eprintln!(
-            "saragossa serve loading embeddings model path={}",
-            path.display()
-        );
-        let model = TextEmbedder::load_local(&path).map_err(embed_error)?;
+        let model = self.shared.get_or_load("embed", &path, || {
+            eprintln!(
+                "saragossa serve loading embeddings model path={}",
+                path.display()
+            );
+            TextEmbedder::load_local(&path).map_err(embed_error)
+        })?;
         self.model = Some(model);
         Ok(())
     }
@@ -219,7 +225,7 @@ mod tests {
     #[test]
     fn embeddings_without_model_returns_clear_error() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
-        let mut state = EmbeddingsState::new(&args);
+        let mut state = EmbeddingsState::new(&args, SharedWeights::default());
         let mut stream = Cursor::new(Vec::new());
         let body = br#"{"model":"e5","input":"bonjour"}"#;
 
@@ -232,7 +238,7 @@ mod tests {
     #[test]
     fn embeddings_rejects_empty_array() {
         let args = ServeArgs::parse(Vec::<String>::new()).expect("invariant: args valides");
-        let mut state = EmbeddingsState::new(&args);
+        let mut state = EmbeddingsState::new(&args, SharedWeights::default());
         let mut stream = Cursor::new(Vec::new());
         let body = br#"{"input":[]}"#;
 
