@@ -190,7 +190,7 @@ kernel void rms_norm_rope_heads_decode_rows_f32(
     device const float* weight [[buffer(1)]],
     device float* out [[buffer(2)]],
     constant uint4& dims [[buffer(3)]],
-    constant float2& params [[buffer(4)]],
+    constant float4& params [[buffer(4)]],
     device const float* inv_freq [[buffer(5)]],
     constant uint2& strides [[buffer(6)]],
 #ifdef TREE_ROWS
@@ -217,31 +217,39 @@ kernel void rms_norm_rope_heads_decode_rows_f32(
 
     threadgroup float partial[256];
     const uint start = head * head_dim;
-    float sumsq = 0.0f;
-    for (uint col = tid; col < head_dim; col += 256u) {
-        const float value = input[start + col];
-        sumsq += value * value;
-    }
-    partial[tid] = sumsq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) { partial[tid] += partial[tid + stride]; }
+    // `params.z` non nul : tête sans QK-norm (Llama, Mistral), rotation seule,
+    // x × 1 × 1 exact ; `weight` est alors un tampon lié mais jamais utile.
+    // Drapeau uniforme sur le threadgroup : la réduction et ses barrières sont
+    // sautées d'un bloc, l'ordre arithmétique de la branche normée est inchangé.
+    const bool rope_only = params.z != 0.0f;
+    float inv_rms = 1.0f;
+    if (!rope_only) {
+        float sumsq = 0.0f;
+        for (uint col = tid; col < head_dim; col += 256u) {
+            const float value = input[start + col];
+            sumsq += value * value;
+        }
+        partial[tid] = sumsq;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) { partial[tid] += partial[tid + stride]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        inv_rms = rsqrt((partial[0] / float(head_dim)) + eps);
     }
-    const float inv_rms = rsqrt((partial[0] / float(head_dim)) + eps);
     const uint pairs = rope_dims / 2u;
     // Gemma proportional sépare les partenaires sur la tête entière ;
     // Qwen partiel conserve la demi-tranche rotative.
     const uint pair_offset = uint(params.y);
     for (uint col = tid; col < head_dim; col += 256u) {
-        float value = input[start + col] * inv_rms * weight[col];
+        float value = input[start + col] * inv_rms * (rope_only ? 1.0f : weight[col]);
         if (col < pairs || (col >= pair_offset && col < pair_offset + pairs)) {
             const uint pair = (col < pair_offset) ? col : (col - pair_offset);
             const float angle = float(position) * inv_freq[pair];
             const float c = precise::cos(angle);
             const float s = precise::sin(angle);
-            const float first = input[start + pair] * inv_rms * weight[pair];
-            const float second = input[start + pair + pair_offset] * inv_rms * weight[pair + pair_offset];
+            const float first = input[start + pair] * inv_rms * (rope_only ? 1.0f : weight[pair]);
+            const float second = input[start + pair + pair_offset] * inv_rms * (rope_only ? 1.0f : weight[pair + pair_offset]);
             // Fast-math peut contracter first*c - second*s en FMA ;
             // cet écart est admis sous la porte CPU de 1e-5.
             value = (col < pair_offset) ? (first * c - second * s) : (first * s + second * c);
@@ -873,7 +881,7 @@ impl DecodeResidentState {
         input: &BufferRef,
         input_offset: u64,
         input_stride: usize,
-        weight: &BufferRef,
+        weight: Option<&BufferRef>,
         output: &BufferRef,
         output_stride: usize,
         num_heads: usize,
@@ -890,10 +898,7 @@ impl DecodeResidentState {
             to_u32(rope_dims, "rope rows rope_dims")?,
             to_u32(position, "rope rows position")?,
         ];
-        let params: [f32; 2] = [
-            eps,
-            crate::metal_backend::rope::rope_half_offset(frequencies),
-        ];
+        let params = super::attention::rope_params(eps, frequencies, weight.is_none());
         let strides = [
             to_u32(input_stride, "rope rows input_stride")?,
             to_u32(output_stride, "rope rows output_stride")?,
@@ -905,7 +910,7 @@ impl DecodeResidentState {
         }
         encoder.set_compute_pipeline_state(&kernels.rope_rows);
         encoder.set_buffer(0, Some(input), input_offset);
-        encoder.set_buffer(1, Some(weight), 0);
+        encoder.set_buffer(1, Some(weight.unwrap_or(input)), 0);
         encoder.set_buffer(2, Some(output), 0);
         set_bytes(encoder, 3, &dims);
         set_bytes(encoder, 4, &params);

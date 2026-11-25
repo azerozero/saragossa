@@ -61,8 +61,9 @@ pub(crate) struct FullAttnDenseLayerWeights<'a> {
     pub k_proj: &'a MetalLinearWeightBuffers,
     pub v_proj: &'a MetalLinearWeightBuffers,
     pub o_proj: &'a MetalLinearWeightBuffers,
-    pub q_norm: &'a Buffer,
-    pub k_norm: &'a Buffer,
+    /// `None` sans QK-norm (Llama, Mistral) : RoPE seule.
+    pub q_norm: Option<&'a BufferRef>,
+    pub k_norm: Option<&'a BufferRef>,
     pub post_norm: &'a Buffer,
     pub pre_feedforward_norm: Option<&'a Buffer>,
     pub post_feedforward_norm: Option<&'a Buffer>,

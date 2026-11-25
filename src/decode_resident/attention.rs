@@ -445,7 +445,8 @@ impl DecodeResidentState {
 
     /// Encode rms_norm par tête + RoPE à la `position` du token courant (single-query)
     /// dans un encoder PARTAGÉ : `input [heads·head_dim]` → `output [heads·head_dim]`.
-    /// `weight` = norme par tête `[head_dim]`. Reproduit `rms_norm_rope_heads_at`
+    /// `weight` = norme par tête `[head_dim]`, `None` sans QK-norm (Llama,
+    /// Mistral : rotation seule). Reproduit `rms_norm_rope_heads_at`
     /// (decoder.rs) — rote à `position`, PAS à l'index de ligne.
     ///
     /// # Errors
@@ -459,7 +460,7 @@ impl DecodeResidentState {
         &self,
         encoder: &ComputeCommandEncoderRef,
         input: &BufferRef,
-        weight: &BufferRef,
+        weight: Option<&BufferRef>,
         output: &BufferRef,
         num_heads: usize,
         head_dim: usize,
@@ -492,7 +493,7 @@ impl DecodeResidentState {
         encoder: &ComputeCommandEncoderRef,
         input: &BufferRef,
         input_offset: u64,
-        weight: &BufferRef,
+        weight: Option<&BufferRef>,
         output: &BufferRef,
         num_heads: usize,
         head_dim: usize,
@@ -526,26 +527,23 @@ impl DecodeResidentState {
         encoder: &ComputeCommandEncoderRef,
         input: &BufferRef,
         input_offset: u64,
-        weight: &BufferRef,
+        weight: Option<&BufferRef>,
         output: &BufferRef,
         num_heads: usize,
         dims: U32x4Param<'_>,
         frequencies: &BufferRef,
         eps: f32,
     ) -> Result<()> {
-        // Le second scalaire transmet l’écart entre partenaires rotate-half.
-        let params: [f32; 2] = [
-            eps,
-            crate::metal_backend::rope::rope_half_offset(frequencies),
-        ];
+        let params = rope_params(eps, frequencies, weight.is_none());
         encoder.set_compute_pipeline_state(&self.rope_decode_kernel);
         encoder.set_buffer(0, Some(input), input_offset);
-        encoder.set_buffer(1, Some(weight), 0);
+        // Sans norme, le noyau ne lit aucun gain : l'entrée sert de liaison valide.
+        encoder.set_buffer(1, Some(weight.unwrap_or(input)), 0);
         encoder.set_buffer(2, Some(output), 0);
         dims.bind(encoder, 3);
         encoder.set_bytes(
             4,
-            std::mem::size_of::<[f32; 2]>() as u64,
+            std::mem::size_of_val(&params) as u64,
             params.as_ptr().cast::<c_void>(),
         );
         encoder.set_buffer(5, Some(frequencies), 0);
@@ -2094,7 +2092,7 @@ impl FullAttentionMetalState {
         encoder: &ComputeCommandEncoderRef,
         k_raw: &BufferRef,
         k_offset: u64,
-        k_norm: &BufferRef,
+        k_norm: Option<&BufferRef>,
         v_buf: &BufferRef,
         v_offset: u64,
         rope: &FullAttnLayerDims,
@@ -2145,7 +2143,7 @@ impl FullAttentionMetalState {
             encoder,
             qkv,
             k_offset,
-            k_norm,
+            Some(k_norm),
             qkv,
             v_offset,
             rope,
@@ -2163,7 +2161,7 @@ impl FullAttentionMetalState {
         encoder: &ComputeCommandEncoderRef,
         k_raw: &BufferRef,
         k_offset: u64,
-        k_norm: &BufferRef,
+        k_norm: Option<&BufferRef>,
         v_buf: &BufferRef,
         v_offset: u64,
         rope: &FullAttnLayerDims,
@@ -2185,18 +2183,16 @@ impl FullAttentionMetalState {
         let element = self.keys.element();
         let offset = byte_offset(self.len * self.kv_dim(), element, "rope append KV offset")?;
         let dims = rope_dims_param(self.kv_heads, self.head_dim, rope.rope_dims, rope.position)?;
-        let params: [f32; 2] = [
-            rope.eps,
-            crate::metal_backend::rope::rope_half_offset(frequencies),
-        ];
+        // Q fusionné (TTS) garde toujours sa norme : un seul drapeau pour Q et K.
+        let params = rope_params(rope.eps, frequencies, k_norm.is_none());
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(k_raw), k_offset);
-        encoder.set_buffer(1, Some(k_norm), 0);
+        encoder.set_buffer(1, Some(k_norm.unwrap_or(k_raw)), 0);
         encoder.set_buffer(2, Some(self.keys.buffer()), offset);
         dims.bind(encoder, 3);
         encoder.set_bytes(
             4,
-            std::mem::size_of::<[f32; 2]>() as u64,
+            std::mem::size_of_val(&params) as u64,
             params.as_ptr().cast::<c_void>(),
         );
         encoder.set_buffer(5, Some(frequencies), 0);
@@ -2369,4 +2365,15 @@ fn flash_decode_rejects_insufficient_threadgroup_limit() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Paramètres des noyaux RoPE résidents : epsilon, écart rotate-half des
+/// partenaires, puis `1` pour une tête sans QK-norm (rotation seule).
+pub(super) fn rope_params(eps: f32, frequencies: &BufferRef, rope_only: bool) -> [f32; 4] {
+    [
+        eps,
+        crate::metal_backend::rope::rope_half_offset(frequencies),
+        f32::from(u8::from(rope_only)),
+        0.0,
+    ]
 }
