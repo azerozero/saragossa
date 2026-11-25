@@ -35,6 +35,8 @@ pub struct Metrics {
     pub vocab: usize,
     pub kl_mean: f64,
     pub kl_max: f64,
+    /// 99e centile de la KL par pas (rang le plus proche).
+    pub kl_p99: f64,
     pub top1_agreement: f64,
     /// Moyenne signée de p_cur(token imposé) - p_ref(token imposé).
     pub forced_delta_p_mean: f64,
@@ -171,9 +173,12 @@ pub fn compare(model: &CausalDecoder, path: &Path) -> Result<Metrics> {
         vocab,
         ..Metrics::default()
     };
+    let mut kls = Vec::with_capacity(meta.n);
     for ((reference, current), &token) in reference.iter().zip(&current).zip(&meta.forced_ids) {
-        metrics.add(reference, current, token)?;
+        kls.push(metrics.add(reference, current, token)?);
     }
+    kls.sort_by(f64::total_cmp);
+    metrics.kl_p99 = kls[(kls.len() * 99).div_ceil(100) - 1];
     metrics.kl_mean /= meta.n as f64;
     metrics.top1_agreement /= meta.n as f64;
     metrics.forced_delta_p_mean /= meta.n as f64;
@@ -256,7 +261,7 @@ pub(super) fn top1(values: &[f32]) -> usize {
 }
 
 impl Metrics {
-    fn add(&mut self, reference: &[f32], current: &[f32], token: usize) -> Result<()> {
+    fn add(&mut self, reference: &[f32], current: &[f32], token: usize) -> Result<f64> {
         if reference.len() != current.len() || token >= reference.len() {
             return Err(invalid("distributions incompatibles"));
         }
@@ -283,8 +288,15 @@ impl Metrics {
             .zip(q)
             .map(|(&p, q)| (q.exp() - p.exp()).abs())
             .sum::<f64>();
-        Ok(())
+        Ok(kl)
     }
+}
+
+/// NOTE: `SARAGOSSA_KL_KV_BF16=1` fait passer l'arène de référence en bf16, seul
+/// dtype où `SARAGOSSA_RUST_KV_QUANT` s'applique ; sans lui l'arène reste f32.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn kv_bf16() -> bool {
+    std::env::var_os("SARAGOSSA_KL_KV_BF16").is_some_and(|value| value == "1")
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -293,7 +305,7 @@ fn record_rows(
     prompt: &[usize],
     n: usize,
 ) -> Result<(Vec<usize>, Vec<Vec<f32>>)> {
-    let (mut cache, state) = model.resident_reference_start(prompt, n, false)?;
+    let (mut cache, state) = model.resident_reference_start(prompt, n, kv_bf16())?;
     let mut logits = model.resident_reference_initial_logits(&cache, &state)?;
     let mut ids = Vec::with_capacity(n);
     let mut rows = Vec::with_capacity(n);
@@ -317,7 +329,7 @@ fn record_rows(
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn compare_rows(model: &CausalDecoder, meta: &Metadata) -> Result<Vec<Vec<f32>>> {
-    let (mut cache, state) = model.resident_reference_start(&meta.prompt_ids, meta.n, false)?;
+    let (mut cache, state) = model.resident_reference_start(&meta.prompt_ids, meta.n, kv_bf16())?;
     let mut rows = vec![model.resident_reference_initial_logits(&cache, &state)?];
     for &token in &meta.forced_ids[..meta.n - 1] {
         let raw = model.resident_reference_step(&mut cache, token)?;
