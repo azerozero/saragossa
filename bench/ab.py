@@ -6,6 +6,8 @@ Lancer sous le verrou externe, sans l'imbriquer ici :
       --prompt-tokens 4096 --max-tokens 256
   python3 -I -B bench/ab.py report OUT [--json]
 
+--cooldown S attend S secondes entre deux blocs (jamais dans un bloc), journalisé
+par le champ cooldown_s de la première passe du bloc ; il fait partie du plan.
 Un bloc contient ABBA (ou BAAB) pour chaque prompt. Reprise à configuration
 identique : les blocs interrompus sont rejoués entièrement ; leurs anciennes
 tentatives restent au journal, exclues explicitement du rapport. Les échecs
@@ -149,7 +151,7 @@ def plan(args):
                        for _ in range(args.blocks)], "order": args.order,
             "random_seed": args.random_seed, "identity": args.identity,
             "primary": args.primary, "min_effect": args.min_effect,
-            "allow_battery": args.allow_battery}
+            "allow_battery": args.allow_battery, "cooldown": args.cooldown}
 
 
 def journal(root, repair=False):
@@ -219,20 +221,31 @@ def run(root, config):
     (root / "raw").mkdir(exist_ok=True)
     manifest = root / "plan.json"
     if manifest.exists():
-        if json.loads(manifest.read_text()) != config:
+        # Un plan antérieur à --cooldown n'a pas la clé : absence = 0.
+        if {"cooldown": 0, **json.loads(manifest.read_text())} != config:
             raise ValueError("reprise refusée : configuration, binaire ou prompt modifié")
     else:
         manifest.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
     rows, _ = journal(root, repair=True)
     active, _ = selected(config, rows)
+    started = False
     with sensors.Sampler(root / "sensors.jsonl") as sampler:
         for block, order in enumerate(config["orders"]):
             if block in active:
                 continue
             attempt = uuid.uuid4().hex
+            # Pause entre blocs seulement : à l'intérieur d'un bloc l'ABBA
+            # doit rester serré, et wait_idle gère déjà l'intervalle entre passages.
+            pause = config["cooldown"] if started else 0
+            if pause:
+                print(f"cooldown {pause} s avant le bloc {block}", file=sys.stderr, flush=True)
+                time.sleep(pause)
+            started = True
             for prompt in range(len(config["prompts"])):
                 for slot, side in enumerate(order):
                     row = passage(root, config, sampler, block, attempt, prompt, slot, side)
+                    if pause and prompt == slot == 0:
+                        row["cooldown_s"] = pause  # attente écoulée juste avant ce bloc
                     row["block_done"] = prompt == len(config["prompts"]) - 1 and slot == 3
                     with (root / "results.jsonl").open("a") as stream:
                         stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
@@ -401,6 +414,8 @@ def cli(argv=None):
     launch.add_argument("--identity", choices=("ids", "none"), default="ids")
     launch.add_argument("--primary", choices=METRICS, default="decode_tok_s")
     launch.add_argument("--allow-battery", action="store_true")
+    launch.add_argument("--cooldown", type=float, default=0, metavar="SECONDS",
+                        help="pause (s) entre deux blocs ABBA, rien ne tourne ; 0 = aucune")
     read = sub.add_parser("report")
     read.add_argument("out_dir", type=pathlib.Path)
     read.add_argument("--json", action="store_true")
@@ -413,7 +428,8 @@ def cli(argv=None):
     if args.command == "run":
         if (min(args.blocks, args.max_tokens, (args.prompt_tokens if args.prompt_tokens is not None else 1)) <= 0 or args.seed < 0
                 or not math.isfinite(args.temperature) or args.temperature < 0
-                or not 0 <= args.min_effect < 1):
+                or not 0 <= args.min_effect < 1
+                or not math.isfinite(args.cooldown) or args.cooldown < 0):
             raise ValueError("paramètre numérique hors limites")
         run(args.out_dir, plan(args))
     result = report(args.out_dir)
