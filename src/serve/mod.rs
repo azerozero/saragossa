@@ -13,11 +13,17 @@
 //! Moteurs parallèles opt-in (`--engines N`, `SARAGOSSA_SERVE_ENGINES`) : N
 //! threads moteur vident la même file, chacun avec son `ServeState` (KV,
 //! scratch Metal cloisonné, cache de préfixe par blocs), sur une seule copie
-//! des poids LLM, Whisper, TTS, diarisation et embeddings (voir `shared`) ; le
-//! cache de préfixe MTP du décodeur, le mémo de prefill TTS et la garde
-//! mémoire restent communs, les morceaux STT streamés gardent leur ordre
-//! d'arrivée. Les lots y sont coupés et une panique de requête arrête le
-//! process, l'état partagé n'étant plus sûr.
+//! des poids LLM, Whisper, TTS, diarisation et embeddings (voir `shared`) ; la
+//! garde mémoire est commune. Dès N > 1 : le cache de préfixe interne du
+//! décodeur (MTP, DFlash, SSD) et le mémo de prefill TTS, portés par les poids
+//! partagés, sont coupés ; les lots aussi ; une panique de requête arrête le
+//! process, l'état partagé n'étant plus sûr. Limites connues : la file de
+//! commandes Metal d'un modèle (prefill, Whisper, diarisation, codec TTS) est
+//! partagée, le premier son croît donc à peu près linéairement avec N ; les
+//! morceaux STT streamés sont sérialisés entre moteurs, dans leur ordre
+//! d'arrivée ; un chargement tient le verrou du registre ; un dérivé de poids
+//! peut être construit deux fois au premier appel concurrent. Mesures :
+//! `docs/perf/serve-multi-moteur.md`.
 //!
 //! Lots opt-in (`SARAGOSSA_SERVE_BATCH=1` avec
 //! `SARAGOSSA_RUST_LIGHTBATCH_MULTI=1`) : quand le moteur prend une requête
@@ -181,6 +187,13 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
     reload::set_launch_models(&args.models);
     reload::set_idle_unload_secs(args.idle_unload_secs);
     saragossa::force_resident_full_linear_decode();
+    if args.engines > 1 {
+        saragossa::runtime_flags::disable_shared_model_caches();
+        eprintln!(
+            "saragossa serve engines={}: cache de préfixe du décodeur et mémo de prefill TTS coupés (partagés entre moteurs)",
+            args.engines
+        );
+    }
     let shared = shared::EngineShared::default();
     let mut state = state::ServeState::with_shared(&args, shared.clone());
     // NOTE: en relais séquentiel, le moteur précharge après la sortie du parent.

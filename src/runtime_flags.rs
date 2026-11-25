@@ -2303,7 +2303,27 @@ pub(crate) fn gather_fast_mode() -> Option<&'static str> {
 
 pub(super) fn prefix_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_CACHE", true))
+    !SHARED_MODEL_CACHES_OFF.load(AtomicOrdering::Relaxed)
+        && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_CACHE", true))
+}
+
+/// Coupe pour tout le process les caches portés par les poids partagés.
+static SHARED_MODEL_CACHES_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `serve --engines N` (N > 1) : coupe le cache de préfixe interne du décodeur
+/// (MTP, DFlash, SSD) et le mémo de prefill TTS. Ils vivent dans les poids
+/// partagés : un moteur changerait les reprises, donc le chemin numérique, d'un
+/// autre. Irréversible, à appeler avant la première requête.
+pub fn disable_shared_model_caches() {
+    SHARED_MODEL_CACHES_OFF.store(true, AtomicOrdering::Relaxed);
+}
+
+/// Un cache porté par les poids partagés (préfixe décodeur, mémo TTS) est-il
+/// actif ?
+#[must_use]
+pub fn shared_model_caches_active() -> bool {
+    prefix_cache_enabled() || tts_prefill_cache_enabled()
 }
 
 /// Autorise `QmmNaDequant` dans le talker et le code_predictor TTS.
@@ -2356,7 +2376,8 @@ pub(crate) fn tts_prefill_cache_enabled() -> bool {
         return enabled;
     }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_PREFILL_CACHE", false))
+    !SHARED_MODEL_CACHES_OFF.load(AtomicOrdering::Relaxed)
+        && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_PREFILL_CACHE", false))
 }
 
 #[cfg(test)]

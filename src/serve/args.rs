@@ -385,8 +385,13 @@ pub(super) fn help_text() -> String {
          are unloaded too.\n\
          Engines: --engines N (serve.engines, SARAGOSSA_SERVE_ENGINES, 1..={MAX_ENGINES}, \
          default 1, not hot-reloadable) runs N inference threads on one shared copy of the \
-         weights, each with its own KV, scratch and block prefix cache (the decoder's MTP \
-         prefix cache and the TTS prefill memo stay shared); 1 keeps the serial engine.\n\
+         weights, each with its own KV, scratch and block prefix cache; 1 keeps the serial \
+         engine. With N > 1 the decoder's internal prefix cache (MTP/DFlash/SSD) and the TTS \
+         prefill memo are disabled, request batching is off and a request panic stops the \
+         process. Limits: one Metal command queue per model is shared (first sound grows \
+         about linearly with N), streamed STT chunks are serialized across engines, a model \
+         load holds the weight registry lock, a derived weight may be built twice on the \
+         first concurrent call. See docs/perf/serve-multi-moteur.md.\n\
          Default transport: Unix socket {DEFAULT_SOCKET} (0600). \\
          --port enables TCP on 127.0.0.1 for grob and requires --api-key \\
          or {API_KEY_ENV}.\n\
