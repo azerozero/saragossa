@@ -7888,7 +7888,7 @@ fn tts_cp_fused_layer_requires_qk_norm() -> Result<()> {
 /// Sans porte de sortie (Llama, Mistral), la vérification en lignes n'existe
 /// pas : la boucle lookup est inéligible et la génération reste celle du
 /// decode ordinaire, au lieu d'échouer au premier draft.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn lookup_greedy_falls_back_without_output_gate() -> Result<()> {
