@@ -50,6 +50,12 @@ pub struct ModelConfig {
     /// Indique si lm_head partage les embeddings.
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    /// Annonce des biais sur Q/K/V/O (`attention_bias` HF Llama/Mistral).
+    #[serde(default)]
+    pub attention_bias: bool,
+    /// Annonce des biais sur le MLP (`mlp_bias` HF Llama).
+    #[serde(default)]
+    pub mlp_bias: bool,
     /// Décrit la quantification déclarée.
     #[serde(default)]
     pub quantization: Option<QuantConfig>,
@@ -176,6 +182,15 @@ pub struct RopeScalingConfig {
     /// Définit le facteur d'étirement des positions.
     #[serde(default)]
     pub factor: Option<f32>,
+    /// Facteur basse fréquence du type `llama3`.
+    #[serde(default)]
+    pub low_freq_factor: Option<f32>,
+    /// Facteur haute fréquence du type `llama3`.
+    #[serde(default)]
+    pub high_freq_factor: Option<f32>,
+    /// Contexte d'entraînement d'origine du type `llama3`.
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

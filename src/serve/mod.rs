@@ -10,6 +10,22 @@
 //! connexion ne coûte que cette connexion et n'abat plus le process ; une
 //! panique moteur l'abat toujours.
 //!
+//! Moteurs parallèles opt-in (`--engines N`, `SARAGOSSA_SERVE_ENGINES`) : N
+//! threads moteur vident la même file, chacun avec son `ServeState` (KV,
+//! scratch Metal cloisonné, cache de préfixe par blocs), sur une seule copie
+//! des poids LLM, Whisper, TTS, diarisation et embeddings (voir `shared`) ; la
+//! garde mémoire est commune. Dès N > 1 : le cache de préfixe interne du
+//! décodeur (MTP, DFlash) et le mémo de prefill TTS, portés par les poids
+//! partagés, sont coupés, le cache SSD (singleton du process) est refusé ; les
+//! lots aussi ; une panique de requête arrête le
+//! process, l'état partagé n'étant plus sûr. Limites connues : la file de
+//! commandes Metal d'un modèle (prefill, Whisper, diarisation, codec TTS) est
+//! partagée, le premier son croît donc à peu près linéairement avec N ; les
+//! morceaux STT streamés sont sérialisés entre moteurs, dans leur ordre
+//! d'arrivée ; un chargement tient le verrou du registre ; un dérivé de poids
+//! peut être construit deux fois au premier appel concurrent. Mesures :
+//! `docs/perf/serve-multi-moteur.md`.
+//!
 //! Lots opt-in (`SARAGOSSA_SERVE_BATCH=1` avec
 //! `SARAGOSSA_RUST_LIGHTBATCH_MULTI=1`) : quand le moteur prend une requête
 //! chat streamée greedy pour un modèle dense éligible, il y joint les requêtes
@@ -26,7 +42,7 @@
 //!
 //! SIGHUP relit le profil (`--profile`/`--config`, `--set` compris) et n'applique
 //! que `serve.read_timeout_secs`, `serve.max_tokens_cap`, `serve.max_tok_s`,
-//! `serve.gpu_share` et la liste `[[models]]` ;
+//! `serve.gpu_share`, `serve.idle_unload_secs` et la liste `[[models]]` ;
 //! tout autre changement ou chemin de modèle illisible est refusé en bloc (voir
 //! `reload`).
 //!
@@ -77,6 +93,8 @@ mod relay;
 mod reload;
 #[cfg(feature = "serve")]
 mod responses;
+#[cfg(feature = "serve")]
+mod shared;
 #[cfg(feature = "serve")]
 mod state;
 pub(crate) mod streaming;
@@ -168,8 +186,17 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         saragossa::set_gpu_share(share);
     }
     reload::set_launch_models(&args.models);
+    reload::set_idle_unload_secs(args.idle_unload_secs);
     saragossa::force_resident_full_linear_decode();
-    let mut state = state::ServeState::new(&args);
+    if args.engines > 1 {
+        saragossa::runtime_flags::disable_shared_model_caches();
+        eprintln!(
+            "saragossa serve engines={}: cache de préfixe du décodeur et mémo de prefill TTS coupés (partagés entre moteurs)",
+            args.engines
+        );
+    }
+    let shared = shared::EngineShared::default();
+    let mut state = state::ServeState::with_shared(&args, shared.clone());
     // NOTE: en relais séquentiel, le moteur précharge après la sortie du parent.
     #[cfg(unix)]
     let deferred = relay::defer_preload(args.preload);

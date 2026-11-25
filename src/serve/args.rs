@@ -14,6 +14,9 @@ const DEFAULT_SOCKET: &str = "/tmp/saragossa-serve.sock";
 const API_KEY_ENV: &str = "SARAGOSSA_API_KEY";
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_TOKENS_CAP: usize = 4096;
+/// Plafond de `--engines` : au-delà, la mémoire par moteur et le partage GPU
+/// rendent le gain illusoire sur une seule machine.
+const MAX_ENGINES: usize = 16;
 
 /// Configuration de lancement du serveur.
 #[derive(Clone, Debug, PartialEq)]
@@ -50,8 +53,12 @@ pub(super) struct ServeArgs {
     pub(super) max_tok_s: Option<f64>,
     /// Part de GPU et de CPU visée (1 à 100), rechargeable à chaud.
     pub(super) gpu_share: Option<u8>,
+    /// Délai sans requête avant déchargement des modèles (0 : jamais), rechargeable à chaud.
+    pub(super) idle_unload_secs: u64,
     /// Cache persistant opt-in.
     pub(super) prefix_ssd: saragossa::runtime_flags::ServePrefixSsdOptions,
+    /// Moteurs d'inférence parallèles partageant les poids (1 : moteur sériel).
+    pub(super) engines: usize,
 }
 
 /// Modèle exposé par `saragossa serve`.
@@ -63,6 +70,34 @@ pub(super) struct ServeModelConfig {
     pub(super) path: PathBuf,
     /// Identifiant HF nu à résoudre avant de lancer le serveur.
     pub(super) hf_repo: Option<String>,
+}
+
+// `parse_with` lit l'environnement : chaque appel de test prend la lecture,
+// [`with_env`] l'écriture. Le fil qui tient l'écriture lit sans verrou.
+#[cfg(test)]
+static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+#[cfg(test)]
+thread_local!(static ENV_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+/// Exécute `f` avec `name=value`, à l'abri des autres `parse_with` de test,
+/// puis restaure la valeur d'origine, même sur panique.
+#[cfg(test)]
+pub(super) fn with_env<R>(name: &'static str, value: &str, f: impl FnOnce() -> R) -> R {
+    struct Restore(&'static str, Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+            ENV_OWNER.set(false);
+        }
+    }
+    let _write = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
+    let _restore = Restore(name, std::env::var_os(name));
+    ENV_OWNER.set(true);
+    std::env::set_var(name, value);
+    f()
 }
 
 impl ServeArgs {
@@ -77,6 +112,8 @@ impl ServeArgs {
         profile: &Profile,
         args: impl IntoIterator<Item = String>,
     ) -> ServeResult<Self> {
+        #[cfg(test)]
+        let _env = (!ENV_OWNER.get()).then(|| ENV_LOCK.read().unwrap_or_else(|e| e.into_inner()));
         let mut host = DEFAULT_HOST.to_string();
         let mut port = None;
         let mut socket = PathBuf::from(DEFAULT_SOCKET);
@@ -109,7 +146,16 @@ impl ServeArgs {
             .or(profile.serve.max_tok_s);
         // invariant: `Profile::validate` borne `serve.gpu_share` à 10..=100.
         let mut gpu_share = profile.serve.gpu_share.map(|v| v as u8);
+        let mut idle_unload_secs =
+            saragossa::runtime_flags::env_var("SARAGOSSA_RUST_IDLE_UNLOAD_SECS")
+                .and_then(|v| v.trim().parse().ok())
+                .or(profile.serve.idle_unload_secs)
+                .unwrap_or(0);
         let mut prefix_ssd = saragossa::runtime_flags::ServePrefixSsdOptions::from_env()?;
+        // invariant: `Profile::validate` borne `serve.engines` à 1..=16.
+        // Validé après la CLI : `--engines` l'emporte sur un environnement invalide.
+        let engines_env = saragossa::runtime_flags::env_var("SARAGOSSA_SERVE_ENGINES");
+        let mut engines_cli = None;
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -207,10 +253,27 @@ impl ServeArgs {
                             .map_err(ServeError::args)?,
                     );
                 }
+                "--engines" => {
+                    engines_cli = Some(parse_engines(&next_value(&mut iter, "--engines")?)?);
+                }
+                "--idle-unload-secs" => {
+                    idle_unload_secs = next_value(&mut iter, "--idle-unload-secs")?
+                        .parse()
+                        .map_err(|_| ServeError::args("--idle-unload-secs attend un entier"))?;
+                }
                 "--help" | "-h" => return Err(ServeError::args(help_text())),
                 other => return Err(ServeError::args(format!("argument serve inconnu: {other}"))),
             }
         }
+        let engines = match (engines_cli, engines_env) {
+            (Some(engines), _) => engines,
+            (None, Some(value)) => parse_engines(&value)?,
+            (None, None) => profile
+                .serve
+                .engines
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(1),
+        };
         // La CLI gagne : une entrée TOML de même id est ignorée.
         for entry in &profile.models {
             if !models.iter().any(|model| model.id == entry.id) {
@@ -218,6 +281,12 @@ impl ServeArgs {
             }
         }
         prefix_ssd.bytes()?;
+        if engines > 1 && prefix_ssd.directory.is_some() {
+            // Le cache SSD est un singleton du process, partagé par les moteurs.
+            return Err(ServeError::args(
+                "--prefix-cache-ssd-dir est incompatible avec --engines > 1 (cache commun aux moteurs)",
+            ));
+        }
         validate_tcp_args(&host, port, api_key.as_deref())?;
         Ok(Self {
             host,
@@ -236,7 +305,9 @@ impl ServeArgs {
             max_tokens_cap,
             max_tok_s,
             gpu_share,
+            idle_unload_secs,
             prefix_ssd,
+            engines,
         })
     }
 
@@ -249,6 +320,15 @@ impl ServeArgs {
     pub(super) fn add_model(&mut self, model: ServeModelConfig) -> ServeResult<()> {
         upsert_model(&mut self.models, model)
     }
+}
+
+fn parse_engines(value: &str) -> ServeResult<usize> {
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|engines| (1..=MAX_ENGINES).contains(engines))
+        .ok_or_else(|| ServeError::args(format!("--engines attend un entier de 1 à {MAX_ENGINES}")))
 }
 
 /// Renvoie l'aide concise de `serve`.
@@ -298,7 +378,7 @@ pub(super) fn help_text() -> String {
         "Usage: saragossa serve [--socket PATH] [--port {DEFAULT_PORT}] \\
          [--api-key TOKEN (deprecated, use SARAGOSSA_API_KEY)] [--model ID=DIR|DIR|ORG/REPO]... \\
          [--model-27b DIR] [--model-35b DIR] \\
-         {modality_options}[--backend cpu|metal] [--preload] [--max-tok-s R] [--gpu-share 10-100] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
+         {modality_options}[--backend cpu|metal] [--preload] [--max-tok-s R] [--gpu-share 10-100] [--idle-unload-secs N] [--engines N] [--profile FILE|low-mem|throughput] [--set section.key=value]...\n\
          Config: optional TOML profile (--profile/--config or SARAGOSSA_CONFIG; `extends = \"low-mem\"` inside a file); precedence CLI/--set > env > TOML > preset > default. SIGHUP reloads serve.read_timeout_secs, serve.max_tokens_cap, serve.max_tok_s, serve.gpu_share and the [[models]] list (id, path) only. See `saragossa config print`.\n\
          Upgrade (Unix): SIGUSR2 starts the same binary path (or --upgrade-binary PATH) with the same arguments on the inherited listening socket, then the old process drains for at most serve.drain_timeout_secs (30) and exits; enhance h2/WebTransport listeners follow. serve.relay_mode=auto|parallel|sequential (auto: sequential only if the memory guard refuses two resident processes).\n\
          SSD (opt-in): --prefix-cache-ssd-dir DIR --prefix-cache-ssd-gib 32; \
@@ -311,6 +391,19 @@ pub(super) fn help_text() -> String {
          --model-35b registers reti-35b.\n\
          {modality_help}Safety defaults: --read-timeout-secs {DEFAULT_READ_TIMEOUT_SECS}, \\
          --max-tokens-cap {DEFAULT_MAX_TOKENS_CAP}.\n\
+         Idle unload: --idle-unload-secs N (serve.idle_unload_secs, \
+         SARAGOSSA_RUST_IDLE_UNLOAD_SECS, hot-reloadable, 0 = off, default) drops all \
+         models after N idle seconds; the next request reloads them. --preload models \
+         are unloaded too.\n\
+         Engines: --engines N (serve.engines, SARAGOSSA_SERVE_ENGINES, 1..={MAX_ENGINES}, \
+         default 1, not hot-reloadable) runs N inference threads on one shared copy of the \
+         weights, each with its own KV, scratch and block prefix cache; 1 keeps the serial \
+         engine. With N > 1 the decoder's internal prefix cache (MTP/DFlash) and the TTS \
+         prefill memo are disabled, --prefix-cache-ssd-dir is refused, request batching is \
+         off and a request panic stops the process. Limits: one Metal command queue per model is shared (first sound grows \
+         about linearly with N), streamed STT chunks are serialized across engines, a model \
+         load holds the weight registry lock, a derived weight may be built twice on the \
+         first concurrent call. See docs/perf/serve-multi-moteur.md.\n\
          Default transport: Unix socket {DEFAULT_SOCKET} (0600). \\
          --port enables TCP on 127.0.0.1 for grob and requires --api-key \\
          or {API_KEY_ENV}.\n\
@@ -447,6 +540,51 @@ fn parse_positive_usize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_unload_secs_defaults_to_off_and_parses() {
+        let off = ServeArgs::parse(["--model".into(), "a=/x/a".into()]).expect("args");
+        assert_eq!(off.idle_unload_secs, 0);
+        let on =
+            ServeArgs::parse(["--model", "a=/x/a", "--idle-unload-secs", "90"].map(String::from))
+                .expect("args");
+        assert_eq!(on.idle_unload_secs, 90);
+    }
+
+    #[test]
+    fn engines_default_to_one_and_are_bounded() {
+        let parse = |value: &str| {
+            ServeArgs::parse(["--model", "a=/x/a", "--engines", value].map(String::from))
+                .map(|args| args.engines)
+        };
+        let default = ServeArgs::parse(["--model".into(), "a=/x/a".into()]).expect("args");
+        assert_eq!(default.engines, 1);
+        assert_eq!(parse("6").ok(), Some(6));
+        for refused in ["0", "17", "x"] {
+            assert!(parse(refused).is_err(), "{refused}");
+        }
+        // CLI > environnement, même invalide ; sans CLI, l'environnement compte.
+        with_env("SARAGOSSA_SERVE_ENGINES", "17", || {
+            assert_eq!(parse("2").ok(), Some(2));
+            assert!(ServeArgs::parse(["--model".into(), "a=/x/a".into()]).is_err());
+        });
+        let ssd = ServeArgs::parse(
+            [
+                "--model",
+                "a=/x/a",
+                "--engines",
+                "2",
+                "--prefix-cache-ssd-dir",
+                "/tmp/x",
+            ]
+            .map(String::from),
+        );
+        assert!(ssd.is_err_and(|e| e.to_string().contains("incompatible")));
+        with_env("SARAGOSSA_SERVE_ENGINES", "3", || {
+            let args = ServeArgs::parse(["--model".into(), "a=/x/a".into()]).expect("args");
+            assert_eq!(args.engines, 3);
+        });
+    }
 
     #[test]
     fn profile_sets_defaults_and_cli_wins() {

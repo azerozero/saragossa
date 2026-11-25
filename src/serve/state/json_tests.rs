@@ -101,7 +101,8 @@ fn missing_qwen_profile_fails_before_prompt_encoding() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("tokenizer.json");
     save_json_tokenizer(&path, r#"{"{}":0,"<pad>":1,"<eos>":2}"#, "<pad>");
-    loaded.assets.tokenizer = RustTokenizer::from_file(&path).expect("tokenizer without profile");
+    loaded.llm_mut().assets.tokenizer =
+        RustTokenizer::from_file(&path).expect("tokenizer without profile");
     let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
         "model":"tiny", "messages":[{"role":"user","content":"test"}]
     }))
@@ -118,7 +119,7 @@ fn custom_stop_routes_to_mtp_when_active() {
     for streaming in [false, true] {
         let mut loaded = tiny_loaded_model();
         // Pas de tête chargée : le routage MTP se voit à son erreur.
-        loaded.mtp_active = true;
+        loaded.llm_mut().mtp_active = true;
         let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "tiny", "messages": [{"role": "user", "content": "JSON"}],
             "temperature": 0, "stop": "{}", "stream": streaming
@@ -457,11 +458,13 @@ pub(super) fn tiny_loaded_model_with_vocab(vocab_json: &str, unk_token: &str) ->
     };
     LoadedModel {
         id: "tiny".to_string(),
-        assets,
-        decoder: CausalDecoder::from_tensors(tiny_weights(), CausalDecoderConfig::default())
-            .expect("invariant: modèle tiny valide"),
-        preset: None,
-        mtp_active: false,
+        llm: std::sync::Arc::new(SharedLlm {
+            assets,
+            decoder: CausalDecoder::from_tensors(tiny_weights(), CausalDecoderConfig::default())
+                .expect("invariant: modèle tiny valide"),
+            preset: None,
+            mtp_active: false,
+        }),
         json_token_catalog: OnceLock::new(),
         schema_token_catalog: OnceLock::new(),
         prefix_cache: BlockAwarePrefixCache::new(1, 0),
@@ -495,7 +498,7 @@ fn write_empty_safetensors_header(path: &Path) {
     fs::write(path, bytes).expect("invariant: safetensors test écrit");
 }
 
-fn tiny_weights() -> HashMap<String, Tensor> {
+pub(super) fn tiny_weights() -> HashMap<String, Tensor> {
     let mut tensors = HashMap::new();
     tensors.insert(
         "embed_tokens.weight".to_string(),

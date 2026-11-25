@@ -1,7 +1,8 @@
 //! Rechargement SIGHUP des limites sûres à chaud et de la liste des modèles.
 //!
 //! Chaud : `serve.read_timeout_secs` (nouvelles connexions),
-//! `serve.max_tokens_cap` (prochaine requête), `serve.max_tok_s` et
+//! `serve.max_tokens_cap` (prochaine requête), `serve.idle_unload_secs`
+//! (prochain tour d'attente du moteur), `serve.max_tok_s` et
 //! `serve.gpu_share` (prochain token ou command buffer) et `[[models]]` : la liste
 //! acceptée sert `/v1/models` aussitôt, le thread moteur l'applique entre deux
 //! requêtes (`ServeState::set_models`), donc une requête en cours finit sur son
@@ -26,6 +27,18 @@ use super::args::{config_from_entry, ServeArgs, ServeModelConfig};
 // 0 = aucune valeur rechargée : on garde celle du lancement.
 static READ_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(0);
 static MAX_TOKENS_CAP: AtomicUsize = AtomicUsize::new(0);
+// Délai d'inactivité avant déchargement, 0 = jamais ; écrit au lancement puis par SIGHUP.
+static IDLE_UNLOAD_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Délai d'inactivité courant en secondes (0 : déchargement désactivé).
+pub(super) fn idle_unload_secs() -> u64 {
+    IDLE_UNLOAD_SECS.load(Ordering::Relaxed)
+}
+
+/// Publie le délai d'inactivité du lancement.
+pub(super) fn set_idle_unload_secs(secs: u64) {
+    IDLE_UNLOAD_SECS.store(secs, Ordering::Relaxed);
+}
 
 /// Timeout de lecture courant, `launch` tant qu'aucun rechargement n'a eu lieu.
 pub(super) fn read_timeout(launch: Duration) -> Duration {
@@ -73,10 +86,39 @@ pub(super) fn model_ids(launch: &[String]) -> Vec<String> {
 
 /// Liste acceptée que le moteur doit encore appliquer, une seule fois. Elle
 /// devient la liste de `/v1/models` ici, quand le moteur la prend.
+#[cfg(test)]
 pub(super) fn take_pending_models() -> Option<Vec<ServeModelConfig>> {
-    let models = lock(&PENDING).take()?;
+    take_pending_generation().map(|(_, models)| models)
+}
+
+/// Prend la liste en attente avec la génération que la prise publie.
+fn take_pending_generation() -> Option<(u64, Vec<ServeModelConfig>)> {
+    // Ordre des verrous : PENDING puis MODELS, comme `effective_models`.
+    let mut pending = lock(&PENDING);
+    let models = pending.take()?;
     *lock(&MODELS) = Some(models.clone());
-    Some(models)
+    let generation = APPLIED_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    Some((generation, models))
+}
+
+/// Listes publiées par une prise, que chaque moteur applique une fois.
+static APPLIED_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Liste qu'un moteur ayant appliqué la génération `seen` doit appliquer :
+/// celle qu'il prend en attente, ou la dernière publiée par un autre moteur.
+/// À un seul moteur, c'est exactement l'ancienne prise unique.
+pub(super) fn sync_models(seen: &mut u64) -> Option<Vec<ServeModelConfig>> {
+    let mut models = take_pending_generation().map(|(generation, models)| {
+        *seen = generation;
+        models
+    });
+    let models_slot = lock(&MODELS);
+    let generation = APPLIED_GENERATION.load(Ordering::Acquire);
+    if generation != *seen {
+        *seen = generation;
+        models = models_slot.clone().or(models);
+    }
+    models
 }
 
 /// Dernière liste acceptée, appliquée ou non : base du prochain rechargement.
@@ -188,6 +230,20 @@ fn reload(
     let diff = diff_models(current_models, &models);
     READ_TIMEOUT_SECS.store(args.read_timeout.as_secs(), Ordering::Relaxed);
     MAX_TOKENS_CAP.store(args.max_tokens_cap, Ordering::Relaxed);
+    // `env_var` relit le profil installé au lancement : au rechargement, la
+    // valeur du nouveau profil gagne, sauf CLI ou variable d'environnement.
+    let pinned = cli.iter().any(|a| a == "--idle-unload-secs")
+        || [
+            "SARAGOSSA_RUST_IDLE_UNLOAD_SECS",
+            "RETI_RUST_IDLE_UNLOAD_SECS",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+    set_idle_unload_secs(if pinned {
+        args.idle_unload_secs
+    } else {
+        next.serve.idle_unload_secs.unwrap_or(0)
+    });
     if changed.contains(&"serve.max_tok_s") {
         saragossa::set_decode_max_tokens_per_s(args.max_tok_s);
     }
@@ -327,6 +383,56 @@ mod tests {
 
     // Un seul test touche aux listes globales MODELS et PENDING.
     #[test]
+    fn idle_unload_secs_follows_the_reloaded_profile() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                IDLE_UNLOAD_SECS.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = Reset;
+        let dir = std::env::temp_dir().join(format!("saragossa-idle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dossier temporaire");
+        let file = dir.join("p.toml");
+        let path = file.to_str().expect("utf8").to_string();
+        let write = |text: &str| std::fs::write(&file, text).expect("écriture");
+        write("[serve]\nidle_unload_secs = 60\n");
+        let (second, _, _) = reload(Some(&path), &[], &[], &Profile::default(), &[]).expect("60");
+        assert_eq!(idle_unload_secs(), 60);
+        write("[serve]\n");
+        reload(Some(&path), &[], &[], &second, &[]).expect("0");
+        assert_eq!(idle_unload_secs(), 0, "60 puis 0 : le nouveau profil gagne");
+    }
+
+    #[test]
+    fn idle_unload_env_pins_the_delay_under_both_names() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("saragossa-idle-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dossier temporaire");
+        let file = dir.join("p.toml");
+        std::fs::write(&file, "[serve]\nidle_unload_secs = 60\n").expect("écriture");
+        let path = file.to_str().expect("utf8").to_string();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                IDLE_UNLOAD_SECS.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = Reset;
+        for name in [
+            "SARAGOSSA_RUST_IDLE_UNLOAD_SECS",
+            "RETI_RUST_IDLE_UNLOAD_SECS",
+        ] {
+            super::super::args::with_env(name, "7", || {
+                reload(Some(&path), &[], &[], &Profile::default(), &[]).expect(name);
+            });
+            assert_eq!(idle_unload_secs(), 7, "{name} prime sur le profil rechargé");
+            IDLE_UNLOAD_SECS.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
     fn model_list_is_atomic_and_applied_by_the_engine() {
         let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Listes globales : les vider même en cas d'échec.
@@ -402,6 +508,18 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(ids, ["a", "p", "b"]);
+
+        // Deux moteurs : le premier prend la liste, le second applique la
+        // liste publiée, une fois chacun.
+        let mut first = APPLIED_GENERATION.load(Ordering::Acquire);
+        let mut second = first;
+        *lock(&PENDING) = Some(launch.to_vec());
+        let len = |models: Option<Vec<ServeModelConfig>>| models.map(|models| models.len());
+        assert_eq!(len(sync_models(&mut first)), Some(2));
+        assert_eq!(model_ids(&[]), ["a", "p"], "publiée par la prise");
+        assert_eq!(len(sync_models(&mut second)), Some(2));
+        assert_eq!(len(sync_models(&mut first)), None);
+        assert_eq!(len(sync_models(&mut second)), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

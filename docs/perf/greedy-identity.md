@@ -90,8 +90,12 @@ Choix du budget d'arbre (27B, DFlash, ABBA, 200 tokens, tok/s) :
 | 4k | 55,3 / 55,3 | 39,5 / 39,1 | 53,8 / 53,1 |
 | 32k | 50,8 / 50,3 | 29,6 / 29,8 | 44,9 / 44,9 |
 
-Le strict B = 3 coûte −4 % à 4k et −12 % à 32k face au défaut rapide. Le
-strict B = 8 coûte −29 % et −41 %. Mesures croisées strict B = 8 / B = 3 :
+Mesure historique (5 nov. 2026), quand le défaut rapide du 27B était
+B = 8 : le strict B = 3 perdait −4 % à 4k et −12 % à 32k face à ce défaut, le
+strict B = 8 −29 % et −41 %. Depuis #316, le greedy prend B = 3 par défaut sur
+les cibles quantifiées (voir plus bas) : cette comparaison ne donne plus le coût
+du mode strict, et aucun coût du mode strict face au nouveau défaut
+B = 3 n'est documenté ici. Mesures croisées strict B = 8 / B = 3 :
 39,5 / 52,4 à 4k et 30,1 / 45,1 à 32k.
 
 ### Arbre DFlash sur cible bf16 dense (21 nov. 2026)

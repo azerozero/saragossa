@@ -32,11 +32,19 @@ struct Message {
 }
 
 #[test]
-fn templates_match_all_28_transformers_references() {
+fn templates_match_all_36_transformers_references() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/goldens/chat_templates");
     let mut count = 0;
-    for model in ["qwen36_moe", "qwen38", "gemma3", "gemma4"] {
+    for model in [
+        "qwen36_moe",
+        "qwen38",
+        "gemma3",
+        "gemma4",
+        "mistral7b",
+        "mistral7b_tail",
+        "llama31",
+    ] {
         let bytes = std::fs::read(root.join(format!("{model}.bin"))).expect("fixture");
         let header: serde_json::Value = serde_json::from_slice(
             &std::fs::read(root.join(format!("{model}.json"))).expect("header"),
@@ -66,6 +74,16 @@ fn templates_match_all_28_transformers_references() {
             let actual = match model {
                 "gemma3" => render_gemma_chat(&messages, case.add_generation_prompt)
                     .map(|s| format!("<bos>{s}")),
+                // Sans outils : tout outil déclaré doit être refusé.
+                "llama31" => render_llama3_chat(
+                    &messages,
+                    case.add_generation_prompt,
+                    crate::chat_template::LLAMA3_FIXED_DATE,
+                ),
+                "mistral7b" | "mistral7b_tail" if !tools.is_empty() => {
+                    Err(TemplateError::UnsupportedRole("tools".to_string()))
+                }
+                "mistral7b" | "mistral7b_tail" => render_mistral_chat(&messages),
                 "gemma4" => Ok(render_gemma4_chat_with_tools(
                     &messages,
                     &tools,
@@ -88,6 +106,8 @@ fn templates_match_all_28_transformers_references() {
                 (Ok(actual), Some(expected), None) => {
                     assert_eq!(actual, expected, "{model}/{}", case.name)
                 }
+                // Mistral refuse aussi, avec son propre message d'erreur.
+                (Err(_), None, Some(_)) if model == "mistral7b" => {}
                 (Err(error), None, Some(expected)) => assert_eq!(
                     format!("TemplateError: {error}"),
                     expected,
@@ -99,5 +119,37 @@ fn templates_match_all_28_transformers_references() {
             count += 1;
         }
     }
-    assert_eq!(count, 28);
+    assert_eq!(count, 36);
+}
+
+#[test]
+#[ignore = "tokenizer Mistral 7B v0.3 local : SARAGOSSA_MISTRAL7B_DIR"]
+fn external_mistral7b_template_token_ids() -> super::external::TestResult {
+    #[derive(Deserialize)]
+    struct Ids {
+        cases: Vec<IdCase>,
+    }
+    #[derive(Deserialize)]
+    struct IdCase {
+        rendered: Option<String>,
+        token_ids: Option<Vec<u32>>,
+    }
+    let Some(dir) = super::external::local("SARAGOSSA_MISTRAL7B_DIR")? else {
+        return Ok(());
+    };
+    let tokenizer = crate::RustTokenizer::from_file(dir.join("tokenizer.json"))?;
+    let (_, bytes) = super::external::read("chat_templates/mistral7b")?;
+    let fixture: Ids = serde_json::from_slice(&bytes)?;
+    let mut checked = 0;
+    for case in fixture.cases {
+        if let (Some(rendered), Some(expected)) = (case.rendered, case.token_ids) {
+            // BOS littéral `<s>` : encodage sans post-processeur, un seul BOS.
+            let ids = tokenizer.encode(&rendered)?;
+            assert_eq!(ids, expected, "{rendered}");
+            assert_eq!(ids.iter().filter(|&&id| id == 1).count(), 1);
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 2);
+    Ok(())
 }

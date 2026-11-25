@@ -335,21 +335,30 @@ fn na_gemm_src_compiles() -> Result<()> {
             .unwrap_or_else(|e| {
                 panic!("NA_GEMM_SRC ne compile pas (casse tous les pipelines NA) : {e}")
             });
-        // Chaque noyau littéral doit donner un pipeline : un `None` du runtime
-        // ferait retomber son chemin en f32 sans erreur.
-        let names: Vec<&str> = NA_GEMM_SRC
-            .split("kernel void ")
+        // Chaque nom demandé par l'hôte (`compile_na` dans pipelines.rs) doit
+        // donner un pipeline : un `None` du runtime ferait retomber son chemin
+        // en f32 sans erreur. NOTE: l'hôte fait foi, pas la source Metal dont
+        // les templates, macros et commentaires trompent une analyse textuelle.
+        let bm = format!("bm{}", crate::metal_backend::MOE_COOP_TILED_BM);
+        let names: Vec<String> = include_str!("../pipelines.rs")
+            .split("compile_na(")
             .skip(1)
-            .filter_map(|rest| rest.split('(').next())
-            .map(str::trim)
-            // Les noyaux générés par macro (`NAME`, `##BM`) n'ont pas de nom littéral.
-            .filter(|name| {
-                name.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            .map(|rest| {
+                let rest = rest.trim_start();
+                let rest = rest.strip_prefix("format!(").unwrap_or(rest);
+                let name = rest
+                    .strip_prefix('"')
+                    .and_then(|r| r.split('"').next())
+                    .unwrap_or_else(|| panic!("compile_na sans nom littéral : {rest:.60}"));
+                name.replace("bm{MOE_COOP_TILED_BM}", &bm)
             })
             .collect();
-        assert!(names.contains(&"gemm_nax"), "analyse des noyaux NA vide");
-        for name in names {
+        assert!(
+            names.iter().all(|name| !name.contains('{')),
+            "nom NA à gabarit non résolu : {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "gemm_nax"), "analyse des noyaux NA vide");
+        for name in &names {
             let function = library
                 .get_function(name, None)
                 .unwrap_or_else(|e| panic!("noyau NA {name} absent : {e}"));

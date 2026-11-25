@@ -1,0 +1,32 @@
+{
+  "dtype": "f32",
+  "shape": [
+    2048,
+    2,
+    64
+  ],
+  "source": {
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "path": "${SARAGOSSA_MISTRAL7B_DIR}",
+    "snapshot": "c170c708c41dac9275d15a8fff4eca08d52bab71",
+    "sha256": {
+      "config.json": "affafc6478ec0fd07a32f0ca57aa2fc57743f4d17d6730f86a96ac24d1507f99",
+      "tokenizer.json": "e553af6fff7d7ad76e830608b218c5c0b0822998d5a1a96099a74cd3c1cb1a49",
+      "tokenizer_config.json": "0533dec9cfe319163801b6618d0f3ec9cfa126b6288e3df5deca6e32acb09cd2",
+      "generation_config.json": "b4669f1b8f4185324bd9b12a69e85a1ad2289bc48111ef739cfaaea3bba6b0a9"
+    },
+    "versions": {
+      "transformers": "5.22.2",
+      "tokenizers": "0.23.3",
+      "jinja2": "3.1.6",
+      "mlx": "0.32.4",
+      "mlx-lm": "0.32.2"
+    },
+    "float32_control": true
+  },
+  "tolerance": "ratio au bruit mlx bf16 / f32, voir README",
+  "mlx_sha": "not-applicable",
+  "captured": "2026-11-22",
+  "payload_sha256": "13e90d48302ba370a4853658c9d816b8b068591f2c34c0fd746071c4dce9b10d",
+  "layout": "par position : K ids (entiers exacts en f32) puis K logprobs float32"
+}

@@ -217,6 +217,8 @@ pub struct CausalDecoderConfig {
     pub rope_full_base_freq: Option<f32>,
     /// Met à l'échelle les positions RoPE (`1/factor` du rope_scaling linear).
     pub rope_position_scale: Option<f32>,
+    /// Paramètres de la table de fréquences `llama3` (Llama 3.1+) ; `None` ailleurs.
+    pub rope_llama3: Option<crate::rope::Llama3RopeScaling>,
     /// Définit la taille de fenêtre des couches locales Gemma 3.
     pub sliding_window: Option<usize>,
     /// Définit la période de la couche globale Gemma 3.
@@ -1230,6 +1232,7 @@ impl Default for CausalDecoderConfig {
             rope_local_base_freq: None,
             rope_full_base_freq: None,
             rope_position_scale: None,
+            rope_llama3: None,
             sliding_window: None,
             sliding_window_pattern: None,
             attention_k_eq_v: false,
@@ -1290,6 +1293,7 @@ impl From<&ModelConfig> for CausalDecoderConfig {
             rope_local_base_freq: config.rope_local_base_freq,
             rope_full_base_freq: config.rope_full_base_freq,
             rope_position_scale: config.rope_position_scale(),
+            rope_llama3: config.rope_llama3_scaling(),
             sliding_window: config.sliding_window,
             sliding_window_pattern: config.sliding_window_pattern,
             attention_k_eq_v: config.attention_k_eq_v,

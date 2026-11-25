@@ -1,0 +1,51 @@
+name: Bug report
+description: Something fails, crashes or gives a wrong result.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Mask secrets in every field (API keys such as `SARAGOSSA_API_KEY`, `HF_TOKEN`, private paths). Use synthetic data in examples."
+  - type: input
+    id: version
+    attributes:
+      label: saragossa version
+      description: "`brew list --versions saragossa` for Homebrew, or `git rev-parse --short HEAD` for a source build."
+      placeholder: "saragossa 0.3.39"
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: "OS and version, chip or CPU, memory, backend (metal or cpu). On a Mac: Apple menu > About This Mac."
+      placeholder: "macOS 26.1, M4 Pro, 48 GB, metal"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Hugging Face id or local directory, and its quantization. Write "n/a" for install or build problems.
+      placeholder: "mlx-community/Qwen3-4B-4bit"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: "The exact command with flags and any SARAGOSSA_* variables (secrets masked). For `saragossa serve`, add the minimal HTTP request (curl); for the library, a minimal Rust snippet."
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Full terminal output.
+      render: text

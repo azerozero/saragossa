@@ -1,0 +1,26 @@
+{
+ "metric": "kl_mean",
+ "prompts": 13,
+ "candidate": 0.03592307692307692,
+ "reference": 0.036153846153846154,
+ "mean_diff": -0.00023076923076923258,
+ "ci95": [
+  -0.0009230769230769271,
+  0.0005384615384615368
+ ],
+ "categories": {
+  "code": {
+   "candidate": 0.03616666666666666,
+   "reference": 0.036333333333333336,
+   "relative": -0.004587155963303011
+  },
+  "prose": {
+   "candidate": 0.03571428571428571,
+   "reference": 0.036,
+   "relative": -0.007936507936507917
+  }
+ },
+ "regressed": [],
+ "gain": false,
+ "worst_prompt": "p9"
+}

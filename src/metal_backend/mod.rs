@@ -184,6 +184,7 @@ pub use self::profiling::{
 };
 pub(crate) use self::profiling::{profile_dispatch, profile_dispatch_shape, trace_dispatch_path};
 pub(crate) use self::scratch::install_scratch_namespace;
+pub use self::scratch::set_scratch_engine;
 #[cfg(test)]
 pub(crate) use self::verify_tree::with_verify_strict_override;
 pub(crate) use self::verify_tree::{
@@ -486,6 +487,8 @@ pub struct MetalExecutor {
     na_gemm_coop_qb_tiled: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_gs128: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4: Option<ComputePipelineState>,
+    /// GEMM tuilé u3 gs64 du prefill, même tuilage que le u4.
+    na_gemm_coop_qb_tiled_u3: Option<ComputePipelineState>,
     /// GEMM tuilé u4 bf16×3 à lhs f32, réservé aux projections sous le
     /// plancher par défaut (petites formes de flint, `=x3` sur les Qwen MoE).
     na_gemm_coop_qb_tiled_u4_x3: Option<ComputePipelineState>,
@@ -1098,6 +1101,8 @@ struct ScratchBufferKey {
     // Slot de flux (light-batch) : deux flux concurrents qui passent par les
     // mêmes labels reçoivent des buffers DISJOINTS au lieu de s'aliaser.
     namespace: u64,
+    /// Moteur serve (`--engines`) : 0 hors multi-moteur.
+    engine: u32,
 }
 
 #[derive(Debug)]

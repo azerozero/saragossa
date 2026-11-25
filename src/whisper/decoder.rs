@@ -414,7 +414,7 @@ impl WhisperDecoder {
                     ));
                 }
             };
-            let weight = metal.cached_buffer_from_f32(tensor.data(), "whisper_dec_w")?;
+            let weight = Some(metal.cached_buffer_from_f32(tensor.data(), "whisper_dec_w")?);
             let weight_na = if crate::metal_backend::whisper_bf16_gemm_enabled() {
                 Some(metal.cached_rhs_t_bf16(tensor)?)
             } else {

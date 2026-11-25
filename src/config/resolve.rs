@@ -39,6 +39,65 @@ impl RawModelConfig {
                     map.entry("partial_rotary_factor".to_string())
                         .or_insert(factor);
                 }
+                // transformers 5 sérialise le scaling dans `rope_parameters` :
+                // un type autre que `default` doit atteindre `rope_scaling`,
+                // sinon il serait ignoré en silence. Les dictionnaires par type
+                // de couche (Gemma 4) n'ont pas de type au premier niveau.
+                let scaled = ["rope_type", "type"].iter().any(|key| {
+                    rope.get(*key)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| kind != "default")
+                });
+                if scaled {
+                    // Un `rope_scaling: null` sérialisé ne doit pas masquer le
+                    // type de `rope_parameters` : il est remplacé.
+                    match map.get("rope_scaling").filter(|value| !value.is_null()) {
+                        None => {
+                            map.insert("rope_scaling".to_string(), rope);
+                        }
+                        Some(existing) => {
+                            let kind = |value: &serde_json::Value| {
+                                ["rope_type", "type"]
+                                    .iter()
+                                    .find_map(|key| value.get(*key).cloned())
+                            };
+                            let differs = kind(existing) != kind(&rope)
+                                || [
+                                    "factor",
+                                    "low_freq_factor",
+                                    "high_freq_factor",
+                                    "original_max_position_embeddings",
+                                ]
+                                .iter()
+                                .any(|key| {
+                                    // `8` et `8.0` désignent le même facteur. Un entier que
+                                    // f64 n'a pas exactement reste comparé tel quel.
+                                    let exact_f64 = |v: Option<&serde_json::Value>| {
+                                        let v = v?;
+                                        let x = v.as_f64()?;
+                                        let exact = match (v.as_i64(), v.as_u64()) {
+                                            (Some(i), _) => {
+                                                x as i64 == i && x.abs() < 2f64.powi(53)
+                                            }
+                                            (None, Some(u)) => x as u64 == u && x < 2f64.powi(53),
+                                            _ => true,
+                                        };
+                                        exact.then_some(x)
+                                    };
+                                    let (a, b) = (existing.get(*key), rope.get(*key));
+                                    match (exact_f64(a), exact_f64(b)) {
+                                        (Some(x), Some(y)) => x != y,
+                                        _ => a != b,
+                                    }
+                                });
+                            if differs {
+                                return Err(InferError::Config(
+                                    "rope_scaling et rope_parameters contradictoires".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             if let Some(eos) = top_eos {
                 map.entry("eos_token_id".to_string()).or_insert(eos);

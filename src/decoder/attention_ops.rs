@@ -13,6 +13,8 @@ pub(super) struct RopeParams {
     /// des couches globales Gemma 3 ≥4B) ; `1.0` = positions brutes. `pos × 1.0`
     /// est bit-identique à `pos` → byte-identité des modèles non scalés.
     pub(super) position_scale: f32,
+    /// Table de fréquences `llama3` ; `None` garde la table par défaut au bit près.
+    pub(super) llama3: Option<crate::rope::Llama3RopeScaling>,
 }
 
 /// Résout la base et l'échelle RoPE effectives d'une couche full-attention.
@@ -35,6 +37,7 @@ pub(super) fn rope_params(
         theta,
         frequency_dim,
         position_scale: attention.rope_position_scale.unwrap_or(1.0),
+        llama3: config.rope_llama3,
     })
 }
 
@@ -980,6 +983,7 @@ struct RopeRotationKey {
     frequency_dim: usize,
     base_theta_bits: u32,
     position_scale_bits: u32,
+    llama3_bits: Option<[u32; 4]>,
 }
 
 type RopeRotations = Arc<Vec<(f32, f32)>>;
@@ -1003,6 +1007,7 @@ pub(super) fn rope_rotations(
         frequency_dim: rope.frequency_dim,
         base_theta_bits: rope.theta.to_bits(),
         position_scale_bits: rope.position_scale.to_bits(),
+        llama3_bits: rope.llama3.map(crate::rope::Llama3RopeScaling::key),
     };
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
@@ -1015,7 +1020,7 @@ pub(super) fn rope_rotations(
     }
     // Les fréquences ne dépendent pas de la position : chaque base/dimension
     // est calculée une fois, même lorsque le cache de rotations s'enrichit.
-    type Frequencies = Mutex<HashMap<(u32, usize), Arc<Vec<f32>>>>;
+    type Frequencies = Mutex<HashMap<(u32, usize, Option<[u32; 4]>), Arc<Vec<f32>>>>;
     static FREQUENCIES: OnceLock<Frequencies> = OnceLock::new();
     let inv = {
         let mut cache = FREQUENCIES
@@ -1023,8 +1028,18 @@ pub(super) fn rope_rotations(
             .lock()
             .map_err(|_| InferError::Config("cache fréquences RoPE empoisonné".to_string()))?;
         cache
-            .entry((rope.theta.to_bits(), rope.frequency_dim))
-            .or_insert_with(|| Arc::new(crate::rope::inv_freq(rope.frequency_dim, rope.theta)))
+            .entry((
+                rope.theta.to_bits(),
+                rope.frequency_dim,
+                rope.llama3.map(crate::rope::Llama3RopeScaling::key),
+            ))
+            .or_insert_with(|| {
+                Arc::new(crate::rope::inv_freq_scaled(
+                    rope.frequency_dim,
+                    rope.theta,
+                    rope.llama3,
+                ))
+            })
             .clone()
     };
     let pairs = rope_dims / 2;
@@ -1385,6 +1400,7 @@ pub(crate) fn gemma_global_attention_prefill_oracle(
         theta: spec.rope_theta,
         frequency_dim: spec.head_dim,
         position_scale: 1.0,
+        llama3: None,
     };
     let q = rms_norm_rope_heads_at(
         q_raw,

@@ -128,7 +128,7 @@ pub use memory_guard::{
     MemoryReservation, PurgeOutcome, PurgePressure, PurgeRegistry, PurgeReport,
 };
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub use metal_backend::MetalExecutor;
+pub use metal_backend::{set_scratch_engine, MetalExecutor};
 pub use mlp::{Activation, FeedForward, GatedMlp, MoeMlp, RouterScore};
 pub use norm::{layer_norm, rms_norm};
 #[cfg(all(target_os = "macos", feature = "metal"))]

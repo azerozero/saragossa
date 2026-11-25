@@ -183,7 +183,7 @@ fn budget_reached_finishes_stream_with_length() {
 #[test]
 fn batched_session_request_alone_would_be_served_by_mtp() {
     let mut loaded = tiny_loaded_model();
-    loaded.mtp_active = true;
+    loaded.llm_mut().mtp_active = true;
     for (stop, admitted) in [("", true), (r#","stop":"{}""#, true)] {
         let body = format!(
             r#"{{"model":"tiny","messages":[{{"role":"user","content":"x"}}],"stream":true{stop}}}"#
@@ -197,7 +197,7 @@ fn batched_session_request_alone_would_be_served_by_mtp() {
             super::super::http::read_request(&mut std::io::Cursor::new(raw.into_bytes()), deadline)
                 .expect("invariant: requête lisible")
                 .expect("invariant: requête présente");
-        let batched = super::super::http::batch_chat(&http, 1024, |_| loaded.mtp_active);
+        let batched = super::super::http::batch_chat(&http, 1024, |_| loaded.llm.mtp_active);
         assert_eq!(batched.is_some(), admitted, "stop {stop}");
         let chat: ChatCompletionRequest =
             serde_json::from_str(&body).expect("invariant: requête test valide");
@@ -239,7 +239,7 @@ fn bytelevel_batch_preserves_content_stop_position_and_usage() {
     }))
     .expect("requête");
     let prepared = loaded.prepare(&request, 16).expect("préparation");
-    loaded.assets = super::super::streaming::incremental_tests::synthetic();
+    loaded.llm_mut().assets = super::super::streaming::incremental_tests::synthetic();
     let mut boxes: Vec<Box<dyn CompletionSink>> = vec![
         Box::new(ExactSink {
             expected: "",
