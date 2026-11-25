@@ -7,6 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.41](https://github.com/azerozero/saragossa/compare/v0.3.40...v0.3.41) - 2026-11-25
+
+### Added
+
+- *(devtools)* p99 de KL et arène bf16 optionnelle pour --kl-record/--kl-compare
+
+### Other
+
+- *(perf)* précise la couverture et les limites du KV q8 en contexte long
+- *(perf)* résultats du KV q8 par défaut en contexte long, critère non rempli
+- Merge remote-tracking branch 'origin/main' into perf/kv8-long-context
+- *(perf)* pré-enregistre le critère du KV q8 par défaut en contexte long
+
+## [0.3.40](https://github.com/azerozero/saragossa/compare/v0.3.39...v0.3.40) - 2026-11-25
+
+### Added
+
+- *(serve)* caches des poids partagés coupés à plusieurs moteurs
+- *(serve)* moteurs parallèles à poids partagés (--engines N)
+
+### Fixed
+
+- *(serve)* mémo TTS consulté seulement avec la feature tts
+- *(serve)* relecture multi-moteur, alias, voix TTS et cache SSD
+- *(serve)* admission, ordre STT et récupération des moteurs partagés
+
+### Other
+
+- *(github)* masquage des secrets et reproduction complète dans les modèles d'issue
+- *(readme)* un chiffre de la campagne 21-final au premier écran, crates.io non publié
+- *(github)* modèles d'issue pour bug, demande de modèle et régression de perf
+- *(readme)* boucle vocale orchestrée par le client, prérequis du bench, portée des tests d'identité
+- *(readme)* commande de reproduction du bench, chaîne vocale en tête, identité non testée par la campagne
+- *(fuzz)* feature stt activée pour les cibles wire_audio
+- *(fuzz)* Cargo.lock du fuzz aligné sur les dépendances actuelles du crate
+- *(fuzz,mutants)* installer cargo-fuzz avec le stable figé et découper les mutations en tiers
+
+## [0.3.39](https://github.com/azerozero/saragossa/compare/v0.3.38...v0.3.39) - 2026-11-24
+
+### Other
+
+- *(bench)* refroidissement entre les entrées, pas avant la première
+- *(bench)* réserves de la campagne de novembre et coût du mode strict
+- *(tts)* conversion bf16 comparée au lecteur safetensors sur tous les motifs
+- *(tts)* table text_embedding gardée en bf16
+- *(stt)* encodeur Whisper sans copie f32 GPU sous NA
+
+## [0.3.38](https://github.com/azerozero/saragossa/compare/v0.3.37...v0.3.38) - 2026-11-24
+
+### Fixed
+
+- *(test)* garde NA, noms vérifiés depuis les demandes de l'hôte
+- *(test)* garde NA, noyaux template vérifiés sous leurs host_name
+
+## [0.3.37](https://github.com/azerozero/saragossa/compare/v0.3.36...v0.3.37) - 2026-11-24
+
+### Added
+
+- *(serve)* décharge les modèles après une période d'inactivité
+
+### Fixed
+
+- *(serve)* date la fin d'un flux enhance à la libération de sa réservation
+- *(serve)* date l'inactivité DFN3 sous verrou et à la fin du flux
+- *(serve)* décharge DFN3 inactif et respecte l'alias RETI au SIGHUP
+- *(serve)* corrige le déchargement d'inactivité après revue
+
+### Other
+
+- Merge pull request #342 from azerozero/feat/serve-idle-unload
+- *(serve)* échéance DFN3 comptée depuis la fin réelle du flux
+
+## [0.3.36](https://github.com/azerozero/saragossa/compare/v0.3.35...v0.3.36) - 2026-11-24
+
+### Added
+
+- *(devtools)* portage Rust de paired.py et kl_eval.py
+
+### Fixed
+
+- *(devtools)* lecture exacte locale à paired et kl-eval borné en mémoire
+- *(serve)* le prefill MTP relit la frontière SSD la plus longue
+
+### Other
+
+- Merge pull request #347 from azerozero/feat/quant-rs-paired-kl
+- *(bench)* JSON tronqué, tours attendus et DONE périmé contrôlés
+- Merge remote-tracking branch 'origin/main' into test/tour-agent-ttft
+- *(bench)* tours en échec et mesures reprises refusées
+- *(perf)* l'édition de contrôle porte sur le milieu du prompt
+- *(bench)* passe invalide rejouée, abandon explicite après deux rejets
+- *(serve)* reprise SSD MTP identique au prefill à froid
+- *(perf)* TTFT d'un tour d'agent avec cache de préfixe
+- *(bench)* TTFT d'un tour d'agent avec cache de préfixe RAM et SSD
+- *(serve)* tour d'agent, seul le delta est prérempli et la sortie égale le froid
+
+## [0.3.35](https://github.com/azerozero/saragossa/compare/v0.3.34...v0.3.35) - 2026-11-24
+
+### Added
+
+- *(loader)* refuse sliding_window inférieur au contexte pour Llama et Mistral
+- *(loader)* RoPE llama3, templates Llama 3 et Mistral, oracle KL Mistral 7B
+
+### Fixed
+
+- *(config)* entier RoPE non représentable en f64 comparé tel quel
+- *(config)* entiers RoPE comparés exactement, sans passer par f64
+- *(config)* facteurs RoPE comparés numériquement (8 et 8.0 équivalents)
+- *(test)* helper rope sans rms_norm_eps manquant, flottants JSON, liste golden llama31
+- *(config)* rope_parameters remplace rope_scaling nul, biais cohérents, sliding_window refusé, système Mistral en loop.last
+
+### Other
+
+- Merge pull request #339 from azerozero/feat/llama-mistral
+- *(loader)* helpers de test sans collision de noms
+- *(llama)* rétablit les tests de main, date par version, oracle RoPE llama3 et configs de familles
+- fusionne origin/main dans feat/llama-mistral
+
 ## [0.3.34](https://github.com/azerozero/saragossa/compare/v0.3.33...v0.3.34) - 2026-11-23
 
 ### Fixed

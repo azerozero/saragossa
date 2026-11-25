@@ -51,6 +51,35 @@ fn scratch_namespace_isolates_label_keyed_buffers() -> Result<()> {
 }
 
 #[test]
+fn scratch_engine_isolates_buffers_between_threads() -> Result<()> {
+    let Some(executor) = test_executor()? else {
+        return Ok(());
+    };
+    let engine_0 = executor.scratch_buffer(64, MetalBufferElement::F32, "engine_test_scratch")?;
+    // Un moteur serve sur un autre thread, même executor : buffer disjoint et
+    // mémoïsé chez lui ; sa purge de fin de portée laisse celui du moteur 0.
+    let engine_1 = std::thread::scope(|scope| {
+        scope
+            .spawn(|| -> Result<_> {
+                crate::metal_backend::set_scratch_engine(1);
+                let _scope = executor.scratch_buffer_scope();
+                let first =
+                    executor.scratch_buffer(64, MetalBufferElement::F32, "engine_test_scratch")?;
+                let again =
+                    executor.scratch_buffer(64, MetalBufferElement::F32, "engine_test_scratch")?;
+                assert_eq!(first.contents(), again.contents());
+                Ok(first.contents() as usize)
+            })
+            .join()
+            .expect("invariant: thread moteur sans panique")
+    })?;
+    assert_ne!(engine_0.contents() as usize, engine_1);
+    let again = executor.scratch_buffer(64, MetalBufferElement::F32, "engine_test_scratch")?;
+    assert_eq!(engine_0.contents(), again.contents());
+    Ok(())
+}
+
+#[test]
 fn scratch_namespace_guard_restores_nested_scopes() {
     let _outer = install_scratch_namespace(7);
     assert_eq!(current_scratch_namespace(), 7);

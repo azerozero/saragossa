@@ -77,6 +77,10 @@ impl CausalDecoder {
     pub(in crate::decoder) fn resident_layer_batch_supported(&self, arena: &ResidentArena) -> bool {
         self.layers.iter().enumerate().all(|(index, layer)| {
             match (self.plan.layers[index].resident_full, layer.mlp.as_ref()) {
+                // Les lignes full-attn exigent la porte de sortie
+                // (`encode_full_attn_dense_layer_rows_impl`) : sans elle (Llama,
+                // Mistral, Gemma), la vérification reste au decode ordinaire.
+                (true, _) if !self.config.attn_output_gate => false,
                 (true, Some(FeedForward::Dense(_))) => {
                     matches!(
                         arena.layers.get(index),

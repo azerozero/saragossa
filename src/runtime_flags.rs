@@ -852,8 +852,7 @@ pub fn gpu_share() -> u8 {
 /// aussi le pool rayon à `share` % des cœurs ; ce pool global se règle une seule
 /// fois par processus, un rechargement ne le redimensionne pas.
 pub fn set_gpu_share(share: u8) {
-    let share = share.clamp(MIN_GPU_SHARE, 100);
-    GPU_SHARE.store(share, AtomicOrdering::Relaxed);
+    let share = set_gpu_duty_share(share);
     if share < 100 {
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
         // NOTE: l'erreur « pool déjà construit » est attendue au rechargement.
@@ -861,6 +860,15 @@ pub fn set_gpu_share(share: u8) {
             .num_threads((cores * usize::from(share) / 100).max(1))
             .build_global();
     }
+}
+
+/// Règle seulement le rapport cyclique GPU (10 à 100, borné), sans toucher au
+/// pool rayon : le cédage automatique de `serve` bascule souvent et ne doit pas
+/// figer le pool global à sa part basse. Renvoie la part retenue.
+pub fn set_gpu_duty_share(share: u8) -> u8 {
+    let share = share.clamp(MIN_GPU_SHARE, 100);
+    GPU_SHARE.store(share, AtomicOrdering::Relaxed);
+    share
 }
 
 /// Analyse `--gpu-share` (entier de 10 à 100).
@@ -2303,7 +2311,31 @@ pub(crate) fn gather_fast_mode() -> Option<&'static str> {
 
 pub(super) fn prefix_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_CACHE", true))
+    !SHARED_MODEL_CACHES_OFF.load(AtomicOrdering::Relaxed)
+        && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_CACHE", true))
+}
+
+/// Coupe pour tout le process les caches portés par les poids partagés.
+static SHARED_MODEL_CACHES_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `serve --engines N` (N > 1) : coupe le cache de préfixe interne du décodeur
+/// (MTP, DFlash) et le mémo de prefill TTS. Ils vivent dans les poids
+/// partagés : un moteur changerait les reprises, donc le chemin numérique, d'un
+/// autre. Irréversible, à appeler avant la première requête.
+pub fn disable_shared_model_caches() {
+    SHARED_MODEL_CACHES_OFF.store(true, AtomicOrdering::Relaxed);
+}
+
+/// Un cache porté par les poids partagés (préfixe décodeur, mémo TTS) est-il
+/// actif ?
+#[must_use]
+pub fn shared_model_caches_active() -> bool {
+    #[cfg(feature = "tts")]
+    let tts = tts_prefill_cache_enabled();
+    #[cfg(not(feature = "tts"))]
+    let tts = false;
+    prefix_cache_enabled() || tts
 }
 
 /// Autorise `QmmNaDequant` dans le talker et le code_predictor TTS.
@@ -2356,7 +2388,8 @@ pub(crate) fn tts_prefill_cache_enabled() -> bool {
         return enabled;
     }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_PREFILL_CACHE", false))
+    !SHARED_MODEL_CACHES_OFF.load(AtomicOrdering::Relaxed)
+        && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_PREFILL_CACHE", false))
 }
 
 #[cfg(test)]

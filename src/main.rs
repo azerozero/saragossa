@@ -13,6 +13,8 @@ mod decide_cli;
 mod diarize_cli;
 mod hf_cache;
 mod hf_resolve;
+#[cfg(feature = "devtools")]
+mod quant_cli;
 mod run_repl;
 mod serve;
 #[cfg(feature = "denoise")]
@@ -139,6 +141,10 @@ fn run() -> CliResult<()> {
             "convert-qwen4exp" => return convert_cli::run(raw_args.into_iter().skip(1)),
             #[cfg(feature = "devtools")]
             "convert" => return convert_cli::run_hf(raw_args.into_iter().skip(1)),
+            #[cfg(feature = "devtools")]
+            "paired" => return quant_cli::run_paired(raw_args.into_iter().skip(1)),
+            #[cfg(feature = "devtools")]
+            "kl-eval" => return quant_cli::run_kl_eval(raw_args.into_iter().skip(1)),
             "list" => return hf_resolve::run_list(raw_args.into_iter().skip(1)),
             "run" => return run_repl::run(raw_args.into_iter().skip(1)),
             #[cfg(feature = "serve")]
@@ -603,6 +609,7 @@ fn mtp_decode_max_draft() -> usize {
 /// chat), utile pour tester un modèle hors familles connues (Llama/Mistral) —
 /// tokens spéciaux du tokenizer activés (BOS Llama). Gemma 3 : tours
 /// `<start_of_turn>` ; Gemma 4 : tours `<|turn>` avec `<bos>` littéral ;
+/// Llama 3 : en-têtes `<|start_header_id|>` ; Mistral : `[INST]` ;
 /// flint : tours `<|user|>…<|assistant|>`. Sinon : ChatML Qwen, byte-identique.
 fn encode_prompt_ids(assets: &ModelAssets, prompt: &str, raw: bool) -> CliResult<Vec<usize>> {
     if raw {
@@ -620,6 +627,12 @@ fn encode_prompt_ids(assets: &ModelAssets, prompt: &str, raw: bool) -> CliResult
     } else if assets.config.is_gemma() {
         let templated = render_gemma_chat(&[ChatTemplateMessage::new("user", prompt)], true)?;
         assets.encode_prompt_with_special(&templated)?
+    } else if let Some(templated) = saragossa::chat_template::render_llama_or_mistral_chat(
+        &assets.config,
+        &[ChatTemplateMessage::new("user", prompt)],
+    ) {
+        // BOS littéral dans le rendu, comme `{{ bos_token }}` du template HF.
+        assets.encode_prompt(&templated?)?
     } else {
         let templated =
             render_qwen_chatml(&[ChatTemplateMessage::new("user", prompt)], true, false);
@@ -945,7 +958,7 @@ fn cli_error(message: impl Into<String>) -> Box<dyn Error> {
 }
 
 fn help_text() -> String {
-    let mut help = "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa config <check FILE|print [FILE]> [--set section.cle=valeur]\n       saragossa <doctor|bench|serve|bench-serve|decide> [options]\n       saragossa convert-qwen4exp --src <fp8> --dst <sortie> --source-revision <sha> [--source-repo <org/nom>] [--converter-commit <sha>] [--only <unité,…>] [--verify] [--plan]\n       saragossa convert <dossier bf16 HF> <sortie> [--bits 4|8] [--minmax] [--keep-8bit motif,…] [--keep-bf16 motif,…] [--verify]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--stop TEXT]... [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N] [--kl-record PATH | --kl-compare PATH]\nKL : run <chemin local> accepte aussi ces deux modes ; --max-tokens fixe n, --kl-compare relit le prompt enregistré.\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet SARAGOSSA_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 with SARAGOSSA_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance.".to_string();
+    let mut help = "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n       saragossa list\n       saragossa config <check FILE|print [FILE]> [--set section.cle=valeur]\n       saragossa <doctor|bench|serve|bench-serve|decide> [options]\n       saragossa convert-qwen4exp --src <fp8> --dst <sortie> --source-revision <sha> [--source-repo <org/nom>] [--converter-commit <sha>] [--only <unité,…>] [--verify] [--plan]\n       saragossa convert <dossier bf16 HF> <sortie> [--bits 4|8] [--minmax] [--keep-8bit motif,…] [--keep-bf16 motif,…] [--verify]\n       saragossa paired <diff CAND.json REF.json | factorial A0F0.json A0F1.json A1F0.json A1F1.json> [--metric kl_mean]\n       saragossa kl-eval --reference <dir> --candidate <dir> [--prompts FILE] [--backend cpu|metal]\n       saragossa --model-dir <dir> (--check | --load-only | --prefill-only (--prompt <text>|--prompt-tokens N) | --prompt <text> | --prompt-tokens N) [--backend cpu|metal] [--raw] [--ignore-stop-tokens] [--stop TEXT]... [--top-k N] [--top-p P] [--max-tokens N] [--temperature T] [--seed N] [--metrics] [--prefill-repeat N] [--kl-record PATH | --kl-compare PATH]\nKL : run <chemin local> accepte aussi ces deux modes ; --max-tokens fixe n, --kl-compare relit le prompt enregistré.\nDefault backend: metal when available, cpu otherwise.\n`run` accepte un chemin local existant ou un id Hugging Face org/repo, télécharge les artefacts absents puis ouvre un REPL chat. `list` affiche les snapshots HF locaux contenant config.json.\nSet SARAGOSSA_RUST_DFLASH_DRAFT_DIR during --check to validate a DFlash draft checkpoint. Set SARAGOSSA_RUST_DFLASH_ACCEPTANCE=1 with SARAGOSSA_RUST_DFLASH_DRAFT_DIR to run AR vs DFlash acceptance.".to_string();
     let commands = [
         Some("doctor"),
         Some("bench"),
@@ -966,6 +979,8 @@ fn help_text() -> String {
             .filter(|line| {
                 !line.contains("convert-qwen4exp")
                     && !line.contains("saragossa convert ")
+                    && !line.contains("saragossa paired ")
+                    && !line.contains("saragossa kl-eval ")
                     && !line.starts_with("KL :")
                     && !line.starts_with("Set SARAGOSSA_RUST_DFLASH")
             })
@@ -1090,6 +1105,8 @@ mod tests {
             ("diarize", cfg!(feature = "diar")),
             ("convert-qwen4exp", cfg!(feature = "devtools")),
             ("saragossa convert ", cfg!(feature = "devtools")),
+            ("saragossa paired ", cfg!(feature = "devtools")),
+            ("saragossa kl-eval ", cfg!(feature = "devtools")),
         ] {
             assert_eq!(help.contains(command), available, "{command}: {help}");
         }

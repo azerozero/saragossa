@@ -38,11 +38,12 @@ pub const PRESETS: [(&str, &str); 2] = [
 ];
 
 /// Clés qu'un rechargement SIGHUP peut appliquer sans redémarrage.
-pub const HOT_KEYS: [&str; 4] = [
+pub const HOT_KEYS: [&str; 5] = [
     "serve.read_timeout_secs",
     "serve.max_tokens_cap",
     "serve.max_tok_s",
     "serve.gpu_share",
+    "serve.idle_unload_secs",
 ];
 
 /// Erreur de lecture ou de validation d'un profil.
@@ -104,10 +105,22 @@ pub struct ServeSection {
     pub max_tok_s: Option<f64>,
     /// Équivalent de `--gpu-share` : part de GPU et de CPU visée, 10 à 100.
     pub gpu_share: Option<u64>,
+    /// Équivalent de `--idle-unload-secs` : décharge les modèles après ce délai
+    /// sans requête (0 ou absent : jamais).
+    pub idle_unload_secs: Option<u64>,
+    /// Équivalent de `--auto-yield` : baisse `gpu_share` tant que l'utilisateur
+    /// se sert du Mac (clavier, souris).
+    pub auto_yield: Option<bool>,
+    /// Part de GPU pendant le cédage automatique, 10 à 100 (défaut 25).
+    pub auto_yield_share: Option<u64>,
+    /// Secondes d'inactivité avant de rendre la part configurée (défaut 60).
+    pub auto_yield_idle_secs: Option<u64>,
     /// Délai max de vidage de l'ancien processus après un relais SIGUSR2.
     pub drain_timeout_secs: Option<u64>,
     /// Relais SIGUSR2 : `auto` (défaut), `parallel` ou `sequential`.
     pub relay_mode: Option<String>,
+    /// Équivalent de `--engines` : moteurs à poids partagés, 1 à 16.
+    pub engines: Option<u64>,
 }
 
 /// Section `[enhance]`.
@@ -204,8 +217,22 @@ impl Profile {
         {
             return Err(err("serve.max_tok_s", "doit être un flottant > 0"));
         }
+        if !self.serve.engines.is_none_or(|v| (1..=16).contains(&v)) {
+            return Err(err("serve.engines", "doit être dans 1..=16"));
+        }
         if !self.serve.gpu_share.is_none_or(|v| (10..=100).contains(&v)) {
             return Err(err("serve.gpu_share", "doit être dans 10..=100"));
+        }
+        if !self
+            .serve
+            .auto_yield_share
+            .is_none_or(|v| (10..=100).contains(&v))
+        {
+            return Err(err("serve.auto_yield_share", "doit être dans 10..=100"));
+        }
+        // En deçà, le seuil d'activité de 5 s du cédage l'emporterait.
+        if self.serve.auto_yield_idle_secs.is_some_and(|v| v < 5) {
+            return Err(err("serve.auto_yield_idle_secs", "doit être >= 5"));
         }
         if let Some(backend) = &self.engine.backend {
             if !matches!(backend.as_str(), "cpu" | "metal") {
@@ -297,12 +324,42 @@ impl Profile {
             ),
             r("serve.gpu_share", None, "100", num(s.gpu_share)),
             r(
+                "serve.idle_unload_secs",
+                Some("SARAGOSSA_RUST_IDLE_UNLOAD_SECS"),
+                "0",
+                num(s.idle_unload_secs),
+            ),
+            r(
+                "serve.auto_yield",
+                Some("SARAGOSSA_SERVE_AUTO_YIELD"),
+                "false",
+                s.auto_yield.map(|v| v.to_string()),
+            ),
+            r(
+                "serve.auto_yield_share",
+                None,
+                "25",
+                num(s.auto_yield_share),
+            ),
+            r(
+                "serve.auto_yield_idle_secs",
+                None,
+                "60",
+                num(s.auto_yield_idle_secs),
+            ),
+            r(
                 "serve.drain_timeout_secs",
                 None,
                 "30",
                 num(s.drain_timeout_secs),
             ),
             r("serve.relay_mode", None, "auto", s.relay_mode.clone()),
+            r(
+                "serve.engines",
+                Some("SARAGOSSA_SERVE_ENGINES"),
+                "1",
+                num(s.engines),
+            ),
             r(
                 "enhance.max_streams",
                 Some("SARAGOSSA_ENHANCE_MAX_STREAMS"),
@@ -478,6 +535,9 @@ impl Resolved {
         for row in self.profile.rows() {
             // Nom canonique puis alias hérité ; vide ou invalide = ignoré ici.
             let valid = |v: &String| {
+                if row.default == "false" {
+                    return super::env_flag_value(v).is_some();
+                }
                 v.parse::<u64>()
                     .is_ok_and(|n| n > 0 || row.key == "memory.headroom_bytes")
             };

@@ -20,8 +20,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Installer le nightly figé en CI
         run: rustup toolchain install nightly-2026-09-02 --profile minimal
+      # NOTE: rustix 0.36.5 (verrouillé par cargo-fuzz) active `rustc_attrs` sur nightly et casse
+      # depuis nightly-2026-09 ; le stable figé le compile sans cet attribut.
       - name: Installer cargo-fuzz en CI seulement
-        run: cargo +nightly-2026-09-02 install cargo-fuzz --version 0.13.1 --locked
+        run: rustup toolchain install 1.98.1 --profile minimal && cargo +1.98.1 install cargo-fuzz --version 0.13.1 --locked
       - name: Vérifier le lockfile et préparer les dépendances
         run: cargo +nightly-2026-09-02 check --manifest-path fuzz/Cargo.toml --locked
       - name: Fuzzer cinq minutes

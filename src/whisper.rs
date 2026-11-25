@@ -374,6 +374,9 @@ impl WhisperEncoder {
             WhisperResidentEncoder, WhisperResidentLayer, WhisperResidentNorm, WhisperResidentProj,
         };
         let na = crate::metal_backend::whisper_bf16_gemm_enabled();
+        // NOTE: sous NA, l'encodage ne lit que `weight_na` ; la copie f32 GPU
+        // (~2,5 Go pour large-v3-turbo) n'est pas construite.
+        let f32_weight = !metal.whisper_encoder_na_available();
         let proj = |linear: &Linear| -> Result<WhisperResidentProj> {
             let tensor = match linear.weight() {
                 crate::LinearWeight::Dense(tensor) => tensor,
@@ -386,7 +389,11 @@ impl WhisperEncoder {
                     ));
                 }
             };
-            let weight = metal.cached_buffer_from_f32(tensor.data(), "whisper_proj_w")?;
+            let weight = if f32_weight {
+                Some(metal.cached_buffer_from_f32(tensor.data(), "whisper_proj_w")?)
+            } else {
+                None
+            };
             // Poids transposé bf16 (rhs^T) pour le matmul2d NA, construit une fois.
             let weight_na = if na {
                 Some(metal.cached_rhs_t_bf16(tensor)?)

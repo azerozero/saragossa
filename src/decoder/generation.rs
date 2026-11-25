@@ -4255,6 +4255,22 @@ impl CausalDecoder {
             eprintln!("state_snapshot refusé : historique MTP absent; prefill normal");
         }
         if prefix_cache_enabled() {
+            // Après redémarrage ou éviction RAM, le tour suivant d'un agent
+            // prolonge le prompt : sa clé exacte n'est jamais sur SSD. La
+            // frontière alignée la plus longue passe par le cache RAM, qui la
+            // prolonge comme un hit mémoire.
+            // ponytail: un hit RAM plus court, consulté avant, reste préféré.
+            let (align, tail) = self.prefix_align_policy(prompt.len()).unwrap_or((1, 0));
+            let shorter = &prompt[..prompt.len().saturating_sub(tail.max(1))];
+            if let Some(state) =
+                self.load_persistent_boundary(shorter, align, 0, SnapshotMode::MtpCommitted)?
+            {
+                if let Some(history) = state.history.filter(super::mtp_history::compatible) {
+                    let boundary = &prompt[..state.cache.position];
+                    let pair = (state.cache, state.final_state);
+                    self.prefix_cache_put(boundary, &pair, Some(&history), None)?;
+                }
+            }
             if let Some(hit) = self.prefix_cache_get_with_mtp_history(prompt, on_final_state)? {
                 if hit.2.len() == prompt.len().saturating_sub(1) {
                     self.snapshot_save(&snapshot, &hit.0, &hit.1, Some(&hit.2), None);
@@ -5764,6 +5780,49 @@ impl CausalDecoder {
         let final_hidden = Tensor::row(hidden.last_row()?.to_vec())?;
         let final_state = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
         Ok((cache, hidden, final_state))
+    }
+
+    /// Logits finalisés de chaque position du prompt (teacher forcing) :
+    /// la ligne `i` prédit le token `i + 1`. Prefill batché per-op en un seul
+    /// morceau, sans cache de préfixe ni chemin résident.
+    ///
+    /// # Errors
+    ///
+    /// Refuse, avant tout calcul, un prompt vide, une architecture sans prefill
+    /// batché ou un prefill découpé en morceaux (`SARAGOSSA_RUST_PREFILL_CHUNK`).
+    #[cfg(feature = "devtools")]
+    pub fn teacher_forced_logits(&self, prompt: &[usize]) -> Result<Tensor> {
+        if prompt.is_empty() || !self.can_prefill_batched() {
+            return Err(InferError::Config(
+                "teacher forcing: prompt vide ou prefill batché indisponible".into(),
+            ));
+        }
+        let chunk_size = prefill_chunk_size();
+        if chunk_size > 0 && chunk_size < prompt.len() {
+            return Err(InferError::Config(
+                "teacher forcing: prefill en morceaux, désactiver SARAGOSSA_RUST_PREFILL_CHUNK"
+                    .into(),
+            ));
+        }
+        let (_, hidden, _) = self.prefill_cache_state_batched_per_op(prompt)?;
+        let states = rms_norm(&hidden, &self.final_norm, self.config.rms_eps)?;
+        let logits = self
+            .lm_head
+            .forward_with_runtime(&states, self.forward_runtime())?;
+        let shape = logits.shape().to_vec();
+        if shape.first() != Some(&prompt.len()) {
+            return Err(InferError::Dimension(
+                "teacher forcing: une ligne de logits par position attendue".into(),
+            ));
+        }
+        // Même softcapping que `finalize_logits`, en place sur la matrice [T, V].
+        let mut data = logits.into_data();
+        if let Some(softcap) = self.config.final_logit_softcapping.filter(|c| *c > 0.0) {
+            for value in &mut data {
+                *value = (*value / softcap).tanh() * softcap;
+            }
+        }
+        Tensor::from_vec(shape, data)
     }
 
     fn prefill_cache_state_batched_chunked(

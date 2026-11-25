@@ -10,9 +10,17 @@
 **Pure-Rust Metal inference engine for Apple Silicon.** Raw `metal-rs` kernels,
 no Python, no MLX, no CoreML. LLM, speech-to-text and text-to-speech in a single
 binary — usable as a library or behind the OpenAI-compatible HTTP server
-`saragossa serve`.
+`saragossa serve`. One server exposes every piece of a client-orchestrated local
+voice loop: speech-to-text, the LLM, streamed text-to-speech, plus offline
+speaker diarization of a full recording.
+
+Decode on an M5 Max, 35B-A3B 4-bit, 512-token prompt: **169.7 tok/s** with MTP
+vs 153.9 for mlx-vlm 0.8.0 with MTP (median of 3). It also loses cells, such as
+the 27B 4-bit at 4096 and 16384 tokens: see [Performance](#performance).
 
 ## Install
+
+Not published on crates.io; install via Homebrew or from source.
 
 ### Homebrew (Apple Silicon)
 
@@ -107,7 +115,7 @@ the **single-user latency × Apple Silicon** quadrant:
 
 | Domain | Details |
 |---|---|
-| LLM | Qwen3.5 / 3.6 / 3.8 dense and MoE (27B / 30B / 35B-A3B; MLX `affine` quants; `mxfp4`/`nvfp4`/`mxfp8` for rank-2 dense weights), Gemma 4 dense (`gemma4_unified`) and MoE (`gemma4`), plus a generic Llama / Mistral / Gemma 3 loader; u2–u8 (incl. mixed 3/4-bit) quantization at group sizes 32–128, bf16 scales/biases |
+| LLM | Qwen3.5 / 3.6 / 3.8 dense and MoE (27B / 30B / 35B-A3B; MLX `affine` quants; `mxfp4`/`nvfp4`/`mxfp8` for rank-2 dense weights), Gemma 4 dense (`gemma4_unified`) and MoE (`gemma4`), Mistral 7B Instruct v0.3 (KL-qualified against mlx-lm float32), Llama 3.1+ (`llama3` RoPE scaling, chat template), plus a generic Gemma 3 loader; u2–u8 (incl. mixed 3/4-bit) quantization at group sizes 32–128, bf16 scales/biases |
 | STT | Whisper large-v3-turbo (resident encoder + decoder, bf16 Neural-Accelerator GEMM) |
 | TTS | Qwen3-TTS: resident talker + GPU codec + intra-sentence streaming |
 | Embeddings | e5-small, pure Rust (CPU) — for semantic memory / RAG |
@@ -150,6 +158,19 @@ tokens. Source: [`campagne-2026-11/21-final`](bench/competitors/data/campagne-20
 (`summary.json`, `freeze.json`, full journal), described in the
 [campaign README](bench/competitors/data/campagne-2026-11/README.md).
 
+To rerun the harness on your own machine, see
+[`bench/competitors/README.md`](bench/competitors/README.md#campagne-autonome-une-commande-une-nuit).
+It needs the competing engines, converted checkpoints and drafters installed
+first; it does not install them. A new run measures the current sources and
+whatever configurations are present, so it is a new campaign, not a replay of
+`21-final`:
+
+```bash
+cp bench/competitors/local.env.example bench/competitors/local.env  # then edit the paths
+python3 -I -B bench/competitors/campaign.py run runs/mine --dry-run  # path and version checks, no measurement
+python3 -I -B bench/competitors/campaign.py run runs/mine            # measurement, resumable from the same directory
+```
+
 ### 27B, 4-bit
 
 | engine | 512 | 4096 | 16384 |
@@ -184,9 +205,10 @@ Caveats:
 - llama.cpp runs GGUF weights (Q4_K_M for the 4-bit row, a BF16 GGUF for the
   BF16 row), not the MLX weights the other engines load, so the weights are not
   identical. llama.cpp was not measured on the 35B-A3B in this run.
-- The `mlx-vlm` 0.8.0 MTP and DFlash outputs are not bit-identical to its own
-  AR output; saragossa's greedy speculative output matches its AR decode except
-  at near-ties, with an exact opt-in strict mode (see below).
+- This campaign does not test output identity: each request carries its own
+  nonce. saragossa's greedy speculative output is checked against its AR decode
+  by separate tests, on the models and flags they cover; it matches except at
+  near-ties, with an exact opt-in strict mode (see below).
 - Results hold for this hardware, these models and these prompts; measure on
   your own machine before choosing.
 
@@ -262,7 +284,7 @@ saragossa diarize --model-dir DIR [--format rttm|json] [--cpu] audio.wav
 
 ## Library usage
 
-Add the crate and drive the engine directly. The main entry points are
+Add the crate as a git dependency (`saragossa = { git = "https://github.com/azerozero/saragossa" }`) and drive the engine directly. The main entry points are
 `qwen_loader` (LLM), `whisper` (STT), `tts` (TTS) and `text_embedder`
 (embeddings); [`src/lib.rs`](src/lib.rs) lists the public API.
 

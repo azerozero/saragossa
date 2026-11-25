@@ -259,7 +259,8 @@ impl DecoderLayer {
     ///
     /// Exige : post-norm + tail MLP encodable (MoE shared-expert ou Dense
     /// gate/up/down biasless) ; pour full-attn, projections Q/K/V/O biasless et
-    /// q_norm/k_norm présents (le kernel fusionné rms_norm+RoPE l'exige). Le
+    /// q_norm/k_norm présents ensemble, ou absents ensemble devant un MLP dense
+    /// (Llama, Mistral : RoPE seule, norme `None`). Le
     /// shared-expert/router biasless est re-vérifié à l'encodage (`ensure_biasless`).
     #[cfg(all(target_os = "macos", feature = "metal"))]
     pub(super) fn supports_resident_full(&self) -> bool {
@@ -287,7 +288,10 @@ impl DecoderLayer {
             }
             FeedForward::Dense(mlp) => {
                 let (gate_proj, up_proj, down_proj) = mlp.projections();
-                gate_proj.bias().is_none() && up_proj.bias().is_none() && down_proj.bias().is_none()
+                gate_proj.bias().is_none()
+                    && up_proj.bias().is_none()
+                    && down_proj.bias().is_none()
+                    && self.resident_dense_activation_ok(mlp)
             }
         };
         if !mlp_supported {
@@ -302,12 +306,24 @@ impl DecoderLayer {
                     && attention.k_proj.bias().is_none()
                     && attention.resident_v_proj().bias().is_none()
                     && attention.o_proj.bias().is_none()
-                    && attention.q_norm.is_some()
-                    && attention.k_norm.is_some()
+                    && attention.q_norm.is_some() == attention.k_norm.is_some()
+                    && (attention.q_norm.is_some() || matches!(mlp, FeedForward::Dense(_)))
             }
             // Linear-attn : chemin résident conv/ssm déjà éprouvé (phases 1a/1b).
             AttentionBlock::Linear(_) => true,
         }
+    }
+
+    /// Le tail dense résident fige l'activation : GeGLU avec les normes FFN
+    /// Gemma, SwiGLU sinon. Toute autre paire reste au per-op.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    pub(super) fn resident_dense_activation_ok(&self, mlp: &crate::GatedMlp) -> bool {
+        let expected = if self.pre_feedforward_norm.is_some() {
+            crate::Activation::GeluTanh
+        } else {
+            crate::Activation::Silu
+        };
+        mlp.activation() == expected
     }
 
     #[cfg(all(target_os = "macos", feature = "metal"))]

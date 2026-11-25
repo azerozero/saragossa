@@ -51,10 +51,12 @@ fn template_model(path: &std::path::Path) -> TestResult<LoadedModel> {
     )?;
     Ok(LoadedModel {
         id: "reference".into(),
-        assets,
-        decoder,
-        preset: None,
-        mtp_active: false,
+        llm: std::sync::Arc::new(SharedLlm {
+            assets,
+            decoder,
+            preset: None,
+            mtp_active: false,
+        }),
         json_token_catalog: OnceLock::new(),
         schema_token_catalog: OnceLock::new(),
         prefix_cache: BlockAwarePrefixCache::from_runtime_flags(),

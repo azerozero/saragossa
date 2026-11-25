@@ -112,6 +112,7 @@ fn external_kld_references_are_consistent() -> TestResult {
         "gemma4_long_1024",
         "gemma4_long_2048",
         "gemma4_long_4100",
+        "mistral7b",
     ]) {
         let reference = load(name)?;
         for (ids, logprobs) in &reference.rows {
@@ -182,6 +183,12 @@ fn external_kld_ratio_gate() {
 #[cfg(all(target_os = "macos", feature = "metal"))]
 fn compare(name: &str, env: &str) -> TestResult {
     compare_with_prefill(name, env, |model, prompt| model.prefill_cache(prompt))
+}
+
+/// Même oracle, decode par le chemin résident complet sans repli per-op.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn compare_resident(name: &str, env: &str) -> TestResult {
+    compare_decode(name, env, true, |model, prompt| model.prefill_cache(prompt))
 }
 
 /// Même référence, provenance et seuils que l'oracle externe ; les deux chemins
@@ -426,6 +433,19 @@ fn compare_with_prefill(
         &[usize],
     ) -> crate::Result<(crate::CausalDecoderCache, crate::Tensor)>,
 ) -> TestResult {
+    compare_decode(name, env, false, prefill)
+}
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn compare_decode(
+    name: &str,
+    env: &str,
+    resident: bool,
+    prefill: impl Fn(
+        &crate::CausalDecoder,
+        &[usize],
+    ) -> crate::Result<(crate::CausalDecoderCache, crate::Tensor)>,
+) -> TestResult {
     let Some(path) = local(env)? else {
         return Ok(());
     };
@@ -444,10 +464,19 @@ fn compare_with_prefill(
     for chunk in &meta.chunks {
         // Même découpe que kld.py : prefill du contexte, puis decode token par token.
         let start = chunk.len() - meta.scored;
-        let (mut cache, mut logits) = prefill(&model, &chunk[..start])?;
+        let (mut cache, first) = prefill(&model, &chunk[..start])?;
+        let mut logits = first.data().to_vec();
+        let mut forced = if resident {
+            let tokens = &chunk[start..chunk.len() - 1];
+            model
+                .resident_forced_logits_for_test(&chunk[..start], tokens, false)?
+                .into_iter()
+        } else {
+            Vec::new().into_iter()
+        };
         for position in start..chunk.len() {
             let (ids, logprobs) = rows.next().ok_or("référence trop courte")?;
-            let values = logits.data();
+            let values = logits.as_slice();
             assert!(values.iter().all(|v| v.is_finite()), "logits non finis");
             let (kl, delta) = metrics(values, ids, logprobs);
             kls.push(kl);
@@ -464,7 +493,14 @@ fn compare_with_prefill(
             same += usize::from(actual == ids[0]);
             tops.push(actual == ids[0]);
             if position + 1 < chunk.len() {
-                logits = model.next_logits_cached(&mut cache, chunk[position])?;
+                logits = if resident {
+                    forced.next().ok_or("logits résidents trop courts")?
+                } else {
+                    model
+                        .next_logits_cached(&mut cache, chunk[position])?
+                        .data()
+                        .to_vec()
+                };
             }
         }
     }
@@ -514,3 +550,16 @@ oracle!(
 oracle!(external_kld_gemma3, "gemma3", "SARAGOSSA_GEMMA3_DIR");
 #[cfg(all(target_os = "macos", feature = "metal"))]
 oracle!(external_kld_gemma4, "gemma4", "SARAGOSSA_GEMMA4_DIR");
+#[cfg(all(target_os = "macos", feature = "metal"))]
+oracle!(
+    external_kld_mistral7b,
+    "mistral7b",
+    "SARAGOSSA_MISTRAL7B_DIR"
+);
+
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "oracle GPU externe: poids locaux requis, lancer sous verrou"]
+fn external_kld_mistral7b_resident() -> TestResult {
+    compare_resident("mistral7b", "SARAGOSSA_MISTRAL7B_DIR")
+}

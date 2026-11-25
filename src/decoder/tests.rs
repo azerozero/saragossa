@@ -1626,6 +1626,7 @@ fn apply_rope_styles_match_mlx_reference() {
         theta: 10_000.0,
         frequency_dim: 4,
         position_scale: 1.0,
+        llama3: None,
     };
     let interleaved = apply_rope_heads_at(&x, 1, 4, 4, rope, 1, RopeStyle::Interleaved)
         .expect("invariant: rope valide");
@@ -1653,6 +1654,7 @@ fn apply_rope_halves_partial_rotates_inside_rope_dims() {
         theta: 10_000.0,
         frequency_dim: 4,
         position_scale: 1.0,
+        llama3: None,
     };
 
     let halves = apply_rope_heads_at(&x, 1, 8, 4, rope, 1, RopeStyle::Halves)
@@ -1676,6 +1678,7 @@ fn apply_rope_position_scale_matches_mlx_reference() {
         theta: 1_000_000.0,
         frequency_dim: 4,
         position_scale: 0.125,
+        llama3: None,
     };
     let halves = apply_rope_heads_at(&x, 1, 4, 4, gemma_global, 5, RopeStyle::Halves)
         .expect("invariant: rope valide");
@@ -1695,6 +1698,7 @@ fn apply_rope_position_scale_matches_mlx_reference() {
         theta: 10_000.0,
         frequency_dim: 4,
         position_scale: 0.125,
+        llama3: None,
     };
     let halves = apply_rope_heads_at(&x, 1, 4, 4, scaled_small_base, 3, RopeStyle::Halves)
         .expect("invariant: rope valide");
@@ -1713,6 +1717,7 @@ fn apply_rope_halves_partial_uses_rotary_slice_half_offset() {
         theta: 10_000.0,
         frequency_dim: 4,
         position_scale: 1.0,
+        llama3: None,
     };
 
     let out = apply_rope_heads_at(&x, 1, 8, 4, rope, 1, RopeStyle::Halves)
@@ -1749,6 +1754,7 @@ fn rope_position_scale_one_is_bit_identical_to_raw_positions() {
                 theta: 1_000_000.0,
                 frequency_dim: 4,
                 position_scale: 1.0,
+                llama3: None,
             },
             7,
             style,
@@ -1789,6 +1795,7 @@ fn rope_rotations_use_scaled_positions_times_common_frequencies() -> Result<()> 
                         theta,
                         frequency_dim,
                         position_scale,
+                        llama3: None,
                     };
                     for position in [5, 2051, 32_767, 131_071, 262_143] {
                         let rotations =
@@ -1831,6 +1838,7 @@ fn fused_rms_rope_matches_two_step_for_both_styles() {
             theta: 10_000.0,
             frequency_dim: 4,
             position_scale,
+            llama3: None,
         };
         for style in [RopeStyle::Interleaved, RopeStyle::Halves] {
             let fused = rms_norm_rope_heads_at(&x, 1, 4, 4, &weight, 1.0e-6, rope, 3, style)
@@ -6673,6 +6681,39 @@ fn gpu_share_keeps_greedy_output_synthetic() -> Result<()> {
     let normal = run(100)?;
     let throttled = run(50)?;
     assert_eq!(throttled, normal, "le bridage ne doit changer aucun token");
+    // Bascule à chaud pendant la génération, comme le cédage automatique de
+    // `serve` : la part change entre deux command buffers, pas les tokens.
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (done, flips) = (AtomicBool::new(false), AtomicUsize::new(0));
+    // Arrête la bascule même si la génération panique, sinon le scope attend.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let (toggled, during) = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::Relaxed) {
+                let n = flips.fetch_add(1, Ordering::Relaxed);
+                crate::set_gpu_duty_share(if n % 2 == 0 { 10 } else { 100 });
+                std::thread::sleep(std::time::Duration::from_millis(3));
+            }
+        });
+        let _stop = Stop(&done);
+        let before = flips.load(Ordering::Relaxed);
+        let out = run(100);
+        (out, flips.load(Ordering::Relaxed) - before)
+    });
+    crate::set_gpu_duty_share(100);
+    assert!(
+        during >= 4,
+        "la part doit basculer pendant la génération ({during})"
+    );
+    assert_eq!(
+        toggled?, normal,
+        "la bascule à chaud ne doit changer aucun token"
+    );
     Ok(())
 }
 
@@ -6731,7 +6772,7 @@ fn mtp_d2_u4_draft_head_matches_ar_synthetic() -> Result<()> {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal"))]
-fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
+pub(super) fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
     mtp_synthetic_model_with(|_| Ok(()))
 }
 
@@ -7410,6 +7451,7 @@ fn gemma4_proportional_cpu_paths_match_independent_oracle() -> Result<()> {
             theta,
             frequency_dim: rotation_dim,
             position_scale: 1.0,
+            llama3: None,
         };
         let plain = apply_rope_heads_at(
             &x,
@@ -7680,5 +7722,358 @@ fn spec_route_alternation_reuses_prefix_real_model() -> Result<()> {
             turn2.stats.reused_prefix_tokens
         );
     }
+    Ok(())
+}
+
+#[test]
+fn llama3_rotations_use_scaled_table_at_long_positions() {
+    // Llama 3.2 1B : d64, θ 5e5, llama3 ×32. Le cache de rotations ne doit
+    // jamais servir la table non scalée à la même (θ, dim, position).
+    let llama3 = crate::rope::Llama3RopeScaling {
+        factor: 32.0,
+        low_freq_factor: 1.0,
+        high_freq_factor: 4.0,
+        original_max_position_embeddings: 8192.0,
+    };
+    let scaled = RopeParams {
+        theta: 500_000.0,
+        frequency_dim: 64,
+        position_scale: 1.0,
+        llama3: Some(llama3),
+    };
+    let plain = RopeParams {
+        llama3: None,
+        ..scaled
+    };
+    let table = crate::rope::inv_freq_scaled(64, 500_000.0, Some(llama3));
+    for position in [0_usize, 1, 8191, 8192, 30_000, 131_071] {
+        let rotations = super::attention_ops::rope_rotations(position, 64, scaled)
+            .expect("invariant: rotations llama3");
+        let unscaled = super::attention_ops::rope_rotations(position, 64, plain)
+            .expect("invariant: rotations par défaut");
+        // transformers : angle f32 = position f32 × fréquence f32, puis cos/sin.
+        for (pair, (&(cos, sin), &frequency)) in rotations.iter().zip(&table).enumerate() {
+            let angle = f64::from(position as f32 * frequency);
+            assert!(
+                (f64::from(cos) - angle.cos()).abs() < 1.0e-6,
+                "{position}/{pair}"
+            );
+            assert!(
+                (f64::from(sin) - angle.sin()).abs() < 1.0e-6,
+                "{position}/{pair}"
+            );
+        }
+        // Paires 0 à 14 (longueur d'onde < 2048) non scalées : seul l'écart
+        // d'un ulp entre `powf` et la puissance arrondie (paire 3) subsiste.
+        // Paires 18 à 31 divisées par 32.
+        for (scaled, plain) in rotations[..15].iter().zip(&unscaled[..15]) {
+            // Corde entre les deux points du cercle ≈ écart d'angle, sans repli à 2π.
+            let chord = f64::from(scaled.0 - plain.0).hypot(f64::from(scaled.1 - plain.1));
+            assert!(chord < 1.0e-6 + 1.0e-7 * position as f64, "{position}");
+        }
+        if position > 0 {
+            assert_ne!(rotations[31], unscaled[31], "{position}");
+        }
+    }
+}
+
+/// Mini-Llama à poids pseudo-aléatoires : 2 couches, hidden 64, vocab 97,
+/// MLP 128, `qk_norm` ajoute des QK-norm Qwen3.
+fn mini_llama_weights(
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    qk_norm: bool,
+) -> Result<HashMap<String, Tensor>> {
+    const HIDDEN: usize = 64;
+    const VOCAB: usize = 97;
+    const LAYERS: usize = 2;
+    const INTER: usize = 128;
+    let tensor = |rows: usize, cols: usize, seed: usize, scale: f32| -> Result<Tensor> {
+        let data = (0..rows * cols)
+            .map(|i| ((i * 7919 + seed * 104_729) as f32 * 0.000_37).sin() * scale)
+            .collect();
+        Tensor::from_vec(vec![rows, cols], data)
+    };
+    let norm = |len: usize, seed: usize| -> Result<Tensor> {
+        Tensor::from_vec(
+            vec![len],
+            (0..len)
+                .map(|i| 1.0 + ((i + seed) as f32 * 0.37).sin() * 0.1)
+                .collect(),
+        )
+    };
+    let mut weights = HashMap::new();
+    weights.insert("embed_tokens.weight".into(), tensor(VOCAB, HIDDEN, 1, 0.5)?);
+    weights.insert("norm.weight".into(), norm(HIDDEN, 2)?);
+    weights.insert("lm_head.weight".into(), tensor(VOCAB, HIDDEN, 3, 0.2)?);
+    for layer in 0..LAYERS {
+        let seed = 10 * (layer + 1);
+        let key = |name: &str| format!("layers.{layer}.{name}");
+        weights.insert(key("input_layernorm.weight"), norm(HIDDEN, seed)?);
+        weights.insert(
+            key("post_attention_layernorm.weight"),
+            norm(HIDDEN, seed + 1)?,
+        );
+        weights.insert(
+            key("self_attn.q_proj.weight"),
+            tensor(heads * head_dim, HIDDEN, seed + 2, 0.15)?,
+        );
+        for (name, extra) in [("k_proj", 3), ("v_proj", 4)] {
+            weights.insert(
+                key(&format!("self_attn.{name}.weight")),
+                tensor(kv_heads * head_dim, HIDDEN, seed + extra, 0.15)?,
+            );
+        }
+        weights.insert(
+            key("self_attn.o_proj.weight"),
+            tensor(HIDDEN, heads * head_dim, seed + 5, 0.1)?,
+        );
+        if qk_norm {
+            weights.insert(key("self_attn.q_norm.weight"), norm(head_dim, seed + 9)?);
+            weights.insert(key("self_attn.k_norm.weight"), norm(head_dim, seed + 10)?);
+        }
+        weights.insert(
+            key("mlp.gate_proj.weight"),
+            tensor(INTER, HIDDEN, seed + 6, 0.1)?,
+        );
+        weights.insert(
+            key("mlp.up_proj.weight"),
+            tensor(INTER, HIDDEN, seed + 7, 0.1)?,
+        );
+        weights.insert(
+            key("mlp.down_proj.weight"),
+            tensor(HIDDEN, INTER, seed + 8, 0.1)?,
+        );
+    }
+    Ok(weights)
+}
+
+/// Configuration du mini-Llama de [`mini_llama_weights`].
+fn mini_llama_config(
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    rope_llama3: Option<crate::rope::Llama3RopeScaling>,
+) -> CausalDecoderConfig {
+    CausalDecoderConfig {
+        num_hidden_layers: 2,
+        num_attention_heads: heads,
+        num_key_value_heads: kv_heads,
+        head_dim: Some(head_dim),
+        rope_theta: Some(500_000.0),
+        rope_llama3,
+        ..CausalDecoderConfig::default()
+    }
+}
+
+/// Le tail dense résident fige l'activation (SwiGLU, GeGLU sous normes FFN
+/// Gemma) : un GeGLU sans ces normes, avec ou sans QK-norm, reste au per-op.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+fn resident_full_refuses_dense_activation_without_its_tail() -> Result<()> {
+    use crate::Activation::{GeluTanh, Silu};
+    for (activation, qk_norm, supported) in [
+        (Silu, false, true),
+        (Silu, true, true),
+        (GeluTanh, false, false),
+        (GeluTanh, true, false),
+    ] {
+        let config = CausalDecoderConfig {
+            activation,
+            ..mini_llama_config(4, 2, 16, None)
+        };
+        let model = CausalDecoder::from_tensors(mini_llama_weights(4, 2, 16, qk_norm)?, config)?;
+        for layer in &model.layers {
+            assert_eq!(
+                layer.supports_resident_full(),
+                supported,
+                "{activation:?} qk_norm={qk_norm}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// La trame TTS fusionnée applique toujours la QK-norm : une couche sans
+/// QK-norm est écartée en amont, avant toute résolution de poids.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "tts"))]
+#[test]
+fn tts_cp_fused_layer_requires_qk_norm() -> Result<()> {
+    use crate::decoder::resident::tts_codebooks::tts_cp_fused_layer_eligible;
+    for qk_norm in [true, false] {
+        let model = CausalDecoder::from_tensors(
+            mini_llama_weights(4, 2, 16, qk_norm)?,
+            mini_llama_config(4, 2, 16, None),
+        )?;
+        for layer in &model.layers {
+            let (AttentionBlock::Full(attention), Some(FeedForward::Dense(mlp))) =
+                (&layer.attention, layer.mlp.as_ref())
+            else {
+                panic!("mini-Llama : couche full-attn dense attendue");
+            };
+            assert_eq!(tts_cp_fused_layer_eligible(attention, mlp), qk_norm);
+        }
+    }
+    Ok(())
+}
+
+/// Sans porte de sortie (Llama, Mistral), la vérification en lignes n'existe
+/// pas : la boucle lookup est inéligible et la génération reste celle du
+/// decode ordinaire, au lieu d'échouer au premier draft.
+#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn lookup_greedy_falls_back_without_output_gate() -> Result<()> {
+    let model = CausalDecoder::from_tensors(
+        mini_llama_weights(2, 1, 64, false)?,
+        mini_llama_config(2, 1, 64, None),
+    )?
+    .with_metal_runtime()?;
+    // Motif répété : le lookup n-grammes propose des drafts dès le premier pas.
+    let prompt: Vec<usize> = (0..64).map(|i| [5, 17, 29, 41][i % 4]).collect();
+    let options = GenerationOptions {
+        temperature: 0.0,
+        ..GenerationOptions::default()
+    };
+    let mut cache = model.prefill_cache_state(&prompt)?.0;
+    assert!(model.setup_resident_full_decode(&mut cache, 32, 0, false)?);
+    let arena = cache
+        .resident
+        .as_ref()
+        .expect("invariant: arène résidente après setup");
+    assert!(!model.resident_layer_batch_supported(arena));
+    assert!(!crate::runtime_flags::with_lookup_greedy_override(
+        4,
+        || { model.lookup_greedy_eligible(&cache, &options) }
+    ));
+    drop(cache);
+    let generate = |drafts: usize| {
+        crate::runtime_flags::with_lookup_greedy_override(drafts, || {
+            model.generate_greedy_timed_with_options(&prompt, 32, &options)
+        })
+        .map(|output| output.tokens)
+    };
+    let reference = generate(0)?;
+    assert_eq!(reference.len(), 32);
+    assert_eq!(generate(4)?, reference);
+    Ok(())
+}
+
+/// Decode résident forcé d'un mini-Llama sous RoPE llama3 (d64 ×32 comme
+/// Llama 3.2 1B, d128 ×8 comme Llama 3.1 8B, contexte d'origine 8192) contre
+/// le CPU, sur des positions qui franchissent 8192. Le témoin non scalé prouve
+/// que l'écart serait vu si le setup résident perdait la table scalée.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn resident_llama3_rope_matches_cpu_oracle() -> Result<()> {
+    const PROMPT: usize = 8186;
+    const STEPS: usize = 12;
+    let llama3 = |factor| crate::rope::Llama3RopeScaling {
+        factor,
+        low_freq_factor: 1.0,
+        high_freq_factor: 4.0,
+        original_max_position_embeddings: 8192.0,
+    };
+    let prompt: Vec<usize> = (0..PROMPT).map(|i| (i * 31 + 7) % 97).collect();
+    let feed: Vec<usize> = (0..STEPS).map(|i| (i * 13 + 3) % 97).collect();
+    for (head_dim, factor) in [(64, 32.0), (128, 8.0)] {
+        let build = |scaling| {
+            CausalDecoder::from_tensors(
+                mini_llama_weights(2, 1, head_dim, false)?,
+                mini_llama_config(2, 1, head_dim, scaling),
+            )
+        };
+        let cpu = build(Some(llama3(factor)))?;
+        let plain = build(None)?;
+        let metal = build(Some(llama3(factor)))?.with_metal_runtime()?;
+        let mut cpu_cache = cpu.prefill_cache_state(&prompt)?.0;
+        let mut plain_cache = plain.prefill_cache_state(&prompt)?.0;
+        let mut gpu_cache = metal.prefill_cache_state(&prompt)?.0;
+        assert!(metal.setup_resident_full_decode(&mut gpu_cache, STEPS + 1, 0, false)?);
+        let (mut worst, mut witness, mut scale) = (0.0_f32, 0.0_f32, 1.0_f32);
+        for &token in &feed {
+            let expected = cpu.next_final_state_cached(&mut cpu_cache, token)?;
+            // Pas résident complet (arène, RoPE GPU), sans repli per-op.
+            let actual = metal
+                .next_final_states_resident_verify(
+                    &mut gpu_cache,
+                    &[token],
+                    crate::decoder::ResidentVerifyHead::Skip,
+                    false,
+                    None,
+                    None,
+                )?
+                .ok_or_else(|| InferError::Config("pas résident indisponible".into()))?
+                .states;
+            let actual = actual.row_slice(0)?;
+            let unscaled = plain.next_final_state_cached(&mut plain_cache, token)?;
+            assert_eq!(actual.len(), expected.data().len());
+            assert!(
+                actual.iter().all(|value| value.is_finite()),
+                "sortie non finie"
+            );
+            for ((e, a), u) in expected.data().iter().zip(actual).zip(unscaled.data()) {
+                scale = scale.max(e.abs());
+                worst = worst.max((e - a).abs());
+                witness = witness.max((e - u).abs());
+            }
+        }
+        assert_eq!(gpu_cache.position, PROMPT + STEPS);
+        eprintln!("d{head_dim} ×{factor}: écart {worst:e}, témoin {witness:e}, échelle {scale}");
+        // Mesuré : écart 1,1e-6 (d64) et 3,0e-6 (d128) ; témoin 2,2e-2 et
+        // 5,6e-3, échelle ≈ 1,6. Le témoin doit dépasser dix fois la porte.
+        assert!(
+            worst <= 1.0e-4 * scale,
+            "d{head_dim} ×{factor}: écart résident/CPU {worst} (échelle {scale})"
+        );
+        assert!(
+            witness > 1.0e-3 * scale,
+            "d{head_dim} ×{factor}: témoin non scalé trop proche ({witness})"
+        );
+    }
+    Ok(())
+}
+
+/// RoPE llama3 : les logits d'un mini-Llama à poids pseudo-aléatoires sont ceux
+/// du CPU, sur ~300 positions bien au-delà de `original_max_position_embeddings`
+/// (64) avec un facteur 32, là où la table scalée diffère de la table standard.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn llama3_rope_metal_matches_cpu_oracle() -> Result<()> {
+    const VOCAB: usize = 97;
+    let build = || mini_llama_weights(4, 2, 16, false);
+    let config = mini_llama_config(
+        4,
+        2,
+        16,
+        Some(crate::rope::Llama3RopeScaling {
+            factor: 32.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position_embeddings: 64.0,
+        }),
+    );
+    let cpu = CausalDecoder::from_tensors(build()?, config.clone())?;
+    let metal = CausalDecoder::from_tensors(build()?, config)?.with_metal_runtime()?;
+    let tokens: Vec<usize> = (0..300).map(|i| (i * 31 + 7) % VOCAB).collect();
+    let expected = cpu.next_logits(&tokens)?;
+    let actual = metal.next_logits(&tokens)?;
+    let scale = expected
+        .data()
+        .iter()
+        .fold(0.0_f32, |acc, value| acc.max(value.abs()))
+        .max(1.0);
+    let worst = expected
+        .data()
+        .iter()
+        .zip(actual.data())
+        .fold(0.0_f32, |acc, (a, b)| acc.max((a - b).abs()));
+    assert!(
+        worst <= 1.0e-3 * scale,
+        "écart Metal/CPU {worst} (échelle {scale})"
+    );
     Ok(())
 }

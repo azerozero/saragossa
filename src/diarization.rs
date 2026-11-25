@@ -631,7 +631,7 @@ impl DiarizationModel {
                 ));
             };
             Ok(WhisperResidentProj {
-                weight: metal.cached_buffer_from_f32(tensor.data(), "diar_proj_w")?,
+                weight: Some(metal.cached_buffer_from_f32(tensor.data(), "diar_proj_w")?),
                 bias: match linear.bias() {
                     Some(b) => Some(metal.cached_buffer_from_f32(b.data(), "diar_proj_b")?),
                     None => None,
@@ -642,13 +642,12 @@ impl DiarizationModel {
             })
         };
         // NOTE: emplacement inerte d'un q/k/v remplacé par `qkv`.
-        static PLACEHOLDER: [f32; 1] = [0.0];
         let separate = |linear: &Linear, fused: bool| -> Result<WhisperResidentProj> {
             if !fused {
                 return proj(linear);
             }
             Ok(WhisperResidentProj {
-                weight: metal.cached_buffer_from_f32(&PLACEHOLDER, "diar_proj_unused")?,
+                weight: None,
                 bias: None,
                 weight_na: None,
                 weight_bf16: None,

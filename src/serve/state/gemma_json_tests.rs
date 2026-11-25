@@ -268,9 +268,9 @@ fn scripted_gemma(path: &Path, pieces: &[&str]) -> (LoadedModel, usize) {
     let decoder = CausalDecoder::from_tensors(weights, CausalDecoderConfig::from(&config))
         .expect("invariant: décodeur Gemma CPU synthétique");
     let mut loaded = tiny_loaded_model();
-    loaded.assets.config = config;
-    loaded.assets.tokenizer = tokenizer;
-    loaded.decoder = decoder;
+    loaded.llm_mut().assets.config = config;
+    loaded.llm_mut().assets.tokenizer = tokenizer;
+    loaded.llm_mut().decoder = decoder;
     (loaded, ids.len())
 }
 
