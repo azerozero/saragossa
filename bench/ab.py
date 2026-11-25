@@ -228,7 +228,8 @@ def run(root, config):
         manifest.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
     rows, _ = journal(root, repair=True)
     active, _ = selected(config, rows)
-    started = False
+    # Reprise : l'attente d'avant le premier bloc rejoué est inconnue, on la refait.
+    started = bool(active)
     with sensors.Sampler(root / "sensors.jsonl") as sampler:
         for block, order in enumerate(config["orders"]):
             if block in active:
@@ -415,7 +416,7 @@ def cli(argv=None):
     launch.add_argument("--primary", choices=METRICS, default="decode_tok_s")
     launch.add_argument("--allow-battery", action="store_true")
     launch.add_argument("--cooldown", type=float, default=0, metavar="SECONDS",
-                        help="pause (s) entre deux blocs ABBA, rien ne tourne ; 0 = aucune")
+                        help="pause (s) entre deux blocs ABBA, aucune inférence ne tourne ; 0 = aucune")
     read = sub.add_parser("report")
     read.add_argument("out_dir", type=pathlib.Path)
     read.add_argument("--json", action="store_true")

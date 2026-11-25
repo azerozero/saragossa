@@ -138,8 +138,26 @@ with tempfile.TemporaryDirectory() as tmp:
         # Attente entre blocs seulement (3 pour 4 blocs), tracée sur la 1re passe.
         with patch.object(ab.time, "sleep") as sleep:
             cool_path, cool_config, _ = campaign("12", cooldown=7)
-        assert cool_config["cooldown"] == 7 and [c.args for c in sleep.call_args_list] == [(7,)] * 3
+        assert cool_config["cooldown"] == 7 and [c.args for c in sleep.call_args_list if c.args == (7,)] == [(7,)] * 3
         assert [r["cooldown_s"] for r in ab.journal(cool_path)[0] if "cooldown_s" in r] == [7] * 3
+        # Reprise partielle : la pause est refaite avant le premier bloc rejoué.
+        part, original = root / "part", ab.passage
+        n = [0]
+
+        def stop(*a):
+            n[0] += 1
+            if n[0] == 6:
+                raise KeyboardInterrupt
+            return original(*a)
+
+        with patch.object(ab, "passage", side_effect=stop), patch.object(ab.time, "sleep"):
+            try:
+                ab.run(part, dict(cool_config))
+            except KeyboardInterrupt:
+                pass
+        with patch.object(ab.time, "sleep") as sleep:
+            ab.run(part, dict(cool_config))
+        assert [c.args for c in sleep.call_args_list if c.args == (7,)] == [(7,)] * 3
         loss_path, _, loss = campaign("8")
         verdict(loss, "perte")
         neutral_path, _, neutral = campaign()
