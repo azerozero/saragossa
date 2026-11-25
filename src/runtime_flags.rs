@@ -852,8 +852,7 @@ pub fn gpu_share() -> u8 {
 /// aussi le pool rayon à `share` % des cœurs ; ce pool global se règle une seule
 /// fois par processus, un rechargement ne le redimensionne pas.
 pub fn set_gpu_share(share: u8) {
-    let share = share.clamp(MIN_GPU_SHARE, 100);
-    GPU_SHARE.store(share, AtomicOrdering::Relaxed);
+    let share = set_gpu_duty_share(share);
     if share < 100 {
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
         // NOTE: l'erreur « pool déjà construit » est attendue au rechargement.
@@ -861,6 +860,15 @@ pub fn set_gpu_share(share: u8) {
             .num_threads((cores * usize::from(share) / 100).max(1))
             .build_global();
     }
+}
+
+/// Règle seulement le rapport cyclique GPU (10 à 100, borné), sans toucher au
+/// pool rayon : le cédage automatique de `serve` bascule souvent et ne doit pas
+/// figer le pool global à sa part basse. Renvoie la part retenue.
+pub fn set_gpu_duty_share(share: u8) -> u8 {
+    let share = share.clamp(MIN_GPU_SHARE, 100);
+    GPU_SHARE.store(share, AtomicOrdering::Relaxed);
+    share
 }
 
 /// Analyse `--gpu-share` (entier de 10 à 100).

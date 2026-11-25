@@ -149,7 +149,7 @@ pub use qwen_loader::{
 pub use runtime::ForwardRuntime;
 pub use runtime_flags::{
     decode_max_tokens_per_s, gpu_share, parse_gpu_share, parse_max_tok_s,
-    set_decode_max_tokens_per_s, set_gpu_share,
+    set_decode_max_tokens_per_s, set_gpu_duty_share, set_gpu_share,
 };
 #[allow(deprecated)]
 pub use runtime_preset::apply_runtime_preset_for_model_dir;

@@ -3,7 +3,8 @@
 //! Chaud : `serve.read_timeout_secs` (nouvelles connexions),
 //! `serve.max_tokens_cap` (prochaine requête), `serve.idle_unload_secs`
 //! (prochain tour d'attente du moteur), `serve.max_tok_s` et
-//! `serve.gpu_share` (prochain token ou command buffer) et `[[models]]` : la liste
+//! `serve.gpu_share` (prochain token ou command buffer ; en cédage automatique,
+//! la part basse reste jusqu'au retour d'inactivité) et `[[models]]` : la liste
 //! acceptée sert `/v1/models` aussitôt, le thread moteur l'applique entre deux
 //! requêtes (`ServeState::set_models`), donc une requête en cours finit sur son
 //! modèle avant qu'il soit déchargé.
@@ -232,23 +233,31 @@ fn reload(
     MAX_TOKENS_CAP.store(args.max_tokens_cap, Ordering::Relaxed);
     // `env_var` relit le profil installé au lancement : au rechargement, la
     // valeur du nouveau profil gagne, sauf CLI ou variable d'environnement.
-    let pinned = cli.iter().any(|a| a == "--idle-unload-secs")
-        || [
-            "SARAGOSSA_RUST_IDLE_UNLOAD_SECS",
-            "RETI_RUST_IDLE_UNLOAD_SECS",
-        ]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some());
-    set_idle_unload_secs(if pinned {
-        args.idle_unload_secs
-    } else {
-        next.serve.idle_unload_secs.unwrap_or(0)
-    });
+    let pinned = |flag: &str, env: &str| {
+        cli.iter().any(|a| a == flag)
+            || [env.to_string(), env.replacen("SARAGOSSA_", "RETI_", 1)]
+                .iter()
+                .any(|name| std::env::var_os(name).is_some())
+    };
+    set_idle_unload_secs(
+        if pinned("--idle-unload-secs", "SARAGOSSA_RUST_IDLE_UNLOAD_SECS") {
+            args.idle_unload_secs
+        } else {
+            next.serve.idle_unload_secs.unwrap_or(0)
+        },
+    );
     if changed.contains(&"serve.max_tok_s") {
-        saragossa::set_decode_max_tokens_per_s(args.max_tok_s);
+        saragossa::set_decode_max_tokens_per_s(
+            if pinned("--max-tok-s", "SARAGOSSA_RUST_MAX_TOK_S") {
+                args.max_tok_s
+            } else {
+                next.serve.max_tok_s
+            },
+        );
     }
+    // Sans variable d'environnement, la CLI réanalysée épingle déjà `--gpu-share`.
     if changed.contains(&"serve.gpu_share") {
-        saragossa::set_gpu_share(args.gpu_share.unwrap_or(100));
+        super::auto_yield::set_configured(args.gpu_share.unwrap_or(100));
     }
     if !(diff.0.is_empty() && diff.1.is_empty()) {
         *lock(&PENDING) = Some(models);
@@ -403,6 +412,48 @@ mod tests {
         write("[serve]\n");
         reload(Some(&path), &[], &[], &second, &[]).expect("0");
         assert_eq!(idle_unload_secs(), 0, "60 puis 0 : le nouveau profil gagne");
+    }
+
+    #[test]
+    fn max_tok_s_and_gpu_share_follow_the_profile_unless_pinned() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                saragossa::set_decode_max_tokens_per_s(None);
+                super::super::auto_yield::set_configured(100);
+            }
+        }
+        let _reset = Reset;
+        let dir = std::env::temp_dir().join(format!("saragossa-share-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dossier temporaire");
+        let file = dir.join("p.toml");
+        let path = file.to_str().expect("utf8").to_string();
+        let write = |text: &str| std::fs::write(&file, text).expect("écriture");
+        let rate = || saragossa::decode_max_tokens_per_s().map(f64::round);
+        write("[serve]\nmax_tok_s = 20.0\ngpu_share = 50\n");
+        let (first, _, _) = reload(Some(&path), &[], &[], &Profile::default(), &[]).expect("1");
+        assert_eq!((rate(), saragossa::gpu_share()), (Some(20.0), 50));
+        write("[serve]\nmax_tok_s = 30.0\ngpu_share = 60\n");
+        let (second, _, _) = reload(Some(&path), &[], &[], &first, &[]).expect("2");
+        assert_eq!((rate(), saragossa::gpu_share()), (Some(30.0), 60));
+        write("[serve]\n");
+        let (third, _, _) = reload(Some(&path), &[], &[], &second, &[]).expect("3");
+        assert_eq!(
+            (rate(), saragossa::gpu_share()),
+            (None, 100),
+            "clés retirées"
+        );
+        // La CLI épingle les deux, l'environnement épingle max_tok_s.
+        write("[serve]\nmax_tok_s = 30.0\ngpu_share = 60\n");
+        let cli = ["--gpu-share", "40", "--max-tok-s", "10"].map(String::from);
+        reload(Some(&path), &[], &cli, &third, &[]).expect("CLI");
+        assert_eq!((rate(), saragossa::gpu_share()), (Some(10.0), 40));
+        super::super::args::with_env("SARAGOSSA_RUST_MAX_TOK_S", "15", || {
+            reload(Some(&path), &[], &[], &third, &[]).expect("env");
+        });
+        assert_eq!(rate(), Some(15.0));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
