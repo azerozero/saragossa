@@ -217,21 +217,26 @@ kernel void rms_norm_rope_heads_decode_rows_f32(
 
     threadgroup float partial[256];
     const uint start = head * head_dim;
-    float sumsq = 0.0f;
-    for (uint col = tid; col < head_dim; col += 256u) {
-        const float value = input[start + col];
-        sumsq += value * value;
-    }
-    partial[tid] = sumsq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) { partial[tid] += partial[tid + stride]; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
     // `params.z` non nul : tête sans QK-norm (Llama, Mistral), rotation seule,
     // x × 1 × 1 exact ; `weight` est alors un tampon lié mais jamais utile.
+    // Drapeau uniforme sur le threadgroup : la réduction et ses barrières sont
+    // sautées d'un bloc, l'ordre arithmétique de la branche normée est inchangé.
     const bool rope_only = params.z != 0.0f;
-    const float inv_rms = rope_only ? 1.0f : rsqrt((partial[0] / float(head_dim)) + eps);
+    float inv_rms = 1.0f;
+    if (!rope_only) {
+        float sumsq = 0.0f;
+        for (uint col = tid; col < head_dim; col += 256u) {
+            const float value = input[start + col];
+            sumsq += value * value;
+        }
+        partial[tid] = sumsq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) { partial[tid] += partial[tid + stride]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        inv_rms = rsqrt((partial[0] / float(head_dim)) + eps);
+    }
     const uint pairs = rope_dims / 2u;
     // Gemma proportional sépare les partenaires sur la tête entière ;
     // Qwen partiel conserve la demi-tranche rotative.
