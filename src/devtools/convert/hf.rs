@@ -275,6 +275,7 @@ fn plan(
                     bits,
                     fit,
                     weight,
+                    proxy: imatrix.is_none() && fit == AffineFit::LeastSquares,
                 });
             }
             None => {

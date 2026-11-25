@@ -563,6 +563,10 @@ pub(crate) enum Job {
         fit: AffineFit,
         /// Importance par colonne (imatrix) du fit aux moindres carrés.
         weight: Option<std::sync::Arc<[f64]>>,
+        /// Importance fictive des petites colonnes (`audit::proxy_importance`) :
+        /// seulement sans imatrix chargée. Avec `--imatrix`, un tenseur exempté
+        /// (`weight` vide : embedding, MTP) garde le fit uniforme.
+        proxy: bool,
     },
     Experts {
         group: ExpertGroup,
@@ -678,6 +682,7 @@ pub(crate) fn plan_shards(inventory: &Inventory, layers: usize) -> Result<Vec<Sh
                     bits: *bits,
                     fit: AffineFit::MinMax,
                     weight: None,
+                    proxy: false,
                 });
             }
             _ => {
@@ -992,6 +997,7 @@ pub(crate) fn write_shard(
                 bits,
                 fit,
                 weight: importance,
+                proxy,
             } => {
                 let [rows, cols] = src.shape[..] else {
                     return Err(InferError::Dimension(src.name.clone()));
@@ -1013,10 +1019,7 @@ pub(crate) fn write_shard(
                     let bytes = source.read(src, row * cols * 2, take * cols * 2)?;
                     let data = bytes_to_dense_f32(&bytes, src.dtype, &src.name)?;
                     // Sans imatrix, importance fictive des colonnes à |w| quasi nul.
-                    let proxy = match (fit, importance) {
-                        (AffineFit::LeastSquares, None) => proxy_importance(&data, cols),
-                        _ => None,
-                    };
+                    let proxy = proxy.then(|| proxy_importance(&data, cols)).flatten();
                     let fit_weight = importance.as_deref().or(proxy.as_deref());
                     let block = quantize_block(&data, cols, *bits, *fit, fit_weight)?;
                     if let Some(columns) = columns.as_mut() {
