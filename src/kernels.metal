@@ -1073,6 +1073,166 @@ kernel void affine_qmv_fast_aligned_u3_gs64_f32(
     }
 }
 
+// qmv u3 gs64 en R lignes (vérification spéculative à M petit) : les packs, les
+// échelles et les biais d'un bloc sont lus une fois pour les R lignes au lieu
+// d'une fois par ligne (qmv répliqué). Pour chaque (ligne, sortie), la suite
+// d'opérations flottantes est celle de `affine_qmv_fast_aligned_u3_gs64_f32`
+// (mêmes `xt`, mêmes sommes, même ordre, même arbre simd_sum) ; l'égalité au bit
+// avec le qmv mono est vérifiée par `qmv_rows_match_mono_bitwise`.
+template <uint R>
+kernel void affine_qmv_rows_u3_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    constant uint& batch [[buffer(6)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    const uint out_dim = dims.x;
+    const uint in_dim = dims.y;
+    const uint packed_cols = dims.z;
+    const uint groups = dims.w;
+    const uint results_per_simdgroup = 4u;
+    const uint simdgroups = 2u;
+    const uint values_per_pack = 8u;
+    const uint values_per_thread = 16u;
+    const uint block_size = values_per_thread * 32u;
+    const uint half_block_size = values_per_pack * 32u;
+    const uint row_base = tile.y * (simdgroups * results_per_simdgroup) +
+        simd_gid * results_per_simdgroup;
+    const uint m_base = tile.x * R;
+    const uint rows_here = min(R, batch - m_base);
+
+    const uint scale_step_per_thread = 8u;
+    const device uint* ws = packed + row_base * packed_cols;
+    const device bfloat* scale_base = scales + row_base * groups + simd_lid / scale_step_per_thread;
+    const device bfloat* bias_base = biases + row_base * groups + simd_lid / scale_step_per_thread;
+    const device float* x = lhs + m_base * in_dim + simd_lid * values_per_pack;
+
+    float result[R][4];
+    for (uint m = 0u; m < R; ++m) {
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            result[m][row] = 0.0f;
+        }
+    }
+    const uint full_blocks = in_dim / block_size;
+    for (uint block = 0u; block < full_blocks; ++block) {
+        uint2 packs[4];
+        float sc0[4], bi0[4], sc1[4], bi1[4];
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            const device uint* row_words = ws + row * packed_cols;
+            packs[row] = load_u3x16_pack24(row_words, row_words + 24u, simd_lid);
+            sc0[row] = scale_base[row * groups];
+            bi0[row] = bias_base[row * groups];
+            sc1[row] = scale_base[row * groups + 4u];
+            bi1[row] = bias_base[row * groups + 4u];
+        }
+        for (uint m = 0u; m < R; ++m) {
+            if (m >= rows_here) {
+                break;
+            }
+            const device float* xm = x + m * in_dim;
+            float xt[16];
+            float sum0 = 0.0f;
+            float sum1 = 0.0f;
+            for (uint i = 0u; i < values_per_pack; ++i) {
+                const float a0 = xm[i];
+                const float a1 = xm[half_block_size + i];
+                sum0 += a0;
+                sum1 += a1;
+                const float inv = u3_inv_scale[i];
+                xt[i] = a0 * inv;
+                xt[values_per_pack + i] = a1 * inv;
+            }
+            for (uint row = 0u; row < results_per_simdgroup; ++row) {
+                const uint pack0 = packs[row].x;
+                const uint pack1 = packs[row].y;
+                float accum0 = 0.0f;
+                accum0 += xt[0] * float(pack0 & 0x000007u);
+                accum0 += xt[1] * float(pack0 & 0x000038u);
+                accum0 += xt[2] * float(pack0 & 0x0001C0u);
+                accum0 += xt[3] * float(pack0 & 0x000E00u);
+                accum0 += xt[4] * float(pack0 & 0x007000u);
+                accum0 += xt[5] * float(pack0 & 0x038000u);
+                accum0 += xt[6] * float(pack0 & 0x1C0000u);
+                accum0 += xt[7] * float(pack0 & 0xE00000u);
+                result[m][row] += sc0[row] * accum0 + sum0 * bi0[row];
+
+                float accum1 = 0.0f;
+                accum1 += xt[8] * float(pack1 & 0x000007u);
+                accum1 += xt[9] * float(pack1 & 0x000038u);
+                accum1 += xt[10] * float(pack1 & 0x0001C0u);
+                accum1 += xt[11] * float(pack1 & 0x000E00u);
+                accum1 += xt[12] * float(pack1 & 0x007000u);
+                accum1 += xt[13] * float(pack1 & 0x038000u);
+                accum1 += xt[14] * float(pack1 & 0x1C0000u);
+                accum1 += xt[15] * float(pack1 & 0xE00000u);
+                result[m][row] += sc1[row] * accum1 + sum1 * bi1[row];
+            }
+        }
+
+        ws += 48u;
+        scale_base += 8u;
+        bias_base += 8u;
+        x += block_size;
+    }
+
+    if (full_blocks * block_size < in_dim) {
+        uint pk[4];
+        float sc[4], bi[4];
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            const device uint* row_words = ws + row * packed_cols;
+            pk[row] = load_u3x8_pack24(row_words, simd_lid);
+            sc[row] = scale_base[row * groups];
+            bi[row] = bias_base[row * groups];
+        }
+        for (uint m = 0u; m < R; ++m) {
+            if (m >= rows_here) {
+                break;
+            }
+            const device float* xm = x + m * in_dim;
+            float xt[8];
+            float sum = 0.0f;
+            for (uint i = 0u; i < values_per_pack; ++i) {
+                const float a = xm[i];
+                sum += a;
+                xt[i] = a * u3_inv_scale[i];
+            }
+            for (uint row = 0u; row < results_per_simdgroup; ++row) {
+                const uint pack24 = pk[row];
+                float accum = 0.0f;
+                accum += xt[0] * float(pack24 & 0x000007u);
+                accum += xt[1] * float(pack24 & 0x000038u);
+                accum += xt[2] * float(pack24 & 0x0001C0u);
+                accum += xt[3] * float(pack24 & 0x000E00u);
+                accum += xt[4] * float(pack24 & 0x007000u);
+                accum += xt[5] * float(pack24 & 0x038000u);
+                accum += xt[6] * float(pack24 & 0x1C0000u);
+                accum += xt[7] * float(pack24 & 0xE00000u);
+                result[m][row] += sc[row] * accum + sum * bi[row];
+            }
+        }
+    }
+
+    for (uint m = 0u; m < R; ++m) {
+        for (uint row = 0u; row < results_per_simdgroup; ++row) {
+            const float reduced = simd_sum(result[m][row]);
+            if (simd_lid == 0u && m < rows_here) {
+                out[(m_base + m) * out_dim + row_base + row] = reduced;
+            }
+        }
+    }
+}
+
+#define QMV_ROWS_U3(R) template [[host_name("affine_qmv_fast_rows_u3_gs64_f32_r" #R)]] kernel void \
+    affine_qmv_rows_u3_gs64_f32<R>(device const float*, device const uint*, device const bfloat*, \
+    device const bfloat*, device float*, constant uint4&, constant uint&, uint, uint, uint2);
+QMV_ROWS_U3(4) QMV_ROWS_U3(8)
+
 kernel void affine_qmv_fast_u4_gs64_align64_f32(
     device const float* lhs [[buffer(0)]],
     device const uint* packed [[buffer(1)]],
@@ -1407,6 +1567,126 @@ kernel void affine_qmv_fast_aligned_u6_gs64_f32(
         affine_qmv_aligned_u56<6u, 16u>(lhs, packed, scales, biases, out, dims, simd_gid, simd_lid, tile);
     }
 }
+
+// qmv aligné u5/u6 en R lignes (vérification spéculative à M petit) : mots,
+// échelles et biais d'un pas sont lus une fois pour les R lignes. Pour chaque
+// (ligne, sortie), mêmes opérations et même ordre que `affine_qmv_aligned_u56`,
+// d'où les mêmes bits que le qmv mono (`qmv_rows_match_mono_bitwise`).
+template <uint bits, uint values, uint R>
+static inline void affine_qmv_rows_u56(
+    device const float* lhs, device const uint* packed,
+    device const bfloat* scales, device const bfloat* biases,
+    device float* out, uint4 dims, uint batch, uint simd_gid, uint simd_lid, uint2 tile
+) {
+    #pragma METAL fp contract(off)
+    const uint row_base = tile.y * 8u + simd_gid * 4u;
+    const uint row_bytes = dims.z * 4u;
+    const uint m_base = tile.x * R;
+    const uint rows_here = min(R, batch - m_base);
+    const device uchar* ws = (const device uchar*)packed +
+        row_base * row_bytes + simd_lid * bits * (values / 8u);
+    const device float* x = lhs + m_base * dims.y + simd_lid * values;
+    float result[R][4];
+    for (uint m = 0u; m < R; ++m) {
+        for (uint row = 0u; row < 4u; ++row) {
+            result[m][row] = 0.0f;
+        }
+    }
+    for (uint k = 0u; k < dims.y; k += values * 32u) {
+        uint words[4][6];
+        float scale[4], bias[4];
+        #pragma unroll
+        for (uint row = 0u; row < 4u; ++row) {
+            if (values == 32u) {
+                const device uint* w = (const device uint*)(ws + row * row_bytes);
+                const uint4 v = uint4(*((const device packed_uint4*)w));
+                words[row][0] = v.x; words[row][1] = v.y; words[row][2] = v.z; words[row][3] = v.w;
+                words[row][4] = w[4];
+                words[row][5] = bits == 6u ? w[5] : 0u;
+            } else {
+                const device ushort* w = (const device ushort*)(ws + row * row_bytes);
+                const ushort4 v = ushort4(*((const device packed_ushort4*)w));
+                words[row][0] = v.x; words[row][1] = v.y; words[row][2] = v.z; words[row][3] = v.w;
+                words[row][4] = w[4];
+                words[row][5] = bits == 6u ? uint(w[5]) : 0u;
+            }
+            const uint affine = (row_base + row) * dims.w + k / 64u + simd_lid / (64u / values);
+            float sc = 0.0f, bi = 0.0f;
+            if ((simd_lid % (64u / values)) == 0u) {
+                sc = float(scales[affine]);
+                bi = float(biases[affine]);
+            }
+            scale[row] = simd_shuffle(sc, simd_lid & ~(64u / values - 1u));
+            bias[row] = simd_shuffle(bi, simd_lid & ~(64u / values - 1u));
+        }
+        for (uint m = 0u; m < R; ++m) {
+            if (m >= rows_here) {
+                break;
+            }
+            const device float* xm = x + m * dims.y;
+            float xt[values];
+            float sum = 0.0f;
+            #pragma unroll
+            for (uint i = 0u; i < values / 4u; ++i) {
+                const float4 v = float4(*((const device packed_float4*)(xm + 4u * i)));
+                xt[4u * i] = v.x;
+                xt[4u * i + 1u] = v.y;
+                xt[4u * i + 2u] = v.z;
+                xt[4u * i + 3u] = v.w;
+                sum += v.x + v.y + v.z + v.w;
+            }
+            #pragma unroll
+            for (uint row = 0u; row < 4u; ++row) {
+                float accum = 0.0f;
+                #pragma unroll
+                for (uint i = 0u; i < values; ++i) {
+                    const uint word = i * bits / values;
+                    const uint shift = i * bits % values;
+                    uint q = uint(words[row][word]) >> shift;
+                    if (shift + bits > values) q |= uint(words[row][word + 1u]) << (values - shift);
+                    accum = fma(xt[i], float(q & ((1u << bits) - 1u)), accum);
+                }
+                result[m][row] = fma(scale[row], accum, fma(sum, bias[row], result[m][row]));
+            }
+        }
+        ws += 32u * bits * (values / 8u);
+        x += values * 32u;
+    }
+    for (uint m = 0u; m < R; ++m) {
+        #pragma unroll
+        for (uint row = 0u; row < 4u; ++row) {
+            const float reduced = simd_sum(result[m][row]);
+            if (simd_lid == 0u && m < rows_here) {
+                out[(m_base + m) * dims.x + row_base + row] = reduced;
+            }
+        }
+    }
+}
+
+template <uint bits, uint R>
+kernel void affine_qmv_rows_u56_gs64_f32(
+    device const float* lhs [[buffer(0)]],
+    device const uint* packed [[buffer(1)]],
+    device const bfloat* scales [[buffer(2)]],
+    device const bfloat* biases [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint4& dims [[buffer(5)]],
+    constant uint& batch [[buffer(6)]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint2 tile [[threadgroup_position_in_grid]]
+) {
+    if (dims.y % 1024u == 0u) {
+        affine_qmv_rows_u56<bits, 32u, R>(lhs, packed, scales, biases, out, dims, batch, simd_gid, simd_lid, tile);
+    } else {
+        affine_qmv_rows_u56<bits, 16u, R>(lhs, packed, scales, biases, out, dims, batch, simd_gid, simd_lid, tile);
+    }
+}
+
+#define QMV_ROWS_U56(B, R) template [[host_name("affine_qmv_fast_rows_u" #B "_gs64_f32_r" #R)]] kernel void \
+    affine_qmv_rows_u56_gs64_f32<B, R>(device const float*, device const uint*, device const bfloat*, \
+    device const bfloat*, device float*, constant uint4&, constant uint&, uint, uint, uint2);
+QMV_ROWS_U56(5, 4) QMV_ROWS_U56(5, 8) QMV_ROWS_U56(6, 4) QMV_ROWS_U56(6, 8)
 
 // Quatre lignes du qmv aligné u5/u6 réduites, pour les épilogues fusionnés
 // du code predictor TTS. Même boucle et mêmes associations que

@@ -17,7 +17,8 @@ use std::sync::Arc;
 use safetensors::{Dtype, SafeTensors};
 
 use super::least_squares::{codes, mlx_params, zero_grid};
-use super::plan::{file_sha256, io_err};
+use super::plan::io_err;
+use super::sha256_bytes;
 use crate::assets::is_mtp_key;
 use crate::quantization::{bf16_bits, bf16_value, quantize_affine_bitstream_bf16, QuantError};
 use crate::{InferError, Result};
@@ -64,9 +65,11 @@ impl Imatrix {
             }
             vectors.insert(name, values.into());
         }
+        // Empreinte des octets décodés : un remplacement du fichier après la
+        // lecture ne peut pas désaccorder vecteurs et manifeste de reprise.
         Ok(Self {
             vectors,
-            sha256: file_sha256(path)?,
+            sha256: sha256_bytes(&bytes),
         })
     }
 

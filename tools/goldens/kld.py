@@ -77,7 +77,7 @@ def stats(kls, deltas, same):
 def main():
     require_versions(LOGITS_PACKAGES)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=["qwen38", "qwen36_moe", "gemma3", "gemma4"], required=True)
+    parser.add_argument("--model", choices=["qwen38", "qwen36_moe", "gemma3", "gemma4", "llama32_1b", "mistral7b"], required=True)
     args = parser.parse_args()
     path = local_model(args.model)
     import mlx.core as mx
@@ -92,8 +92,11 @@ def main():
     chunks = chat_ids(mx, model, tokenizer) if chat else chunk_ids(tokenizer)
     scored = CHAT_SCORED if chat else SCORED
     reference = []  # par position : (ids top-K, logprobs top-K)
+    nll = []
     for chunk in chunks:
         lp = logprobs(mx, model, chunk, scored)
+        targets = mx.array(chunk[len(chunk) - scored:])
+        nll += (-mx.take_along_axis(lp, targets[:, None], axis=-1)[:, 0]).tolist()
         top = mx.argsort(-lp, axis=-1)[:, :K]
         values = mx.take_along_axis(lp, top, axis=-1)
         mx.eval(top, values)
@@ -118,6 +121,9 @@ def main():
             same.append(int(argmax[row].item()) == ids[0])
     noise = stats(kls, deltas, same)
     print(args.model, "mlx bf16 / f32 :", noise)
+    # Perplexité f32 des tokens notés : un instruct qui ne prédit pas le texte
+    # brut (Gemma 4) se voit ici avant toute comparaison.
+    print(args.model, "perplexité f32 :", math.exp(sum(nll) / len(nll)))
 
     source = provenance(args.model, path, LOGITS_PACKAGES)
     source["float32_control"] = True

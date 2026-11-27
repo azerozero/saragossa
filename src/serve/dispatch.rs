@@ -5,7 +5,8 @@
 //! part dans une file bornée vers le thread moteur, seul propriétaire de
 //! [`ServeState`] : l'inférence reste sérielle, seules les E/S sont parallèles,
 //! sauf les lots opt-in (`SARAGOSSA_SERVE_BATCH=1`, voir [`run_engine`]) qui
-//! décodent ensemble plusieurs requêtes chat streamées greedy.
+//! décodent ensemble plusieurs requêtes chat streamées greedy, et les moteurs
+//! opt-in (`--engines N`) qui prennent chacun le job suivant de la même file.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -14,7 +15,7 @@ use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,7 @@ use super::http::{
     batch_chat, configure_tcp_stream, handle_batch, handle_job, read_body, read_head,
     read_or_reject, reply_on_error, route_front, send_error, send_route_error, HttpRequest,
 };
+use super::shared::{SttOrder, SttTicket};
 use super::state::ServeState;
 
 /// Contexte figé au démarrage, lu par les threads de connexion sans toucher à
@@ -79,6 +81,8 @@ struct Job<S> {
     stream: S,
     _bytes: Reservation,
     waiting: Reservation,
+    /// Tour d'un morceau STT streamé, émis à la prise dans une file commune.
+    turn: Option<SttTicket>,
 }
 
 /// Plafonds de la façade d'E/S.
@@ -189,6 +193,8 @@ where
         Arc::clone(&dispatcher.front),
         Arc::clone(&dispatcher.connections),
     )?;
+    #[cfg(feature = "denoise")]
+    let _reaper = spawn_enhance_reaper(Arc::downgrade(&dispatcher.front))?;
     // NOTE: thread détaché plutôt que scope : une panique moteur doit tuer le
     // process comme avant, pas attendre un accept qui ne finit jamais.
     let acceptor = thread::Builder::new()
@@ -197,7 +203,11 @@ where
         .map_err(|e| ServeError::io("thread d'accept", e))?;
     // La boucle s'arrête quand l'accept et toutes les connexions ont lâché
     // leur émetteur.
-    let max_streams = if serve_batch_enabled() {
+    let engines = state.engines();
+    // ponytail: lots coupés à plusieurs moteurs (`drain_queue` d'un moteur
+    // viderait la file commune dans sa file locale) ; drainer au plus sa part
+    // si lots et moteurs doivent se combiner.
+    let max_streams = if serve_batch_enabled() && engines == 1 {
         serve_max_streams()
     } else {
         1
@@ -210,10 +220,135 @@ where
             eprintln!("saragossa serve relais: préchargement différé échoué: {error}");
         }
     }
-    run_engine(&queue, state, max_streams);
+    if engines == 1 {
+        run_engine(&queue, state, max_streams);
+    } else {
+        let queue = Arc::new(SharedJobs::new(queue, state.stt_order()));
+        let workers = (1..engines)
+            .map(|engine| spawn_engine(engine, state.engine_seed(engine), Arc::clone(&queue)))
+            .collect::<ServeResult<Vec<_>>>()?;
+        eprintln!("saragossa serve engines={engines} (poids partagés)");
+        run_engine(&*queue, state, max_streams);
+        // File fermée : les autres moteurs finissent leur job en cours.
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
     acceptor
         .join()
         .map_err(|_| ServeError::io("thread d'accept", io::Error::other("panique")))?
+}
+
+/// Lance le moteur secondaire `engine` sur son thread : son `ServeState` y est
+/// construit (arènes et pools scratch sont par thread), ses poids viennent du
+/// registre commun.
+fn spawn_engine<S: ServeStream>(
+    engine: usize,
+    seed: super::state::EngineSeed,
+    queue: Arc<SharedJobs<S>>,
+) -> ServeResult<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name(format!("saragossa-serve-engine-{engine}"))
+        .spawn(move || {
+            // Une panique hors `guarded` (boucle, construction) abat le process,
+            // comme sur le moteur principal.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut state = seed.build();
+                run_engine(&*queue, &mut state, 1);
+            }));
+            if outcome.is_err() {
+                eprintln!("saragossa serve panique du moteur {engine} hors requête, arrêt");
+                std::process::exit(101);
+            }
+        })
+        .map_err(|e| ServeError::io("thread moteur", e))
+}
+
+/// File de jobs vue d'un moteur : le récepteur seul (un moteur) ou partagé
+/// sous verrou (plusieurs moteurs, chacun prend le job suivant).
+trait JobQueue<J> {
+    fn recv_timeout(&self, timeout: Duration) -> Result<J, RecvTimeoutError>;
+    fn try_recv(&self) -> Option<J>;
+}
+
+impl<J> JobQueue<J> for Receiver<J> {
+    fn recv_timeout(&self, timeout: Duration) -> Result<J, RecvTimeoutError> {
+        Receiver::recv_timeout(self, timeout)
+    }
+
+    fn try_recv(&self) -> Option<J> {
+        Receiver::try_recv(self).ok()
+    }
+}
+
+/// File commune à plusieurs moteurs : chacun prend le job suivant sous verrou ;
+/// un morceau STT streamé y reçoit son tour dans l'ordre d'arrivée.
+///
+/// ponytail: un seul moteur attend sur le canal, les autres sur le verrou,
+/// leur maintenance (SIGHUP, inactivité) étant retardée d'autant ; un canal
+/// MPMC si cette attente se voit en latence.
+struct SharedJobs<S> {
+    rx: Mutex<Receiver<Job<S>>>,
+    stt_order: Arc<SttOrder>,
+}
+
+impl<S> SharedJobs<S> {
+    fn new(rx: Receiver<Job<S>>, stt_order: Arc<SttOrder>) -> Self {
+        Self {
+            rx: Mutex::new(rx),
+            stt_order,
+        }
+    }
+
+    fn take(&self, recv: impl FnOnce(&Receiver<Job<S>>) -> Option<Job<S>>) -> Option<Job<S>> {
+        let rx = self
+            .rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut job = recv(&rx)?;
+        if job.request.method == "POST" && job.request.route() == STT_STREAM_ROUTE {
+            job.turn = Some(self.stt_order.issue());
+        }
+        Some(job)
+    }
+}
+
+const STT_STREAM_ROUTE: &str = "/v1/audio/transcriptions/stream";
+
+impl<S> JobQueue<Job<S>> for SharedJobs<S> {
+    fn recv_timeout(&self, timeout: Duration) -> Result<Job<S>, RecvTimeoutError> {
+        let mut failure = RecvTimeoutError::Timeout;
+        self.take(|rx| {
+            rx.recv_timeout(timeout)
+                .map_err(|error| failure = error)
+                .ok()
+        })
+        .ok_or(failure)
+    }
+
+    fn try_recv(&self) -> Option<Job<S>> {
+        self.take(|rx| rx.try_recv().ok())
+    }
+}
+
+/// Décharge DFN3 après `serve.idle_unload_secs` sans flux enhance. Il est
+/// servi hors du thread moteur (h2, webtransport) : `next_job` ne le voit pas.
+/// Le thread s'arrête quand `Front` est libéré.
+#[cfg(feature = "denoise")]
+fn spawn_enhance_reaper(front: std::sync::Weak<Front>) -> ServeResult<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("saragossa-serve-enhance-idle".to_string())
+        .spawn(move || {
+            while let Some(front) = front.upgrade() {
+                let secs = super::reload::idle_unload_secs();
+                if front.enhance.unload_idle(secs, Instant::now) {
+                    eprintln!("saragossa serve unloaded enhance idle_secs={secs}");
+                }
+                drop(front);
+                thread::sleep(Duration::from_millis(250));
+            }
+        })
+        .map_err(|e| ServeError::io("thread d'inactivité enhance", e))
 }
 
 /// Job en attente du moteur, avec le modèle visé s'il est admissible à un
@@ -247,7 +382,7 @@ impl<S> Queued<S> {
 /// NOTE: l'admission n'a lieu qu'entre deux générations ; un job arrivé
 /// pendant un lot attend la fin de tout le lot.
 fn run_engine<S: ServeStream>(
-    queue: &Receiver<Job<S>>,
+    queue: &impl JobQueue<Job<S>>,
     state: &mut ServeState,
     max_streams: usize,
 ) {
@@ -264,7 +399,12 @@ fn run_engine<S: ServeStream>(
         let leader = match pending.pop_front() {
             Some(queued) => queued,
             None => match next_job(queue, state) {
-                Some(job) => Queued::new(job, batching(state), state),
+                Some(job) => {
+                    // Un SIGHUP appliqué par un autre moteur pendant l'attente
+                    // vaut avant le routage de ce job.
+                    apply_pending_models(state);
+                    Queued::new(job, batching(state), state)
+                }
                 None => break,
             },
         };
@@ -296,35 +436,62 @@ fn run_engine<S: ServeStream>(
 }
 
 /// Applique la liste de modèles d'un SIGHUP ; entre deux jobs seulement.
+///
+/// Le premier moteur libre prend la liste en attente ; les autres appliquent
+/// la liste qu'il a publiée, au plus tard avant de router leur job suivant.
 fn apply_pending_models(state: &mut ServeState) {
-    if let Some(models) = super::reload::take_pending_models() {
+    let mut seen = state.models_generation();
+    if let Some(models) = super::reload::sync_models(&mut seen) {
         state.set_models(&models);
     }
+    state.set_models_generation(seen);
 }
 
 /// Attend le prochain job en regardant toutes les 250 ms si un SIGHUP a changé
 /// les modèles ; `None` quand tous les émetteurs ont lâché.
-fn next_job<S>(queue: &Receiver<Job<S>>, state: &mut ServeState) -> Option<Job<S>> {
+///
+/// Appelé seulement file vide et moteur libre : au bout de
+/// `serve.idle_unload_secs` sans job, les modèles sont déchargés (une fois), et
+/// le job suivant attend leur rechargement sur ce même thread.
+fn next_job<T>(queue: &impl JobQueue<T>, state: &mut ServeState) -> Option<T> {
+    let idle_since = Instant::now();
+    let mut unloaded = false;
     loop {
         match queue.recv_timeout(Duration::from_millis(250)) {
             Ok(job) => return Some(job),
-            Err(RecvTimeoutError::Timeout) => apply_pending_models(state),
+            Err(RecvTimeoutError::Timeout) => {
+                apply_pending_models(state);
+                let secs = super::reload::idle_unload_secs();
+                if !unloaded && idle_expired(idle_since, Instant::now(), secs) {
+                    // Un job arrivé depuis le timeout passe avant tout déchargement.
+                    if let Some(job) = queue.try_recv() {
+                        return Some(job);
+                    }
+                    state.unload_idle(secs);
+                    unloaded = true;
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => return None,
         }
     }
 }
 
+/// Le délai d'inactivité `secs` (0 : désactivé) est-il écoulé entre `since` et `now` ?
+pub(super) fn idle_expired(since: Instant, now: Instant, secs: u64) -> bool {
+    secs > 0 && now.saturating_duration_since(since) >= Duration::from_secs(secs)
+}
+
 /// Déplace sans bloquer les jobs déjà en file vers `pending`, jusqu'à `cap`.
 fn drain_queue<J, T>(
-    queue: &Receiver<J>,
+    queue: &impl JobQueue<J>,
     pending: &mut VecDeque<T>,
     cap: usize,
     wrap: impl Fn(J) -> T,
 ) {
     while pending.len() < cap {
         match queue.try_recv() {
-            Ok(job) => pending.push_back(wrap(job)),
-            Err(_) => break,
+            Some(job) => pending.push_back(wrap(job)),
+            None => break,
         }
     }
 }
@@ -360,8 +527,9 @@ fn run_batch<S: ServeStream>(batch: Vec<Queued<S>>, state: &mut ServeState) {
                 stream,
                 _bytes,
                 waiting,
+                turn,
             } = queued.job;
-            drop(waiting);
+            drop((waiting, turn));
             (stream, request, _bytes)
         })
         .collect();
@@ -428,6 +596,13 @@ fn guarded(state: &mut ServeState, work: impl FnOnce(&mut ServeState)) -> bool {
     if outcome.is_ok() {
         return true;
     }
+    // Plusieurs moteurs : poids, executors et caches partagés restent vivants
+    // chez les autres, verrous possiblement empoisonnés ; on ne les réutilise
+    // pas, le process s'arrête (le superviseur relance).
+    if state.engines() > 1 {
+        eprintln!("saragossa serve panique d'un moteur à poids partagés, arrêt");
+        std::process::exit(101);
+    }
     eprintln!("saragossa serve panique du moteur contenue, modèles invalidés");
     // Un Drop qui paniquerait à son tour ne doit pas tuer le moteur.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.invalidate_models()));
@@ -447,14 +622,18 @@ fn run_job<S: ServeStream>(job: Job<S>, state: &mut ServeState) {
         mut stream,
         _bytes,
         waiting,
+        turn,
     } = job;
     drop(waiting);
+    state.set_stt_turn(turn);
     let mut sent = Sent::new(&mut stream);
     let ok = guarded(state, |state| {
         if let Err(error) = handle_job(&mut sent, state, &request) {
             eprintln!("saragossa serve request error: {error}");
         }
     });
+    // Le tour STT passe au morceau suivant, servi ou non.
+    state.set_stt_turn(None);
     if !ok {
         sent.reply_500();
     }
@@ -527,6 +706,7 @@ impl<S: ServeStream> Connection<S> {
             stream,
             _bytes: bytes,
             waiting,
+            turn: None,
         };
         match self.jobs.try_send(job) {
             Ok(()) => Ok(()),
@@ -550,6 +730,8 @@ impl<S: ServeStream> Connection<S> {
 pub(super) struct Reservation {
     counter: Arc<AtomicUsize>,
     amount: usize,
+    // Horodatage repoussé à la libération, avant de rendre la part.
+    released_at: Option<Arc<std::sync::Mutex<Instant>>>,
 }
 
 impl Reservation {
@@ -564,6 +746,7 @@ impl Reservation {
                     return Some(Self {
                         counter: Arc::clone(counter),
                         amount,
+                        released_at: None,
                     })
                 }
                 Err(current) => count = current,
@@ -572,8 +755,22 @@ impl Reservation {
     }
 }
 
+impl Reservation {
+    /// Date la libération dans `at` (au plus tard des dates vues).
+    #[cfg(feature = "denoise")]
+    pub(super) fn stamped(mut self, at: &Arc<std::sync::Mutex<Instant>>) -> Self {
+        self.released_at = Some(Arc::clone(at));
+        self
+    }
+}
+
 impl Drop for Reservation {
     fn drop(&mut self) {
+        if let Some(at) = &self.released_at {
+            if let Ok(mut at) = at.lock() {
+                *at = at.max(Instant::now());
+            }
+        }
         self.counter.fetch_sub(self.amount, Ordering::AcqRel);
     }
 }
@@ -674,6 +871,52 @@ mod tests {
             .read_to_string(&mut response)
             .expect("invariant: réponse lisible avant le timeout");
         response
+    }
+
+    #[cfg(feature = "denoise")]
+    #[test]
+    fn enhance_reaper_stops_when_front_is_dropped() {
+        let front = Arc::new(Front::new(None, Vec::new()));
+        let reaper = spawn_enhance_reaper(Arc::downgrade(&front)).expect("thread");
+        drop(front);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !reaper.is_finished() {
+            assert!(Instant::now() < deadline, "le thread survit à Front");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // Boucle réelle : un job arrivé après le délai d'inactivité est servi, la
+    // boucle ne reste pas bloquée par le déchargement.
+    #[test]
+    fn next_job_serves_a_job_sent_after_the_idle_delay() {
+        let _serial = super::super::reload::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let args = super::super::args::ServeArgs::parse(
+            ["--model", "a=/x/a", "--backend", "cpu"].map(String::from),
+        )
+        .expect("args");
+        let mut state = ServeState::new(&args);
+        super::super::reload::set_idle_unload_secs(1);
+        let (tx, rx) = std::sync::mpsc::channel::<u8>();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            tx.send(7).expect("invariant: récepteur vivant");
+        });
+        assert_eq!(next_job(&rx, &mut state), Some(7));
+        super::super::reload::set_idle_unload_secs(0);
+        sender.join().expect("invariant: émetteur");
+    }
+
+    #[test]
+    fn idle_expiry_follows_the_injected_clock() {
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        assert!(!idle_expired(t0, at(1000), 0), "0 = désactivé");
+        assert!(!idle_expired(t0, at(59), 60));
+        assert!(idle_expired(t0, at(60), 60));
+        assert!(!idle_expired(at(10), t0, 5), "horloge à rebours");
     }
 
     #[test]
@@ -796,6 +1039,7 @@ mod tests {
                 stream: server,
                 _bytes: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
                 waiting: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
+                turn: None,
             })
             .expect("invariant: file ouverte");
             clients.push(client);
@@ -803,6 +1047,63 @@ mod tests {
         drop(tx);
 
         run_engine(&rx, &mut state, 8);
+
+        for client in clients {
+            let answer = response(client);
+            assert!(answer.starts_with("HTTP/1.1 "), "réponse absente: {answer}");
+            assert!(!answer.starts_with("HTTP/1.1 200"));
+        }
+    }
+
+    /// `--engines 3` : les moteurs secondaires et le principal vident la même
+    /// file, chaque job reçoit sa réponse.
+    #[test]
+    fn engines_share_the_queue_and_answer_every_job() {
+        let args = ServeArgs::parse(
+            ["--model", "alpha=/nonexistent/a", "--engines", "3"].map(String::from),
+        )
+        .expect("invariant: args valides");
+        let mut state = ServeState::new(&args);
+        assert_eq!(state.engines(), 3);
+        let (tx, rx) = sync_channel(8);
+        let body = br#"{"model":"alpha","messages":[]}"#;
+        let raw = [
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+            body,
+        ]
+        .concat();
+        let mut clients = Vec::new();
+        for _ in 0..6 {
+            let (client, server) = tcp_pair();
+            let mut cursor = std::io::Cursor::new(raw.clone());
+            let request = super::super::http::read_request(
+                &mut cursor,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .expect("invariant: requête lisible")
+            .expect("invariant: requête présente");
+            let counter = Arc::new(AtomicUsize::new(0));
+            tx.send(Job {
+                request,
+                stream: server,
+                _bytes: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
+                waiting: Reservation::acquire(&counter, 0, 1).expect("invariant: réservation vide"),
+                turn: None,
+            })
+            .expect("invariant: file ouverte");
+            clients.push(client);
+        }
+        drop(tx);
+        let queue = Arc::new(SharedJobs::new(rx, state.stt_order()));
+        for engine in 1..state.engines() {
+            spawn_engine(engine, state.engine_seed(engine), Arc::clone(&queue))
+                .expect("invariant: thread moteur lancé");
+        }
+        run_engine(&*queue, &mut state, 1);
 
         for client in clients {
             let answer = response(client);

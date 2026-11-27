@@ -390,6 +390,61 @@ mod tests {
     use super::super::args::ServeArgs;
     use super::*;
 
+    // Le déchargement d'inactivité libère les modèles mais garde les sessions :
+    // une pause plus longue que le délai ne doit pas rendre « session inconnue ».
+    #[test]
+    fn idle_unload_keeps_stt_sessions() {
+        let args = ServeArgs::parse(["--model", "a=/x/a", "--backend", "cpu"].map(String::from))
+            .expect("args");
+        let mut audio = super::super::audio::AudioState::new(&args);
+        let (id, session) = audio
+            .stt_sessions
+            .lock()
+            .expect("invariant: sessions saines")
+            .open("fr".into(), Instant::now());
+        audio
+            .stt_sessions
+            .lock()
+            .expect("invariant: sessions saines")
+            .open
+            .insert(id.clone(), session);
+        assert!(!audio.unload_models(), "rien de chargé");
+        assert!(audio
+            .stt_sessions
+            .lock()
+            .expect("invariant: sessions saines")
+            .open
+            .contains_key(&id));
+        audio.invalidate();
+        assert!(
+            audio
+                .stt_sessions
+                .lock()
+                .expect("invariant: sessions saines")
+                .open
+                .is_empty(),
+            "panique : tout part"
+        );
+    }
+
+    // Une panique sous le verrou des sessions ne les condamne pas : la
+    // récupération du moteur les remet à neuf.
+    #[test]
+    fn invalidate_recovers_poisoned_sessions() {
+        let args = ServeArgs::parse(["--model", "a=/x/a", "--backend", "cpu"].map(String::from))
+            .expect("args");
+        let mut audio = super::super::audio::AudioState::new(&args);
+        let sessions = std::sync::Arc::clone(&audio.stt_sessions);
+        let _ = std::thread::spawn(move || {
+            let _guard = sessions.lock();
+            panic!("panique sous le verrou des sessions");
+        })
+        .join();
+        assert!(audio.stt_sessions.is_poisoned());
+        audio.invalidate();
+        assert!(!audio.stt_sessions.is_poisoned());
+    }
+
     #[test]
     fn sse_events_follow_openai_transcript_format() -> ServeResult<()> {
         assert_eq!(
@@ -445,7 +500,12 @@ mod tests {
         let error = handle_transcription_stream(&mut response, &mut audio, &headers, &[0; 320])
             .expect_err("invariant: STT non configuré refusé");
         assert!(error.to_string().contains("STT non configuré"));
-        assert!(audio.stt_sessions.open.is_empty());
+        assert!(audio
+            .stt_sessions
+            .lock()
+            .expect("invariant: sessions saines")
+            .open
+            .is_empty());
         // Un corps hors limite est refusé avant toute copie ou chargement.
         let huge = vec![0; MAX_CHUNK_SAMPLES * 2 + 2];
         assert!(matches!(

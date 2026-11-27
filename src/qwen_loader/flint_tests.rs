@@ -271,6 +271,34 @@ fn router_defaults_to_sigmoid_for_flint_only() {
     assert!(config.router_score().is_err());
 }
 
+/// Chaque ligne du teacher forcing égale le forward sans cache du préfixe.
+#[cfg(feature = "devtools")]
+#[test]
+fn synthetic_flint_teacher_forced_logits_match_prefix_forwards() {
+    let model = load(flint_tensors(true)).expect("invariant: flint synthétique chargeable");
+    let prompt = [1, 2, 3, 4];
+    let rows = model
+        .teacher_forced_logits(&prompt)
+        .expect("invariant: teacher forcing CPU");
+    assert_eq!(rows.shape(), &[prompt.len(), VOCAB]);
+    for end in 0..prompt.len() {
+        let row = rows.row_slice(end).expect("invariant: ligne");
+        let oracle = model
+            .next_logits(&prompt[..=end])
+            .expect("invariant: forward du préfixe");
+        for (got, want) in row.iter().zip(oracle.data()) {
+            assert!(
+                (got - want).abs() < 1.0e-4,
+                "position {end}: {got} != {want}"
+            );
+        }
+    }
+    let (kl, agreement) =
+        crate::devtools::kl_eval::kl_and_agreement(&rows, &rows).expect("invariant: KL identité");
+    assert_eq!((kl, agreement), (0.0, 1.0));
+    assert!(model.teacher_forced_logits(&[]).is_err());
+}
+
 #[test]
 fn synthetic_flint_loads_and_generates_on_cpu() {
     let model = load(flint_tensors(true)).expect("invariant: flint synthétique chargeable");
@@ -415,6 +443,28 @@ fn synthetic_flint_resident_decode_matches_cpu_oracle() {
         resident_decode_steps() - steps_before >= 7,
         "greedy GPU passé par le decode résident"
     );
+}
+
+/// Déchargement d'inactivité : le décodeur est abandonné (poids, arènes, KV)
+/// puis rechargé ; la sortie greedy résidente reste identique au bit.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "GPU synthétique : exécuté par gpu-synthetic.yml"]
+fn synthetic_flint_greedy_identical_after_unload_and_reload() {
+    let load_gpu = || {
+        load(flint_tensors(true))
+            .expect("invariant: flint synthétique")
+            .with_metal_runtime()
+            .expect("invariant: runtime Metal attaché")
+    };
+    let prompt = [1, 2, 3];
+    let model = load_gpu();
+    let before = model.generate_greedy(&prompt, 8).expect("greedy avant");
+    drop(model);
+    let after = load_gpu()
+        .generate_greedy(&prompt, 8)
+        .expect("greedy après");
+    assert_eq!(before, after, "greedy différent après rechargement");
 }
 
 /// Même oracle synthétique, toutes les compilations du runtime sans fast-math.

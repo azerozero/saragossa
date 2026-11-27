@@ -27,10 +27,8 @@ fn fixture(root: &Path) -> (CausalDecoder, Option<Request>) {
     (model, Some(request))
 }
 
-#[test]
-fn roundtrip_and_reject_corruption_without_weights() -> Result<()> {
-    let dir = tempfile::tempdir().unwrap();
-    let (mut model, request) = fixture(dir.path());
+/// Tête MTP minimale sur le modèle 2D de test, chemin CPU.
+pub(super) fn with_tiny_mtp(model: &mut CausalDecoder) -> Result<()> {
     let AttentionBlock::Full(attention) = &model.layers[0].attention else {
         panic!("fixture full-attention attendue");
     };
@@ -54,6 +52,14 @@ fn roundtrip_and_reject_corruption_without_weights() -> Result<()> {
         },
         norm: model.final_norm.clone(),
     });
+    Ok(())
+}
+
+#[test]
+fn roundtrip_and_reject_corruption_without_weights() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut model, request) = fixture(dir.path());
+    with_tiny_mtp(&mut model)?;
     let (mut cache, final_state) = model.prefill_cache_state(&[0, 1])?;
     // Le transport doit conserver les bits bf16, le f32 et les états CPU,
     // indépendamment du chemin qui a produit ce cache synthétique.

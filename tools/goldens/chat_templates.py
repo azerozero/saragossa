@@ -10,6 +10,10 @@ from common import TEMPLATE_PACKAGES, require_versions, local_model, provenance,
 
 def main():
     require_versions(TEMPLATE_PACKAGES)
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", action="append", help="ne capturer que ces modèles")
+    args = parser.parse_args()
     from transformers import AutoTokenizer
     multi = [dict(role="system", content="Réponds brièvement."),
              dict(role="user", content="Bonjour !"),
@@ -23,7 +27,7 @@ def main():
                   function=dict(name="weather", arguments=dict(city="Paris")))]),
              dict(role="tool", name="weather", tool_call_id="call_1", content='{"temperature":18}'),
              dict(role="user", content="Merci, résume.")]
-    for name in ["qwen38", "qwen36_moe", "gemma3", "gemma4", "qwen3_tts"]:
+    for name in args.model or ["qwen38", "qwen36_moe", "gemma3", "gemma4", "qwen3_tts"]:
         path = local_model(name)
         tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True, trust_remote_code=False)
         template = tokenizer.chat_template
@@ -38,6 +42,9 @@ def main():
             for generation in [False, True]:
                 for thinking in thinking_modes:
                     kwargs = {} if thinking is None else dict(enable_thinking=thinking)
+                    if "strftime_now" in str(template):
+                        # Llama 3.2 date son bloc système : date figée, injectée côté Rust.
+                        kwargs["date_string"] = "26 Jul 2024"
                     case = dict(name=f"{kind}/generation={generation}/thinking={thinking}",
                                 messages=messages, tools=definitions, add_generation_prompt=generation,
                                 enable_thinking=thinking)

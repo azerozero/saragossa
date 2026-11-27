@@ -10,7 +10,16 @@
 //! Les noms et layouts HF bruts sont conservés (le loader applique lui-même
 //! l'offset `1 + w` des normes et accepte le conv1d `[C, 1, K]`) : un shard de
 //! sortie par shard source, mêmes noms de fichiers, donc la tête MTP reste dans
-//! un seul shard et le loader la trouve sans sidecar. Un tenseur est lu par
+//! un seul shard et le loader la trouve sans sidecar.
+//!
+//! MoE (Qwen3.5/3.6-A3B) : les experts fusionnés `experts.gate_up_proj`
+//! `[E, 2I, H]` et `experts.down_proj` `[E, H, I]` deviennent les piles
+//! `switch_mlp.{gate,up,down}_proj` du loader (gate = lignes `0..I` de chaque
+//! expert, up = `I..2I`), comme le `sanitize` de mlx-lm. Une tête MTP MoE est
+//! recopiée en bf16 : le loader la quantifie lui-même à la charge (fc et
+//! attention u8, experts u4), seul format qu'il accepte pour elle. Avec
+//! `--keep-bf16`, les piles d'experts restent en bf16 : `--keep-bf16 .` donne
+//! ainsi une référence BF16 que le loader charge (KL). Un tenseur est lu par
 //! blocs bornés (~64 Mo), quantifié en parallèle par lignes et écrit à son
 //! offset : la mémoire ne dépend pas de la taille du modèle. Sortie
 //! déterministe, reprise par shard (journal), `--verify` rehache les shards.
@@ -176,11 +185,11 @@ fn is_router(name: &str) -> bool {
 /// Largeur de quantification d'un tenseur source, `None` pour une copie.
 fn width(tensor: &TensorRef, options: &HfConvertOptions) -> Result<Option<usize>> {
     let name = tensor.name.as_str();
-    // ponytail: les experts MoE HF devraient être empilés en `switch_mlp` pour
-    // le loader ; refus explicite tant que seul le dense est converti.
+    // Experts fusionnés traités par `fused_experts` ; experts un par un
+    // (format Qwen3-MoE) non pris en charge.
     if name.contains(".mlp.experts.") {
         return Err(InferError::Config(format!(
-            "experts MoE non pris en charge par `convert` : {name}"
+            "experts MoE hors format fusionné `gate_up_proj`/`down_proj` : {name}"
         )));
     }
     let matches = |list: &[String]| list.iter().any(|pattern| name.contains(pattern.as_str()));
@@ -212,6 +221,38 @@ fn width(tensor: &TensorRef, options: &HfConvertOptions) -> Result<Option<usize>
         8
     } else {
         options.bits
+    }))
+}
+
+/// Experts fusionnés du tronc → segments `(base switch_mlp, lignes)`.
+fn fused_experts(tensor: &TensorRef) -> Result<Option<Vec<(String, usize)>>> {
+    let name = tensor.name.as_str();
+    let (prefix, gate_up) = if let Some(prefix) = name.strip_suffix(".mlp.experts.gate_up_proj") {
+        (prefix, true)
+    } else if let Some(prefix) = name.strip_suffix(".mlp.experts.down_proj") {
+        (prefix, false)
+    } else {
+        return Ok(None);
+    };
+    let valid = tensor.dtype == Dtype::BF16
+        && matches!(tensor.shape[..], [experts, rows, cols]
+            if experts > 0 && rows > 0 && cols > 0 && cols % GROUP_SIZE == 0
+                && (!gate_up || rows % 2 == 0));
+    let &[_, rows, _] = &tensor.shape[..] else {
+        return Err(InferError::Dimension(name.to_string()));
+    };
+    if !valid {
+        return Err(InferError::Config(format!(
+            "experts fusionnés {name}: BF16 [E, R, C] avec C multiple de {GROUP_SIZE} attendu, \
+             reçu {:?} {:?}",
+            tensor.dtype, tensor.shape
+        )));
+    }
+    let base = |proj: &str| format!("{prefix}.mlp.switch_mlp.{proj}");
+    Ok(Some(if gate_up {
+        vec![(base("gate_proj"), rows / 2), (base("up_proj"), rows / 2)]
+    } else {
+        vec![(base("down_proj"), rows)]
     }))
 }
 
@@ -256,13 +297,60 @@ fn plan(
         })
         .collect::<Result<Vec<_>>>()?;
     let mtp = mtp_shard(refs);
+    let moe_mtp = refs
+        .iter()
+        .any(|t| is_mtp_key(&t.name) && t.name.ends_with(".mlp.experts.gate_up_proj"));
     for tensor in refs {
+        let is_mtp = is_mtp_key(&tensor.name);
         let shard = match mtp {
-            Some(shard) if is_mtp_key(&tensor.name) => shard,
+            Some(shard) if is_mtp => shard,
             _ => tensor.shard,
         };
         let plan = &mut plans[shard];
-        match width(tensor, options)? {
+        let fused = if is_mtp { None } else { fused_experts(tensor)? };
+        if let Some(outs) = fused {
+            let [experts, _, cols] = tensor.shape[..] else {
+                return Err(InferError::Dimension(tensor.name.clone()));
+            };
+            let keep = |list: &[String]| {
+                list.iter()
+                    .any(|pattern| tensor.name.contains(pattern.as_str()))
+            };
+            // 16 : piles recopiées en bf16 (référence BF16 chargeable).
+            let bits = if keep(&options.keep_bf16) {
+                16
+            } else if keep(&options.keep_8bit) {
+                8
+            } else {
+                options.bits
+            };
+            for (base, rows) in &outs {
+                if bits == 16 {
+                    plan.tensors.push(OutTensor {
+                        name: format!("{base}.weight"),
+                        dtype: "BF16".to_string(),
+                        shape: vec![experts, *rows, cols],
+                        nbytes: (experts * rows * cols * 2) as u64,
+                    });
+                } else {
+                    plan.tensors
+                        .extend(affine_outputs(base, &[experts], *rows, cols, bits));
+                }
+            }
+            plan.jobs.push(Job::Stacked {
+                src: tensor.clone(),
+                outs,
+                bits,
+                fit,
+            });
+            continue;
+        }
+        let width = if is_mtp && moe_mtp {
+            None
+        } else {
+            width(tensor, options)?
+        };
+        match width {
             Some(bits) => {
                 let [rows, cols] = tensor.shape[..] else {
                     return Err(InferError::Dimension(tensor.name.clone()));
@@ -320,6 +408,16 @@ fn output_config(
                     serde_json::json!({ "group_size": GROUP_SIZE, "bits": bits }),
                 );
             }
+            Job::Stacked { outs, bits, .. } if *bits != options.bits => {
+                for (base, _) in outs {
+                    let entry = if *bits == 16 {
+                        false.into()
+                    } else {
+                        serde_json::json!({ "group_size": GROUP_SIZE, "bits": bits })
+                    };
+                    quant.insert(base.clone(), entry);
+                }
+            }
             Job::Copy { src, out } if src.shape.len() == 2 && !is_vision(out) => {
                 if let Some(base) = out.strip_suffix(".weight") {
                     if options
@@ -347,7 +445,8 @@ fn output_config(
 ///
 /// # Errors
 ///
-/// Renvoie une erreur si la source est incohérente ou contient des experts MoE,
+/// Renvoie une erreur si la source est incohérente ou contient des experts MoE
+/// hors format fusionné,
 /// si la largeur n'est ni 4 ni 8, si l'identité diffère d'une reprise, si la
 /// destination est verrouillée, ou sur toute erreur de lecture, de
 /// quantification ou d'écriture.
@@ -412,7 +511,7 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
     let read = |path: &Path| std::fs::read(path).map_err(|e| io_err(path, e));
     let identity = Identity {
         format: FORMAT.to_string(),
-        source_index_sha256: sha256_bytes(&read(&source.dir.join("model.safetensors.index.json"))?),
+        source_index_sha256: sha256_bytes(&source.index),
         source_config_sha256: sha256_bytes(&read(&config_path)?),
         bits: options.bits,
         fit: if options.minmax {
@@ -583,7 +682,10 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
     let mut copied = 0;
     for job in plans.iter().flat_map(|plan| &plan.jobs) {
         match job {
-            Job::Affine { bits, .. } => *quantized.entry(*bits).or_insert(0) += 1,
+            Job::Stacked { bits: 16, .. } => copied += 1,
+            Job::Affine { bits, .. } | Job::Stacked { bits, .. } => {
+                *quantized.entry(*bits).or_insert(0) += 1;
+            }
             _ => copied += 1,
         }
     }

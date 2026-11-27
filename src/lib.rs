@@ -128,7 +128,7 @@ pub use memory_guard::{
     MemoryReservation, PurgeOutcome, PurgePressure, PurgeRegistry, PurgeReport,
 };
 #[cfg(all(target_os = "macos", feature = "metal"))]
-pub use metal_backend::MetalExecutor;
+pub use metal_backend::{set_scratch_engine, MetalExecutor};
 pub use mlp::{Activation, FeedForward, GatedMlp, MoeMlp, RouterScore};
 pub use norm::{layer_norm, rms_norm};
 #[cfg(all(target_os = "macos", feature = "metal"))]
@@ -147,7 +147,10 @@ pub use qwen_loader::{
     load_causal_decoder_for_metal, load_causal_decoder_for_metal_with_memory_guard,
 };
 pub use runtime::ForwardRuntime;
-pub use runtime_flags::{decode_max_tokens_per_s, set_decode_max_tokens_per_s};
+pub use runtime_flags::{
+    decode_max_tokens_per_s, gpu_share, parse_gpu_share, parse_max_tok_s,
+    set_decode_max_tokens_per_s, set_gpu_duty_share, set_gpu_share,
+};
 #[allow(deprecated)]
 pub use runtime_preset::apply_runtime_preset_for_model_dir;
 pub use runtime_preset::{

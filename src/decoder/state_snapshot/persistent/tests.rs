@@ -416,6 +416,162 @@ fn hybrid_recurrence_survives_background_publication() {
     );
 }
 
+/// Lance chaque phase dans un processus neuf : le cache SSD est global, et un
+/// redémarrage vide le cache RAM.
+fn run_phases(name: &str, ignored: bool, phases: &[&str]) {
+    let root = private_dir();
+    fs::write(root.path().join("weights"), b"synthetic weights identity").unwrap();
+    for phase in phases {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", name, "--nocapture"]);
+        if ignored {
+            command.arg("--ignored");
+        }
+        let output = command
+            .env("SSD_TEST_ROOT", root.path())
+            .env("SSD_TEST_PHASE", phase)
+            .env_remove("SARAGOSSA_RUST_STATE_SNAPSHOT")
+            .env_remove("RETI_RUST_STATE_SNAPSHOT")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{phase}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Phase courante et racine ; le SSD n'est configuré qu'hors phase `cold`.
+fn phase_root() -> Option<(String, PathBuf)> {
+    let phase = std::env::var("SSD_TEST_PHASE").ok()?;
+    let root = PathBuf::from(std::env::var_os("SSD_TEST_ROOT").unwrap());
+    if phase != "cold" {
+        configure_prefix_disk_cache(&root.join("cache"), 64 << 20, 0).unwrap();
+    }
+    Some((phase, root))
+}
+
+/// Octets du cache, de l'état final et de l'historique MTP, segments concaténés.
+fn mtp_state_bytes(
+    cache: &CausalDecoderCache,
+    final_state: &Tensor,
+    history: &LayerKvCache,
+) -> Vec<u8> {
+    let mut bytes = cache.position.to_le_bytes().to_vec();
+    for layer in cache.layers.iter().chain([history]) {
+        for rows in [&layer.keys, &layer.values] {
+            for (_, segment) in rows.snapshot_segments() {
+                bytes.extend_from_slice(segment);
+            }
+        }
+        for values in [&layer.linear.conv, &layer.linear.ssm] {
+            bytes.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+        }
+    }
+    bytes.extend(final_state.data().iter().flat_map(|v| v.to_le_bytes()));
+    bytes
+}
+
+/// Tour d'agent après redémarrage : le prompt N+1 prolonge le prompt N
+/// persisté sur SSD, sa clé exacte n'y est pas. Le préfixe relu puis prolongé
+/// doit donner les octets d'un prefill à froid.
+#[test]
+fn process_restart_mtp_extends_shorter_ssd_boundary() {
+    const NAME: &str =
+        "decoder::state_snapshot::persistent::tests::process_restart_mtp_extends_shorter_ssd_boundary";
+    let Some((phase, root)) = phase_root() else {
+        return run_phases(NAME, false, &["cold", "turn_n", "turn_n1"]);
+    };
+    let mut model = CausalDecoder::from_tensors(
+        crate::decoder::tests::test_weights(),
+        CausalDecoderConfig::default(),
+    )
+    .unwrap();
+    super::super::tests::with_tiny_mtp(&mut model).unwrap();
+    let model =
+        model.with_snapshot_sources(SnapshotSources::capture([root.join("weights").as_path()]));
+    let _scope = PrefixDiskSession::enter(Some("session"));
+    let turn: &[usize] = if phase == "turn_n" {
+        &[0, 1, 2, 0]
+    } else {
+        &[0, 1, 2, 0, 1, 2]
+    };
+    let (cache, final_state, history, reused) = model
+        .prefill_cache_state_with_mtp_history(turn, &mut |_| Ok(true))
+        .unwrap();
+    assert_eq!(history.len(), turn.len() - 1, "historique MTP complet");
+    let bytes = mtp_state_bytes(&cache, &final_state, &history);
+    match phase.as_str() {
+        "cold" => {
+            assert_eq!(reused, 0);
+            fs::write(root.join("cold.bin"), bytes).unwrap();
+        }
+        "turn_n" => {
+            wait(store().unwrap());
+            assert_eq!(reused, 0);
+        }
+        _ => {
+            assert_eq!(reused, 4, "frontière SSD du tour N relue");
+            assert!(
+                fs::read(root.join("cold.bin")).unwrap() == bytes,
+                "cache, état final ou historique MTP différent du froid"
+            );
+        }
+    }
+}
+
+/// Même tour d'agent sur Metal : ancre alignée relue du SSD après
+/// redémarrage, reprise MTP, sortie greedy identique au chemin à froid.
+#[cfg(all(target_os = "macos", feature = "metal"))]
+#[test]
+#[ignore = "device Metal requis, données synthétiques"]
+fn process_restart_mtp_aligned_resume_matches_cold_greedy_synthetic() {
+    const NAME: &str = "decoder::state_snapshot::persistent::tests::process_restart_mtp_aligned_resume_matches_cold_greedy_synthetic";
+    let Some((phase, root)) = phase_root() else {
+        return run_phases(NAME, true, &["cold", "turn_n", "turn_n1"]);
+    };
+    let (model, prompt) = crate::decoder::tests::mtp_seed_synthetic_model().unwrap();
+    let model =
+        model.with_snapshot_sources(SnapshotSources::capture([root.join("weights").as_path()]));
+    let _scope = PrefixDiskSession::enter(Some("session"));
+    let mut extended = prompt.clone();
+    extended.extend((0..100).map(|i| (i * 13 + 5) % 97));
+    let turn = if phase == "turn_n" {
+        &prompt
+    } else {
+        &extended
+    };
+    let output = crate::metal_backend::with_prefill_kv_layout_override(512, usize::MAX, || {
+        model.generate_greedy_mtp_batched_with_options(turn, 24, &GenerationOptions::default(), 2)
+    })
+    .unwrap();
+    let reused = output.stats.reused_prefix_tokens;
+    match phase.as_str() {
+        "cold" => {
+            assert_eq!(reused, 0);
+            fs::write(
+                root.join("cold.json"),
+                serde_json::to_vec(&output.tokens).unwrap(),
+            )
+            .unwrap();
+        }
+        "turn_n" => {
+            wait(store().unwrap());
+            assert_eq!(reused, 0);
+        }
+        _ => {
+            assert!(
+                reused > 0 && reused <= prompt.len(),
+                "frontière SSD du tour N attendue, reprise={reused}"
+            );
+            let cold: Vec<usize> =
+                serde_json::from_slice(&fs::read(root.join("cold.json")).unwrap()).unwrap();
+            assert_eq!(output.tokens, cold, "reprise SSD différente du froid");
+        }
+    }
+}
+
 #[test]
 fn process_restart_uses_persistent_hooks() {
     process_oracle(false);

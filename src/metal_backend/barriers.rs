@@ -195,6 +195,22 @@ impl Drop for EncoderEndGuard<'_> {
     }
 }
 
+/// Rapport cyclique `--gpu-share` : dort `busy * (100 / share - 1)` après un
+/// command buffer terminé. À 100 (défaut), un seul chargement atomique.
+pub(crate) fn duty_pause(command_buffer: &metal::CommandBufferRef) {
+    let share = crate::runtime_flags::gpu_share();
+    if share < 100 {
+        let busy = command_buffer_gpu_ns(command_buffer);
+        let mut left = crate::runtime_flags::duty_sleep_ns(busy, share).min(1_000_000_000);
+        // Tranches de 20 ms : repasser à 100 à chaud interrompt le sommeil.
+        while left > 0 && crate::runtime_flags::gpu_share() < 100 {
+            let slice = left.min(20_000_000);
+            std::thread::sleep(std::time::Duration::from_nanos(slice));
+            left -= slice;
+        }
+    }
+}
+
 /// `commit()` + `wait_until_completed()` + `ensure_completed`, centralisant le
 /// **point de synchronisation CPU↔GPU bloquant** (cf. plan : ~80-120/token).
 /// Sous `SARAGOSSA_RUST_DECODE_PROFILE`, compte le command buffer et chronomètre le
@@ -207,6 +223,7 @@ pub(crate) fn commit_and_wait(command_buffer: &metal::CommandBufferRef) -> Resul
         command_buffer.commit();
         command_buffer.wait_until_completed();
         record_commit_component(label, started.elapsed().as_secs_f64());
+        duty_pause(command_buffer);
         return ensure_completed(command_buffer.status());
     }
     if decode_profile_enabled() {
@@ -220,6 +237,7 @@ pub(crate) fn commit_and_wait(command_buffer: &metal::CommandBufferRef) -> Resul
         command_buffer.commit();
         command_buffer.wait_until_completed();
     }
+    duty_pause(command_buffer);
     ensure_completed(command_buffer.status())
 }
 
@@ -259,6 +277,7 @@ pub(crate) fn commit_and_wait_with(
     } else if decode_profile_enabled() {
         DECODE_PROFILE_WAIT_NS.fetch_add(wait_started.elapsed().as_nanos() as u64, Relaxed);
     }
+    duty_pause(command_buffer);
     ensure_completed(command_buffer.status())?;
     Ok(keep_going)
 }
@@ -355,5 +374,6 @@ pub(crate) fn wait_for_completion(command_buffer: &metal::CommandBufferRef) -> R
     } else {
         command_buffer.wait_until_completed();
     }
+    duty_pause(command_buffer);
     ensure_completed(command_buffer.status())
 }

@@ -19,6 +19,12 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
         print_run_help();
         return Ok(());
     };
+    if let Some(rate) = args.max_tok_s {
+        saragossa::set_decode_max_tokens_per_s(Some(rate));
+    }
+    if let Some(share) = args.gpu_share {
+        saragossa::set_gpu_share(share);
+    }
     let model_dir = hf_resolve::resolve_model(&args.model)?;
     eprintln!("saragossa run loading {}", model_dir.display());
     let mut generator = ReplModel::load(&model_dir, &args)?;
@@ -31,7 +37,7 @@ pub(super) fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
 
 fn print_run_help() {
     println!(
-        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N]\n\nCtrl-D quitte le REPL. HF_TOKEN ou HUGGING_FACE_HUB_TOKEN est requis pour les modèles gated."
+        "Usage: saragossa run <chemin|org/repo> [--backend cpu|metal] [--max-tokens N] [--temperature T] [--top-k N] [--top-p P] [--seed N] [--max-tok-s R] [--gpu-share 10-100]\n\nCtrl-D quitte le REPL. HF_TOKEN ou HUGGING_FACE_HUB_TOKEN est requis pour les modèles gated."
     );
 }
 
@@ -44,6 +50,8 @@ struct RunArgs {
     top_p: Option<f32>,
     top_k: Option<usize>,
     seed: u64,
+    max_tok_s: Option<f64>,
+    gpu_share: Option<u8>,
 }
 
 impl RunArgs {
@@ -55,6 +63,8 @@ impl RunArgs {
         let mut top_p: Option<f32> = None;
         let mut top_k: Option<usize> = None;
         let mut seed = 0_u64;
+        let mut max_tok_s = None;
+        let mut gpu_share = None;
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -77,6 +87,18 @@ impl RunArgs {
                 }
                 "--seed" => {
                     seed = next_value(&mut iter, "--seed")?.parse()?;
+                }
+                "--max-tok-s" => {
+                    max_tok_s = Some(
+                        saragossa::parse_max_tok_s(&next_value(&mut iter, "--max-tok-s")?)
+                            .map_err(cli_error)?,
+                    );
+                }
+                "--gpu-share" => {
+                    gpu_share = Some(
+                        saragossa::parse_gpu_share(&next_value(&mut iter, "--gpu-share")?)
+                            .map_err(cli_error)?,
+                    );
                 }
                 other if other.starts_with('-') => {
                     return Err(cli_error(format!("argument run inconnu: {other}")));
@@ -111,6 +133,8 @@ impl RunArgs {
             top_p,
             top_k,
             seed,
+            max_tok_s,
+            gpu_share,
         }))
     }
 }
@@ -343,6 +367,10 @@ fn encode_chat_prompt(
         render_gemma4_chat(messages, true, false)
     } else if assets.config.is_gemma() {
         render_gemma_chat(messages, true)?
+    } else if let Some(rendered) =
+        saragossa::chat_template::render_llama_or_mistral_chat(&assets.config, messages)
+    {
+        rendered?
     } else {
         saragossa::chat_template::render_qwen_chatml_profile(
             messages,

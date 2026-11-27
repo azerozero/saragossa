@@ -26,9 +26,10 @@ impl CausalDecoder {
                 "couche full-attn attendue (decode résident)".to_string(),
             ));
         };
-        if attention.q_norm.is_none() || attention.k_norm.is_none() {
+        // Sans QK-norm, les noyaux RoPE reçoivent `None` : rotation seule.
+        if attention.q_norm.is_some() != attention.k_norm.is_some() {
             return Err(InferError::Config(
-                "q_norm/k_norm manquant (decode résident)".to_string(),
+                "q_norm/k_norm dépareillés (decode résident)".to_string(),
             ));
         }
         if layer.post_attention_norm.is_none() {
@@ -117,8 +118,8 @@ impl CausalDecoder {
                     k_proj: &resolved.k_proj,
                     v_proj: &resolved.v_proj,
                     o_proj: &resolved.o_proj,
-                    q_norm: &resolved.q_norm,
-                    k_norm: &resolved.k_norm,
+                    q_norm: resolved.q_norm.as_deref(),
+                    k_norm: resolved.k_norm.as_deref(),
                     post_norm: &resolved.post_norm,
                     pre_feedforward_norm: resolved.pre_feedforward_norm.as_ref(),
                     post_feedforward_norm: resolved.post_feedforward_norm.as_ref(),
@@ -506,9 +507,9 @@ impl CausalDecoder {
                 "couche full-attn attendue (verify résident batché)".to_string(),
             ));
         };
-        if attention.q_norm.is_none() || attention.k_norm.is_none() {
+        if attention.q_norm.is_some() != attention.k_norm.is_some() {
             return Err(InferError::Config(
-                "q_norm/k_norm manquant (verify résident batché)".to_string(),
+                "q_norm/k_norm dépareillés (verify résident batché)".to_string(),
             ));
         }
         if !matches!(layer.mlp.as_ref(), Some(FeedForward::Dense(_))) {
@@ -543,8 +544,8 @@ impl CausalDecoder {
             k_proj: &resolved.k_proj,
             v_proj: &resolved.v_proj,
             o_proj: &resolved.o_proj,
-            q_norm: &resolved.q_norm,
-            k_norm: &resolved.k_norm,
+            q_norm: resolved.q_norm.as_deref(),
+            k_norm: resolved.k_norm.as_deref(),
             post_norm: &resolved.post_norm,
             pre_feedforward_norm: resolved.pre_feedforward_norm.as_ref(),
             post_feedforward_norm: resolved.post_feedforward_norm.as_ref(),

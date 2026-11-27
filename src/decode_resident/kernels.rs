@@ -1182,7 +1182,7 @@ inline void rms_norm_rope_head(
     device const float* weight,
     device T* out,
     uint4 dims,
-    float2 params,
+    float4 params,
     device const float* inv_freq,
     uint tid,
     uint head,
@@ -1194,32 +1194,40 @@ inline void rms_norm_rope_head(
     const float eps = params.x;
 
     const uint start = head * head_dim;
-    float sumsq = 0.0f;
-    for (uint col = tid; col < head_dim; col += 256u) {
-        const float value = input[start + col];
-        sumsq += value * value;
-    }
-    partial[tid] = sumsq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) { partial[tid] += partial[tid + stride]; }
+    // `params.z` non nul : tête sans QK-norm (Llama, Mistral), rotation seule,
+    // x × 1 × 1 exact ; `weight` est alors un tampon lié mais jamais utile.
+    // Drapeau uniforme sur le threadgroup : la réduction et ses barrières sont
+    // sautées d'un bloc, l'ordre arithmétique de la branche normée est inchangé.
+    const bool rope_only = params.z != 0.0f;
+    float inv_rms = 1.0f;
+    if (!rope_only) {
+        float sumsq = 0.0f;
+        for (uint col = tid; col < head_dim; col += 256u) {
+            const float value = input[start + col];
+            sumsq += value * value;
+        }
+        partial[tid] = sumsq;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) { partial[tid] += partial[tid + stride]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        inv_rms = rsqrt((partial[0] / float(head_dim)) + eps);
     }
-    const float inv_rms = rsqrt((partial[0] / float(head_dim)) + eps);
     const uint pairs = rope_dims / 2u;
     // Gemma proportional sépare les partenaires sur la tête entière ;
     // Qwen partiel conserve la demi-tranche rotative.
     const uint pair_offset = uint(params.y);
     for (uint col = tid; col < head_dim; col += 256u) {
-        float value = input[start + col] * inv_rms * weight[col];
+        float value = input[start + col] * inv_rms * (rope_only ? 1.0f : weight[col]);
         if (col < pairs || (col >= pair_offset && col < pair_offset + pairs)) {
             // Les fréquences hôte partagent les arrondis f32 de la référence CPU.
             const uint pair = (col < pair_offset) ? col : (col - pair_offset);
             const float angle = float(position) * inv_freq[pair];
             const float c = precise::cos(angle);
             const float s = precise::sin(angle);
-            const float first = input[start + pair] * inv_rms * weight[pair];
-            const float second = input[start + pair + pair_offset] * inv_rms * weight[pair + pair_offset];
+            const float first = input[start + pair] * inv_rms * (rope_only ? 1.0f : weight[pair]);
+            const float second = input[start + pair + pair_offset] * inv_rms * (rope_only ? 1.0f : weight[pair + pair_offset]);
             // Fast-math peut contracter first*c - second*s en FMA ;
             // cet écart est admis sous la porte CPU de 1e-5.
             value = (col < pair_offset) ? (first * c - second * s) : (first * s + second * c);
@@ -1233,7 +1241,7 @@ kernel void rms_norm_rope_heads_decode_f32(
     device const float* weight [[buffer(1)]],
     device float* out [[buffer(2)]],
     constant uint4& dims [[buffer(3)]],
-    constant float2& params [[buffer(4)]],
+    constant float4& params [[buffer(4)]],
     device const float* inv_freq [[buffer(5)]],
     uint tid [[thread_index_in_threadgroup]],
     uint head [[threadgroup_position_in_grid]]
@@ -1251,7 +1259,7 @@ inline void rope_append_kv(
     device const float* weight,
     device T* keys,
     uint4 dims,
-    float2 params,
+    float4 params,
     device const float* inv_freq,
     device const float* v_in,
     device T* values,
@@ -1271,7 +1279,7 @@ kernel void rms_norm_rope_append_kv_f32(
     device const float* weight [[buffer(1)]],
     device float* keys [[buffer(2)]],
     constant uint4& dims [[buffer(3)]],
-    constant float2& params [[buffer(4)]],
+    constant float4& params [[buffer(4)]],
     device const float* inv_freq [[buffer(5)]],
     device const float* v_in [[buffer(6)]],
     device float* values [[buffer(7)]],
@@ -1288,7 +1296,7 @@ kernel void rms_norm_rope_append_kv_bf16(
     device const float* weight [[buffer(1)]],
     device bfloat* keys [[buffer(2)]],
     constant uint4& dims [[buffer(3)]],
-    constant float2& params [[buffer(4)]],
+    constant float4& params [[buffer(4)]],
     device const float* inv_freq [[buffer(5)]],
     device const float* v_in [[buffer(6)]],
     device bfloat* values [[buffer(7)]],
@@ -1312,7 +1320,7 @@ inline void rope_qk_append_kv(
     device const float* k_weight,
     device T* keys,
     uint4 dims,
-    float2 params,
+    float4 params,
     device const float* inv_freq,
     device const float* v_in,
     device T* values,
@@ -1333,7 +1341,7 @@ kernel void rms_norm_rope_qk_append_kv_f32(
     device const float* k_weight [[buffer(1)]],
     device float* keys [[buffer(2)]],
     constant uint4& dims [[buffer(3)]],
-    constant float2& params [[buffer(4)]],
+    constant float4& params [[buffer(4)]],
     device const float* inv_freq [[buffer(5)]],
     device const float* v_in [[buffer(6)]],
     device float* values [[buffer(7)]],
@@ -1353,7 +1361,7 @@ kernel void rms_norm_rope_qk_append_kv_bf16(
     device const float* k_weight [[buffer(1)]],
     device bfloat* keys [[buffer(2)]],
     constant uint4& dims [[buffer(3)]],
-    constant float2& params [[buffer(4)]],
+    constant float4& params [[buffer(4)]],
     device const float* inv_freq [[buffer(5)]],
     device const float* v_in [[buffer(6)]],
     device bfloat* values [[buffer(7)]],
