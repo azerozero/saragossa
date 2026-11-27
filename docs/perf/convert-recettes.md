@@ -32,9 +32,10 @@ Il est cité tel quel :
 - Qualité : `chat_kl.py eval --json` sur les 24 prompts de sélection
   (`tools/quant/sets/selection.json`), 4 608 positions. `paired.py` compare chaque variante à (a) :
   IC 95 % par bootstrap, 10 000 tirages, graine 0.
-- Budget : `audit_bytes.py`, octets `language_model.*` / 26 895 998 464 paramètres.
-- Débit : `bench/ab.py`, ordre ABBA, 4 blocs, 8 passages par côté. 256 tokens greedy, prompts de
-  1 024 et 16 384 tokens, caches de préfixe coupés. Les passes rejetées par le harnais
+- Budget : `audit_bytes.py`, octets `language_model.*`, `model.language_model.*` et `lm_head.*`
+  / 26 895 998 464 paramètres.
+- Débit : `bench/ab.py`, ordre ABBA, 4 blocs, 8 passages par côté. 256 tokens greedy, prompts demandés de
+  1 024 et 16 384 tokens (1 036 et 16 396 tokens effectifs), caches de préfixe coupés. Les passes rejetées par le harnais
   (bridage thermique, échec) ont été relancées. Versions retenues : `ab-d-ar-16384-r2`,
   `ab-d-mtp-16384-r3`, `ab-d-dflash-16384-r5`, les autres en première passe.
 
@@ -72,27 +73,31 @@ est sous 0,97 : le verdict ne dépend pas de cette lecture. Le prefill de (b) es
 
 - (b) passe en AR, mais échoue en MTP (0,943 / 0,963) et en DFlash (0,938 / 0,966). Le critère
   n'est pas rempli : **(a) reste le défaut**. `--imatrix` reste une option.
-- (c) n'a pas de mesure de débit. Sa KL est moins bonne que celle de (b), donc il ne serait pas
-  retenu même en passant le débit.
-- (d), qui n'est qu'un repère, perd 0,84 à 0,94 du débit decode selon le mode.
-- La validation aveugle (`tools/quant/sets/validation.json`) n'a pas été ouverte, puisqu'aucune
-  variante ne remplace (a).
+- (c) n'a pas de mesure de débit. Le journal du 23 nov. applique le critère en deux temps :
+  meilleure KL d'abord, puis la condition de débit pour ce seul candidat. Dans cette lecture, (c)
+  n'est pas candidat. Si on lit « meilleure KL parmi les variantes qui passent le débit », (c)
+  redevient candidat après l'échec de (b), et son débit reste à mesurer : rien ne le disqualifie.
+- (d), qui n'est qu'un repère, conserve 0,84 à 0,94 fois le débit decode de (a) selon le mode
+  (perte de 6 à 16 %).
+- Dérogation au protocole : la validation aveugle (`tools/quant/sets/validation.json`) n'a pas été
+  ouverte. Le journal prévoyait de l'ouvrir pour la variante retenue, sans exception si celle-ci est
+  (a). Cette dérogation ne change pas l'échec de (b) au seuil de débit.
 
 ## Recette recommandée
 
 - Par défaut, quand le débit spéculatif (MTP, DFlash) compte : `saragossa convert` sans option.
 - Quand la qualité prime sur la vitesse spéculative : `saragossa convert --imatrix FICHIER`, avec
   une imatrix de `tools/quant/imatrix.py` calculée sur un corpus disjoint des prompts
-  d'évaluation. Gain mesuré à budget et débit AR égaux : Qwen3.8-27B 0,0323 → 0,0220 en KL.
+  d'évaluation. Gain mesuré à budget égal, sans différence de débit AR détectée : Qwen3.8-27B 0,0323 → 0,0220 en KL.
   Mistral-7B v0.3 u4 : 0,188 → 0,126 (`kl_mlx.py`, ablation dans
   [`tools/quant/README.md`](../../tools/quant/README.md)).
-- `--bits-for motif=N,…` sert aux recettes mixtes comme (d). Il sort du budget de 4,6 bpw et coûte
-  du débit.
+- `--bits-for motif=N,…` sert aux recettes mixtes. La recette (d) mesurée ici sort du budget de
+  4,6 bpw et coûte du débit. D'autres choix de largeurs n'ont pas été mesurés.
 
 ## Limites
 
 - La perte MTP/DFlash de (b) vient probablement de l'acceptance des drafts, plus basse avec des
-  poids cibles différents, puisque le débit AR est identique. **Non vérifié** : l'acceptance n'a
+  poids cibles différents, puisqu'aucune différence de débit AR n'est détectée. **Non vérifié** : l'acceptance n'a
   pas été extraite des passes.
 - (c) GPTQ n'a pas été mesuré en débit.
 - Un seul modèle cible pour le critère (Qwen3.8-27B), un prompt par contexte dans le harnais de

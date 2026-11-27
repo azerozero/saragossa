@@ -41,7 +41,7 @@ fit pondéré est gardé en erreur pondérée. L'embedding et la tête MTP reste
 en fit uniforme, comme les piles d'experts MoE fusionnées, que `--bits-for`
 n'atteint pas non plus ; un autre linéaire sans vecteur est refusé. Des poids tous
 égaux redonnent exactement la sortie sans imatrix. `--bits-for motif=N,…`
-(2 à 8 bits, première correspondance) sert aux recettes mixtes. Recettes
+(2, 3, 4, 5, 6 ou 8 bits, première correspondance) sert aux recettes mixtes. Recettes
 mesurées : [docs/perf/convert-recettes.md](../../docs/perf/convert-recettes.md).
 Corpus de calibration publiable : `calib_corpus.py` (splits train de
 no_robots et aya_dataset), disjonction contrôlée par `calib_disjoint.py`.
