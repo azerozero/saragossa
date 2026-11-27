@@ -1115,7 +1115,8 @@ pub(crate) fn write_shard(
                     let bytes = source.read(src, expert * expert_bytes, take * expert_bytes)?;
                     let data = bytes_to_dense_f32(&bytes, src.dtype, &src.name)?;
                     // Lignes indépendantes : le bloc entier se quantifie d'un coup.
-                    let block = quantize_block(&data, cols, *bits, *fit)?;
+                    // NOTE: pas d'imatrix par expert, les piles restent en fit uniforme.
+                    let block = quantize_block(&data, cols, *bits, *fit, None)?;
                     peak.sample();
                     for local in 0..take {
                         let mut row = local * rows;
