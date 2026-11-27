@@ -168,6 +168,46 @@ impl Controller {
     }
 }
 
+/// Un tour du thread : `measure` (relevé `ioreg`) n'est appelé qu'en cédage
+/// dynamique, puis l'état bascule ou non. Renvoie `Some(état)` sur bascule ;
+/// la fenêtre repart alors de la part de départ.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn tick(
+    config: AutoYield,
+    controller: &mut Controller,
+    since_input: Duration,
+    measure: impl FnOnce() -> Option<f64>,
+) -> Option<bool> {
+    if config.dynamic && lock().yielding {
+        let external = measure();
+        let before = controller.share;
+        let share = controller.push(external);
+        if share != before {
+            match external {
+                Some(external) => eprintln!(
+                    "saragossa serve auto-yield: part {share} % (GPU externe {external:.0} %)"
+                ),
+                None => eprintln!(
+                    "saragossa serve auto-yield: part {share} % (mesure GPU indisponible)"
+                ),
+            }
+        }
+    }
+    let flipped = step(config, controller.share, since_input);
+    if let Some(yielding) = flipped {
+        *controller = Controller::new(config.share);
+        eprintln!(
+            "saragossa serve auto-yield: {}",
+            if yielding {
+                "cède le GPU"
+            } else {
+                "part configurée rendue"
+            }
+        );
+    }
+    flipped
+}
+
 /// Lance le thread de cédage (macOS seulement).
 pub(super) fn spawn(config: AutoYield) {
     #[cfg(target_os = "macos")]
@@ -186,35 +226,13 @@ pub(super) fn spawn(config: AutoYield) {
             .name("auto-yield".into())
             .spawn(move || {
                 let mut controller = Controller::new(config.share);
-                let mut sampler = None;
+                let mut sampler: Option<Sampler> = None;
                 loop {
-                    if lock().yielding && config.dynamic {
-                        let external = sampler.get_or_insert_with(Sampler::new).external();
-                        let before = controller.share;
-                        let share = controller.push(external);
-                        if share != before {
-                            match external {
-                                Some(external) => eprintln!(
-                                    "saragossa serve auto-yield: part {share} % (GPU externe {external:.0} %)"
-                                ),
-                                None => eprintln!(
-                                    "saragossa serve auto-yield: part {share} % (mesure GPU indisponible)"
-                                ),
-                            }
-                        }
-                    }
-                    if let Some(yielding) = step(config, controller.share, since_input()) {
-                        // Nouvelle période : la fenêtre repart de la part de départ.
-                        controller = Controller::new(config.share);
+                    let flipped = tick(config, &mut controller, since_input(), || {
+                        sampler.get_or_insert_with(Sampler::new).external()
+                    });
+                    if flipped.is_some() {
                         sampler = None;
-                        eprintln!(
-                            "saragossa serve auto-yield: {}",
-                            if yielding {
-                                "cède le GPU"
-                            } else {
-                                "part configurée rendue"
-                            }
-                        );
                     }
                     std::thread::sleep(POLL);
                 }
@@ -245,13 +263,17 @@ fn since_input() -> Duration {
     Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
 }
 
-/// Utilisation GPU des autres processus entre deux relevés `ioreg`.
 /// Temps GPU cumulé (ns) par client `AGXDeviceUserClient` : (pid, id de registre).
 type ClientTimes = HashMap<(u32, u64), u64>;
 
 /// Délai maximal d'un relevé `ioreg` (une vingtaine de ms d'ordinaire).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const IOREG_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Intervalle minimal entre deux relevés comparés : en deçà, la division par
+/// un temps quasi nul amplifierait le bruit jusqu'à 100 %.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Utilisation GPU des autres processus entre deux relevés `ioreg`.
 #[cfg(target_os = "macos")]
@@ -262,24 +284,32 @@ struct Sampler {
 #[cfg(target_os = "macos")]
 impl Sampler {
     fn new() -> Self {
-        Self {
-            last: gpu_time_snapshot().map(|times| (times, std::time::Instant::now())),
-        }
+        Self { last: None }
     }
 
-    /// `None` tant qu'il manque un relevé de référence ou si `ioreg` échoue.
+    /// `None` si `ioreg` échoue, sans relevé de référence ou si la référence
+    /// date de moins de [`MIN_SAMPLE_INTERVAL`] (elle est alors gardée). Les
+    /// deux relevés sont datés au même point, après `ioreg`.
     fn external(&mut self) -> Option<f64> {
+        let Some(current) = gpu_time_snapshot() else {
+            self.last = None;
+            return None;
+        };
         let now = std::time::Instant::now();
-        let current = gpu_time_snapshot();
-        let previous = std::mem::replace(&mut self.last, current.clone().map(|t| (t, now)));
-        let ((previous, at), current) = (previous?, current?);
-        let elapsed = now.duration_since(at).as_nanos() as f64;
-        Some(external_percent(
-            &previous,
+        let Some((previous, at)) = &self.last else {
+            self.last = Some((current, now));
+            return None;
+        };
+        let external = external_percent(
+            previous,
             &current,
             std::process::id(),
-            elapsed,
-        ))
+            now.duration_since(*at),
+        );
+        if external.is_some() {
+            self.last = Some((current, now));
+        }
+        external
     }
 }
 
@@ -291,28 +321,42 @@ fn gpu_time_snapshot() -> Option<ClientTimes> {
     gpu_time_by_client(&String::from_utf8_lossy(&stdout))
 }
 
-/// Sortie standard d'une commande réussie dans le délai, sinon `None` (la
-/// commande est alors tuée). Un thread lit la sortie pour qu'un tube plein ne
-/// bloque pas l'enfant.
+/// Sortie standard d'une commande réussie dans le délai, sinon `None`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn output_within(mut command: std::process::Command, timeout: Duration) -> Option<Vec<u8>> {
-    use std::io::Read;
     use std::process::Stdio;
-    let mut child = command
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let Some(mut stdout) = child.stdout.take() else {
+    collect_within(child, timeout)
+}
+
+/// Attend `child` au plus `timeout` ; au-delà, ou si le thread lecteur ne
+/// démarre pas, l'enfant est tué puis récolté. Le thread lit la sortie pour
+/// qu'un tube plein ne bloque pas l'enfant.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn collect_within(mut child: std::process::Child, timeout: Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let abort = |child: &mut std::process::Child| {
         let _ = child.kill();
         let _ = child.wait();
-        return None;
+        None
     };
-    let reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        stdout.read_to_end(&mut buffer).map(|_| buffer)
-    });
+    let Some(mut stdout) = child.stdout.take() else {
+        return abort(&mut child);
+    };
+    let reader = std::thread::Builder::new()
+        .name("auto-yield-ioreg".into())
+        .spawn(move || {
+            let mut buffer = Vec::new();
+            stdout.read_to_end(&mut buffer).map(|_| buffer)
+        });
+    let Ok(reader) = reader else {
+        return abort(&mut child);
+    };
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -323,12 +367,8 @@ fn output_within(mut command: std::process::Command, timeout: Duration) -> Optio
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            _ => {
-                // NOTE: le thread lecteur se termine à la fermeture du tube.
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+            // NOTE: le thread lecteur se termine à la fermeture du tube.
+            _ => return abort(&mut child),
         }
     }
 }
@@ -372,8 +412,9 @@ fn gpu_time_by_client(ioreg: &str) -> Option<ClientTimes> {
     (!times.is_empty()).then_some(times)
 }
 
-/// Part du temps écoulé (`elapsed_ns`) passée sur le GPU par les processus
-/// autres que `own_pid`, bornée à 0..=100. Les deltas se prennent client par
+/// Part du temps écoulé (`elapsed`) passée sur le GPU par les processus
+/// autres que `own_pid`, bornée à 0..=100 ; `None` sous
+/// [`MIN_SAMPLE_INTERVAL`]. Les deltas se prennent client par
 /// client présent aux deux relevés : un client disparu ou apparu entre-temps
 /// (cumul au passé inconnu) ne fausse pas ceux qui restent.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -381,8 +422,11 @@ fn external_percent(
     previous: &ClientTimes,
     current: &ClientTimes,
     own_pid: u32,
-    elapsed_ns: f64,
-) -> f64 {
+    elapsed: Duration,
+) -> Option<f64> {
+    if elapsed < MIN_SAMPLE_INTERVAL {
+        return None;
+    }
     let busy: u64 = current
         .iter()
         .filter(|((pid, _), _)| *pid != own_pid)
@@ -392,7 +436,7 @@ fn external_percent(
                 .map(|before| now.saturating_sub(*before))
         })
         .sum();
-    (busy as f64 * 100.0 / elapsed_ns.max(1.0)).clamp(0.0, 100.0)
+    Some((busy as f64 * 100.0 / elapsed.as_nanos() as f64).clamp(0.0, 100.0))
 }
 
 #[cfg(test)]
@@ -527,15 +571,26 @@ mod tests {
         after.insert((11, 0x4e), 5_000_000_000);
         // 0,6 s de GPU pour le jeu en 1 s ; le moteur (pid 9) et le nouveau
         // client ne comptent pas.
-        let pct = external_percent(&before, &after, 9, 1e9);
+        let second = Duration::from_secs(1);
+        let pct = external_percent(&before, &after, 9, second).expect("intervalle");
         assert!((pct - 60.0).abs() < 1e-9, "{pct}");
         after.insert((7, 0x1a), 120 + 3_000_000_000);
-        assert_eq!(external_percent(&before, &after, 9, 1e9), 100.0, "borné");
         assert_eq!(
-            external_percent(&after, &before, 9, 1e9),
-            0.0,
+            external_percent(&before, &after, 9, second),
+            Some(100.0),
+            "borné"
+        );
+        assert_eq!(
+            external_percent(&after, &before, 9, second),
+            Some(0.0),
             "cumul remis à zéro"
         );
+        // Premier intervalle quasi nul : pas de mesure plutôt que 100 %.
+        assert_eq!(
+            external_percent(&before, &after, 9, Duration::from_millis(1)),
+            None
+        );
+        assert!(external_percent(&before, &after, 9, MIN_SAMPLE_INTERVAL).is_some());
     }
 
     #[test]
@@ -545,7 +600,7 @@ mod tests {
         let s = 1_000_000_000_u64;
         let before = HashMap::from([((7, 1), 10 * s), ((7, 2), s)]);
         let after = HashMap::from([((7, 2), s * 18 / 10)]);
-        let pct = external_percent(&before, &after, 9, 1e9);
+        let pct = external_percent(&before, &after, 9, Duration::from_secs(1)).expect("intervalle");
         assert!((pct - 80.0).abs() < 1e-9, "{pct}");
     }
 
@@ -558,23 +613,89 @@ mod tests {
     }
 
     #[test]
-    fn slow_collector_is_killed_at_the_deadline() {
+    fn slow_collector_is_killed_and_reaped_at_the_deadline() {
+        use std::process::{Command, Stdio};
+        let child = Command::new("/bin/sleep")
+            .arg("5")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("sleep");
+        let pid = child.id().to_string();
         let started = std::time::Instant::now();
-        let mut sleep = std::process::Command::new("/bin/sleep");
-        sleep.arg("5");
-        assert_eq!(output_within(sleep, Duration::from_millis(100)), None);
+        assert_eq!(collect_within(child, Duration::from_millis(100)), None);
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "{:?}",
-            started.elapsed()
+            (Duration::from_millis(100)..Duration::from_millis(400)).contains(&elapsed),
+            "{elapsed:?}"
         );
-        let mut echo = std::process::Command::new("/bin/echo");
+        // Récolté : ni vivant ni zombie, `ps` ne le trouve plus.
+        let ps = Command::new("/bin/ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .expect("ps");
+        assert!(
+            !ps.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ps.stdout)
+        );
+        assert!(ps.stdout.is_empty());
+
+        let mut echo = Command::new("/bin/echo");
         echo.arg("ok");
         assert_eq!(
             output_within(echo, Duration::from_secs(5)).as_deref(),
             Some(&b"ok\n"[..])
         );
-        let failing = std::process::Command::new("/usr/bin/false");
-        assert_eq!(output_within(failing, Duration::from_secs(5)), None);
+        assert_eq!(
+            output_within(Command::new("/usr/bin/false"), Duration::from_secs(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn fixed_mode_never_measures() {
+        let _serial = super::super::reload::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                *lock() = State {
+                    configured: 100,
+                    low: 100,
+                    yielding: false,
+                };
+                saragossa::set_gpu_duty_share(100);
+            }
+        }
+        let _reset = Reset;
+        let fixed = AutoYield {
+            share: 25,
+            idle: Duration::from_secs(60),
+            dynamic: false,
+        };
+        let calls = std::cell::Cell::new(0);
+        let measure = || {
+            calls.set(calls.get() + 1);
+            Some(0.0)
+        };
+        let mut controller = Controller::new(25);
+        let active = Duration::ZERO;
+        assert_eq!(tick(fixed, &mut controller, active, measure), Some(true));
+        for _ in 0..WINDOW + 2 {
+            assert_eq!(tick(fixed, &mut controller, active, measure), None);
+        }
+        assert_eq!(calls.get(), 0, "ioreg lancé en mode fixe");
+        assert_eq!(saragossa::gpu_share(), 25);
+        // En dynamique, la même boucle mesure à chaque tour de cédage.
+        let dynamic = AutoYield {
+            dynamic: true,
+            ..fixed
+        };
+        for _ in 0..WINDOW {
+            tick(dynamic, &mut controller, active, measure);
+        }
+        assert_eq!(calls.get(), WINDOW);
+        assert_eq!(saragossa::gpu_share(), 50, "GPU libre");
     }
 }
