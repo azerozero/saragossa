@@ -5,8 +5,8 @@
 //! nommés comme les modules mlx-lm (`language_model.model.layers.N.….q_proj`,
 //! `language_model.lm_head`). Par groupe, la procédure est celle de
 //! [`super::least_squares`] avec l'erreur `Σ_j E[x_j²]·(w_j − ŵ_j)²` : min-max
-//! bf16, grille MLX, 8 alternances codes ↔ équations normales pondérées, et le
-//! meilleur des trois en erreur pondérée est gardé. Avec des poids tous égaux
+//! bf16, grille MLX, 8 alternances codes ↔ équations normales pondérées, grille
+//! à zéro, et le meilleur des quatre en erreur pondérée est gardé. Avec des poids tous égaux
 //! à 1, chaque opération coïncide au bit près avec la version non pondérée
 //! (multiplications par 1, même ordre de sommation).
 
@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use safetensors::{Dtype, SafeTensors};
 
-use super::least_squares::{codes, mlx_params};
+use super::least_squares::{codes, mlx_params, zero_grid};
 use super::plan::io_err;
 use super::sha256_bytes;
 use crate::assets::is_mtp_key;
@@ -107,7 +107,7 @@ impl Imatrix {
 }
 
 /// Lit le code `lane` d'un groupe emballé en flux little-endian.
-fn read_code(words: &[u32], lane: usize, bits: usize) -> u32 {
+pub(super) fn read_code(words: &[u32], lane: usize, bits: usize) -> u32 {
     let mask = (1_u32 << bits) - 1;
     let (word, shift) = ((lane * bits) / 32, (lane * bits) % 32);
     let mut code = words[word] >> shift;
@@ -253,6 +253,11 @@ pub(crate) fn quantize_affine_wls_bf16(
             &q,
             &mut best_q,
         );
+        let starts = [(s, b), (f64::from(ms), f64::from(mb))];
+        let cand = zero_grid(values, w, starts, levels, &mut q, |s, b, q| {
+            candidate(values, w, s, b, levels, q)
+        });
+        keep(cand, &q, &mut best_q);
         if best != minmax {
             scales[index] = best.0;
             biases[index] = best.1;

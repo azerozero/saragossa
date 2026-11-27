@@ -40,9 +40,36 @@ Avec `--imatrix FICHIER` (format de `imatrix.py`), les moindres carrés minimise
 fit pondéré est gardé en erreur pondérée. L'embedding et la tête MTP restent
 en fit uniforme, comme les piles d'experts MoE fusionnées, que `--bits-for`
 n'atteint pas non plus ; un autre linéaire sans vecteur est refusé. Des poids tous
-égaux redonnent exactement la sortie sans imatrix. `--bits-for motif=N,…`
+égaux redonnent exactement le fit non pondéré, mais pas la conversion sans
+imatrix (importance fictive ci-dessous). `--bits-for motif=N,…`
 (2, 3, 4, 5, 6 ou 8 bits, première correspondance) sert aux recettes mixtes. Recettes
 mesurées : [docs/perf/convert-recettes.md](../../docs/perf/convert-recettes.md).
+Chaque groupe essaie aussi une « grille à zéro » (biais −k·s, k entier), gardée
+seulement si elle réduit l'erreur. Sans imatrix, les colonnes dont |w| moyen
+est sous 0,1 fois la médiane des colonnes (au plus 16 par bloc de lignes)
+reçoivent une importance fictive de 1e4 : signature poids seuls des
+super-activations à poids quasi nuls. `--audit-report FICHIER.json` liste, par
+tenseur, les colonnes qui portent plus de 10 % de l'erreur `E[x²]·δ²` (avec
+imatrix) et ces petites colonnes (classées sur le tenseur entier, pas par bloc).
+
+Limites de l'importance fictive :
+
+- elle n'existe que sans `--imatrix` : une imatrix de 1 donne le fit uniforme,
+  donc une autre sortie que sans imatrix ; les tenseurs exemptés par
+  `--imatrix` (embedding, MTP) restent en fit uniforme ;
+- elle est décidée par bloc de lecture (2²⁴ éléments, soit
+  `2²⁴ / colonnes` lignes), seulement sur un bloc d'au moins 256 lignes et
+  1 à 16 petites colonnes : la protection dépend donc du découpage. Un dernier
+  bloc de moins de 256 lignes n'en reçoit pas, et au-delà de 65 536 colonnes
+  aucun bloc n'atteint 256 lignes.
+
+Ablation Mistral-7B v0.3 u4 (KL moyen contre bf16, `kl_mlx.py`) : base 0,188,
+grille à zéro seule 0,1887, grille + importance fictive 0,169, `--imatrix`
+0,120 (0,126 avant ce changement). NOTE: le 0,120 avec imatrix est à refaire
+avec le code final (fusion de la branche imatrix à jour) ; non remesuré.
+Sans imatrix, le gain vient donc de l'importance fictive. Avec imatrix, la
+mesure ne sépare pas la part de la grille à zéro. Qwen3.8-27B : 0,0323 → 0,0318 (IC95 contient zéro).
+
 Corpus de calibration publiable : `calib_corpus.py` (splits train de
 no_robots et aya_dataset), disjonction contrôlée par `calib_disjoint.py`.
 

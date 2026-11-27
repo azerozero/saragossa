@@ -8,7 +8,9 @@
 //! 2. la grille de `mx.quantize` (`affine_quantize`,
 //!    `mlx/backend/metal/kernels/quantized.h`), paramètres arrondis bf16 et codes
 //!    recalculés contre eux, comme le `e0` de `opt_quant.fit` ;
-//! 3. 8 alternances codes ↔ équations normales partant de (2), arrondies bf16.
+//! 3. 8 alternances codes ↔ équations normales partant de (2), arrondies bf16 ;
+//! 4. la « grille à zéro » de [`zero_grid`] : biais −k·s, k entier, ajusté
+//!    depuis (2) et (3), retenu seulement s'il réduit l'erreur.
 //!
 //! Le résultat n'est donc jamais pire que l'un ou l'autre min-max. Écarts
 //! connus avec `opt_quant.py` : équations normales en f64 (f32 chez MLX) et
@@ -65,6 +67,78 @@ pub(super) fn mlx_params(values: &[f32], levels: f32) -> (f32, f32) {
     }
 }
 
+/// Arrondit `x` à `p` bits significatifs (1 ≤ p ≤ 24), au plus proche.
+fn round_significand(x: f32, p: u32) -> f32 {
+    let drop = 24 - p;
+    if drop == 0 {
+        return x;
+    }
+    f32::from_bits((x.to_bits() + (1 << (drop - 1))) & !((1 << drop) - 1))
+}
+
+/// Candidat « grille à zéro » : biais contraint à −k·s (k entier), pour que
+/// le code k restitue 0. Une colonne d'entrée à poids quasi nuls mais à
+/// super-activation (Mistral-7B v0.3, `layers.1.mlp.down_proj`, colonne 7310)
+/// paie sinon chaque décalage du biais à `E[x²]` ≈ 2290 fois son poids.
+///
+/// Pour chaque k tiré des départs `starts` (`round(−b/s)`), l'échelle est
+/// ajustée aux moindres carrés (pondérés par `weight`) à k fixé, puis deux
+/// arrondis sont évalués par `eval` : échelle bf16 et biais −k·s arrondi bf16
+/// (zéro à un demi-ulp près), ou échelle tronquée pour que −k·s soit exact en
+/// bf16 (zéro exact). Renvoie le meilleur selon `eval`, codes dans `q`.
+pub(super) fn zero_grid(
+    values: &[f32],
+    weight: Option<&[f64]>,
+    starts: [(f64, f64); 2],
+    levels: f64,
+    q: &mut [u32],
+    mut eval: impl FnMut(f32, f32, &mut [u32]) -> Option<(u16, u16, f64)>,
+) -> Option<(u16, u16, f64)> {
+    let mut best: Option<((f32, f32), f64)> = None;
+    let mut seen = [f64::NAN; 2];
+    for (slot, (s0, b0)) in starts.into_iter().enumerate() {
+        if s0 == 0.0 || !s0.is_finite() || !b0.is_finite() {
+            continue;
+        }
+        let k = (-b0 / s0).round().clamp(0.0, levels);
+        if seen.contains(&k) {
+            continue;
+        }
+        seen[slot] = k;
+        let mut s = s0;
+        for _ in 0..ITERS {
+            codes(values, s, -k * s, levels, q);
+            let (mut num, mut den) = (0.0, 0.0);
+            for (j, (&code, &value)) in q.iter().zip(values).enumerate() {
+                let (a, d) = (weight.map_or(1.0, |w| w[j]), f64::from(code) - k);
+                num += a * d * f64::from(value);
+                den += a * d * d;
+            }
+            let s1 = num / den;
+            if den > 0.0 && s1 != 0.0 && s1.is_finite() {
+                s = s1;
+            }
+        }
+        let s = s as f32;
+        // Zéro exact : k = 2^t·impair ; échelle à 8 − bits(impair) bits
+        // significatifs (au moins 1 : une puissance de deux décale seulement
+        // l'impair, même à 8 bits), produit k·s exact sur les 8 bits du bf16.
+        let odd = (k as u32) >> (k as u32).trailing_zeros().min(31);
+        let p = 8_u32.saturating_sub(32 - odd.leading_zeros()).max(1);
+        let exact = round_significand(s, p);
+        for scale in [bf16_value(bf16_bits(s)), exact] {
+            let bias = -(k as f32 * scale);
+            if let Some(cand) = eval(scale, bias, q) {
+                if best.is_none_or(|(_, e)| cand.2 < e) {
+                    best = Some(((scale, bias), cand.2));
+                }
+            }
+        }
+    }
+    let ((scale, bias), _) = best?;
+    eval(scale, bias, q)
+}
+
 /// Paramètres bf16 finis `(bits scale, bits biais, codes, erreur)` d'un groupe.
 fn candidate(
     values: &[f32],
@@ -98,6 +172,22 @@ pub(crate) fn quantize_affine_ls_bf16(
     packed: &mut [u32],
     scales: &mut [u16],
     biases: &mut [u16],
+) -> Result<QuantError> {
+    ls_impl(data, cols, group_size, bits, packed, scales, biases, true)
+}
+
+/// Corps de [`quantize_affine_ls_bf16`] ; `zero = false` retire le candidat
+/// (4), pour comparer au bit près dans les tests.
+#[allow(clippy::too_many_arguments)]
+fn ls_impl(
+    data: &[f32],
+    cols: usize,
+    group_size: usize,
+    bits: usize,
+    packed: &mut [u32],
+    scales: &mut [u16],
+    biases: &mut [u16],
+    zero: bool,
 ) -> Result<QuantError> {
     if !matches!(bits, 4 | 8) {
         return Err(InferError::Config(format!(
@@ -169,6 +259,13 @@ pub(crate) fn quantize_affine_ls_bf16(
             &q,
             &mut best_q,
         );
+        if zero {
+            let starts = [(s, b), (f64::from(ms), f64::from(mb))];
+            let cand = zero_grid(values, None, starts, levels, &mut q, |s, b, q| {
+                candidate(values, s, b, levels, q)
+            });
+            keep(cand, &q, &mut best_q);
+        }
         if best != minmax {
             scales[index] = best.0;
             biases[index] = best.1;
@@ -343,6 +440,68 @@ mod tests {
                 .map(|(&v, &x)| f64::from(v - x).powi(2))
                 .sum();
             assert!((total - ls.sum_sq_err).abs() <= 1e-9 * total.max(1.0));
+        }
+    }
+
+    /// Sans grille à zéro retenue, chaque groupe sort identique au bit près ;
+    /// quand elle l'est, l'erreur baisse strictement et un code restitue 0
+    /// (au demi-ulp bf16 du biais près, exactement sur la branche « zéro
+    /// exact », qui doit être retenue au moins une fois).
+    #[test]
+    fn zero_grid_changes_only_groups_it_improves() {
+        let data: Vec<f32> = (0..64 * 256)
+            .map(|i| ((i as f32 * 0.37).sin() * 3.0).powi(3) + (i % 7) as f32 * 0.01)
+            .collect();
+        for bits in [4, 8] {
+            let run = |zero: bool| {
+                let groups = data.len() / 64;
+                let (mut p, mut s, mut b) = (
+                    vec![0; data.len() * bits / 32],
+                    vec![0; groups],
+                    vec![0; groups],
+                );
+                ls_impl(&data, 256, 64, bits, &mut p, &mut s, &mut b, zero)
+                    .expect("invariant: entrée valide");
+                (dequant(&p, &s, &b, bits), p, s, b)
+            };
+            let (d0, p0, s0, b0) = run(false);
+            let (d1, p1, s1, b1) = run(true);
+            let words = 2 * bits;
+            let (mut same, mut changed, mut exact) = (0, 0, 0);
+            for (g, values) in data.chunks(64).enumerate() {
+                let range = g * 64..(g + 1) * 64;
+                let err = |d: &[f32]| -> f64 {
+                    values
+                        .iter()
+                        .zip(&d[range.clone()])
+                        .map(|(&v, &x)| f64::from(v - x).powi(2))
+                        .sum()
+                };
+                if (s0[g], b0[g]) == (s1[g], b1[g]) {
+                    assert_eq!(
+                        p0[g * words..(g + 1) * words],
+                        p1[g * words..(g + 1) * words]
+                    );
+                    same += 1;
+                    continue;
+                }
+                changed += 1;
+                assert!(err(&d1) < err(&d0), "{bits} bits, groupe {g}");
+                let (s, b) = (bf16_value(s1[g]), bf16_value(b1[g]));
+                let k = (-b / s).round();
+                assert!((0.0..=((1 << bits) - 1) as f32).contains(&k));
+                assert!(
+                    (k * s + b).abs() <= b.abs() / 256.0,
+                    "{bits} bits, groupe {g}"
+                );
+                // Branche « zéro exact » : le code k restitue 0 au bit près.
+                if k * s + b == 0.0 && d1[range.clone()].contains(&0.0) {
+                    exact += 1;
+                }
+            }
+            assert!(same > 0, "{bits} bits : {changed} groupes changés");
+            assert!(changed > 0, "{bits} bits : grille à zéro jamais retenue");
+            assert!(exact > 0, "{bits} bits : zéro exact jamais restitué");
         }
     }
 }

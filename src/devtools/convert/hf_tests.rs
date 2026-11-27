@@ -125,6 +125,7 @@ fn options(src: &Path, dst: &Path) -> HfConvertOptions {
         verify: false,
         imatrix: None,
         bits_for: Vec::new(),
+        audit_report: None,
     }
 }
 
@@ -416,7 +417,14 @@ fn imatrix_uniform_is_identity_and_bits_for_overrides() {
     let mut opts = options(&src, &weighted);
     opts.imatrix = Some(skewed);
     opts.bits_for = vec![("mlp.up_proj".to_string(), 5)];
+    let report = root.path().join("audit.json");
+    opts.audit_report = Some(report.clone());
     convert_hf(&opts).expect("invariant: imatrix pondérée");
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("invariant: rapport écrit"))
+            .expect("invariant: rapport JSON");
+    assert_eq!(report["weighted"], true);
+    assert!(report["tensors"].is_array());
     let up = "model.language_model.layers.0.mlp.up_proj";
     assert_eq!(
         tensor_bytes(&weighted, SHARDS[0], &format!("{up}.weight")).1,
@@ -432,12 +440,138 @@ fn imatrix_uniform_is_identity_and_bits_for_overrides() {
     };
     assert_ne!(lm_head(&weighted), lm_head(&plain));
 
+    // Un rapport dans la source ou la sortie est refusé avant toute écriture.
+    let before = std::fs::read(src.join(SHARDS[0])).expect("invariant: shard source");
+    for report in [
+        src.join(SHARDS[0]),
+        weighted.join("model.safetensors.index.json"),
+        weighted.join(".convert").join("audit.json"),
+    ] {
+        let mut opts = options(&src, &weighted);
+        opts.audit_report = Some(report.clone());
+        assert!(
+            convert_hf(&opts).is_err(),
+            "rapport accepté : {}",
+            report.display()
+        );
+    }
+    // Lien sortant de la source : `rename` remplacerait le lien lui-même.
+    #[cfg(unix)]
+    {
+        let outside = root.path().join("outside.json");
+        std::fs::write(&outside, "{}").expect("invariant: cible extérieure");
+        let link = src.join("linked.json");
+        std::os::unix::fs::symlink(&outside, &link).expect("invariant: lien");
+        let mut opts = options(&src, &weighted);
+        opts.audit_report = Some(link);
+        assert!(convert_hf(&opts).is_err(), "lien de la source accepté");
+        // Temporaire extérieur liant vers un shard source.
+        std::os::unix::fs::symlink(src.join(SHARDS[0]), root.path().join("trap.tmp-write"))
+            .expect("invariant: lien");
+        let mut opts = options(&src, &weighted);
+        opts.audit_report = Some(root.path().join("trap.json"));
+        assert!(
+            convert_hf(&opts).is_err(),
+            "temporaire lié à la source accepté"
+        );
+    }
+    assert_eq!(
+        std::fs::read(src.join(SHARDS[0])).expect("invariant: shard source"),
+        before
+    );
+
     let missing = root.path().join("missing.safetensors");
     serialize_to_file(Vec::<(&str, TensorView<'_>)>::new(), None, &missing)
         .expect("invariant: imatrix vide");
     let mut opts = options(&src, &root.path().join("refused"));
     opts.imatrix = Some(missing);
     assert!(convert_hf(&opts).is_err(), "module sans imatrix accepté");
+}
+
+/// Avec `--imatrix`, l'embedding (exempté d'importance) garde le fit uniforme
+/// même s'il a une petite colonne sur ≥ 256 lignes ; sans imatrix, l'importance
+/// fictive le modifie.
+#[test]
+fn imatrix_exempt_tensor_gets_no_proxy() {
+    const EMBED: &str = "model.language_model.embed_tokens.weight";
+    let root = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let src = root.path().join("src");
+    std::fs::create_dir(&src).expect("invariant: src");
+    write_source(&src);
+    // Embedding agrandi à [256, 128], colonne 5 à |w| ≈ 1 % de la médiane.
+    let embed: Vec<f32> = values(&[256, 128], 0)
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            if i % 128 == 5 {
+                bf16_value(bf16_bits(v * 0.01))
+            } else {
+                v
+            }
+        })
+        .collect();
+    let shard = src.join(SHARDS[0]);
+    let bytes = std::fs::read(&shard).expect("invariant: shard source");
+    let st = SafeTensors::deserialize(&bytes).expect("invariant: shard valide");
+    let embed_bytes: Vec<u8> = embed
+        .iter()
+        .flat_map(|v| bf16_bits(*v).to_le_bytes())
+        .collect();
+    let owned: Vec<(String, Dtype, Vec<usize>, Vec<u8>)> = st
+        .tensors()
+        .into_iter()
+        .map(|(name, view)| {
+            if name == EMBED {
+                (name, Dtype::BF16, vec![256, 128], embed_bytes.clone())
+            } else {
+                (
+                    name,
+                    view.dtype(),
+                    view.shape().to_vec(),
+                    view.data().to_vec(),
+                )
+            }
+        })
+        .collect();
+    let views = owned.iter().map(|(name, dtype, shape, data)| {
+        (
+            name.clone(),
+            TensorView::new(*dtype, shape.clone(), data).expect("invariant: vue valide"),
+        )
+    });
+    serialize_to_file(views, None, &shard).expect("invariant: shard réécrit");
+
+    let groups = embed.len() / 64;
+    let (mut p, mut s, mut b) = (
+        vec![0_u32; embed.len() / 8],
+        vec![0_u16; groups],
+        vec![0_u16; groups],
+    );
+    super::least_squares::quantize_affine_ls_bf16(&embed, 128, 64, 4, &mut p, &mut s, &mut b)
+        .expect("invariant: entrée valide");
+    let uniform = [
+        bytemuck::cast_slice::<u32, u8>(&p).to_vec(),
+        bytemuck::cast_slice::<u16, u8>(&s).to_vec(),
+        bytemuck::cast_slice::<u16, u8>(&b).to_vec(),
+    ];
+    let embed_out = |dir: &Path| {
+        ["weight", "scales", "biases"].map(|suffix| {
+            let name = format!("model.language_model.embed_tokens.{suffix}");
+            tensor_bytes(dir, SHARDS[0], &name).2
+        })
+    };
+
+    let ones = root.path().join("ones.safetensors");
+    write_imatrix(&ones, |_| 1.0);
+    let weighted = root.path().join("weighted");
+    let mut opts = options(&src, &weighted);
+    opts.imatrix = Some(ones);
+    convert_hf(&opts).expect("invariant: imatrix uniforme");
+    assert_eq!(embed_out(&weighted), uniform);
+
+    let plain = root.path().join("plain");
+    convert_hf(&options(&src, &plain)).expect("invariant: sans imatrix");
+    assert_ne!(embed_out(&plain), uniform, "importance fictive sans effet");
 }
 
 /// Source MoE d'un seul shard (experts fusionnés transformers, tête MTP MoE).

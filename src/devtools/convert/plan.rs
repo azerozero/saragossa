@@ -12,6 +12,7 @@ use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::audit::{proxy_importance, ColumnAudit, TensorAudit};
 use super::imatrix::quantize_affine_wls_bf16;
 use super::least_squares::quantize_affine_ls_bf16;
 use super::rules::{
@@ -587,6 +588,10 @@ pub(crate) enum Job {
         fit: AffineFit,
         /// Importance par colonne (imatrix) du fit aux moindres carrés.
         weight: Option<std::sync::Arc<[f64]>>,
+        /// Importance fictive des petites colonnes (`audit::proxy_importance`) :
+        /// seulement sans imatrix chargée. Avec `--imatrix`, un tenseur exempté
+        /// (`weight` vide : embedding, MTP) garde le fit uniforme.
+        proxy: bool,
     },
     Experts {
         group: ExpertGroup,
@@ -712,6 +717,7 @@ pub(crate) fn plan_shards(inventory: &Inventory, layers: usize) -> Result<Vec<Sh
                     bits: *bits,
                     fit: AffineFit::MinMax,
                     weight: None,
+                    proxy: false,
                 });
             }
             _ => {
@@ -959,6 +965,8 @@ impl PeakTracker {
 }
 
 /// Écrit un shard complet dans `path` (déjà créé et dimensionné par l'appelant).
+/// Avec `audit`, chaque tenseur affine dense qui a une colonne signalée y
+/// ajoute son entrée (voir `audit`).
 ///
 /// # Errors
 ///
@@ -971,6 +979,7 @@ pub(crate) fn write_shard(
     file: &File,
     path: &Path,
     peak: &PeakTracker,
+    mut audit: Option<&mut Vec<TensorAudit>>,
 ) -> Result<Vec<TensorRecord>> {
     let (header, offsets) = build_header(plan)?;
     pwrite_all(file, &header, 0).map_err(|source| io_err(path, source))?;
@@ -1023,6 +1032,7 @@ pub(crate) fn write_shard(
                 bits,
                 fit,
                 weight: importance,
+                proxy,
             } => {
                 let [rows, cols] = src.shape[..] else {
                     return Err(InferError::Dimension(src.name.clone()));
@@ -1037,12 +1047,25 @@ pub(crate) fn write_shard(
                 let mut biases = stream(&names[2])?;
                 let block_rows = (DENSE_BLOCK_ELEMENTS / cols).max(1);
                 let mut error = QuantError::default();
+                let mut columns = audit.is_some().then(|| ColumnAudit::new(cols, *bits));
                 let mut row = 0;
                 while row < rows {
                     let take = block_rows.min(rows - row);
                     let bytes = source.read(src, row * cols * 2, take * cols * 2)?;
                     let data = bytes_to_dense_f32(&bytes, src.dtype, &src.name)?;
-                    let block = quantize_block(&data, cols, *bits, *fit, importance.as_deref())?;
+                    // Sans imatrix, importance fictive des colonnes à |w| quasi nul.
+                    let proxy = proxy.then(|| proxy_importance(&data, cols)).flatten();
+                    let fit_weight = importance.as_deref().or(proxy.as_deref());
+                    let block = quantize_block(&data, cols, *bits, *fit, fit_weight)?;
+                    if let Some(columns) = columns.as_mut() {
+                        columns.add(
+                            &data,
+                            &block.packed,
+                            &block.scales,
+                            &block.biases,
+                            importance.as_deref(),
+                        );
+                    }
                     // Source et sortie du bloc encore vivantes : pic réel du bloc.
                     peak.sample();
                     weight.write(bytemuck::cast_slice(&block.packed))?;
@@ -1058,6 +1081,9 @@ pub(crate) fn write_shard(
                 rec.group_size = Some(GROUP_SIZE);
                 rec.rel_err = Some(error.relative());
                 records.push(rec);
+                if let (Some(out), Some(columns)) = (audit.as_mut(), columns) {
+                    out.extend(columns.finish(&src.name, importance.as_deref()));
+                }
                 records.push(record(&names[1], scales.finish()?)?);
                 records.push(record(&names[2], biases.finish()?)?);
             }
