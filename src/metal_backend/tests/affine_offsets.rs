@@ -91,6 +91,7 @@ fn affine_offsets_alignment_without_device() {
         Qmm8,
         QmmNaFusedTiledU4,
         QmmNaFusedTiledU4Align64,
+        QmmNaFusedTiledUb,
         FastQmvU4,
         FastQmvU4Align64,
         FastQmvU2,
@@ -148,6 +149,9 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
         (QmmNaFusedTiledU4, 4, 64, 17, 2048, 2048),
         (QmmNaFusedTiledU4, 4, 64, 17, 64, 512),
         (QmmNaFusedTiledU4Align64, 4, 64, 17, 64, 576),
+        (QmmNaFusedTiledUb, 3, 64, 40, 2048, 2048),
+        (QmmNaFusedTiledUb, 5, 64, 40, 2048, 2048),
+        (QmmNaFusedTiledUb, 6, 64, 40, 2048, 2048),
         (FastQmvU4, 4, 64, 1, 64, 512),
         (FastQmvU4, 4, 64, 1, 13, 512),
         (FastQmvU4Align64, 4, 64, 1, 13, 576),
@@ -179,12 +183,14 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
         (QmmNaDequant, 5, 64, 32, 13, 512),
         (QmmNaDequant, 6, 64, 33, 64, 512),
     ] {
-        let weight = match bits {
-            2 => test_affine_mlx_u2(n, k)?,
-            3 => test_affine_mlx_u3(n, k)?,
-            4 => test_affine_varied_group(n, k, gs)?,
-            5 => test_affine_varied_u5(n, k)?,
-            6 => test_affine_varied_u6(n, k)?,
+        let weight = match (kernel, bits) {
+            // Le GEMM tuilé u3/u5/u6 partage le poids de l'oracle CPU dédié.
+            (QmmNaFusedTiledUb, _) => test_affine_varied_u356(bits, n, k)?,
+            (_, 2) => test_affine_mlx_u2(n, k)?,
+            (_, 3) => test_affine_mlx_u3(n, k)?,
+            (_, 4) => test_affine_varied_group(n, k, gs)?,
+            (_, 5) => test_affine_varied_u5(n, k)?,
+            (_, 6) => test_affine_varied_u6(n, k)?,
             _ => test_affine_varied_u8_group(n, k, gs)?,
         };
         super::matmul_select::OFFSET_TEST_KERNEL.with(|value| value.set(Some(kernel)));
@@ -230,7 +236,10 @@ fn affine_offsets_fast_kernels_bit_exact() -> Result<()> {
                     );
                 }
             }
-            if matches!(kernel, QmmBatchedU6 | FastQmvU5 | FastQmvU6 | QmmNaDequant | Skinny) {
+            if matches!(
+                kernel,
+                QmmBatchedU6 | FastQmvU5 | FastQmvU6 | QmmNaDequant | Skinny | QmmNaFusedTiledUb
+            ) {
                 // Alignement minimal uint/bfloat, sans alignement vectoriel.
                 let shifted = offset_weight(&metal, &weight, [4, 2, 6], 0xdead)?;
                 assert_eq!(offset_dispatch(&metal, &shifted, m, resident)?, reference);

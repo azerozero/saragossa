@@ -3371,6 +3371,7 @@ fn qmm_na_fused_tiled_u4_x4_matches_f32_reference() -> Result<()> {
                 out_dim,
                 "x4_test",
                 "x4_test",
+                4,
             )?;
             encoder.end_encoding();
             commit_and_wait(command_buffer)?;

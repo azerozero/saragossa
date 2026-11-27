@@ -392,6 +392,7 @@ impl MetalExecutor {
                 out_dim,
                 "gemm_nax_coop_qb_tiled_u4_x3",
                 "qmm_na_fused_tiled_u4_x3_gs64",
+                4,
             );
         }
         self.encode_affine_qmm_na_fused_tiled_u4_pipeline(
@@ -410,6 +411,7 @@ impl MetalExecutor {
             self.na_gemm_coop_qb_tiled_u4.as_ref(),
             "gemm_nax_coop_qb_tiled_u4",
             "qmm_na_fused_tiled_u4_gs64",
+            4,
         )
     }
 
@@ -474,6 +476,7 @@ impl MetalExecutor {
             Some(pso),
             label,
             profile_label,
+            bits,
         )
     }
 
@@ -508,6 +511,7 @@ impl MetalExecutor {
             self.na_gemm_coop_qb_tiled_u4_align64.as_ref(),
             "gemm_nax_coop_qb_tiled_u4_align64",
             "qmm_na_fused_tiled_u4_align64_gs64",
+            4,
         )
     }
 
@@ -786,6 +790,7 @@ impl MetalExecutor {
             in_dim,
             "gemm_nax_coop_qb_tiled_u4",
             "qmm_na_fused_tiled_u4_gs64",
+            4,
         )
     }
 
@@ -873,6 +878,7 @@ impl MetalExecutor {
         pipeline: Option<&ComputePipelineState>,
         label: &'static str,
         profile_label: &'static str,
+        bits: usize,
     ) -> Result<()> {
         if out_dim % 64 != 0 {
             return Err(InferError::Dimension(format!(
@@ -900,6 +906,7 @@ impl MetalExecutor {
             out_dim,
             label,
             profile_label,
+            bits,
         )
     }
 
@@ -921,6 +928,7 @@ impl MetalExecutor {
         out_dim: usize,
         label: &'static str,
         profile_label: &'static str,
+        bits: usize,
     ) -> Result<()> {
         let mnk = [
             checked_u32(batch, "qmm na fused-tiled u4 batch")?,
@@ -941,7 +949,7 @@ impl MetalExecutor {
             in_dim,
             out_dim,
             FAST_QMV_GROUP_SIZE,
-            4,
+            bits,
         ));
         trace_dispatch_path(label, batch, out_dim, in_dim);
         profile_dispatch();

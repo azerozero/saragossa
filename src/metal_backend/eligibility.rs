@@ -594,8 +594,14 @@ pub(super) fn can_use_qmm_na_fused_tiled_ub_buffers(
         && batch >= qmm_na_min_batch()
         && out_dim % 64 == 0
         && in_dim.min(out_dim) >= QMM_NA_U4_DEFAULT_MIN_DIM
-        // NOTE: u5/u6 suivent la portée bf16 du prefill (TTS : qmv par défaut).
-        && (bits == 3 || (matches!(bits, 5 | 6) && crate::runtime_flags::qmm_na_dequant_allowed()))
+        // NOTE: u5/u6 gardent les contrôles de `QmmNaDequant` (docs/perf/qmv-u56.md) :
+        // portée bf16 du prefill (TTS : qmv par défaut), `SARAGOSSA_RUST_QMM_NA=0`
+        // et priorité de l'opt-in `SARAGOSSA_RUST_QMM_U6=1`.
+        && (bits == 3
+            || (matches!(bits, 5 | 6)
+                && crate::runtime_flags::qmm_na_dequant_allowed()
+                && qmm_na_enabled()
+                && !(bits == 6 && qmm_u6_enabled())))
         && group_size == FAST_QMV_GROUP_SIZE
         && in_dim % 512 == 0
 }
