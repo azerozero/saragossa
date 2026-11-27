@@ -317,6 +317,10 @@ impl ServeArgs {
             auto_yield: auto_yield.then(|| super::auto_yield::AutoYield {
                 share: profile.serve.auto_yield_share.unwrap_or(25) as u8,
                 idle: Duration::from_secs(profile.serve.auto_yield_idle_secs.unwrap_or(60)),
+                dynamic: saragossa::runtime_flags::env_flag(
+                    "SARAGOSSA_SERVE_AUTO_YIELD_DYNAMIC",
+                    profile.serve.auto_yield_dynamic.unwrap_or(true),
+                ),
             }),
             prefix_ssd,
             engines,
@@ -408,9 +412,12 @@ pub(super) fn help_text() -> String {
          models after N idle seconds; the next request reloads them. --preload models \
          are unloaded too.\n\
          Auto yield (macOS, opt-in): --auto-yield (serve.auto_yield, SARAGOSSA_SERVE_AUTO_YIELD) \
-         lowers the GPU share to serve.auto_yield_share (25) while keyboard or mouse input \
-         is seen, and restores the configured share after serve.auto_yield_idle_secs (60) \
-         idle seconds; output tokens are unchanged, only timing.\n\
+         lowers the GPU share while keyboard or mouse input is seen, and restores the \
+         configured share after serve.auto_yield_idle_secs (60) idle seconds; output tokens \
+         are unchanged, only timing. The share follows the GPU use of other processes \
+         (100 - theirs - 10, within 10..=50, ioreg average over 5 s); \
+         serve.auto_yield_dynamic = false (SARAGOSSA_SERVE_AUTO_YIELD_DYNAMIC=0) pins it to \
+         serve.auto_yield_share (25), also the starting and fallback share.\n\
          Engines: --engines N (serve.engines, SARAGOSSA_SERVE_ENGINES, 1..={MAX_ENGINES}, \
          default 1, not hot-reloadable) runs N inference threads on one shared copy of the \
          weights, each with its own KV, scratch and block prefix cache; 1 keeps the serial \
@@ -576,6 +583,7 @@ mod tests {
         let default = Some(AutoYield {
             share: 25,
             idle: Duration::from_secs(60),
+            dynamic: true,
         });
         let mut cli = base.to_vec();
         cli.push("--auto-yield".into());
@@ -587,12 +595,13 @@ mod tests {
             );
         });
         let profile = saragossa::runtime_flags::Profile::parse(
-            "[serve]\nauto_yield = true\nauto_yield_share = 40\nauto_yield_idle_secs = 9\n",
+            "[serve]\nauto_yield = true\nauto_yield_share = 40\nauto_yield_idle_secs = 9\nauto_yield_dynamic = false\n",
         )
         .expect("profil");
         let tuned = Some(AutoYield {
             share: 40,
             idle: Duration::from_secs(9),
+            dynamic: false,
         });
         let parsed = ServeArgs::parse_with(&profile, base.to_vec()).expect("profil");
         assert_eq!(parsed.auto_yield, tuned);

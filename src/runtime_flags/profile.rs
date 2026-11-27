@@ -111,8 +111,12 @@ pub struct ServeSection {
     /// Équivalent de `--auto-yield` : baisse `gpu_share` tant que l'utilisateur
     /// se sert du Mac (clavier, souris).
     pub auto_yield: Option<bool>,
-    /// Part de GPU pendant le cédage automatique, 10 à 100 (défaut 25).
+    /// Part de GPU pendant le cédage automatique, 10 à 100 (défaut 25) ; en
+    /// mode dynamique, part de départ et de repli si la mesure GPU échoue.
     pub auto_yield_share: Option<u64>,
+    /// Part de cédage ajustée entre 10 et 50 % selon l'activité GPU des autres
+    /// processus (défaut `true`) ; `false` garde la part fixe `auto_yield_share`.
+    pub auto_yield_dynamic: Option<bool>,
     /// Secondes d'inactivité avant de rendre la part configurée (défaut 60).
     pub auto_yield_idle_secs: Option<u64>,
     /// Délai max de vidage de l'ancien processus après un relais SIGUSR2.
@@ -340,6 +344,12 @@ impl Profile {
                 None,
                 "25",
                 num(s.auto_yield_share),
+            ),
+            r(
+                "serve.auto_yield_dynamic",
+                Some("SARAGOSSA_SERVE_AUTO_YIELD_DYNAMIC"),
+                "true",
+                s.auto_yield_dynamic.map(|v| v.to_string()),
             ),
             r(
                 "serve.auto_yield_idle_secs",
