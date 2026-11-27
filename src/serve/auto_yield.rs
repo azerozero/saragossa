@@ -612,6 +612,8 @@ mod tests {
         assert_eq!(gpu_time_by_client(no_counter), None);
     }
 
+    // Utilise /bin/sleep, /bin/ps et /bin/echo : absents sous Windows.
+    #[cfg(unix)]
     #[test]
     fn slow_collector_is_killed_and_reaped_at_the_deadline() {
         use std::process::{Command, Stdio};
