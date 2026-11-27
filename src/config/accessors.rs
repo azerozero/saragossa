@@ -101,6 +101,18 @@ impl ModelConfig {
     }
 
     #[must_use]
+    /// Indique un Llama 3.x (`model_type` `llama`, template à en-têtes).
+    pub fn is_llama(&self) -> bool {
+        self.model_type == "llama"
+    }
+
+    #[must_use]
+    /// Indique un Mistral dense (`model_type` `mistral`, template `[INST]`).
+    pub fn is_mistral(&self) -> bool {
+        self.model_type == "mistral"
+    }
+
+    #[must_use]
     /// Indique si la configuration suit l'architecture flint (RecursiveSI).
     pub fn is_flint(&self) -> bool {
         self.model_type == "flint"
@@ -208,6 +220,23 @@ impl ModelConfig {
             .factor
             .filter(|factor| factor.is_finite() && *factor > 0.0)
             .map(|factor| 1.0 / factor)
+    }
+
+    #[must_use]
+    /// Renvoie les paramètres du scaling `llama3`, ou `None` pour un autre type.
+    ///
+    /// Valeurs par défaut de transformers et mlx-lm pour les clés absentes
+    /// (low 1, high 4, contexte 8192) ; leur validité est portée par le chargeur.
+    pub fn rope_llama3_scaling(&self) -> Option<crate::rope::Llama3RopeScaling> {
+        let scaling = self.rope_scaling.as_ref()?;
+        (scaling.scaling_type() == "llama3").then(|| crate::rope::Llama3RopeScaling {
+            factor: scaling.factor.unwrap_or(f32::NAN),
+            low_freq_factor: scaling.low_freq_factor.unwrap_or(1.0),
+            high_freq_factor: scaling.high_freq_factor.unwrap_or(4.0),
+            original_max_position_embeddings: scaling
+                .original_max_position_embeddings
+                .unwrap_or(8192) as f32,
+        })
     }
 
     #[must_use]

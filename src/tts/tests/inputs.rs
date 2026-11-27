@@ -47,3 +47,60 @@ fn default_instruction_only_conditions_voicedesign() -> Result<()> {
     }
     Ok(())
 }
+
+/// Portée de requête sur un modèle partagé (`serve --engines N`) : mêmes
+/// entrées que `set_voice`, restaurée au retour, propre à chaque thread et au
+/// seul modèle visé.
+#[test]
+#[ignore = "inférence: snapshots TTS locaux et verrou GPU requis"]
+fn request_voice_matches_set_voice_per_thread() -> Result<()> {
+    let path = local_tts_snapshot(
+        "SARAGOSSA_QWEN3_TTS_CUSTOMVOICE_DIR",
+        "models--mlx-community--Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit",
+    )
+    .ok_or_else(|| InferError::Config("snapshot CustomVoice requis".into()))?;
+    let mut model = TtsModel::load_local(&path)?;
+    let other = TtsModel::load_local(&path)?;
+    let text = "Bonjour, comment allez-vous ?";
+    let serena = model.prepare_inputs(text)?.input.data().to_vec();
+    model.set_voice(Some("ryan"))?;
+    let ryan = model.prepare_inputs(text)?.input.data().to_vec();
+    model.set_voice(None)?;
+    assert_ne!(serena, ryan);
+    let (model, serena, ryan) = (&model, &serena, &ryan);
+    // Un autre modèle appelé pendant la portée garde sa voix.
+    let nested = model.with_request_voice(Some("ryan"), Some(7), || {
+        other.prepare_inputs(text).map(|p| p.input.data().to_vec())
+    })??;
+    assert_eq!(&nested, serena);
+    std::thread::scope(|scope| -> Result<()> {
+        let handles: Vec<_> = [(Some("ryan"), ryan), (None, serena)]
+            .into_iter()
+            .map(|(voice, expected)| {
+                scope.spawn(move || -> Result<()> {
+                    for _ in 0..3 {
+                        model.with_request_voice(voice, Some(7), || -> Result<()> {
+                            assert_eq!(model.prepare_inputs(text)?.input.data(), &expected[..]);
+                            assert_eq!(model.effective_seed(), Some(7));
+                            Ok(())
+                        })??;
+                    }
+                    assert_eq!(model.prepare_inputs(text)?.input.data(), &serena[..]);
+                    assert_eq!(model.effective_seed(), None);
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| InferError::Config("thread voix en panique".into()))??;
+        }
+        Ok(())
+    })?;
+    assert!(model
+        .with_request_voice(Some("inconnue"), None, || ())
+        .is_err());
+    assert_eq!(model.prepare_inputs(text)?.input.data(), &serena[..]);
+    Ok(())
+}

@@ -174,6 +174,13 @@ fn resident_features_match_host_path_bitwise() -> Result<()> {
     for (index, (a, b)) in got.iter().zip(host.data()).enumerate() {
         assert_eq!(a.to_bits(), b.to_bits(), "feature {index}");
     }
+    // Sous NA, l'encodeur résident ne garde pas de copie f32 GPU des projections.
+    let enc = encoder.build_resident(&metal)?;
+    let na = metal.whisper_encoder_na_available();
+    assert!(enc
+        .layers
+        .iter()
+        .all(|l| l.q.weight.is_none() == na && l.fc2.weight.is_none() == na));
     Ok(())
 }
 

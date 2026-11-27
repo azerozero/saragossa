@@ -439,3 +439,225 @@ fn imatrix_uniform_is_identity_and_bits_for_overrides() {
     opts.imatrix = Some(missing);
     assert!(convert_hf(&opts).is_err(), "module sans imatrix accepté");
 }
+
+/// Source MoE d'un seul shard (experts fusionnés transformers, tête MTP MoE).
+fn write_moe_source(dir: &Path) -> Vec<(&'static str, Vec<usize>, Vec<f32>)> {
+    let tensors: Vec<(&str, Vec<usize>)> = vec![
+        (
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            vec![3, 128, 128],
+        ),
+        (
+            "model.language_model.layers.0.mlp.experts.down_proj",
+            vec![3, 128, 64],
+        ),
+        (
+            "model.language_model.layers.0.mlp.gate.weight",
+            vec![3, 128],
+        ),
+        ("mtp.layers.0.mlp.experts.gate_up_proj", vec![3, 128, 128]),
+        ("mtp.fc.weight", vec![8, 256]),
+    ];
+    let owned: Vec<_> = tensors
+        .into_iter()
+        .enumerate()
+        .map(|(seed, (name, shape))| {
+            let data = values(&shape, seed);
+            (name, shape, data)
+        })
+        .collect();
+    let bytes: Vec<Vec<u8>> = owned
+        .iter()
+        .map(|(_, _, data)| {
+            data.iter()
+                .flat_map(|v| bf16_bits(*v).to_le_bytes())
+                .collect()
+        })
+        .collect();
+    let views = owned.iter().zip(&bytes).map(|((name, shape, _), bytes)| {
+        (
+            (*name).to_string(),
+            TensorView::new(Dtype::BF16, shape.clone(), bytes).expect("invariant: vue BF16"),
+        )
+    });
+    let file = "model.safetensors";
+    serialize_to_file(views, None, &dir.join(file)).expect("invariant: shard écrit");
+    let weight_map: serde_json::Map<_, _> = owned
+        .iter()
+        .map(|(name, _, _)| ((*name).to_string(), file.into()))
+        .collect();
+    let index = serde_json::json!({ "metadata": {}, "weight_map": weight_map });
+    std::fs::write(dir.join("model.safetensors.index.json"), index.to_string())
+        .expect("invariant: index écrit");
+    std::fs::write(dir.join("config.json"), r#"{"model_type":"qwen3_5_moe"}"#)
+        .expect("invariant: config écrite");
+    std::fs::write(dir.join("tokenizer.json"), "{}\n").expect("invariant: tokenizer écrit");
+    owned
+}
+
+/// Référence min-max d'une matrice `[rows, cols]` : (codes, scales, biais).
+fn minmax_ref(data: &[f32], cols: usize, bits: usize) -> [Vec<u8>; 3] {
+    let rows = data.len() / cols;
+    let mut packed = vec![0_u32; rows * cols * bits / 32];
+    let mut scales = vec![0_u16; rows * cols / 64];
+    let mut biases = vec![0_u16; rows * cols / 64];
+    quantize_affine_bitstream_bf16(data, cols, 64, bits, &mut packed, &mut scales, &mut biases)
+        .expect("invariant: référence min-max");
+    [
+        bytemuck::cast_slice(&packed).to_vec(),
+        bytemuck::cast_slice(&scales).to_vec(),
+        bytemuck::cast_slice(&biases).to_vec(),
+    ]
+}
+
+#[test]
+fn fused_moe_experts_become_switch_mlp_stacks_and_mtp_head_stays_bf16() {
+    let root = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let src = root.path().join("src");
+    std::fs::create_dir(&src).expect("invariant: src");
+    let source = write_moe_source(&src);
+    let dst = root.path().join("dst");
+    let mut opts = options(&src, &dst);
+    opts.minmax = true;
+    let report = convert_hf(&opts).expect("invariant: conversion MoE");
+    // gate_up + down → 2 piles u4, routeur u8 ; tête MTP recopiée.
+    assert_eq!(report.quantized, BTreeMap::from([(4, 2), (8, 1)]));
+    assert_eq!(report.copied, 2);
+    let file = "model.safetensors";
+    let layer = "model.language_model.layers.0.mlp.switch_mlp";
+    let check = |base: &str, shape: [usize; 3], data: &[f32]| {
+        let reference = minmax_ref(data, shape[2], 4);
+        for (suffix, expected) in ["weight", "scales", "biases"].iter().zip(&reference) {
+            let (_, out_shape, bytes) = tensor_bytes(&dst, file, &format!("{base}.{suffix}"));
+            assert_eq!(&bytes, expected, "{base}.{suffix}");
+            assert_eq!(out_shape[..2], shape[..2], "{base}.{suffix}");
+        }
+    };
+    let gate_up = &source[0].2;
+    let (inter, hidden) = (64, 128);
+    let half = |second: bool| -> Vec<f32> {
+        gate_up
+            .chunks(2 * inter * hidden)
+            .flat_map(|expert| {
+                let (gate, up) = expert.split_at(inter * hidden);
+                if second { up } else { gate }.to_vec()
+            })
+            .collect()
+    };
+    check(
+        &format!("{layer}.gate_proj"),
+        [3, inter, hidden],
+        &half(false),
+    );
+    check(&format!("{layer}.up_proj"), [3, inter, hidden], &half(true));
+    check(
+        &format!("{layer}.down_proj"),
+        [3, hidden, inter],
+        &source[1].2,
+    );
+    let router = "model.language_model.layers.0.mlp.gate";
+    assert_eq!(
+        tensor_bytes(&dst, file, &format!("{router}.weight")).2,
+        minmax_ref(&source[2].2, 128, 8)[0]
+    );
+    for (name, shape, data) in &source[3..] {
+        let expected: Vec<u8> = data
+            .iter()
+            .flat_map(|v| bf16_bits(*v).to_le_bytes())
+            .collect();
+        assert_eq!(
+            tensor_bytes(&dst, file, name),
+            (Dtype::BF16, shape.clone(), expected),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        config(&dst)["quantization"][router]["bits"].as_u64(),
+        Some(8)
+    );
+
+    // `--keep-bf16 .` : référence BF16, piles d'experts recopiées sans perte.
+    let bf16 = root.path().join("bf16");
+    let mut opts = options(&src, &bf16);
+    opts.keep_bf16 = vec![".".to_string()];
+    let report = convert_hf(&opts).expect("invariant: conversion bf16");
+    assert!(report.quantized.is_empty(), "{:?}", report.quantized);
+    let as_bytes =
+        |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| bf16_bits(*x).to_le_bytes()).collect() };
+    for (proj, shape, data) in [
+        ("gate_proj", vec![3, inter, hidden], half(false)),
+        ("up_proj", vec![3, inter, hidden], half(true)),
+        ("down_proj", vec![3, hidden, inter], source[1].2.clone()),
+    ] {
+        let name = format!("{layer}.{proj}.weight");
+        assert_eq!(
+            tensor_bytes(&bf16, file, &name),
+            (Dtype::BF16, shape, as_bytes(&data)),
+            "{name}"
+        );
+        assert_eq!(
+            config(&bf16)["quantization"][&format!("{layer}.{proj}")],
+            false
+        );
+    }
+}
+
+/// Source mono-fichier sans index (Llama 3.2 1B : `model.safetensors` seul,
+/// embeddings liés) : conversion, reprise à l'identique, refus après altération.
+#[test]
+fn single_file_source_without_index_converts_and_resumes() {
+    let root = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let src = root.path().join("src");
+    std::fs::create_dir(&src).expect("invariant: src");
+    let owned: Vec<(&str, Vec<usize>, Vec<u8>)> = [
+        ("model.embed_tokens.weight", vec![16, 128]),
+        ("model.layers.0.self_attn.q_proj.weight", vec![8, 128]),
+        ("model.layers.0.input_layernorm.weight", vec![128]),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(seed, (name, shape))| {
+        let bytes = values(&shape, seed)
+            .iter()
+            .flat_map(|v| bf16_bits(*v).to_le_bytes())
+            .collect();
+        (name, shape, bytes)
+    })
+    .collect();
+    let views = owned.iter().map(|(name, shape, bytes)| {
+        (
+            (*name).to_string(),
+            TensorView::new(Dtype::BF16, shape.clone(), bytes).expect("invariant: vue BF16"),
+        )
+    });
+    let single = src.join("model.safetensors");
+    serialize_to_file(views, None, &single).expect("invariant: fichier écrit");
+    std::fs::write(src.join("config.json"), r#"{"model_type":"llama"}"#)
+        .expect("invariant: config écrite");
+    std::fs::write(src.join("tokenizer.json"), "{\"pre_tokenizer\":null}\n")
+        .expect("invariant: tokenizer écrit");
+
+    let dst = root.path().join("dst");
+    let first = convert_hf(&options(&src, &dst)).expect("invariant: conversion mono-fichier");
+    assert_eq!(first.units_written, ["model.safetensors"]);
+    let index: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dst.join("model.safetensors.index.json")).expect("invariant: index"),
+    )
+    .expect("invariant: index JSON");
+    assert_eq!(
+        index["weight_map"]["model.embed_tokens.weight"],
+        "model.safetensors"
+    );
+    assert_eq!(
+        tensor_bytes(&dst, "model.safetensors", "model.embed_tokens.weight").1,
+        [16, 16]
+    );
+    let before = snapshot(&dst);
+    let again = convert_hf(&options(&src, &dst)).expect("invariant: reprise");
+    assert_eq!(again.units_resumed, ["model.safetensors"]);
+    assert_eq!(snapshot(&dst), before);
+
+    perturb_data(&single);
+    let error = convert_hf(&options(&src, &dst)).expect_err("reprise sur d'autres poids acceptée");
+    assert!(error.to_string().contains("shards source"), "{error}");
+}

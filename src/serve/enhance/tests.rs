@@ -316,3 +316,73 @@ fn enhance_without_model_returns_clear_error() {
     assert!(error.to_string().contains("enhance non configuré"));
     assert!(headers(&mut BufReader::new(client)).starts_with("HTTP/1.1 400"));
 }
+
+#[cfg(any(feature = "ws", feature = "h2", feature = "webtransport"))]
+#[test]
+fn idle_dfn3_waits_for_the_end_of_the_stream() {
+    let service = EnhanceService::new(None);
+    *service.model.lock().unwrap() = Some(super::test_support::model());
+    let start = Instant::now();
+    let at = |ms| move || start + Duration::from_millis(ms);
+    assert!(!service.unload_idle(0, at(600_000)), "0 : désactivé");
+    let slot = service.reserve().unwrap();
+    let held = service.model().unwrap();
+    assert!(!service.unload_idle(1, at(5_000)), "flux actif : on garde");
+    drop(slot);
+    // Fin datée par la réservation : délai compté depuis elle.
+    let ended = *service.usage.lock().unwrap();
+    let after = |ms| move || ended + Duration::from_millis(ms);
+    assert!(!service.unload_idle(1, after(999)));
+    assert!(service.unload_idle(1, after(1_000)));
+    assert!(service.model.lock().unwrap().is_none());
+    // L'Arc déjà cloné reste utilisable après le vidage du slot.
+    let _stream = DenoiseStream::new(&held);
+    assert!(!service.unload_idle(1, at(600_000)), "déjà vide");
+}
+
+#[cfg(any(feature = "ws", feature = "h2", feature = "webtransport"))]
+#[test]
+fn idle_dfn3_counts_from_a_stream_ended_between_two_passes() {
+    // Délai 1 s, modèle pris à ~0, flux fini à 0,24 s, passage suivant à 1,02 s.
+    let service = EnhanceService::new(None);
+    *service.model.lock().unwrap() = Some(super::test_support::model());
+    let start = Instant::now();
+    let slot = service.reserve().unwrap();
+    let held = service.model().unwrap();
+    thread::sleep(Duration::from_millis(240));
+    drop((held, slot));
+    let at = |ms| move || start + Duration::from_millis(ms);
+    assert!(
+        !service.unload_idle(1, at(1_020)),
+        "0,78 s d'inactivité seulement"
+    );
+    // L'échéance se compte depuis la fin réelle du flux, quel que soit l'ordonnanceur.
+    let ended = *service.usage.lock().unwrap();
+    assert!(service.unload_idle(1, move || ended + Duration::from_millis(1_000)));
+}
+
+#[cfg(any(feature = "ws", feature = "h2", feature = "webtransport"))]
+#[test]
+fn idle_dfn3_keeps_a_model_whose_loading_outlasted_the_delay() {
+    let service = EnhanceService::new(Some(PathBuf::from("lent.safetensors")));
+    // Chemin h2 : réservation, puis chargement plus long que le délai d'1 s.
+    let slot = service.reserve().unwrap();
+    let held = thread::scope(|scope| {
+        let loader = scope.spawn(|| {
+            service.model_with(|_| {
+                thread::sleep(Duration::from_millis(1500));
+                Ok(super::test_support::model())
+            })
+        });
+        thread::sleep(Duration::from_millis(200));
+        // Bloqué derrière le chargement ; l'horloge est lue après.
+        assert!(!service.unload_idle(1, Instant::now));
+        loader.join().unwrap().unwrap()
+    });
+    // Flux bref après un long chargement : aucun déchargement immédiat.
+    drop((held, slot));
+    assert!(!service.unload_idle(1, Instant::now));
+    assert!(!service.unload_idle(1, Instant::now));
+    thread::sleep(Duration::from_millis(1100));
+    assert!(service.unload_idle(1, Instant::now));
+}

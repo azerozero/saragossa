@@ -33,6 +33,23 @@ pub(crate) fn install_scratch_namespace(namespace: u64) -> ScratchNamespaceGuard
 }
 
 thread_local! {
+    // Moteur serve propriétaire du thread : 0 hors `serve --engines N`. Les
+    // moteurs partagent l'executor (poids) mais jamais un buffer scratch.
+    static SCRATCH_ENGINE: Cell<u32> = const { Cell::new(0) };
+}
+
+pub(super) fn current_scratch_engine() -> u32 {
+    SCRATCH_ENGINE.with(Cell::get)
+}
+
+/// Attache le thread courant au moteur `engine` pour toute sa durée de vie :
+/// ses buffers scratch sont disjoints de ceux des autres moteurs et sa purge
+/// de fin de portée ne touche qu'eux. Le moteur 0 garde les clés historiques.
+pub fn set_scratch_engine(engine: u32) {
+    SCRATCH_ENGINE.with(|slot| slot.set(engine));
+}
+
+thread_local! {
     // Morceau de prefill plus court que les autres : (lignes, capacité).
     static SCRATCH_ROW_CAPACITY: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }

@@ -16,11 +16,20 @@ jobs:
       fail-fast: false
       matrix:
         file:
-          - src/tts/sampling.rs
           - src/tts/helpers.rs
           - src/tts/synth.rs
-          - src/serve/audio.rs
-          - src/sampling.rs
+        shard: ["0/1"]
+        include:
+          # Ces trois fichiers dépassaient 180 min : un tiers de mutants par job.
+          - { file: src/tts/sampling.rs, shard: "0/3" }
+          - { file: src/tts/sampling.rs, shard: "1/3" }
+          - { file: src/tts/sampling.rs, shard: "2/3" }
+          - { file: src/serve/audio.rs, shard: "0/3" }
+          - { file: src/serve/audio.rs, shard: "1/3" }
+          - { file: src/serve/audio.rs, shard: "2/3" }
+          - { file: src/sampling.rs, shard: "0/3" }
+          - { file: src/sampling.rs, shard: "1/3" }
+          - { file: src/sampling.rs, shard: "2/3" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Installer Rust figé en CI
@@ -30,7 +39,7 @@ jobs:
       # Un mutant survivant sort en code 2 : le rapport sert d'alerte, pas le statut.
       - name: Muter un module et exécuter ses tests CPU
         continue-on-error: true
-        run: cargo +1.98.1 mutants --no-default-features --features devtools --file "${{ matrix.file }}" -C --locked -- --lib --bins
+        run: cargo +1.98.1 mutants --no-default-features --features devtools --file "${{ matrix.file }}" --shard "${{ matrix.shard }}" -C --locked -- --lib --bins
       - name: Publier les survivants dans le journal
         if: always()
         run: tail -n +1 mutants.out/*.txt

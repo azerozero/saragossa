@@ -173,6 +173,33 @@ impl SafetensorPayload {
         )
     }
 
+    /// Table 2D lue ligne à ligne : bf16 conservé tel quel, sinon f32.
+    pub(super) fn read_row_table(&self, name: &str) -> Result<super::helpers::RowTable> {
+        let entry = self.entry(name)?;
+        let &[rows, cols] = entry.shape.as_slice() else {
+            return Err(InferError::Dimension(format!(
+                "{name} attendu rang 2, reçu {:?}",
+                entry.shape
+            )));
+        };
+        if entry.dtype != Dtype::BF16 {
+            return Ok(super::helpers::RowTable::F32(self.read_dense_tensor(name)?));
+        }
+        let bytes = self.read_entry_bytes(entry)?;
+        if Some(bytes.len()) != rows.checked_mul(cols).and_then(|n| n.checked_mul(2)) {
+            return Err(InferError::Shape(format!(
+                "{name} BF16 {:?} incompatible avec {} octets",
+                entry.shape,
+                bytes.len()
+            )));
+        }
+        let bits = bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        Ok(super::helpers::RowTable::Bf16 { rows, cols, bits })
+    }
+
     pub(crate) fn read_u32_tensor(&self, name: &str) -> Result<Vec<u32>> {
         let entry = self.entry(name)?;
         if entry.dtype != Dtype::U32 {

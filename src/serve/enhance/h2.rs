@@ -132,7 +132,7 @@ async fn request_stream(
         Ok(config) => config,
         Err(_) => return reject(&mut response, 400).await,
     };
-    let Some(slot) = Reservation::acquire(&front.enhance.active, 1, enhance_max_streams()) else {
+    let Some(slot) = front.enhance.reserve() else {
         return reject(&mut response, 503).await;
     };
     let loader = Arc::clone(&front);

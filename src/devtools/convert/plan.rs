@@ -72,6 +72,9 @@ pub(crate) struct TensorRef {
 pub(crate) struct Source {
     pub(crate) dir: PathBuf,
     pub(crate) headers: Vec<ShardHeader>,
+    /// Octets de l'index lu, ou index canonique synthétisé pour une source
+    /// mono-fichier (`model.safetensors` seul, Llama 3.2 1B) : identité de reprise.
+    pub(crate) index: Vec<u8>,
     files: Vec<File>,
 }
 
@@ -84,7 +87,28 @@ impl Source {
     /// tenseur est absent, dupliqué ou affecté à un autre shard que l'index.
     pub(crate) fn open(dir: &Path) -> Result<(Self, Vec<TensorRef>)> {
         let index_path = dir.join("model.safetensors.index.json");
-        let raw = std::fs::read(&index_path).map_err(|source| io_err(&index_path, source))?;
+        let single = dir.join("model.safetensors");
+        let raw = match std::fs::read(&index_path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && single.is_file() => {
+                // Tri explicite (serde_json garde l'ordre d'insertion) : index
+                // déterministe pour un même en-tête.
+                let mut names: Vec<String> =
+                    read_shard_header(&single)?.tensors.into_keys().collect();
+                names.sort();
+                let weight_map: serde_json::Map<String, serde_json::Value> = names
+                    .into_iter()
+                    .map(|name| (name, "model.safetensors".into()))
+                    .collect();
+                serde_json::to_vec(&serde_json::json!({ "weight_map": weight_map })).map_err(
+                    |source| InferError::Json {
+                        path: index_path.clone(),
+                        source,
+                    },
+                )?
+            }
+            Err(source) => return Err(io_err(&index_path, source)),
+        };
         let index: serde_json::Value =
             serde_json::from_slice(&raw).map_err(|source| InferError::Json {
                 path: index_path.clone(),
@@ -146,6 +170,7 @@ impl Source {
             Self {
                 dir: dir.to_path_buf(),
                 headers,
+                index: raw,
                 files,
             },
             refs,
@@ -567,6 +592,16 @@ pub(crate) enum Job {
         group: ExpertGroup,
         proj: Proj,
         out_base: String,
+    },
+    /// Experts fusionnés bf16 `[E, R, C]` (transformers) : les `R` lignes de
+    /// chaque expert se découpent en segments consécutifs `(base, lignes)`,
+    /// chacun empilé dans sa pile affine `[E, lignes, C]` (`bits` = 16 : pile
+    /// bf16 recopiée).
+    Stacked {
+        src: TensorRef,
+        outs: Vec<(String, usize)>,
+        bits: usize,
+        fit: AffineFit,
     },
     Copy {
         src: TensorRef,
@@ -1025,6 +1060,93 @@ pub(crate) fn write_shard(
                 records.push(rec);
                 records.push(record(&names[1], scales.finish()?)?);
                 records.push(record(&names[2], biases.finish()?)?);
+            }
+            Job::Stacked {
+                src,
+                outs,
+                bits,
+                fit,
+            } => {
+                let [experts, rows, cols] = src.shape[..] else {
+                    return Err(InferError::Dimension(src.name.clone()));
+                };
+                if rows == 0 || outs.iter().map(|(_, seg)| seg).sum::<usize>() != rows {
+                    return Err(InferError::Dimension(format!(
+                        "{}: segments {outs:?} pour {rows} lignes",
+                        src.name
+                    )));
+                }
+                if *bits == 16 {
+                    // Piles bf16 : segments recopiés à l'octet, expert par expert.
+                    let mut streams = Vec::with_capacity(outs.len());
+                    for (base, _) in outs {
+                        streams.push(stream(&format!("{base}.weight"))?);
+                    }
+                    let row_bytes = cols * 2;
+                    for expert in 0..experts {
+                        let mut offset = expert * rows * row_bytes;
+                        for ((_, seg), out) in outs.iter().zip(&mut streams) {
+                            out.write(&source.read(src, offset, seg * row_bytes)?)?;
+                            offset += seg * row_bytes;
+                        }
+                    }
+                    for ((base, _), out) in outs.iter().zip(streams) {
+                        let mut rec = record(&format!("{base}.weight"), out.finish()?)?;
+                        rec.source = Some(src.name.clone());
+                        records.push(rec);
+                    }
+                    continue;
+                }
+                let mut streams = Vec::with_capacity(outs.len());
+                for (base, _) in outs {
+                    streams.push([
+                        stream(&format!("{base}.weight"))?,
+                        stream(&format!("{base}.scales"))?,
+                        stream(&format!("{base}.biases"))?,
+                    ]);
+                }
+                let (packed_cols, groups) = (cols * bits / 32, cols / GROUP_SIZE);
+                let expert_bytes = rows * cols * 2;
+                let per_block = (DENSE_BLOCK_ELEMENTS / (rows * cols)).max(1);
+                let mut error = QuantError::default();
+                let mut expert = 0;
+                while expert < experts {
+                    let take = per_block.min(experts - expert);
+                    let bytes = source.read(src, expert * expert_bytes, take * expert_bytes)?;
+                    let data = bytes_to_dense_f32(&bytes, src.dtype, &src.name)?;
+                    // Lignes indépendantes : le bloc entier se quantifie d'un coup.
+                    let block = quantize_block(&data, cols, *bits, *fit)?;
+                    peak.sample();
+                    for local in 0..take {
+                        let mut row = local * rows;
+                        for ((_, seg), [weight, scales, biases]) in outs.iter().zip(&mut streams) {
+                            let end = row + seg;
+                            weight.write(bytemuck::cast_slice(
+                                &block.packed[row * packed_cols..end * packed_cols],
+                            ))?;
+                            scales.write(bytemuck::cast_slice(
+                                &block.scales[row * groups..end * groups],
+                            ))?;
+                            biases.write(bytemuck::cast_slice(
+                                &block.biases[row * groups..end * groups],
+                            ))?;
+                            row = end;
+                        }
+                    }
+                    error.add(block.error);
+                    expert += take;
+                }
+                for ((base, _), [weight, scales, biases]) in outs.iter().zip(streams) {
+                    let mut rec = record(&format!("{base}.weight"), weight.finish()?)?;
+                    rec.source = Some(src.name.clone());
+                    rec.bits = Some(*bits);
+                    rec.group_size = Some(GROUP_SIZE);
+                    // Erreur du tenseur source entier, partagée par ses segments.
+                    rec.rel_err = Some(error.relative());
+                    records.push(rec);
+                    records.push(record(&format!("{base}.scales"), scales.finish()?)?);
+                    records.push(record(&format!("{base}.biases"), biases.finish()?)?);
+                }
             }
             Job::Experts {
                 group,

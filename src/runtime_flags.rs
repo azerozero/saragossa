@@ -10,7 +10,7 @@ pub use profile::{ModelEntry, Profile, ProfileError, Resolved, ServeSection, HOT
 use std::cell::Cell;
 #[cfg(all(target_os = "macos", feature = "metal"))]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -836,6 +836,63 @@ pub fn set_decode_max_tokens_per_s(rate: Option<f64>) {
             DECODE_MIN_INTERVAL_NS.store(0, AtomicOrdering::Relaxed);
         }
     }
+}
+
+/// Plancher du réglage : en dessous, le decode paraîtrait figé.
+const MIN_GPU_SHARE: u8 = 10;
+static GPU_SHARE: AtomicU8 = AtomicU8::new(100);
+
+/// Part de GPU visée en pourcentage (100 = pas de bridage).
+pub fn gpu_share() -> u8 {
+    GPU_SHARE.load(AtomicOrdering::Relaxed)
+}
+
+/// Règle à chaud la part de GPU visée (10 à 100, borné) : après chaque command
+/// buffer, le thread dort `busy * (100 / share - 1)`. En dessous de 100, limite
+/// aussi le pool rayon à `share` % des cœurs ; ce pool global se règle une seule
+/// fois par processus, un rechargement ne le redimensionne pas.
+pub fn set_gpu_share(share: u8) {
+    let share = set_gpu_duty_share(share);
+    if share < 100 {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        // NOTE: l'erreur « pool déjà construit » est attendue au rechargement.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads((cores * usize::from(share) / 100).max(1))
+            .build_global();
+    }
+}
+
+/// Règle seulement le rapport cyclique GPU (10 à 100, borné), sans toucher au
+/// pool rayon : le cédage automatique de `serve` bascule souvent et ne doit pas
+/// figer le pool global à sa part basse. Renvoie la part retenue.
+pub fn set_gpu_duty_share(share: u8) -> u8 {
+    let share = share.clamp(MIN_GPU_SHARE, 100);
+    GPU_SHARE.store(share, AtomicOrdering::Relaxed);
+    share
+}
+
+/// Analyse `--gpu-share` (entier de 10 à 100).
+pub fn parse_gpu_share(value: &str) -> Result<u8, String> {
+    value
+        .parse::<u8>()
+        .ok()
+        .filter(|v| (MIN_GPU_SHARE..=100).contains(v))
+        .ok_or_else(|| format!("--gpu-share doit être un entier de 10 à 100, reçu {value}"))
+}
+
+/// Analyse `--max-tok-s` (flottant fini > 0).
+pub fn parse_max_tok_s(value: &str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .ok_or_else(|| format!("--max-tok-s doit être un flottant > 0, reçu {value}"))
+}
+
+/// Sommeil qui ramène un temps GPU occupé `busy_ns` à `share` % de rapport cyclique.
+pub(crate) fn duty_sleep_ns(busy_ns: u64, share: u8) -> u64 {
+    let share = u128::from(share.clamp(1, 100));
+    u64::try_from(u128::from(busy_ns) * (100 - share) / share).unwrap_or(u64::MAX)
 }
 
 fn decode_min_interval_ns() -> Option<u64> {
@@ -2254,7 +2311,31 @@ pub(crate) fn gather_fast_mode() -> Option<&'static str> {
 
 pub(super) fn prefix_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_CACHE", true))
+    !SHARED_MODEL_CACHES_OFF.load(AtomicOrdering::Relaxed)
+        && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFIX_CACHE", true))
+}
+
+/// Coupe pour tout le process les caches portés par les poids partagés.
+static SHARED_MODEL_CACHES_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `serve --engines N` (N > 1) : coupe le cache de préfixe interne du décodeur
+/// (MTP, DFlash) et le mémo de prefill TTS. Ils vivent dans les poids
+/// partagés : un moteur changerait les reprises, donc le chemin numérique, d'un
+/// autre. Irréversible, à appeler avant la première requête.
+pub fn disable_shared_model_caches() {
+    SHARED_MODEL_CACHES_OFF.store(true, AtomicOrdering::Relaxed);
+}
+
+/// Un cache porté par les poids partagés (préfixe décodeur, mémo TTS) est-il
+/// actif ?
+#[must_use]
+pub fn shared_model_caches_active() -> bool {
+    #[cfg(feature = "tts")]
+    let tts = tts_prefill_cache_enabled();
+    #[cfg(not(feature = "tts"))]
+    let tts = false;
+    prefix_cache_enabled() || tts
 }
 
 /// Autorise `QmmNaDequant` dans le talker et le code_predictor TTS.
@@ -2307,7 +2388,8 @@ pub(crate) fn tts_prefill_cache_enabled() -> bool {
         return enabled;
     }
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_PREFILL_CACHE", false))
+    !SHARED_MODEL_CACHES_OFF.load(AtomicOrdering::Relaxed)
+        && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_PREFILL_CACHE", false))
 }
 
 #[cfg(test)]
@@ -3007,6 +3089,16 @@ fn hash_environment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duty_sleep_matches_share() {
+        use super::duty_sleep_ns as sleep;
+        assert_eq!(sleep(10_000, 100), 0);
+        assert_eq!(sleep(10_000, 50), 10_000);
+        assert_eq!(sleep(10_000, 25), 30_000);
+        assert_eq!(sleep(10_000, 10), 90_000);
+        assert_eq!(sleep(u64::MAX, 1), u64::MAX);
+    }
+
     /// Valeurs littérales du budget d'arbre DFlash par défaut : une régression
     /// de constante (par exemple 8 au lieu de 3) doit échouer ici.
     #[test]

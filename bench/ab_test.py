@@ -72,7 +72,7 @@ with tempfile.TemporaryDirectory() as tmp:
                            env_b=[f"AB_COUNTER={counter}"], prompt_file=None, prompt_tokens=8,
                            model_dir=str(root / "aucun-modèle"), max_tokens=3, temperature=0,
                            seed=1, blocks=4, order="abba", random_seed=42, identity="ids",
-                           primary="decode_tok_s", min_effect=0.01, allow_battery=False)
+                           primary="decode_tok_s", min_effect=0.01, allow_battery=False, cooldown=0)
     ac = dict(on_ac=True, low_power=False)
     normal = dict(throttled=False, pressure=0)
     with (patch.object(ab.sensors, "Sampler", Sampler),
@@ -125,6 +125,39 @@ with tempfile.TemporaryDirectory() as tmp:
             raise AssertionError("configuration modifiée acceptée")
         except ValueError as error:
             assert "reprise refusée" in str(error)
+        # Plan antérieur à --cooldown (sans la clé) : reprenable à 0, refusé sinon.
+        legacy = {k: v for k, v in config.items() if k != "cooldown"}
+        (path / "plan.json").write_text(json.dumps(legacy))
+        ab.run(path, config)
+        assert counter.read_text() == before
+        try:
+            ab.run(path, dict(config, cooldown=5))
+            raise AssertionError("cooldown modifié accepté")
+        except ValueError as error:
+            assert "reprise refusée" in str(error)
+        # Attente entre blocs seulement (3 pour 4 blocs), tracée sur la 1re passe.
+        with patch.object(ab.time, "sleep") as sleep:
+            cool_path, cool_config, _ = campaign("12", cooldown=7)
+        assert cool_config["cooldown"] == 7 and [c.args for c in sleep.call_args_list if c.args == (7,)] == [(7,)] * 3
+        assert [r["cooldown_s"] for r in ab.journal(cool_path)[0] if "cooldown_s" in r] == [7] * 3
+        # Reprise partielle : la pause est refaite avant le premier bloc rejoué.
+        part, original = root / "part", ab.passage
+        n = [0]
+
+        def stop(*a):
+            n[0] += 1
+            if n[0] == 6:
+                raise KeyboardInterrupt
+            return original(*a)
+
+        with patch.object(ab, "passage", side_effect=stop), patch.object(ab.time, "sleep"):
+            try:
+                ab.run(part, dict(cool_config))
+            except KeyboardInterrupt:
+                pass
+        with patch.object(ab.time, "sleep") as sleep:
+            ab.run(part, dict(cool_config))
+        assert [c.args for c in sleep.call_args_list if c.args == (7,)] == [(7,)] * 3
         loss_path, _, loss = campaign("8")
         verdict(loss, "perte")
         neutral_path, _, neutral = campaign()

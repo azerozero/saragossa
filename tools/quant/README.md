@@ -7,7 +7,7 @@ fabriquer des poids, pas à les exécuter.
 | Fichier | Rôle |
 |---|---|
 | `mixed_quant.py` | Alloue deux largeurs de bits par couche selon la sensibilité, écrit un modèle MLX |
-| `kl_eval.py` | Mesure KL(bf16 ‖ quantifié) et l'accord top-1, en teacher forcing |
+| `kl_eval.py` | Mesure KL(bf16 ‖ quantifié) et l'accord top-1, en teacher forcing (portage : `saragossa kl-eval`) |
 | `test_allocation.py` | Tests de la logique d'allocation, sans dépendance à MLX |
 | `convert_ls.py` | Re-quantifie en affine gs64 (3/4/5/6/8 bits, selon le template) par moindres carrés, éventuellement pondérés par l'imatrix |
 | `gptq.py` | Quantification de second ordre, Hessienne complète par module/expert, mêmes largeurs et format que le template |
@@ -20,7 +20,7 @@ fabriquer des poids, pas à les exécuter.
 | `tokenizer_sidecar.py` | Recopie `tokenizer.json` de la source à l'identique et refuse une regex de pré-tokenizer réécrite par transformers (`test_tokenizer_sidecar.py`) |
 | `chat_kl.py` | KL en régime chat contre les poids officiels bf16 (référence transformers, candidat mlx-lm) ; `--prompts`, `--json` par prompt, `--full-vocab`, `--reverse` |
 | `prompt_sets.py` | Ensembles figés `sets/selection.json` et `sets/validation.json` (aveugle), disjonction et SHA-256 |
-| `paired.py` | Différences appariées par prompt, IC 95 % bootstrap, plan factoriel 2×2 |
+| `paired.py` | Différences appariées par prompt, IC 95 % bootstrap, plan factoriel 2×2 (portage : `saragossa paired`) |
 | `audit_bytes.py` | bpw langage et total depuis les en-têtes safetensors, refus au-delà d'une limite |
 
 ## Conversion native, sans Python
@@ -38,7 +38,8 @@ saragossa convert SRC DST --keep-8bit self_attn --keep-bf16 lm_head
 Avec `--imatrix FICHIER` (format de `imatrix.py`), les moindres carrés minimisent
 `Σ_j E[x_j²]·(w_j − ŵ_j)²` par groupe ; le meilleur de min-max, grille MLX et
 fit pondéré est gardé en erreur pondérée. L'embedding et la tête MTP restent
-en fit uniforme ; un autre linéaire sans vecteur est refusé. Des poids tous
+en fit uniforme, comme les piles d'experts MoE fusionnées, que `--bits-for`
+n'atteint pas non plus ; un autre linéaire sans vecteur est refusé. Des poids tous
 égaux redonnent exactement la sortie sans imatrix. `--bits-for motif=N,…`
 (2 à 8 bits, première correspondance) sert aux recettes mixtes. Recettes
 mesurées : [docs/perf/convert-recettes.md](../../docs/perf/convert-recettes.md).
@@ -60,6 +61,28 @@ Sans `--imatrix`, `mixed_quant.py --target-bpw` classe en espace des poids
 (taille · ‖ΔW‖²/‖W‖² du fit uniforme, sans corpus). `convert_ls.py --uniform-fit`
 remplit un template imatrix sans pondération. Résultats de la campagne ≤ 4,2 bpw :
 [docs/perf/quant-campagne-42bpw.md](../../docs/perf/quant-campagne-42bpw.md).
+
+### Mistral-7B v0.3 : la LS perd contre `mx.quantize`
+
+La KL top-64 est mesurée dans mlx-lm contre la référence f32 `kld/mistral7b` sur 2048 positions. saragossa trouve la même valeur, à 2e-4 près.
+
+- **Constat.** Le u4 LS de `convert` donne 0,188, contre 0,175 pour `mlx_lm.convert` q4, au même débit de 4,50 bpw.
+- **Cause probable.** Passer le seul module `layers.1.mlp.down_proj` en 8 bits fait tomber la KL de 0,188 à 0,156 : ce module porte une part importante de l'écart. Dans ce module, la colonne d'entrée 7310 est une super-activation : son E[x²] vaut 2290, contre environ 2e-5 ailleurs, et elle porte 89 % de l'erreur E[x²]·δ² du module (0,325 sur 0,365, contre 0,089 chez MLX). Ses poids sont quasi nuls. Le lien entre cette erreur pondérée et la KL n'est pas mesuré directement.
+- **Hypothèse expliquant l'avantage de MLX.** Sa grille contient le zéro exact (biais = q0·s), et 3921 de ces 4096 poids reviennent exactement à 0. Notre LS déplace le biais : seulement 680 reviennent à 0, et les autres prennent un bruit que la super-activation pourrait amplifier.
+- **Le bord exact des super-poids ne suffit pas.** Forcer le bord exact pour les groupes à plus de 50× la médiane de ligne (9 groupes du module) laisse la KL à 0,1883 et l'erreur pondérée du module inchangée. Cette expérience est conservée hors de main.
+- **Recettes**, avec `--bits-for` et `--imatrix` de la branche `feat/convert-imatrix` :
+
+  | recette | bpw | KL |
+  |---|---|---|
+  | `--bits-for layers.1.mlp.down_proj=8` | 4,53 | 0,156 |
+  | `--imatrix` | 4,50 | 0,126 |
+  | `--imatrix --bits-for v_proj=8` | 4,57 | 0,112 |
+
+  L'imatrix se capture avec `imatrix.py`, qui accepte les modèles sans préfixe `language_model.`.
+
+Limites : chaque KL est une mesure unique sur un seul corpus de 2048 positions, sans IC apparié ; les scripts de diagnostic ne sont pas dans le dépôt.
+
+Piste non mesurée : un candidat LS « zéro exact » (contrainte b = −k·s) pour les colonnes à |w| anormalement petit, comme recette sans corpus.
 
 ## Qwen3.8-27B : alternative GPTQ à 4,2 bpw
 
@@ -490,6 +513,32 @@ Conserver le même vocabulaire et la même correspondance token/id entre modèle
 du token imposé) et `mean_abs_delta_p` (moyenne absolue sur les entrées `[n, vocab]`). Les log-probabilités f32 des deux côtés sont
 renormalisées en f64 pour les métriques. La KL couvre tout le vocabulaire ;
 ce format est propre au moteur, sans compatibilité binaire llama.cpp.
+
+## Portages Rust de `paired.py` et `kl_eval.py`
+
+Avec la feature `devtools` (active par défaut) :
+
+```bash
+saragossa paired diff CANDIDAT.json REFERENCE.json [--metric kl_mean]
+saragossa paired factorial A0F0.json A0F1.json A1F0.json A1F1.json
+saragossa kl-eval --reference MODELE-bf16 --candidate MODELE-quantifie [--prompts F] [--backend cpu|metal]
+```
+
+`paired` lit les mêmes JSON (`chat_kl.py eval --json`) et rend le même JSON
+que `paired.py` : générateur MT19937 de `random.Random(0)`, sommes compensées
+comme `sum()` de Python ≥ 3.12. Sur la fixture de
+`src/devtools/paired.rs`, la sortie est identique octet pour octet à
+`python3.13 paired.py`. Python 3.9 somme sans compensation et diffère au
+dernier ULP. Une valeur non finie est refusée au chargement.
+
+`kl-eval` garde les prompts figés, la tokenisation avec tokens spéciaux et la
+formule `Σ p·(ln(p+1e-9) − ln(q+1e-9))`, calculée en f64 au lieu du f32 MLX.
+Les logits viennent du prefill batché du moteur et non de mlx-lm : la parité de
+bout en bout sur un vrai modèle n'est pas encore mesurée. `paired.py` et
+`kl_eval.py` restent la référence d'ici là. Le prefill en morceaux
+(`SARAGOSSA_RUST_PREFILL_CHUNK`) est refusé. Les logits `[T, V]` f32 de la référence restent
+en mémoire pour tous les prompts (4·V·ΣT octets, ~120 Mo pour le jeu figé
+avec V = 248k) ; ceux du candidat sont comparés puis libérés prompt par prompt.
 
 ## Modèles publiés avec ces outils
 

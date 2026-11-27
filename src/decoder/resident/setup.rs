@@ -218,8 +218,8 @@ impl CausalDecoder {
                     k_proj,
                     v_proj,
                     o_proj,
-                    q_norm,
-                    k_norm,
+                    q_norm: Some(q_norm),
+                    k_norm: Some(k_norm),
                     post_norm,
                     pre_feedforward_norm: None,
                     post_feedforward_norm: None,
@@ -626,11 +626,11 @@ impl CausalDecoder {
                 let AttentionBlock::Full(attention) = &layer.attention else {
                     return Ok(false);
                 };
-                let (Some(q_norm), Some(k_norm)) =
-                    (attention.q_norm.as_ref(), attention.k_norm.as_ref())
-                else {
+                // Sans QK-norm (Llama, Mistral), seul le tail dense est câblé.
+                let (q_norm, k_norm) = (attention.q_norm.as_ref(), attention.k_norm.as_ref());
+                if q_norm.is_some() != k_norm.is_some() {
                     return Ok(false);
-                };
+                }
                 // Même géométrie que le decode, résolue une seule fois par couche.
                 let theta = self.config.rope_theta.ok_or_else(|| {
                     InferError::Config("rope_theta absent (setup résident)".to_string())
@@ -638,8 +638,11 @@ impl CausalDecoder {
                 let rope = self.plan.layers[index]
                     .resident
                     .resident_full_attn_layer_dims(0, 0, 0.0, theta)?;
-                let rope_frequencies =
-                    metal.rope_frequencies(rope.theta, rope.rope_frequency_dim)?;
+                let rope_frequencies = metal.rope_frequencies_scaled(
+                    rope.theta,
+                    rope.rope_frequency_dim,
+                    self.config.rope_llama3,
+                )?;
                 let v_proj = attention.resident_v_proj();
                 let Some(post_norm) = layer.post_attention_norm.as_ref() else {
                     return Ok(false);
@@ -652,6 +655,9 @@ impl CausalDecoder {
                 };
                 match layer.mlp.as_ref() {
                     Some(FeedForward::Moe(mlp)) if sigmoid_moe.is_none() => {
+                        let (Some(q_norm), Some(k_norm)) = (q_norm, k_norm) else {
+                            return Ok(false);
+                        };
                         let (pre_feedforward_norm, post_feedforward_norm, layer_scalar) =
                             resolve_gemma_tail_buffers(metal, layer)?;
                         let input_norm = metal.cached_buffer_from_f32(
@@ -822,14 +828,22 @@ impl CausalDecoder {
                                     attention.o_proj.weight(),
                                     "resident_dense_full_o_proj",
                                 )?,
-                                q_norm: metal.cached_buffer_from_f32(
-                                    q_norm.data(),
-                                    "resident_dense_full_q_norm",
-                                )?,
-                                k_norm: metal.cached_buffer_from_f32(
-                                    k_norm.data(),
-                                    "resident_dense_full_k_norm",
-                                )?,
+                                q_norm: q_norm
+                                    .map(|norm| {
+                                        metal.cached_buffer_from_f32(
+                                            norm.data(),
+                                            "resident_dense_full_q_norm",
+                                        )
+                                    })
+                                    .transpose()?,
+                                k_norm: k_norm
+                                    .map(|norm| {
+                                        metal.cached_buffer_from_f32(
+                                            norm.data(),
+                                            "resident_dense_full_k_norm",
+                                        )
+                                    })
+                                    .transpose()?,
                                 post_norm: metal.cached_buffer_from_f32(
                                     post_norm.data(),
                                     "resident_dense_full_post_norm",

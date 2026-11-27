@@ -96,6 +96,7 @@ fn vision_cpu_chunking_decode_and_text_identity() -> Result<()> {
             theta: 10_000_000.0,
             frequency_dim: 64,
             position_scale: 1.0,
+            llama3: None,
         },
         5,
         RopeStyle::Halves,

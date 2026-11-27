@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
-saragossa = { path = "..", default-features = false }
+saragossa = { path = "..", default-features = false, features = ["stt"] }
 
 # Crate autonome : ni libFuzzer ni nightly dans le build du moteur.
 [workspace]

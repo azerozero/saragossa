@@ -1,6 +1,28 @@
 use super::{add_into, gather_rows_i32, push_rows, PreparedVoiceDesign, TtsCloneContext, TtsModel};
 use crate::{InferError, Result, Tensor};
 
+/// Voix et graine d'une requête, rattachées à l'adresse du modèle visé.
+#[derive(Clone, Copy)]
+struct RequestVoice {
+    model: usize,
+    speaker_id: Option<i32>,
+    seed: Option<u64>,
+}
+
+thread_local! {
+    // Portée de [`TtsModel::with_request_voice`] ; `None` : champs du modèle.
+    static REQUEST_VOICE: std::cell::Cell<Option<RequestVoice>> = const { std::cell::Cell::new(None) };
+}
+
+/// Restaure la portée précédente, y compris si la synthèse panique.
+struct RestoreVoice(Option<RequestVoice>);
+
+impl Drop for RestoreVoice {
+    fn drop(&mut self) {
+        REQUEST_VOICE.with(|slot| slot.set(self.0));
+    }
+}
+
 impl TtsModel {
     /// Fournit une instruction VoiceDesign ou CustomVoice explicite ; sans effet sur le clonage ICL.
     #[must_use]
@@ -13,6 +35,51 @@ impl TtsModel {
     pub fn set_voice(&mut self, voice: Option<&str>) -> Result<()> {
         self.speaker_id = self.assets.model_config.speaker_id(voice)?;
         Ok(())
+    }
+
+    /// Exécute `run` avec la voix et la graine d'une requête sur un modèle
+    /// partagé (`&self`) : pendant `run`, les synthèses de **ce** modèle sur ce
+    /// thread lisent `voice` et `seed` au lieu des champs posés par
+    /// [`Self::set_voice`] et [`Self::set_seed`] ; les autres modèles gardent
+    /// les leurs. La portée précédente est restaurée au retour.
+    ///
+    /// # Errors
+    ///
+    /// Renvoie l'erreur de [`Self::set_voice`] pour une voix inconnue, sans
+    /// exécuter `run`.
+    pub fn with_request_voice<R>(
+        &self,
+        voice: Option<&str>,
+        seed: Option<u64>,
+        run: impl FnOnce() -> R,
+    ) -> Result<R> {
+        let speaker_id = self.assets.model_config.speaker_id(voice)?;
+        let scope = RequestVoice {
+            model: self.identity(),
+            speaker_id,
+            seed,
+        };
+        let _restore = RestoreVoice(REQUEST_VOICE.with(|slot| slot.replace(Some(scope))));
+        Ok(run())
+    }
+
+    fn identity(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    fn request_voice(&self) -> Option<RequestVoice> {
+        REQUEST_VOICE
+            .with(std::cell::Cell::get)
+            .filter(|scope| scope.model == self.identity())
+    }
+
+    pub(super) fn effective_speaker_id(&self) -> Option<i32> {
+        self.request_voice()
+            .map_or(self.speaker_id, |scope| scope.speaker_id)
+    }
+
+    pub(super) fn effective_seed(&self) -> Option<u64> {
+        self.request_voice().map_or(self.seed, |scope| scope.seed)
     }
 
     pub(super) fn prepare_inputs(&self, text: &str) -> Result<PreparedVoiceDesign> {
@@ -173,7 +240,7 @@ impl TtsModel {
         let tts_bos = tts_embeds.row_slice(0)?.to_vec();
         let tts_pad = tts_embeds.row_slice(2)?.to_vec();
 
-        let codec_ids = cfg.codec_prompt_ids(self.speaker_id);
+        let codec_ids = cfg.codec_prompt_ids(self.effective_speaker_id());
         let codec_embed = self.codec_embed(&codec_ids)?;
         let codec_len = codec_embed.shape()[0];
         let hidden = self.hidden_dim()?;
@@ -231,7 +298,7 @@ impl TtsModel {
     }
 
     pub(super) fn text_embed(&self, ids: &[i32]) -> Result<Tensor> {
-        let raw = gather_rows_i32(&self.text_embedding, ids)?;
+        let raw = self.text_embedding.gather_i32(ids)?;
         self.text_projection_fc2
             .forward(&crate::silu(&self.text_projection_fc1.forward(&raw)?))
     }
