@@ -65,10 +65,10 @@ Limites de l'importance fictive :
 
 Ablation Mistral-7B v0.3 u4 (KL moyen contre bf16, `kl_mlx.py`) : base 0,188,
 grille à zéro seule 0,1887, grille + importance fictive 0,169, `--imatrix`
-0,120 (0,126 avant ce changement ; 0,120 mesuré avant la fusion de
-feat/convert-imatrix à jour, à refaire avec le code final, non remesuré). Sans imatrix, le gain vient donc de
-l'importance fictive. Avec imatrix, la mesure ne sépare pas la part de la
-grille à zéro. Qwen3.8-27B : 0,0323 → 0,0318 (IC95 contient zéro).
+0,120 (0,126 avant ce changement). NOTE: le 0,120 avec imatrix est à refaire
+avec le code final (fusion de la branche imatrix à jour) ; non remesuré.
+Sans imatrix, le gain vient donc de l'importance fictive. Avec imatrix, la
+mesure ne sépare pas la part de la grille à zéro. Qwen3.8-27B : 0,0323 → 0,0318 (IC95 contient zéro).
 
 Corpus de calibration publiable : `calib_corpus.py` (splits train de
 no_robots et aya_dataset), disjonction contrôlée par `calib_disjoint.py`.
