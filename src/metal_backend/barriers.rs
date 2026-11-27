@@ -195,20 +195,37 @@ impl Drop for EncoderEndGuard<'_> {
     }
 }
 
+thread_local! {
+    /// Sommeil `--gpu-share` dû (> 0) ou d'avance (< 0) pour ce thread : le
+    /// dépassement d'un sommeil est rendu aux command buffers suivants.
+    static DUTY_DEBT_NS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
 /// Rapport cyclique `--gpu-share` : dort `busy * (100 / share - 1)` après un
-/// command buffer terminé. À 100 (défaut), un seul chargement atomique.
+/// command buffer terminé, en reportant l'écart entre sommeil dû et sommeil
+/// effectif. À 100 (défaut), un chargement atomique et la remise à zéro du
+/// report local au thread.
 pub(crate) fn duty_pause(command_buffer: &metal::CommandBufferRef) {
     let share = crate::runtime_flags::gpu_share();
-    if share < 100 {
-        let busy = command_buffer_gpu_ns(command_buffer);
-        let mut left = crate::runtime_flags::duty_sleep_ns(busy, share).min(1_000_000_000);
+    if share >= 100 {
+        DUTY_DEBT_NS.set(0);
+        return;
+    }
+    let busy = command_buffer_gpu_ns(command_buffer);
+    let debt = crate::runtime_flags::duty_debt_ns(DUTY_DEBT_NS.get(), busy, share);
+    let mut slept = 0;
+    if debt > 0 {
+        let started = std::time::Instant::now();
+        let mut left = debt.unsigned_abs();
         // Tranches de 20 ms : repasser à 100 à chaud interrompt le sommeil.
         while left > 0 && crate::runtime_flags::gpu_share() < 100 {
             let slice = left.min(20_000_000);
             std::thread::sleep(std::time::Duration::from_nanos(slice));
             left -= slice;
         }
+        slept = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     }
+    DUTY_DEBT_NS.set(crate::runtime_flags::duty_debt_after_sleep(debt, slept));
 }
 
 /// `commit()` + `wait_until_completed()` + `ensure_completed`, centralisant le

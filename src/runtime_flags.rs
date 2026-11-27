@@ -895,6 +895,30 @@ pub(crate) fn duty_sleep_ns(busy_ns: u64, share: u8) -> u64 {
     u64::try_from(u128::from(busy_ns) * (100 - share) / share).unwrap_or(u64::MAX)
 }
 
+/// Bornes du sommeil reporté d'un command buffer au suivant : au plus 1 s
+/// due (l'ancien plafond par command buffer), au plus 250 ms d'avance.
+const DUTY_DEBT_MAX_NS: i64 = 1_000_000_000;
+const DUTY_CREDIT_MAX_NS: i64 = 250_000_000;
+
+/// Sommeil à faire après un command buffer : la dette reportée `debt_ns`
+/// (négative quand le système a fait dormir plus que demandé) plus le sommeil
+/// dû pour `busy_ns`, bornée. Sans ce report, chaque dépassement du sommeil
+/// (granularité des timers, coalescence en QoS background) s'ajoutait et la
+/// part réelle tombait bien sous la part visée.
+pub(crate) fn duty_debt_ns(debt_ns: i64, busy_ns: u64, share: u8) -> i64 {
+    let due = i64::try_from(duty_sleep_ns(busy_ns, share)).unwrap_or(i64::MAX);
+    debt_ns
+        .saturating_add(due)
+        .clamp(-DUTY_CREDIT_MAX_NS, DUTY_DEBT_MAX_NS)
+}
+
+/// Dette restante après un sommeil effectif de `slept_ns`, bornée.
+pub(crate) fn duty_debt_after_sleep(debt_ns: i64, slept_ns: u64) -> i64 {
+    debt_ns
+        .saturating_sub(i64::try_from(slept_ns).unwrap_or(i64::MAX))
+        .clamp(-DUTY_CREDIT_MAX_NS, DUTY_DEBT_MAX_NS)
+}
+
 fn decode_min_interval_ns() -> Option<u64> {
     let loaded = DECODE_MIN_INTERVAL_NS.load(AtomicOrdering::Relaxed);
     let nanos = if loaded == DECODE_INTERVAL_UNINITIALIZED_NS {
@@ -3097,6 +3121,40 @@ mod tests {
         assert_eq!(sleep(10_000, 25), 30_000);
         assert_eq!(sleep(10_000, 10), 90_000);
         assert_eq!(sleep(u64::MAX, 1), u64::MAX);
+    }
+
+    #[test]
+    fn duty_debt_carries_oversleep_and_bounds_it() {
+        use super::{duty_debt_after_sleep as after, duty_debt_ns as debt};
+        let ms = 1_000_000_i64;
+        // Part 25 : 10 ms de GPU doivent 30 ms ; dormir 50 ms laisse 20 ms d'avance.
+        let owed = debt(0, 10_000_000, 25);
+        assert_eq!(owed, 30 * ms);
+        let credit = after(owed, 50_000_000);
+        assert_eq!(credit, -20 * ms);
+        // L'avance est rendue au command buffer suivant : 30 - 20 = 10 ms.
+        assert_eq!(debt(credit, 10_000_000, 25), 10 * ms);
+        // Sur une longue suite, le sommeil total vaut le sommeil dû malgré les
+        // dépassements de +70 % (sauf la dernière avance, bornée).
+        let (mut d, mut slept, mut owed_total) = (0_i64, 0_i64, 0_i64);
+        for _ in 0..1000 {
+            owed_total += 30 * ms;
+            d = debt(d, 10_000_000, 25);
+            if d > 0 {
+                let s = d * 17 / 10;
+                slept += s;
+                d = after(d, s as u64);
+            }
+        }
+        assert!(
+            (slept - owed_total).abs() <= 250 * ms,
+            "{slept} vs {owed_total}"
+        );
+        // Bornes : une veille de 10 s n'offre que 250 ms d'avance ; la dette
+        // plafonne à 1 s.
+        assert_eq!(after(0, 10_000_000_000), -250 * ms);
+        assert_eq!(debt(0, u64::MAX, 10), 1_000 * ms);
+        assert_eq!(debt(-250 * ms, 0, 100), -250 * ms);
     }
 
     /// Valeurs littérales du budget d'arbre DFlash par défaut : une régression
