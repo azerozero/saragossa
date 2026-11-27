@@ -1,4 +1,4 @@
-//! Moindres carrés pondérés par une imatrix (importance diagonale E[x²] par
+//! Moindres carrés pondérés par une imatrix (importance diagonale `E[x²]` par
 //! colonne d'entrée), toutes largeurs affines gs64 (2 à 8 bits).
 //!
 //! Format : celui de `tools/quant/imatrix.py`, un safetensors de vecteurs f32

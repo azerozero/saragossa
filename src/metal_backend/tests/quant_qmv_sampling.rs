@@ -2727,6 +2727,9 @@ fn affine_qmm_u6_matches_qmv_bitwise_and_routes() -> Result<()> {
     // Un lancement explicite doit échouer sans device, pas réussir sans calcul.
     let mut executor = MetalExecutor::new()?;
     executor.na_gemm_bf16 = None;
+    // NOTE: 2048×2048 passerait sinon par le GEMM NA tuilé u6, couvert par
+    // `qmm_ub_tiled_prefill_matches_bf16_cpu_and_routes` ; ici le qmm scalaire.
+    executor.na_gemm_coop_qb_tiled_u6 = None;
     let assert_exact = |actual: &[f32], expected: &[f32], context: &str| {
         assert_eq!(actual.len(), expected.len(), "{context}");
         for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
@@ -3368,6 +3371,7 @@ fn qmm_na_fused_tiled_u4_x4_matches_f32_reference() -> Result<()> {
                 out_dim,
                 "x4_test",
                 "x4_test",
+                4,
             )?;
             encoder.end_encoding();
             commit_and_wait(command_buffer)?;

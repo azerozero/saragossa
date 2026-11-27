@@ -87,7 +87,7 @@ pub struct HfConvertOptions {
     pub keep_bf16: Vec<String>,
     /// Rehache les shards déjà terminés au lieu de contrôler leur taille.
     pub verify: bool,
-    /// Imatrix (`tools/quant/imatrix.py`) : moindres carrés pondérés par E[x²].
+    /// Imatrix (`tools/quant/imatrix.py`) : moindres carrés pondérés par `E[x²]`.
     pub imatrix: Option<PathBuf>,
     /// `(sous-chaîne, largeur)` : première correspondance, avant `keep_8bit`
     /// (2, 3, 4, 5, 6 ou 8 bits ; la tête MTP reste u4).
