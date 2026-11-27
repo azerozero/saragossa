@@ -78,9 +78,10 @@ La porte loadavg < 2 et le secteur sont vérifiés à chaque passe. Le complet a
 | TTS seul | 97,3 à 98,1 | — | 9,20 à 9,27 | — | 1,20 à 1,26 s |
 
 - Les temps s'additionnent : LLM seul + TTS seul = 114,7 s, contre 114,3 s pour
-  le complet. Le GPU est partagé dans le temps sans aucun recouvrement utile. Le
-  TTS prend 85 % de la machine et le LLM 15 %. Un LLM en lignes parfait
-  (s → ∞) plafonne donc le débit global à ×1,17.
+  le complet. C'est compatible avec un partage du GPU dans le temps sans
+  recouvrement utile, sans le démontrer. Sous cette hypothèse de sérialisation,
+  le TTS prend environ 85 % du temps et le LLM 15 %, et un LLM en lignes parfait
+  (s → ∞) plafonnerait le débit global à environ ×1,17.
 - Aucun trou intra-requête sur 48 tours par passe. L'attente cumulée de lecture
   reste sous 1 s par passe complète.
 - Identité : réponse et SHA-256 du PCM identiques par clip à la passe de
@@ -102,7 +103,8 @@ exécutions.
 | 6 | 7,40 à 7,45 ms (×2,8) | 11,33 ms | 22,0 ms | 0,55 ms (×2,8) | 1,62 ms |
 
 - Le qmv en lignes (bit-exact contre le mono dès R ≥ 3) fait 6 flux en 2,8 ×
-  T(1), soit s ≈ 2,1 contre 6 qmv mono indépendants. Le `QmmBatchedU6` est 3 fois
+  T(1), soit s ≈ 2,1 contre 6 × T(1) ; contre les 6 qmv mono mesurés
+  (11,33 ms), le gain vaut ×1,52. Le `QmmBatchedU6` est 3 fois
   plus lent que lui à R = 6 et ne convient pas.
 - Borne Amdahl d'un TTS en lignes entre moteurs à N=6 : ×1,2 si seule la part
   matmul (~1/3 d'une trame mesurée à N=1) accélère, ×1,8 si toute la trame

@@ -97,7 +97,8 @@ fn tts_u6_rows_cost_bench() -> Result<()> {
         );
         for rows in [2_usize, 4, 6] {
             let mono = pass(rows, true)?;
-            let lines = pass(rows, false)?;
+            // Override explicite : un SARAGOSSA_RUST_QMM_U6=1 ambiant mesurerait déjà le QMM.
+            let lines = super::flags::with_qmm_u6_override(false, || pass(rows, false))?;
             let qmm = super::flags::with_qmm_u6_override(true, || pass(rows, false))?;
             eprintln!(
                 "tts_rows {name} R={rows} mono×R={mono:.3} lignes={lines:.3} qmm_u6={qmm:.3} ms \
