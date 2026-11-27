@@ -2928,10 +2928,12 @@ impl CausalDecoder {
         } else {
             Some(self.snapshot_speculative_cache(cache)?)
         };
-        // À T>0 avec rollback résident, la ligne du dernier draft est vérifiée
-        // aussi : si tout est accepté, le token bonus se tire de cette ligne au
-        // lieu d'un pas de decode complet (32 ms sur le 27B).
-        let bonus_row = options.temperature > f32::EPSILON && batched_rollback;
+        // Avec rollback résident, la ligne du dernier draft est vérifiée aussi :
+        // si tout est accepté, le token bonus se tire de cette ligne au lieu d'un
+        // pas de decode complet (32-34 ms sur le 27B). En greedy, c'est l'argmax
+        // de la ligne, calculé par le même vérifieur en lignes que les autres
+        // cibles : même identité au bit avec l'AR que celles-ci.
+        let bonus_row = batched_rollback;
         let verified_drafts = if bonus_row {
             drafts.len()
         } else {
@@ -3178,7 +3180,16 @@ impl CausalDecoder {
         let bonus = if accepted_all && bonus_row {
             let position = verify_tokens.len().saturating_sub(1);
             let state = Tensor::row(target_states.row_slice(position)?.to_vec())?;
-            let token = if dense {
+            let greedy_target = target_tokens
+                .as_ref()
+                .and_then(|tokens| tokens.get(position))
+                .copied();
+            let token = if options.temperature <= f32::EPSILON {
+                match greedy_target {
+                    Some(token) => token,
+                    None => self.sample_token_from_state(&state, options, sampler)?,
+                }
+            } else if dense {
                 let row = target_logits_row(position, &state)?;
                 sample_from_dense_distribution(
                     &softmax(row.as_row()?, options.temperature),
