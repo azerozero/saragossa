@@ -30,6 +30,7 @@ const EXEMPT: &[(&str, &str)] = &[
     ("golden_voicedesign_e2e_audio_matches_fixture", "a-trier"),
     ("kernel_profiles_per_model_metal_parity", "a-trier"),
     ("moe_gather_overlap_cost_bench", "bench"),
+    ("tts_u6_rows_cost_bench", "bench"),
     ("mtp_bf16_busy_claim_memory_guard_cleans_setup", "a-trier"),
     (
         "mtp_bf16_history_generation_adoption_and_f32_fallback",
