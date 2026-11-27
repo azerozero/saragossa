@@ -17,7 +17,7 @@ pub(crate) const HOT_SHARE: f64 = 0.1;
 /// Colonne « petite » : |w| moyen sous cette fraction de la médiane des colonnes.
 pub(crate) const SMALL_RATIO: f64 = 0.1;
 /// Au-delà de ce nombre de petites colonnes, c'est un sous-espace mort (q/k des
-/// couches 0-1 de Mistral : ~1000 colonnes, E[x²] ≈ 1e-10), pas une
+/// couches 0-1 de Mistral : ~1000 colonnes, `E[x²]` ≈ 1e-10), pas une
 /// super-activation isolée : pas d'importance fictive.
 // ponytail: seuil fixe, à remplacer par une imatrix quand un corpus existe.
 const MAX_SMALL: usize = 16;
@@ -79,7 +79,7 @@ pub(crate) struct HotColumn {
     pub(crate) col: usize,
     pub(crate) share: f64,
     pub(crate) error: f64,
-    /// E[x²] de la colonne (imatrix).
+    /// `E[x²]` de la colonne (imatrix).
     pub(crate) importance: Option<f64>,
 }
 

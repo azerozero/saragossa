@@ -79,7 +79,7 @@ fn round_significand(x: f32, p: u32) -> f32 {
 /// Candidat « grille à zéro » : biais contraint à −k·s (k entier), pour que
 /// le code k restitue 0. Une colonne d'entrée à poids quasi nuls mais à
 /// super-activation (Mistral-7B v0.3, `layers.1.mlp.down_proj`, colonne 7310)
-/// paie sinon chaque décalage du biais à E[x²] ≈ 2290 fois son poids.
+/// paie sinon chaque décalage du biais à `E[x²]` ≈ 2290 fois son poids.
 ///
 /// Pour chaque k tiré des départs `starts` (`round(−b/s)`), l'échelle est
 /// ajustée aux moindres carrés (pondérés par `weight`) à k fixé, puis deux
