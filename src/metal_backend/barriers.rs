@@ -196,36 +196,49 @@ impl Drop for EncoderEndGuard<'_> {
 }
 
 thread_local! {
-    /// Sommeil `--gpu-share` dû (> 0) ou d'avance (< 0) pour ce thread : le
-    /// dépassement d'un sommeil est rendu aux command buffers suivants.
-    static DUTY_DEBT_NS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    /// Report du sommeil `--gpu-share` de ce thread (voir `DutyDebt`).
+    static DUTY_DEBT: std::cell::Cell<crate::runtime_flags::DutyDebt> =
+        std::cell::Cell::new(crate::runtime_flags::DutyDebt::default());
+}
+
+/// Horloge monotone du report, en ns depuis le premier command buffer bridé.
+fn duty_clock_ns() -> u64 {
+    static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+    let elapsed = ORIGIN.get_or_init(std::time::Instant::now).elapsed();
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Rapport cyclique `--gpu-share` : dort `busy * (100 / share - 1)` après un
 /// command buffer terminé, en reportant l'écart entre sommeil dû et sommeil
-/// effectif. À 100 (défaut), un chargement atomique et la remise à zéro du
+/// effectif (`DutyDebt`). Un changement de réglage interrompt le sommeil et
+/// efface le report. À 100 (défaut), un chargement atomique et l'oubli du
 /// report local au thread.
 pub(crate) fn duty_pause(command_buffer: &metal::CommandBufferRef) {
-    let share = crate::runtime_flags::gpu_share();
+    use crate::runtime_flags::{gpu_share, gpu_share_generation};
+    let share = gpu_share();
     if share >= 100 {
-        DUTY_DEBT_NS.set(0);
+        DUTY_DEBT.set(crate::runtime_flags::DutyDebt::default());
         return;
     }
+    let generation = gpu_share_generation();
     let busy = command_buffer_gpu_ns(command_buffer);
-    let debt = crate::runtime_flags::duty_debt_ns(DUTY_DEBT_NS.get(), busy, share);
-    let mut slept = 0;
-    if debt > 0 {
-        let started = std::time::Instant::now();
-        let mut left = debt.unsigned_abs();
-        // Tranches de 20 ms : repasser à 100 à chaud interrompt le sommeil.
-        while left > 0 && crate::runtime_flags::gpu_share() < 100 {
-            let slice = left.min(20_000_000);
-            std::thread::sleep(std::time::Duration::from_nanos(slice));
-            left -= slice;
+    let mut duty = DUTY_DEBT.get();
+    let mut left = duty.plan(duty_clock_ns(), generation, busy, share);
+    let started = std::time::Instant::now();
+    let mut interrupted = false;
+    // Tranches de 20 ms : un nouveau réglage (retour à 100 compris) coupe court.
+    while left > 0 {
+        if gpu_share_generation() != generation {
+            interrupted = true;
+            break;
         }
-        slept = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let slice = left.min(20_000_000);
+        std::thread::sleep(std::time::Duration::from_nanos(slice));
+        left -= slice;
     }
-    DUTY_DEBT_NS.set(crate::runtime_flags::duty_debt_after_sleep(debt, slept));
+    let slept = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    duty.settle(duty_clock_ns(), slept, interrupted);
+    DUTY_DEBT.set(duty);
 }
 
 /// `commit()` + `wait_until_completed()` + `ensure_completed`, centralisant le

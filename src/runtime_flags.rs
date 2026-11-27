@@ -841,6 +841,14 @@ pub fn set_decode_max_tokens_per_s(rate: Option<f64>) {
 /// Plancher du réglage : en dessous, le decode paraîtrait figé.
 const MIN_GPU_SHARE: u8 = 10;
 static GPU_SHARE: AtomicU8 = AtomicU8::new(100);
+/// Incrémentée à chaque réglage de la part : le report de sommeil d'un
+/// command buffer ne survit pas à un changement, même aller-retour.
+static GPU_SHARE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Génération courante du réglage de la part (voir [`set_gpu_duty_share`]).
+pub(crate) fn gpu_share_generation() -> u64 {
+    GPU_SHARE_GENERATION.load(AtomicOrdering::Relaxed)
+}
 
 /// Part de GPU visée en pourcentage (100 = pas de bridage).
 pub fn gpu_share() -> u8 {
@@ -868,6 +876,7 @@ pub fn set_gpu_share(share: u8) {
 pub fn set_gpu_duty_share(share: u8) -> u8 {
     let share = share.clamp(MIN_GPU_SHARE, 100);
     GPU_SHARE.store(share, AtomicOrdering::Relaxed);
+    GPU_SHARE_GENERATION.fetch_add(1, AtomicOrdering::Relaxed);
     share
 }
 
@@ -899,24 +908,54 @@ pub(crate) fn duty_sleep_ns(busy_ns: u64, share: u8) -> u64 {
 /// due (l'ancien plafond par command buffer), au plus 250 ms d'avance.
 const DUTY_DEBT_MAX_NS: i64 = 1_000_000_000;
 const DUTY_CREDIT_MAX_NS: i64 = 250_000_000;
+/// Au-delà de ce délai depuis le dernier command buffer bridé (fin de requête,
+/// inactivité), le report est oublié.
+const DUTY_DEBT_TTL_NS: u64 = 1_000_000_000;
 
-/// Sommeil à faire après un command buffer : la dette reportée `debt_ns`
-/// (négative quand le système a fait dormir plus que demandé) plus le sommeil
-/// dû pour `busy_ns`, bornée. Sans ce report, chaque dépassement du sommeil
-/// (granularité des timers, coalescence en QoS background) s'ajoutait et la
-/// part réelle tombait bien sous la part visée.
-pub(crate) fn duty_debt_ns(debt_ns: i64, busy_ns: u64, share: u8) -> i64 {
-    let due = i64::try_from(duty_sleep_ns(busy_ns, share)).unwrap_or(i64::MAX);
-    debt_ns
-        .saturating_add(due)
-        .clamp(-DUTY_CREDIT_MAX_NS, DUTY_DEBT_MAX_NS)
+/// Report du sommeil `--gpu-share` d'un command buffer au suivant, pour un
+/// thread : `debt_ns` > 0 reste dû, < 0 a déjà été dormi en trop. Sans ce
+/// report, chaque dépassement du sommeil (granularité des timers, coalescence
+/// en QoS background) s'ajoutait et la part réelle tombait sous la part visée.
+/// Horloge (`now_ns`, monotone) et génération du réglage injectées.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DutyDebt {
+    debt_ns: i64,
+    generation: u64,
+    last_ns: Option<u64>,
 }
 
-/// Dette restante après un sommeil effectif de `slept_ns`, bornée.
-pub(crate) fn duty_debt_after_sleep(debt_ns: i64, slept_ns: u64) -> i64 {
-    debt_ns
-        .saturating_sub(i64::try_from(slept_ns).unwrap_or(i64::MAX))
-        .clamp(-DUTY_CREDIT_MAX_NS, DUTY_DEBT_MAX_NS)
+impl DutyDebt {
+    /// Sommeil à faire après `busy_ns` de GPU à la part `share`. Le report
+    /// repart de zéro si la génération a changé ou si le dernier command
+    /// buffer bridé date de plus de [`DUTY_DEBT_TTL_NS`].
+    pub(crate) fn plan(&mut self, now_ns: u64, generation: u64, busy_ns: u64, share: u8) -> u64 {
+        let stale = self
+            .last_ns
+            .is_none_or(|last| now_ns.saturating_sub(last) > DUTY_DEBT_TTL_NS);
+        if stale || generation != self.generation {
+            self.debt_ns = 0;
+            self.generation = generation;
+        }
+        let due = i64::try_from(duty_sleep_ns(busy_ns, share)).unwrap_or(i64::MAX);
+        self.debt_ns = self
+            .debt_ns
+            .saturating_add(due)
+            .clamp(-DUTY_CREDIT_MAX_NS, DUTY_DEBT_MAX_NS);
+        self.debt_ns.max(0).unsigned_abs()
+    }
+
+    /// Enregistre le sommeil effectif `slept_ns` terminé à `now_ns`. Un
+    /// sommeil interrompu par un changement de réglage efface le report.
+    pub(crate) fn settle(&mut self, now_ns: u64, slept_ns: u64, interrupted: bool) {
+        self.debt_ns = if interrupted {
+            0
+        } else {
+            self.debt_ns
+                .saturating_sub(i64::try_from(slept_ns).unwrap_or(i64::MAX))
+                .clamp(-DUTY_CREDIT_MAX_NS, DUTY_DEBT_MAX_NS)
+        };
+        self.last_ns = Some(now_ns);
+    }
 }
 
 fn decode_min_interval_ns() -> Option<u64> {
@@ -3123,38 +3162,95 @@ mod tests {
         assert_eq!(sleep(u64::MAX, 1), u64::MAX);
     }
 
+    /// Simule `n` command buffers de `busy` ns à la part `share` avec un
+    /// sommeil qui dépasse de `over` % : renvoie (sommeil total, sommeil dû).
+    fn simulate(
+        duty: &mut super::DutyDebt,
+        now: &mut u64,
+        generation: u64,
+        share: u8,
+        n: usize,
+        over: u64,
+    ) -> (u64, u64) {
+        let busy = 10_000_000;
+        let (mut slept_total, mut owed) = (0, 0);
+        for _ in 0..n {
+            *now += busy;
+            owed += super::duty_sleep_ns(busy, share);
+            let sleep = duty.plan(*now, generation, busy, share);
+            let slept = sleep * (100 + over) / 100;
+            *now += slept;
+            slept_total += slept;
+            duty.settle(*now, slept, false);
+        }
+        (slept_total, owed)
+    }
+
     #[test]
     fn duty_debt_carries_oversleep_and_bounds_it() {
-        use super::{duty_debt_after_sleep as after, duty_debt_ns as debt};
-        let ms = 1_000_000_i64;
-        // Part 25 : 10 ms de GPU doivent 30 ms ; dormir 50 ms laisse 20 ms d'avance.
-        let owed = debt(0, 10_000_000, 25);
-        assert_eq!(owed, 30 * ms);
-        let credit = after(owed, 50_000_000);
-        assert_eq!(credit, -20 * ms);
-        // L'avance est rendue au command buffer suivant : 30 - 20 = 10 ms.
-        assert_eq!(debt(credit, 10_000_000, 25), 10 * ms);
-        // Sur une longue suite, le sommeil total vaut le sommeil dû malgré les
-        // dépassements de +70 % (sauf la dernière avance, bornée).
-        let (mut d, mut slept, mut owed_total) = (0_i64, 0_i64, 0_i64);
-        for _ in 0..1000 {
-            owed_total += 30 * ms;
-            d = debt(d, 10_000_000, 25);
-            if d > 0 {
-                let s = d * 17 / 10;
-                slept += s;
-                d = after(d, s as u64);
-            }
-        }
-        assert!(
-            (slept - owed_total).abs() <= 250 * ms,
-            "{slept} vs {owed_total}"
+        let ms = 1_000_000_u64;
+        let mut duty = super::DutyDebt::default();
+        let mut now = 0;
+        // Part 25 : 10 ms de GPU doivent 30 ms ; dormir 50 ms laisse 20 ms
+        // d'avance, rendue au command buffer suivant (30 - 20 = 10 ms).
+        assert_eq!(duty.plan(now, 1, 10 * ms, 25), 30 * ms);
+        now += 50 * ms;
+        duty.settle(now, 50 * ms, false);
+        now += 10 * ms;
+        assert_eq!(duty.plan(now, 1, 10 * ms, 25), 10 * ms);
+        duty.settle(now + 10 * ms, 10 * ms, false);
+        // Sur une longue suite, le sommeil total vaut le sommeil dû malgré
+        // +70 % de dépassement, à la dernière avance près.
+        let (slept, owed) = simulate(&mut duty, &mut now, 1, 25, 1000, 70);
+        assert!(slept.abs_diff(owed) <= 250 * ms, "{slept} vs {owed}");
+        // Une veille de 10 s n'offre que 250 ms d'avance, et pas au-delà de
+        // l'expiration.
+        let mut fresh = super::DutyDebt::default();
+        fresh.plan(0, 1, 0, 25);
+        fresh.settle(0, 10_000 * ms, false);
+        assert_eq!(fresh.debt_ns, -250 * ms as i64);
+        assert_eq!(fresh.plan(100 * ms, 1, 100 * ms, 25), 50 * ms);
+        // La dette plafonne à 1 s.
+        assert_eq!(
+            super::DutyDebt::default().plan(0, 1, u64::MAX, 10),
+            1_000 * ms
         );
-        // Bornes : une veille de 10 s n'offre que 250 ms d'avance ; la dette
-        // plafonne à 1 s.
-        assert_eq!(after(0, 10_000_000_000), -250 * ms);
-        assert_eq!(debt(0, u64::MAX, 10), 1_000 * ms);
-        assert_eq!(debt(-250 * ms, 0, 100), -250 * ms);
+    }
+
+    #[test]
+    fn duty_debt_resets_on_share_change_interruption_and_expiry() {
+        let ms = 1_000_000_u64;
+        let mut duty = super::DutyDebt::default();
+        let mut now = 0;
+        // Avance accumulée à la part 25 (génération 1).
+        simulate(&mut duty, &mut now, 1, 25, 10, 70);
+        duty.plan(now, 1, 10 * ms, 25);
+        duty.settle(now + 60 * ms, 60 * ms, false);
+        now += 60 * ms;
+        assert!(duty.debt_ns < 0, "avance : {}", duty.debt_ns);
+        // Nouvelle génération (part 50, ou aller-retour 25 -> 100 -> 25) :
+        // pas d'avance héritée, le sommeil dû est intégral.
+        assert_eq!(duty.plan(now + ms, 2, 10 * ms, 50), 10 * ms);
+        duty.settle(now + 11 * ms, 10 * ms, false);
+        now += 11 * ms;
+        // Sommeil interrompu (réglage changé pendant le sommeil) : la dette
+        // restante est effacée, pas repayée plus tard.
+        assert_eq!(duty.plan(now, 2, 100 * ms, 10), 900 * ms);
+        duty.settle(now + 20 * ms, 20 * ms, true);
+        now += 20 * ms;
+        assert_eq!(duty.debt_ns, 0);
+        assert_eq!(duty.plan(now + ms, 2, 10 * ms, 50), 10 * ms);
+        // Avance puis plus d'1 s sans command buffer bridé (nouvelle requête) :
+        // expirée.
+        duty.settle(now + 40 * ms, 39 * ms, false);
+        now += 40 * ms;
+        assert!(duty.debt_ns < 0);
+        now += 1_001 * ms;
+        assert_eq!(duty.plan(now, 2, 10 * ms, 50), 10 * ms);
+        // Le même délai sans dépasser l'expiration garde le report.
+        duty.settle(now + 30 * ms, 30 * ms, false);
+        now += 30 * ms + 999 * ms;
+        assert_eq!(duty.plan(now, 2, 10 * ms, 50), 0);
     }
 
     /// Valeurs littérales du budget d'arbre DFlash par défaut : une régression
