@@ -12,16 +12,17 @@
 //!
 //! En mode dynamique (défaut, `serve.auto_yield_dynamic`), la part basse suit
 //! l'activité GPU des autres processus : `100 - la leur - 10`, bornée à
-//! 10..=50 (voir [`dynamic_share`]). L'utilisation vient de `ioreg`
-//! (`Device Utilization %` d'IOAccelerator), moyennée sur [`WINDOW`] secondes
-//! car le signal est en pics. La charge du moteur y est comprise : on retranche
-//! le temps GPU de nos propres command buffers bridés, mesuré exactement par
-//! `GPUStartTime`/`GPUEndTime`. Échantillonner pendant nos pauses ne suffirait
-//! pas : elles durent quelques millisecondes alors que la fenêtre du pilote
-//! est plus longue et y mêle encore notre travail. Sans mesure (pas d'ioreg),
-//! la part de départ `serve.auto_yield_share` reste en place.
+//! 10..=50 (voir [`dynamic_share`]), moyennée sur [`WINDOW`] secondes car le
+//! signal est en pics. La mesure vient de `ioreg` : `accumulatedGPUTime` de
+//! chaque client `AGXDeviceUserClient`, par pid, notre propre pid exclu.
+//! Écarté à la mesure : `Device Utilization %` d'IOAccelerator moins le temps
+//! `GPUStartTime..GPUEndTime` de nos command buffers. Ce temps inclut les
+//! tranches où le GPU sert les autres, la soustraction devient fausse sous
+//! contention et la part oscillait entre 14 et 80 % externes pour une charge
+//! constante. Sans mesure (pas d'ioreg), la part de départ
+//! `serve.auto_yield_share` reste en place.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -231,45 +232,95 @@ fn since_input() -> Duration {
     Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
 }
 
-/// Utilisation GPU externe : celle d'IOAccelerator moins nos command buffers.
+/// Utilisation GPU des autres processus entre deux relevés `ioreg`.
 #[cfg(target_os = "macos")]
 struct Sampler {
-    own_ns: u64,
-    at: std::time::Instant,
+    last: Option<(HashMap<u32, u64>, std::time::Instant)>,
 }
 
 #[cfg(target_os = "macos")]
 impl Sampler {
     fn new() -> Self {
         Self {
-            own_ns: saragossa::runtime_flags::throttled_gpu_ns(),
-            at: std::time::Instant::now(),
+            last: gpu_time_snapshot().map(|times| (times, std::time::Instant::now())),
         }
     }
 
+    /// `None` tant qu'il manque un relevé de référence ou si `ioreg` échoue.
     fn external(&mut self) -> Option<f64> {
-        let output = std::process::Command::new("/usr/sbin/ioreg")
-            .args(["-r", "-d", "1", "-c", "IOAccelerator", "-w0"])
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        let device = device_utilization(&String::from_utf8_lossy(&output.stdout))?;
-        let own_ns = saragossa::runtime_flags::throttled_gpu_ns();
-        let elapsed = self.at.elapsed().as_nanos().max(1) as f64;
-        let own = own_ns.saturating_sub(self.own_ns) as f64 * 100.0 / elapsed;
-        self.own_ns = own_ns;
-        self.at = std::time::Instant::now();
-        Some((device - own).max(0.0))
+        let now = std::time::Instant::now();
+        let current = gpu_time_snapshot();
+        let previous = std::mem::replace(&mut self.last, current.clone().map(|t| (t, now)));
+        let ((previous, at), current) = (previous?, current?);
+        let elapsed = now.duration_since(at).as_nanos() as f64;
+        Some(external_percent(
+            &previous,
+            &current,
+            std::process::id(),
+            elapsed,
+        ))
     }
 }
 
-/// `"Device Utilization %"=N` du premier IOAccelerator de la sortie `ioreg`.
+#[cfg(target_os = "macos")]
+fn gpu_time_snapshot() -> Option<HashMap<u32, u64>> {
+    let output = std::process::Command::new("/usr/sbin/ioreg")
+        .args(["-r", "-c", "AGXDeviceUserClient", "-d", "1", "-w0"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| gpu_time_by_pid(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Temps GPU cumulé (`accumulatedGPUTime`, ns) par pid, client par client :
+/// chaque bloc `+-o AGXDeviceUserClient` porte son `IOUserClientCreator`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn device_utilization(ioreg: &str) -> Option<f64> {
-    let key = "\"Device Utilization %\"=";
-    let rest = &ioreg[ioreg.find(key)? + key.len()..];
-    let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
-    digits.parse::<u8>().ok().map(f64::from)
+fn gpu_time_by_pid(ioreg: &str) -> HashMap<u32, u64> {
+    const PID: &str = "\"IOUserClientCreator\" = \"pid ";
+    const TIME: &str = "\"accumulatedGPUTime\"=";
+    let leading_number = |text: &str| -> Option<u64> {
+        let end = text
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len());
+        text[..end].parse().ok()
+    };
+    let mut times = HashMap::new();
+    for client in ioreg.split("+-o ").skip(1) {
+        let Some(pid) = client
+            .find(PID)
+            .and_then(|at| leading_number(&client[at + PID.len()..]))
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            continue;
+        };
+        let total: u64 = client
+            .match_indices(TIME)
+            .filter_map(|(at, _)| leading_number(&client[at + TIME.len()..]))
+            .sum();
+        *times.entry(pid).or_insert(0) += total;
+    }
+    times
+}
+
+/// Part du temps écoulé (`elapsed_ns`) passée sur le GPU par les processus
+/// autres que `own_pid`, bornée à 0..=100. Un processus apparu entre les deux
+/// relevés n'est compté qu'au suivant : son cumul inclut un passé inconnu.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn external_percent(
+    previous: &HashMap<u32, u64>,
+    current: &HashMap<u32, u64>,
+    own_pid: u32,
+    elapsed_ns: f64,
+) -> f64 {
+    let busy: u64 = current
+        .iter()
+        .filter(|(pid, _)| **pid != own_pid)
+        .filter_map(|(pid, now)| previous.get(pid).map(|before| now.saturating_sub(*before)))
+        .sum();
+    (busy as f64 * 100.0 / elapsed_ns.max(1.0)).clamp(0.0, 100.0)
 }
 
 #[cfg(test)]
@@ -360,10 +411,43 @@ mod tests {
     }
 
     #[test]
-    fn device_utilization_reads_the_ioreg_statistic() {
-        let ioreg = r#"| "PerformanceStatistics" = {"Tiler Utilization %"=15,"Renderer Utilization %"=22,"Device Utilization %"=25,"SplitSceneCount"=0}"#;
-        assert_eq!(device_utilization(ioreg), Some(25.0));
-        assert_eq!(device_utilization("\"Device Utilization %\"=x"), None);
-        assert_eq!(device_utilization("rien"), None);
+    fn external_gpu_time_excludes_the_engine_and_new_processes() {
+        // Ordre des clés d'ioreg arbitraire : AppUsage avant ou après le pid.
+        let ioreg = r#"+-o AGXDeviceUserClient  <class AGXDeviceUserClient>
+    {
+      "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=100},{"API"="Metal","accumulatedGPUTime"=20})
+      "IOUserClientCreator" = "pid 7, game"
+    }
++-o AGXDeviceUserClient  <class AGXDeviceUserClient>
+    {
+      "IOUserClientCreator" = "pid 7, game"
+      "AppUsage" = ({"API"="Metal","lastSubmittedTime"=5,"accumulatedGPUTime"=30})
+    }
++-o AGXDeviceUserClient  <class AGXDeviceUserClient>
+    {
+      "IOUserClientCreator" = "pid 9, saragossa"
+      "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=500})
+    }
++-o AGXDeviceUserClient  <class AGXDeviceUserClient>
+    {
+      "AppUsage" = ()
+    }"#;
+        let before = gpu_time_by_pid(ioreg);
+        assert_eq!(before, HashMap::from([(7, 150), (9, 500)]));
+        let mut after = before.clone();
+        after.insert(7, 150 + 600_000_000);
+        after.insert(9, 500 + 900_000_000);
+        after.insert(11, 5_000_000_000);
+        // 0,6 s de GPU pour le jeu en 1 s ; le moteur (pid 9) et le nouveau
+        // processus (pid 11) ne comptent pas.
+        let pct = external_percent(&before, &after, 9, 1e9);
+        assert!((pct - 60.0).abs() < 1e-9, "{pct}");
+        after.insert(7, 150 + 3_000_000_000);
+        assert_eq!(external_percent(&before, &after, 9, 1e9), 100.0, "borné");
+        assert_eq!(
+            external_percent(&after, &before, 9, 1e9),
+            0.0,
+            "cumul remis à zéro"
+        );
     }
 }

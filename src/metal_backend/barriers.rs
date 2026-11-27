@@ -201,7 +201,6 @@ pub(crate) fn duty_pause(command_buffer: &metal::CommandBufferRef) {
     let share = crate::runtime_flags::gpu_share();
     if share < 100 {
         let busy = command_buffer_gpu_ns(command_buffer);
-        crate::runtime_flags::add_throttled_gpu_ns(busy);
         let mut left = crate::runtime_flags::duty_sleep_ns(busy, share).min(1_000_000_000);
         // Tranches de 20 ms : repasser à 100 à chaud interrompt le sommeil.
         while left > 0 && crate::runtime_flags::gpu_share() < 100 {

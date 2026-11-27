@@ -871,19 +871,6 @@ pub fn set_gpu_duty_share(share: u8) -> u8 {
     share
 }
 
-static THROTTLED_GPU_NS: AtomicU64 = AtomicU64::new(0);
-
-/// Temps GPU cumulé des command buffers bridés (part < 100), en ns. Le cédage
-/// dynamique de `serve` le retranche de l'utilisation GPU mesurée pour ne
-/// garder que celle des autres processus.
-pub fn throttled_gpu_ns() -> u64 {
-    THROTTLED_GPU_NS.load(AtomicOrdering::Relaxed)
-}
-
-pub(crate) fn add_throttled_gpu_ns(ns: u64) {
-    THROTTLED_GPU_NS.fetch_add(ns, AtomicOrdering::Relaxed);
-}
-
 /// Analyse `--gpu-share` (entier de 10 à 100).
 pub fn parse_gpu_share(value: &str) -> Result<u8, String> {
     value
