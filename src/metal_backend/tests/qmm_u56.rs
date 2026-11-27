@@ -152,13 +152,24 @@ fn qmm_u56_prefill_matches_bf16_cpu_and_routes() -> Result<()> {
 }
 
 #[test]
-#[ignore = "device Metal NAX requis : prefill u3 tuilé, sans modèle"]
-fn qmm_u3_tiled_prefill_matches_bf16_cpu_and_routes() -> Result<()> {
+#[ignore = "device Metal NAX requis : prefill u3/u5/u6 tuilé, sans modèle"]
+fn qmm_ub_tiled_prefill_matches_bf16_cpu_and_routes() -> Result<()> {
+    // L'oracle numérique suppose les défauts NA=1, U6=0, quel que soit l'env.
+    super::flags::with_qmm_na_override(true, || {
+        super::flags::with_qmm_u6_override(false, qmm_ub_tiled_prefill_oracle)
+    })
+}
+
+fn qmm_ub_tiled_prefill_oracle() -> Result<()> {
+    use crate::runtime_flags::install_tts_qmm_na_dequant_scope;
+
     let metal = MetalExecutor::new()?;
-    assert!(
-        metal.na_gemm_coop_qb_tiled_u3.is_some(),
-        "oracle NAX explicite : pipeline requise"
-    );
+    for bits in [3, 5, 6] {
+        assert!(
+            metal.qmm_na_fused_tiled_ub_pipeline(bits).is_some(),
+            "oracle NAX explicite : pipeline u{bits} requise"
+        );
+    }
     // Sous le plancher, owned et résident gardent tous deux le qmv u3 f32 :
     // aucun bf16 n'entre dans un chemin que le résident sert en f32.
     for (m, n, k) in [(32, 8, 512), (40, 1024, 2048), (524, 2048, 1536)] {
@@ -176,46 +187,110 @@ fn qmm_u3_tiled_prefill_matches_bf16_cpu_and_routes() -> Result<()> {
     }
     // M couvre une tuile partielle (40) et plusieurs tuiles (130) ; N et K
     // atteignent le plancher 2048 du GEMM tuilé.
-    for (m, n, k) in [(40, 2048, 2048), (130, 2112, 2560)] {
-        let weight = test_affine_varied_u356(3, n, k)?;
+    for (bits, (m, n, k)) in [3, 5, 6]
+        .into_iter()
+        .flat_map(|bits| [(40, 2048, 2048), (130, 2112, 2560)].map(|shape| (bits, shape)))
+    {
+        let weight = test_affine_varied_u356(bits, n, k)?;
         assert_eq!(
             metal.select_owned_affine_matmul_kernel(m, k, &weight, false),
-            AffineMatmulKernel::QmmNaFusedTiledU3
+            AffineMatmulKernel::QmmNaFusedTiledUb
         );
         assert_eq!(
-            metal.select_resident_affine_matmul_kernel(m, k, n, 64, 3, false),
-            AffineMatmulKernel::QmmNaFusedTiledU3
+            metal.select_resident_affine_matmul_kernel(m, k, n, 64, bits, false),
+            AffineMatmulKernel::QmmNaFusedTiledUb
         );
+        if bits != 3 {
+            // La portée TTS sans bf16 rend le qmv aux u5/u6.
+            let _tts = install_tts_qmm_na_dequant_scope(false);
+            assert_ne!(
+                metal.select_resident_affine_matmul_kernel(m, k, n, 64, bits, false),
+                AffineMatmulKernel::QmmNaFusedTiledUb
+            );
+        }
         assert_eq!(
             metal.select_owned_affine_matmul_kernel(1, k, &weight, false),
-            AffineMatmulKernel::FastQmvU3
+            match bits {
+                3 => AffineMatmulKernel::FastQmvU3,
+                5 => AffineMatmulKernel::FastQmvU5,
+                _ => AffineMatmulKernel::FastQmvU6,
+            }
         );
         let lhs: Vec<f32> = (0..m * k)
             .map(|i| ((i * 37 % 31) as f32 - 15.0) / 64.0)
             .collect();
         let cpu_weight = weight.dequantize()?.map(bf16_round);
         let cpu = Tensor::from_vec(vec![m, k], lhs.clone())?.matmul_rhs_t(&cpu_weight)?;
-        let lhs = metal.upload_f32_buffer(&lhs, "prefill_u3_lhs")?;
-        let out = metal.upload_f32_buffer(&vec![-12345.0; m * n + 32], "prefill_u3_out")?;
+        let lhs = metal.upload_f32_buffer(&lhs, "prefill_ub_lhs")?;
         let weight = LinearWeight::AffineQuantized(weight);
-        let mut scratch = Vec::new();
-        let cb = metal.queue.new_command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        super::profiling::OFFSET_TEST_DISPATCHES.with(|v| *v.borrow_mut() = Some(Vec::new()));
-        metal.encode_matmul_weight(enc, &mut scratch, &lhs, m, k, &weight, &out)?;
-        enc.end_encoding();
-        commit_and_wait(cb)?;
-        let trace = super::profiling::OFFSET_TEST_DISPATCHES
-            .with(|v| v.borrow_mut().take())
-            .expect("invariant: capture active");
-        assert!(trace
-            .iter()
-            .any(|v| v.starts_with("gemm_nax_coop_qb_tiled_u3")));
-        assert!(!trace.iter().any(|v| v.contains("qmv") || v.contains("dequant")));
-        let actual = read_f32_buffer(&out, m * n + 32)?;
-        assert!(actual[m * n..].iter().all(|&v| v == -12345.0));
-        // Même epsilon que l'oracle u5/u6 ci-dessus.
-        assert_close_eps(&actual[..m * n], cpu.data(), 1.0e-3);
+        let buffers = metal.resolve_linear_weight_buffers(&weight, "prefill_ub_resident")?;
+        // Les deux encodeurs (owned, résident) servent le même GEMM tuilé.
+        for resident in [false, true] {
+            let out = metal.upload_f32_buffer(&vec![-12345.0; m * n + 32], "prefill_ub_out")?;
+            let mut scratch = Vec::new();
+            let cb = metal.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            super::profiling::OFFSET_TEST_DISPATCHES.with(|v| *v.borrow_mut() = Some(Vec::new()));
+            let _ = super::profiling::take_dispatch_shapes_for_test();
+            if resident {
+                metal.encode_matmul_weight_buffers(enc, &lhs, m, k, &buffers, &out, false)?;
+            } else {
+                metal.encode_matmul_weight(enc, &mut scratch, &lhs, m, k, &weight, &out)?;
+            }
+            enc.end_encoding();
+            commit_and_wait(cb)?;
+            let trace = super::profiling::OFFSET_TEST_DISPATCHES
+                .with(|v| v.borrow_mut().take())
+                .expect("invariant: capture active");
+            assert!(
+                trace
+                    .iter()
+                    .any(|v| v.starts_with(&format!("gemm_nax_coop_qb_tiled_u{bits}"))),
+                "u{bits} resident={resident} {trace:?}"
+            );
+            assert!(!trace.iter().any(|v| v.contains("qmv") || v.contains("dequant")));
+            // Le profilage porte la largeur réelle, pas celle du dispatch u4 partagé.
+            assert!(super::profiling::take_dispatch_shapes_for_test()
+                .iter()
+                .any(|shape| shape.kind == format!("qmm_na_fused_tiled_u{bits}_gs64")
+                    && shape.bits == bits
+                    && (shape.batch, shape.in_dim, shape.out_dim) == (m, k, n)));
+            let actual = read_f32_buffer(&out, m * n + 32)?;
+            assert!(actual[m * n..].iter().all(|&v| v == -12345.0));
+            // Même epsilon que l'oracle u5/u6 ci-dessus.
+            assert_close_eps(&actual[..m * n], cpu.data(), 1.0e-3);
+        }
+    }
+    // Contrôles documentés (docs/perf/qmv-u56.md) sur une forme éligible au
+    // tuilé : `SARAGOSSA_RUST_QMM_NA=0` rend le qmv aux u5/u6 et
+    // `SARAGOSSA_RUST_QMM_U6=1` garde la priorité du qmm scalaire u6. Le u3
+    // reste gouverné par `SARAGOSSA_RUST_QMM_NA_FUSED_TILED` seul.
+    let (m, n, k) = (32, 2048, 2048);
+    assert!(m >= qmm_na_min_batch());
+    for bits in [3, 5, 6] {
+        let weight = test_affine_varied_u356(bits, n, k)?;
+        for (na, u6) in [(true, false), (false, false), (true, true), (false, true)] {
+            let expected = match (bits, na, u6) {
+                (6, _, true) => AffineMatmulKernel::QmmBatchedU6,
+                (3, _, _) | (_, true, _) => AffineMatmulKernel::QmmNaFusedTiledUb,
+                (5, false, _) => AffineMatmulKernel::FastQmvU5,
+                _ => AffineMatmulKernel::FastQmvU6,
+            };
+            super::flags::with_qmm_na_override(na, || {
+                super::flags::with_qmm_u6_override(u6, || {
+                    assert_eq!(
+                        metal.select_owned_affine_matmul_kernel(m, k, &weight, false),
+                        expected,
+                        "owned u{bits} NA={na} U6={u6}"
+                    );
+                    assert_eq!(
+                        metal.select_resident_affine_matmul_kernel(m, k, n, 64, bits, false),
+                        expected,
+                        "résident u{bits} NA={na} U6={u6}"
+                    );
+                });
+            });
+        }
     }
     Ok(())
 }

@@ -363,8 +363,31 @@ pub(crate) static MMAP_WEIGHT_VIEWS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 pub(super) fn qmm_na_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = QMM_NA_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QMM_NA", true))
+}
+
+#[cfg(test)]
+thread_local! {
+    // Isole le flag du OnceLock et des autres tests exécutés en parallèle.
+    static QMM_NA_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_qmm_na_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            QMM_NA_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(QMM_NA_TEST_OVERRIDE.with(|cell| cell.replace(Some(enabled))));
+    run()
 }
 
 pub(super) fn qmm_na_gs128_enabled() -> bool {

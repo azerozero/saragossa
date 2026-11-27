@@ -487,8 +487,10 @@ pub struct MetalExecutor {
     na_gemm_coop_qb_tiled: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_gs128: Option<ComputePipelineState>,
     na_gemm_coop_qb_tiled_u4: Option<ComputePipelineState>,
-    /// GEMM tuilé u3 gs64 du prefill, même tuilage que le u4.
+    /// GEMM tuilés u3/u5/u6 gs64 du prefill, même tuilage que le u4.
     na_gemm_coop_qb_tiled_u3: Option<ComputePipelineState>,
+    na_gemm_coop_qb_tiled_u5: Option<ComputePipelineState>,
+    na_gemm_coop_qb_tiled_u6: Option<ComputePipelineState>,
     /// GEMM tuilé u4 bf16×3 à lhs f32, réservé aux projections sous le
     /// plancher par défaut (petites formes de flint, `=x3` sur les Qwen MoE).
     na_gemm_coop_qb_tiled_u4_x3: Option<ComputePipelineState>,
