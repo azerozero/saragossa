@@ -133,6 +133,8 @@ fn dynamic_share(external: f64, current: u8) -> u8 {
 struct Controller {
     window: VecDeque<f64>,
     share: u8,
+    /// Part de départ, reprise dès qu'une mesure manque.
+    fallback: u8,
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -141,11 +143,19 @@ impl Controller {
         Self {
             window: VecDeque::with_capacity(WINDOW),
             share,
+            fallback: share,
         }
     }
 
     /// Ajoute un échantillon ; la part ne bouge qu'une fois la fenêtre pleine.
-    fn push(&mut self, external: f64) -> u8 {
+    /// Sans mesure (`None`), la fenêtre se vide et la part de départ revient :
+    /// une part adaptée n'est jamais gardée sur une mesure périmée.
+    fn push(&mut self, external: Option<f64>) -> u8 {
+        let Some(external) = external else {
+            self.window.clear();
+            self.share = self.fallback;
+            return self.share;
+        };
         if self.window.len() == WINDOW {
             self.window.pop_front();
         }
@@ -176,24 +186,27 @@ pub(super) fn spawn(config: AutoYield) {
             .name("auto-yield".into())
             .spawn(move || {
                 let mut controller = Controller::new(config.share);
-                let mut sampler = Sampler::new();
+                let mut sampler = None;
                 loop {
-                    let yielding = lock().yielding;
-                    if config.dynamic && yielding {
-                        if let Some(external) = sampler.external() {
-                            let before = controller.share;
-                            let share = controller.push(external);
-                            if share != before {
-                                eprintln!(
+                    if lock().yielding && config.dynamic {
+                        let external = sampler.get_or_insert_with(Sampler::new).external();
+                        let before = controller.share;
+                        let share = controller.push(external);
+                        if share != before {
+                            match external {
+                                Some(external) => eprintln!(
                                     "saragossa serve auto-yield: part {share} % (GPU externe {external:.0} %)"
-                                );
+                                ),
+                                None => eprintln!(
+                                    "saragossa serve auto-yield: part {share} % (mesure GPU indisponible)"
+                                ),
                             }
                         }
                     }
                     if let Some(yielding) = step(config, controller.share, since_input()) {
                         // Nouvelle période : la fenêtre repart de la part de départ.
                         controller = Controller::new(config.share);
-                        sampler = Sampler::new();
+                        sampler = None;
                         eprintln!(
                             "saragossa serve auto-yield: {}",
                             if yielding {
@@ -233,9 +246,17 @@ fn since_input() -> Duration {
 }
 
 /// Utilisation GPU des autres processus entre deux relevés `ioreg`.
+/// Temps GPU cumulé (ns) par client `AGXDeviceUserClient` : (pid, id de registre).
+type ClientTimes = HashMap<(u32, u64), u64>;
+
+/// Délai maximal d'un relevé `ioreg` (une vingtaine de ms d'ordinaire).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const IOREG_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Utilisation GPU des autres processus entre deux relevés `ioreg`.
 #[cfg(target_os = "macos")]
 struct Sampler {
-    last: Option<(HashMap<u32, u64>, std::time::Instant)>,
+    last: Option<(ClientTimes, std::time::Instant)>,
 }
 
 #[cfg(target_os = "macos")]
@@ -263,62 +284,113 @@ impl Sampler {
 }
 
 #[cfg(target_os = "macos")]
-fn gpu_time_snapshot() -> Option<HashMap<u32, u64>> {
-    let output = std::process::Command::new("/usr/sbin/ioreg")
-        .args(["-r", "-c", "AGXDeviceUserClient", "-d", "1", "-w0"])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| gpu_time_by_pid(&String::from_utf8_lossy(&output.stdout)))
+fn gpu_time_snapshot() -> Option<ClientTimes> {
+    let mut command = std::process::Command::new("/usr/sbin/ioreg");
+    command.args(["-r", "-c", "AGXDeviceUserClient", "-d", "1", "-w0"]);
+    let stdout = output_within(command, IOREG_TIMEOUT)?;
+    gpu_time_by_client(&String::from_utf8_lossy(&stdout))
 }
 
-/// Temps GPU cumulé (`accumulatedGPUTime`, ns) par pid, client par client :
-/// chaque bloc `+-o AGXDeviceUserClient` porte son `IOUserClientCreator`.
+/// Sortie standard d'une commande réussie dans le délai, sinon `None` (la
+/// commande est alors tuée). Un thread lit la sortie pour qu'un tube plein ne
+/// bloque pas l'enfant.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn gpu_time_by_pid(ioreg: &str) -> HashMap<u32, u64> {
+fn output_within(mut command: std::process::Command, timeout: Duration) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stdout.read_to_end(&mut buffer).map(|_| buffer)
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = reader.join().ok()?.ok()?;
+                return status.success().then_some(output);
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            _ => {
+                // NOTE: le thread lecteur se termine à la fermeture du tube.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Temps GPU cumulé (`accumulatedGPUTime`, ns) de chaque client : un bloc
+/// `+-o AGXDeviceUserClient <class …, id 0x…>` porte son `IOUserClientCreator`.
+/// `None` si aucun client n'est reconnu : mesure indisponible, pas GPU inactif
+/// (WindowServer a toujours un client).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn gpu_time_by_client(ioreg: &str) -> Option<ClientTimes> {
     const PID: &str = "\"IOUserClientCreator\" = \"pid ";
     const TIME: &str = "\"accumulatedGPUTime\"=";
-    let leading_number = |text: &str| -> Option<u64> {
+    const ID: &str = ", id 0x";
+    let digits = |text: &str, radix: u32| -> Option<u64> {
         let end = text
-            .find(|c: char| !c.is_ascii_digit())
+            .find(|c: char| !c.is_digit(radix))
             .unwrap_or(text.len());
-        text[..end].parse().ok()
+        u64::from_str_radix(&text[..end], radix).ok()
     };
     let mut times = HashMap::new();
     for client in ioreg.split("+-o ").skip(1) {
-        let Some(pid) = client
+        let header = client.lines().next().unwrap_or_default();
+        let id = header
+            .find(ID)
+            .and_then(|at| digits(&header[at + ID.len()..], 16));
+        let pid = client
             .find(PID)
-            .and_then(|at| leading_number(&client[at + PID.len()..]))
-            .and_then(|pid| u32::try_from(pid).ok())
-        else {
+            .and_then(|at| digits(&client[at + PID.len()..], 10))
+            .and_then(|pid| u32::try_from(pid).ok());
+        let (Some(id), Some(pid)) = (id, pid) else {
             continue;
         };
-        let total: u64 = client
+        let counters: Vec<u64> = client
             .match_indices(TIME)
-            .filter_map(|(at, _)| leading_number(&client[at + TIME.len()..]))
-            .sum();
-        *times.entry(pid).or_insert(0) += total;
+            .filter_map(|(at, _)| digits(&client[at + TIME.len()..], 10))
+            .collect();
+        if !counters.is_empty() {
+            times.insert((pid, id), counters.iter().sum());
+        }
     }
-    times
+    (!times.is_empty()).then_some(times)
 }
 
 /// Part du temps écoulé (`elapsed_ns`) passée sur le GPU par les processus
-/// autres que `own_pid`, bornée à 0..=100. Un processus apparu entre les deux
-/// relevés n'est compté qu'au suivant : son cumul inclut un passé inconnu.
+/// autres que `own_pid`, bornée à 0..=100. Les deltas se prennent client par
+/// client présent aux deux relevés : un client disparu ou apparu entre-temps
+/// (cumul au passé inconnu) ne fausse pas ceux qui restent.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn external_percent(
-    previous: &HashMap<u32, u64>,
-    current: &HashMap<u32, u64>,
+    previous: &ClientTimes,
+    current: &ClientTimes,
     own_pid: u32,
     elapsed_ns: f64,
 ) -> f64 {
     let busy: u64 = current
         .iter()
-        .filter(|(pid, _)| **pid != own_pid)
-        .filter_map(|(pid, now)| previous.get(pid).map(|before| now.saturating_sub(*before)))
+        .filter(|((pid, _), _)| *pid != own_pid)
+        .filter_map(|(client, now)| {
+            previous
+                .get(client)
+                .map(|before| now.saturating_sub(*before))
+        })
         .sum();
     (busy as f64 * 100.0 / elapsed_ns.max(1.0)).clamp(0.0, 100.0)
 }
@@ -401,53 +473,108 @@ mod tests {
         // Moyenne glissante : rien avant la fenêtre pleine, un pic est dilué.
         let mut controller = Controller::new(25);
         for _ in 0..WINDOW - 1 {
-            assert_eq!(controller.push(0.0), 25, "fenêtre incomplète");
+            assert_eq!(controller.push(Some(0.0)), 25, "fenêtre incomplète");
         }
-        assert_eq!(controller.push(100.0), 50, "moyenne 20 %, pas 100 %");
+        assert_eq!(controller.push(Some(100.0)), 50, "moyenne 20 %, pas 100 %");
         for _ in 0..WINDOW {
-            controller.push(80.0);
+            controller.push(Some(80.0));
         }
         assert_eq!(controller.share, 10);
     }
 
     #[test]
+    fn missing_measure_falls_back_to_the_starting_share() {
+        let mut controller = Controller::new(25);
+        for _ in 0..WINDOW {
+            controller.push(Some(0.0));
+        }
+        assert_eq!(controller.share, 50);
+        assert_eq!(controller.push(None), 25, "repli immédiat");
+        // La fenêtre repart de zéro : une seule mesure ne suffit pas à rebouger.
+        assert_eq!(controller.push(Some(0.0)), 25);
+    }
+
+    #[test]
     fn external_gpu_time_excludes_the_engine_and_new_processes() {
         // Ordre des clés d'ioreg arbitraire : AppUsage avant ou après le pid.
-        let ioreg = r#"+-o AGXDeviceUserClient  <class AGXDeviceUserClient>
+        let ioreg = r#"+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1a, !registered>
     {
       "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=100},{"API"="Metal","accumulatedGPUTime"=20})
       "IOUserClientCreator" = "pid 7, game"
     }
-+-o AGXDeviceUserClient  <class AGXDeviceUserClient>
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1b, !registered>
     {
       "IOUserClientCreator" = "pid 7, game"
       "AppUsage" = ({"API"="Metal","lastSubmittedTime"=5,"accumulatedGPUTime"=30})
     }
-+-o AGXDeviceUserClient  <class AGXDeviceUserClient>
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x2c, !registered>
     {
       "IOUserClientCreator" = "pid 9, saragossa"
       "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=500})
     }
-+-o AGXDeviceUserClient  <class AGXDeviceUserClient>
++-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x3d, !registered>
     {
       "AppUsage" = ()
     }"#;
-        let before = gpu_time_by_pid(ioreg);
-        assert_eq!(before, HashMap::from([(7, 150), (9, 500)]));
+        let before = gpu_time_by_client(ioreg).expect("clients");
+        assert_eq!(
+            before,
+            HashMap::from([((7, 0x1a), 120), ((7, 0x1b), 30), ((9, 0x2c), 500)])
+        );
         let mut after = before.clone();
-        after.insert(7, 150 + 600_000_000);
-        after.insert(9, 500 + 900_000_000);
-        after.insert(11, 5_000_000_000);
+        after.insert((7, 0x1a), 120 + 600_000_000);
+        after.insert((9, 0x2c), 500 + 900_000_000);
+        after.insert((11, 0x4e), 5_000_000_000);
         // 0,6 s de GPU pour le jeu en 1 s ; le moteur (pid 9) et le nouveau
-        // processus (pid 11) ne comptent pas.
+        // client ne comptent pas.
         let pct = external_percent(&before, &after, 9, 1e9);
         assert!((pct - 60.0).abs() < 1e-9, "{pct}");
-        after.insert(7, 150 + 3_000_000_000);
+        after.insert((7, 0x1a), 120 + 3_000_000_000);
         assert_eq!(external_percent(&before, &after, 9, 1e9), 100.0, "borné");
         assert_eq!(
             external_percent(&after, &before, 9, 1e9),
             0.0,
             "cumul remis à zéro"
         );
+    }
+
+    #[test]
+    fn departed_client_does_not_hide_the_remaining_one() {
+        // A = 10 s et B = 1 s pour le même pid, puis A part et B passe à 1,8 s :
+        // 0,8 s en 1 s, et non 1,8 - 11 saturé à 0.
+        let s = 1_000_000_000_u64;
+        let before = HashMap::from([((7, 1), 10 * s), ((7, 2), s)]);
+        let after = HashMap::from([((7, 2), s * 18 / 10)]);
+        let pct = external_percent(&before, &after, 9, 1e9);
+        assert!((pct - 80.0).abs() < 1e-9, "{pct}");
+    }
+
+    #[test]
+    fn unrecognised_ioreg_output_is_unavailable_not_idle() {
+        assert_eq!(gpu_time_by_client(""), None);
+        assert_eq!(gpu_time_by_client("+-o IOService  <class IOService>"), None);
+        let no_counter = "+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1a>\n  \"IOUserClientCreator\" = \"pid 7, game\"\n  \"AppUsage\" = ()";
+        assert_eq!(gpu_time_by_client(no_counter), None);
+    }
+
+    #[test]
+    fn slow_collector_is_killed_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let mut sleep = std::process::Command::new("/bin/sleep");
+        sleep.arg("5");
+        assert_eq!(output_within(sleep, Duration::from_millis(100)), None);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let mut echo = std::process::Command::new("/bin/echo");
+        echo.arg("ok");
+        assert_eq!(
+            output_within(echo, Duration::from_secs(5)).as_deref(),
+            Some(&b"ok\n"[..])
+        );
+        let failing = std::process::Command::new("/usr/bin/false");
+        assert_eq!(output_within(failing, Duration::from_secs(5)), None);
     }
 }
