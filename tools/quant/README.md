@@ -35,6 +35,17 @@ saragossa convert SRC DST --minmax                          # min-max bf16 seul
 saragossa convert SRC DST --keep-8bit self_attn --keep-bf16 lm_head
 ```
 
+Avec `--imatrix FICHIER` (format de `imatrix.py`), les moindres carrés minimisent
+`Σ_j E[x_j²]·(w_j − ŵ_j)²` par groupe ; le meilleur de min-max, grille MLX et
+fit pondéré est gardé en erreur pondérée. L'embedding et la tête MTP restent
+en fit uniforme, comme les piles d'experts MoE fusionnées, que `--bits-for`
+n'atteint pas non plus ; un autre linéaire sans vecteur est refusé. Des poids tous
+égaux redonnent exactement la sortie sans imatrix. `--bits-for motif=N,…`
+(2, 3, 4, 5, 6 ou 8 bits, première correspondance) sert aux recettes mixtes. Recettes
+mesurées : [docs/perf/convert-recettes.md](../../docs/perf/convert-recettes.md).
+Corpus de calibration publiable : `calib_corpus.py` (splits train de
+no_robots et aya_dataset), disjonction contrôlée par `calib_disjoint.py`.
+
 Contrat des conversions MLX : toute matrice BF16 `.weight` de rang 2 dont la
 largeur est un multiple de 64 est quantifiée, embeddings et `lm_head` compris ;
 normes, `A_log`, `dt_bias`, `conv1d` et tour vision restent bf16 ; routeur MoE

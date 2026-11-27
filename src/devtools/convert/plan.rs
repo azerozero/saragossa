@@ -12,6 +12,7 @@ use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::imatrix::quantize_affine_wls_bf16;
 use super::least_squares::quantize_affine_ls_bf16;
 use super::rules::{
     classify, expected_source_names, output_name, ExpertGroup, LayerType, Placement, Proj, Role,
@@ -571,7 +572,8 @@ impl Inventory {
 pub(crate) enum AffineFit {
     /// Min-max bf16 de [`quantize_affine_bitstream_bf16`].
     MinMax,
-    /// Min-max puis moindres carrés (u4/u8), voir `least_squares`.
+    /// Min-max puis moindres carrés, pondérés si une imatrix est fournie
+    /// (`least_squares`, `imatrix`).
     LeastSquares,
 }
 
@@ -583,6 +585,8 @@ pub(crate) enum Job {
         out_base: String,
         bits: usize,
         fit: AffineFit,
+        /// Importance par colonne (imatrix) du fit aux moindres carrés.
+        weight: Option<std::sync::Arc<[f64]>>,
     },
     Experts {
         group: ExpertGroup,
@@ -707,6 +711,7 @@ pub(crate) fn plan_shards(inventory: &Inventory, layers: usize) -> Result<Vec<Sh
                     out_base: base,
                     bits: *bits,
                     fit: AffineFit::MinMax,
+                    weight: None,
                 });
             }
             _ => {
@@ -867,17 +872,31 @@ struct AffineBlock {
     error: QuantError,
 }
 
-fn quantize_block(data: &[f32], cols: usize, bits: usize, fit: AffineFit) -> Result<AffineBlock> {
+fn quantize_block(
+    data: &[f32],
+    cols: usize,
+    bits: usize,
+    fit: AffineFit,
+    weight: Option<&[f64]>,
+) -> Result<AffineBlock> {
     let rows = data.len() / cols;
     let packed_cols = cols * bits / 32;
     let groups = cols / GROUP_SIZE;
     let mut packed = vec![0_u32; rows * packed_cols];
     let mut scales = vec![0_u16; rows * groups];
     let mut biases = vec![0_u16; rows * groups];
-    let quantize = match fit {
-        AffineFit::MinMax => quantize_affine_bitstream_bf16,
-        AffineFit::LeastSquares => quantize_affine_ls_bf16,
-    };
+    let quantize =
+        |data: &[f32], packed: &mut [u32], scales: &mut [u16], biases: &mut [u16]| match fit {
+            AffineFit::MinMax => {
+                quantize_affine_bitstream_bf16(data, cols, GROUP_SIZE, bits, packed, scales, biases)
+            }
+            AffineFit::LeastSquares if weight.is_none() && matches!(bits, 4 | 8) => {
+                quantize_affine_ls_bf16(data, cols, GROUP_SIZE, bits, packed, scales, biases)
+            }
+            AffineFit::LeastSquares => quantize_affine_wls_bf16(
+                data, cols, GROUP_SIZE, bits, weight, packed, scales, biases,
+            ),
+        };
     // Erreurs collectées dans l'ordre puis sommées en séquence : une réduction
     // rayon dépendrait du découpage et rendrait le manifeste non déterministe.
     let parts = data
@@ -885,9 +904,7 @@ fn quantize_block(data: &[f32], cols: usize, bits: usize, fit: AffineFit) -> Res
         .zip(packed.par_chunks_mut(ROWS_PER_TASK * packed_cols))
         .zip(scales.par_chunks_mut(ROWS_PER_TASK * groups))
         .zip(biases.par_chunks_mut(ROWS_PER_TASK * groups))
-        .map(|(((data, packed), scales), biases)| {
-            quantize(data, cols, GROUP_SIZE, bits, packed, scales, biases)
-        })
+        .map(|(((data, packed), scales), biases)| quantize(data, packed, scales, biases))
         .collect::<Result<Vec<_>>>()?;
     let mut error = QuantError::default();
     for part in parts {
@@ -1005,6 +1022,7 @@ pub(crate) fn write_shard(
                 out_base,
                 bits,
                 fit,
+                weight: importance,
             } => {
                 let [rows, cols] = src.shape[..] else {
                     return Err(InferError::Dimension(src.name.clone()));
@@ -1024,7 +1042,7 @@ pub(crate) fn write_shard(
                     let take = block_rows.min(rows - row);
                     let bytes = source.read(src, row * cols * 2, take * cols * 2)?;
                     let data = bytes_to_dense_f32(&bytes, src.dtype, &src.name)?;
-                    let block = quantize_block(&data, cols, *bits, *fit)?;
+                    let block = quantize_block(&data, cols, *bits, *fit, importance.as_deref())?;
                     // Source et sortie du bloc encore vivantes : pic réel du bloc.
                     peak.sample();
                     weight.write(bytemuck::cast_slice(&block.packed))?;
@@ -1097,7 +1115,8 @@ pub(crate) fn write_shard(
                     let bytes = source.read(src, expert * expert_bytes, take * expert_bytes)?;
                     let data = bytes_to_dense_f32(&bytes, src.dtype, &src.name)?;
                     // Lignes indépendantes : le bloc entier se quantifie d'un coup.
-                    let block = quantize_block(&data, cols, *bits, *fit)?;
+                    // NOTE: pas d'imatrix par expert, les piles restent en fit uniforme.
+                    let block = quantize_block(&data, cols, *bits, *fit, None)?;
                     peak.sample();
                     for local in 0..take {
                         let mut row = local * rows;
@@ -1154,8 +1173,13 @@ pub(crate) fn write_shard(
                         .par_iter()
                         .map(|expert| {
                             let values = dequantize_expert(source, expert)?;
-                            let block =
-                                quantize_block(&values, cols, EXPERT_BITS, AffineFit::MinMax)?;
+                            let block = quantize_block(
+                                &values,
+                                cols,
+                                EXPERT_BITS,
+                                AffineFit::MinMax,
+                                None,
+                            )?;
                             peak.sample();
                             Ok(block)
                         })

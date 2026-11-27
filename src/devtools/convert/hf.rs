@@ -33,6 +33,7 @@ use rayon::prelude::*;
 use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
 
+use super::imatrix::Imatrix;
 use super::plan::{
     affine_outputs, dtype_name, file_sha256, io_err, shard_size, strip_weight, write_shard,
     AffineFit, Job, OutTensor, PeakTracker, ShardPlan, Source, TensorRef,
@@ -82,6 +83,11 @@ pub struct HfConvertOptions {
     pub keep_bf16: Vec<String>,
     /// Rehache les shards déjà terminés au lieu de contrôler leur taille.
     pub verify: bool,
+    /// Imatrix (`tools/quant/imatrix.py`) : moindres carrés pondérés par `E[x²]`.
+    pub imatrix: Option<PathBuf>,
+    /// `(sous-chaîne, largeur)` : première correspondance, avant `keep_8bit`
+    /// (2, 3, 4, 5, 6 ou 8 bits ; la tête MTP reste u4).
+    pub bits_for: Vec<(String, usize)>,
 }
 
 /// Bilan de la conversion.
@@ -109,6 +115,12 @@ struct Identity {
     fit: AffineFit,
     keep_8bit: Vec<String>,
     keep_bf16: Vec<String>,
+    // Absents des journaux antérieurs et omis quand ils sont vides : une
+    // conversion sans ces options garde un manifeste identique à l'octet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    imatrix_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bits_for: Vec<(String, usize)>,
 }
 
 /// Empreinte complète d'un shard source : une reprise sur d'autres poids de
@@ -186,6 +198,13 @@ fn width(tensor: &TensorRef, options: &HfConvertOptions) -> Result<Option<usize>
         }
         return Ok(Some(4));
     }
+    if let Some((_, bits)) = options
+        .bits_for
+        .iter()
+        .find(|(pattern, _)| name.contains(pattern.as_str()))
+    {
+        return Ok(Some(*bits));
+    }
     Ok(Some(if matches(&options.keep_8bit) || is_router(name) {
         8
     } else {
@@ -238,7 +257,12 @@ fn mtp_shard(refs: &[TensorRef]) -> Option<usize> {
 
 /// Un shard de sortie par shard source (tête MTP regroupée), tenseurs triés
 /// par nom.
-fn plan(source: &Source, refs: &[TensorRef], options: &HfConvertOptions) -> Result<Vec<ShardPlan>> {
+fn plan(
+    source: &Source,
+    refs: &[TensorRef],
+    options: &HfConvertOptions,
+    imatrix: Option<&Imatrix>,
+) -> Result<Vec<ShardPlan>> {
     let fit = if options.minmax {
         AffineFit::MinMax
     } else {
@@ -322,11 +346,16 @@ fn plan(source: &Source, refs: &[TensorRef], options: &HfConvertOptions) -> Resu
                 let base = strip_weight(&tensor.name)?.to_string();
                 plan.tensors
                     .extend(affine_outputs(&base, &[], rows, cols, bits));
+                let weight = match imatrix {
+                    Some(matrix) => matrix.for_tensor(&tensor.name, cols)?,
+                    None => None,
+                };
                 plan.jobs.push(Job::Affine {
                     src: tensor.clone(),
                     out_base: base,
                     bits,
                     fit,
+                    weight,
                 });
             }
             None => {
@@ -417,11 +446,26 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
             options.bits
         )));
     }
+    if let Some((pattern, bits)) = options
+        .bits_for
+        .iter()
+        .find(|(_, bits)| !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8))
+    {
+        return Err(InferError::Config(format!(
+            "--bits-for {pattern}={bits} : 2, 3, 4, 5, 6 ou 8 attendu"
+        )));
+    }
+    if options.minmax && options.imatrix.is_some() {
+        return Err(InferError::Config(
+            "--imatrix pondère les moindres carrés : incompatible avec --minmax".to_string(),
+        ));
+    }
     refuse_in_place(&options.src, &options.dst)?;
+    let imatrix = options.imatrix.as_deref().map(Imatrix::load).transpose()?;
     let config_path = options.src.join("config.json");
     let src_config = read_json(&config_path)?;
     let (source, refs) = Source::open(&options.src)?;
-    let plans = plan(&source, &refs, options)?;
+    let plans = plan(&source, &refs, options, imatrix.as_ref())?;
     let read = |path: &Path| std::fs::read(path).map_err(|e| io_err(path, e));
     let identity = Identity {
         format: FORMAT.to_string(),
@@ -435,6 +479,8 @@ pub fn convert_hf(options: &HfConvertOptions) -> Result<HfConvertReport> {
         },
         keep_8bit: options.keep_8bit.clone(),
         keep_bf16: options.keep_bf16.clone(),
+        imatrix_sha256: imatrix.as_ref().map(|m| m.sha256.clone()),
+        bits_for: options.bits_for.clone(),
     };
 
     let dst = &options.dst;

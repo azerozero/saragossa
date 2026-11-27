@@ -7,6 +7,7 @@
 //! sortie et par segment n-gram, journal persistant les entrées du manifeste.
 
 mod hf;
+mod imatrix;
 mod least_squares;
 mod ngram;
 mod plan;

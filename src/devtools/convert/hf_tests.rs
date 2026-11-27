@@ -123,6 +123,8 @@ fn options(src: &Path, dst: &Path) -> HfConvertOptions {
         keep_8bit: Vec::new(),
         keep_bf16: Vec::new(),
         verify: false,
+        imatrix: None,
+        bits_for: Vec::new(),
     }
 }
 
@@ -357,6 +359,85 @@ fn resume_refuses_rewritten_source_weights() {
     }
     let error = convert_hf(&options(&src, &dst)).expect_err("reprise sur d'autres poids acceptée");
     assert!(error.to_string().contains("shards source"), "{error}");
+}
+
+/// Imatrix fixture : un vecteur par linéaire quantifié hors embedding et MTP.
+fn write_imatrix(path: &Path, value: impl Fn(usize) -> f32) {
+    let vectors: Vec<(&str, Vec<u8>)> = [
+        "language_model.model.layers.0.mlp.up_proj",
+        "language_model.lm_head",
+    ]
+    .into_iter()
+    .map(|name| {
+        let bytes = (0..128).flat_map(|j| value(j).to_le_bytes()).collect();
+        (name, bytes)
+    })
+    .collect();
+    let views: Vec<(&str, TensorView<'_>)> = vectors
+        .iter()
+        .map(|(name, bytes)| {
+            let view =
+                TensorView::new(Dtype::F32, vec![128], bytes).expect("invariant: vecteur valide");
+            (*name, view)
+        })
+        .collect();
+    serialize_to_file(views, None, path).expect("invariant: imatrix écrite");
+}
+
+/// Imatrix uniforme : shards identiques à l'octet au fit non pondéré ; imatrix
+/// non uniforme : autres codes ; `--bits-for` produit du u5 déclaré dans la config.
+#[test]
+fn imatrix_uniform_is_identity_and_bits_for_overrides() {
+    let root = tempfile::tempdir().expect("invariant: dossier temporaire");
+    let src = root.path().join("src");
+    std::fs::create_dir(&src).expect("invariant: src");
+    write_source(&src);
+    let shards = |dir: &Path| -> Vec<Vec<u8>> {
+        SHARDS
+            .iter()
+            .map(|f| std::fs::read(dir.join(f)).expect("invariant: shard"))
+            .collect()
+    };
+    let plain = root.path().join("plain");
+    convert_hf(&options(&src, &plain)).expect("invariant: sans imatrix");
+
+    let ones = root.path().join("ones.safetensors");
+    write_imatrix(&ones, |_| 1.0);
+    let uniform = root.path().join("uniform");
+    let mut opts = options(&src, &uniform);
+    opts.imatrix = Some(ones);
+    convert_hf(&opts).expect("invariant: imatrix uniforme");
+    assert_eq!(shards(&uniform), shards(&plain));
+
+    let skewed = root.path().join("skewed.safetensors");
+    // Importance variable dans chaque groupe (constante par groupe = même optimum).
+    write_imatrix(&skewed, |j| if j % 3 == 0 { 100.0 } else { 0.01 });
+    let weighted = root.path().join("weighted");
+    let mut opts = options(&src, &weighted);
+    opts.imatrix = Some(skewed);
+    opts.bits_for = vec![("mlp.up_proj".to_string(), 5)];
+    convert_hf(&opts).expect("invariant: imatrix pondérée");
+    let up = "model.language_model.layers.0.mlp.up_proj";
+    assert_eq!(
+        tensor_bytes(&weighted, SHARDS[0], &format!("{up}.weight")).1,
+        [8, 20]
+    );
+    assert_eq!(
+        config(&weighted)["quantization"][up]["bits"].as_u64(),
+        Some(5)
+    );
+    let lm_head = |dir: &Path| {
+        ["weight", "scales", "biases"]
+            .map(|suffix| tensor_bytes(dir, SHARDS[1], &format!("lm_head.{suffix}")))
+    };
+    assert_ne!(lm_head(&weighted), lm_head(&plain));
+
+    let missing = root.path().join("missing.safetensors");
+    serialize_to_file(Vec::<(&str, TensorView<'_>)>::new(), None, &missing)
+        .expect("invariant: imatrix vide");
+    let mut opts = options(&src, &root.path().join("refused"));
+    opts.imatrix = Some(missing);
+    assert!(convert_hf(&opts).is_err(), "module sans imatrix accepté");
 }
 
 /// Source MoE d'un seul shard (experts fusionnés transformers, tête MTP MoE).

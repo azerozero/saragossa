@@ -3,8 +3,8 @@
   python3 -I audit_bytes.py MODELE [--limit 4.2] [--params 26895998464]
   python3 -I audit_bytes.py                      # auto-tests stdlib
 
-Lit seulement les en-têtes safetensors. Langage = tenseurs `language_model.*`
-(codes, échelles, biais et tenseurs fixes) ; le reste (vision, MTP) entre dans
+Lit seulement les en-têtes safetensors. Langage = tenseurs `language_model.*`,
+ou `model.language_model.*` et `lm_head.*` en noms HF (`saragossa convert`) (codes, échelles, biais et tenseurs fixes) ; le reste (vision, MTP) entre dans
 le total publié à côté. Le dénominateur est le nombre de paramètres langage du
 BF16 (Qwen3.8-27B par défaut). Refus (code 1) si le bpw langage dépasse la
 limite ou s'écarte de `allocation.json.actual_bpw` quand il existe.
@@ -24,6 +24,11 @@ def header(path):
         return json.loads(f.read(size))
 
 
+def is_language(key):
+    """Noms MLX (`language_model.*`) ou HF bruts de `saragossa convert`."""
+    return key.startswith(("language_model.", "model.language_model.", "lm_head."))
+
+
 def audit(model, params=QWEN38_27B_LANGUAGE_PARAMS, limit=None):
     language = other = 0
     files = sorted(Path(model).glob("*.safetensors"))
@@ -34,7 +39,7 @@ def audit(model, params=QWEN38_27B_LANGUAGE_PARAMS, limit=None):
             if key == "__metadata__":
                 continue
             start, end = entry["data_offsets"]
-            if key.startswith("language_model."):
+            if is_language(key):
                 language += end - start
             else:
                 other += end - start
@@ -63,6 +68,8 @@ def _self_check():
         root = Path(tmp)
         write(root / "model-1.safetensors", {"language_model.a": 50, "vision_tower.b": 10, "__metadata__": 0})
         write(root / "mtp.safetensors", {"fc.weight": 5})
+        assert is_language("model.language_model.layers.0.x") and is_language("lm_head.scales")
+        assert not is_language("mtp.fc.weight") and not is_language("model.visual.x")
         out = audit(root, params=100, limit=4.2)
         assert out["language_bpw"] == 4.0 and out["total_bpw"] == 5.2 and "refused" not in out
         assert "refused" in audit(root, params=100, limit=3.9)
