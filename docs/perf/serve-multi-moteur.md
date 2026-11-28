@@ -110,6 +110,33 @@ exécutions.
   matmul (~1/3 d'une trame mesurée à N=1) accélère, ×1,8 si toute la trame
   suit le facteur 2,1. Cette borne reste à confirmer par un prototype.
 
+#### Référence révisée : R passes complètes sur R files (28 nov. 2026)
+
+Le « R × qmv mono » ci-dessus relit chaque poids R fois de suite, donc chaud en
+cache, ce qui avantage le mono. Le serve fait R passes complètes, une par
+moteur, sur des files distinctes. Le même bench mesure maintenant ce cas, en
+temps mur, sur 3 exécutions (porte loadavg < 2, secteur) :
+
+| R | talker : R files concurrentes | R passes séquentielles | lignes | predictor : R files | lignes |
+|---|---|---|---|---|---|
+| 2 | 5,61 à 5,64 ms | 5,31 ms | 3,00 à 3,03 ms | 0,53 à 0,55 ms | 0,22 ms |
+| 6 | 16,26 à 16,30 ms | 15,94 à 15,99 ms | 7,42 ms | 1,34 à 1,37 ms | 0,555 ms |
+
+- Les files concurrentes ne recouvrent rien : 6 passes coûtent 6 × T(1).
+  Contre le schéma actuel, les lignes gagnent ×2,2 sur le talker et ×2,45 sur
+  le predictor à R = 6, et non ×1,52.
+- Profil de trame à N=1 (`SARAGOSSA_TTS_INTERNAL_PROFILE=1`,
+  `SARAGOSSA_RUST_DECODE_PROFILE=1`, CustomVoice échantillonné, 118 trames,
+  2 passes) : 10,2 ms de mur par trame, dont talker 4,4 ms et trame fusionnée
+  du code predictor 5,6 à 5,8 ms (891 dispatches). Les matmuls pèsent
+  environ 2,65 + 16 × 0,2 ≈ 5,9 ms, soit ~58 % de la trame, et non 1/3. Le GPU
+  du codec (3,2 ms par trame, recouvert sur un autre thread) se mêle aux
+  compteurs GPU des phases.
+- Borne révisée, sous l'hypothèse de sérialisation à N=6 (trame GPU ≈ 8,7 ms) :
+  le TTS gagnerait environ ×1,6 si seules les matmuls passent en lignes, soit
+  ~×1,45 sur la chaîne vocale. Cette estimation n'est pas une mesure de bout en
+  bout.
+
 ### Réglages faciles mesurés (ABBA `bench/ab.py`, 4 blocs, cooldown 120 s, N=6)
 
 | Essai | Cellule | Ratio B/A débit global [IC 95 %] | Verdict |
