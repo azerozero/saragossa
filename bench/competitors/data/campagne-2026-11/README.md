@@ -58,6 +58,11 @@ prompt depends on the commit of the sources.
   covered by separate tests, listed in
   [`docs/perf/greedy-identity.md`](../../../../docs/perf/greedy-identity.md).
 - llama.cpp was not measured on the 35B in `21-final`.
+- The "16384" cells measured prompts of at most 16383 tokens, one below the
+  threshold that was then the default (16384, `SARAGOSSA_RUST_KV_BF16_MIN_TOKENS`)
+  at which saragossa's greedy resident decode (AR, MTP and DFlash) switches its
+  KV cache from f32 to bf16. These cells therefore ran with an f32 KV cache and
+  do not exercise saragossa's bf16 KV path.
 - `19b`, mistral.rs DFlash on the 27B 4-bit: throughput falls with prompt length
   (medians 28.7, 13.8 and 6.2 tok/s at 512, 4096 and 16384, computed as
   255 / (time of last non-empty chunk − time of first non-empty chunk)). The cause is not

@@ -21,7 +21,7 @@ Deux kernels actifs par défaut ne sont pas bit-identiques au pas mono-ligne.
 
 | Kernel | Quand | Pourquoi |
 |---|---|---|
-| matmul u4 skinny | lots de 5 lignes et plus : DFlash, lookup, MTP avec drafts lookup sur prompt long (8 lignes) | MMA bf16 hi+lo contre FMA scalaire du qmv |
+| matmul u4 skinny | lots de 5 lignes et plus : DFlash, lookup, MTP avec drafts lookup sur prompt long (8 lignes), MTP à 4 drafts avec ligne bonus (5 lignes) | MMA bf16 hi+lo contre FMA scalaire du qmv |
 | préfixe NAX de l'attention en lignes | contexte ≥ 16k, KV bf16, lots de 2 lignes et plus | Q en bf16 et MMA |
 
 Avec ces réglages par défaut, le texte reste celui de l'AR, sauf sur une
@@ -150,6 +150,25 @@ partir de 11.
 Le scan gated-delta inverse
 (`SARAGOSSA_RUST_LINEAR_INV_DELTA`, opt-in) reste hors périmètre : la
 vérification en lignes n'a pas de variante inverse.
+
+### Ligne bonus du MTP greedy hors cycle fusionné (27 nov. 2026)
+
+Le chemin général du MTP (propositions du lookup 8, profondeurs autres que 2)
+ne vérifiait pas la ligne du dernier draft en greedy : un bloc entièrement
+accepté payait ensuite un pas de decode complet pour le token bonus
+(`bonus_next`, 34 ms sur le 27B 4 bits). Comme à T > 0 depuis octobre, la
+ligne du dernier draft est désormais vérifiée dans le même bloc dès que le
+rollback résident existe ; le bonus est l'argmax de cette ligne, produit par le
+même vérifieur en lignes que les autres cibles.
+
+Profil (`SARAGOSSA_RUST_MTP_STEP_PROFILE=1`, CLI, 256 tokens, prompt de code
+de 4108 tokens) : 55 vérifications lookup pour 10 cycles D2 fusionnés ; avant,
+verify 45,5 ms et `bonus_next` 34,3 ms × 53 (36 % du decode) ; après, verify
+51 ms et plus de `bonus_next`. Passages uniques (n = 1, pas d'ABBA) :
+50,3 → 71,1 tok/s à 4108 tokens, 55,3 → 56,6 à 524 ; 47,8 à 16395, sans
+passage de base à cette longueur. Ids identiques à l'AR (`SARAGOSSA_RUST_MTP_DECODE=0`) aux trois
+longueurs, KV f32 et bf16. Le gain dépend de la fréquence du lookup, donc du
+prompt : faible sur la prose.
 
 ## Corrigé
 
