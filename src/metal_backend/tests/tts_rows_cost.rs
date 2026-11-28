@@ -87,6 +87,71 @@ fn tts_u6_rows_cost_bench() -> Result<()> {
             samples.sort_by(f64::total_cmp);
             Ok(samples[samples.len() / 2])
         };
+        // NOTE: le « mono×R » ci-dessus relit chaque poids R fois de suite, donc
+        // chaud en cache. Le serve multi-moteur fait plutôt R passes complètes,
+        // une par moteur, sur R files concurrentes, chacune avec sa sortie
+        // (comme les scratchs des moteurs). `wall(files, batch)` chronomètre en
+        // temps mur, du commit des command buffers à la fin du dernier : R
+        // files à 1 ligne (serve actuel) ou 1 file à R lignes, même horloge.
+        // `sequential` enchaîne les R passes complètes (durée GPU).
+        let queues: Vec<_> = (0..6).map(|_| executor.device.new_command_queue()).collect();
+        let outs = (0..6)
+            .map(|_| executor.uncached_f32_buffer(6 * 6144, "tts_rows_bench_out"))
+            .collect::<Result<Vec<_>>>()?;
+        let full_pass = |encoder: &metal::ComputeCommandEncoderRef,
+                         batch: usize,
+                         out: &metal::BufferRef|
+         -> Result<()> {
+            for weight in &weights {
+                if let MetalLinearWeightBuffers::AffineQuantized { in_dim, .. } = weight {
+                    executor.encode_matmul_weight_buffers(
+                        encoder, &lhs, batch, *in_dim, weight, out, false,
+                    )?;
+                }
+            }
+            Ok(())
+        };
+        let wall = |files: usize, batch: usize| -> Result<f64> {
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let buffers = queues[..files]
+                    .iter()
+                    .zip(&outs)
+                    .map(|(queue, out)| {
+                        let command_buffer = queue.new_command_buffer().to_owned();
+                        let encoder = command_buffer.new_compute_command_encoder();
+                        full_pass(encoder, batch, out)?;
+                        encoder.end_encoding();
+                        Ok(command_buffer)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let started = std::time::Instant::now();
+                buffers.iter().for_each(|buffer| buffer.commit());
+                buffers.iter().for_each(|buffer| buffer.wait_until_completed());
+                // Un buffer en erreur donnerait un temps sans calcul.
+                for buffer in &buffers {
+                    crate::metal_backend::byte_helpers::ensure_completed(buffer.status())?;
+                }
+                samples.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            samples.sort_by(f64::total_cmp);
+            Ok(samples[samples.len() / 2])
+        };
+        let sequential = |rows: usize| -> Result<f64> {
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let command_buffer = executor.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                for _ in 0..rows {
+                    full_pass(encoder, 1, &out)?;
+                }
+                encoder.end_encoding();
+                commit_and_wait(command_buffer)?;
+                samples.push(command_buffer_gpu_ns(command_buffer) as f64 / 1e6);
+            }
+            samples.sort_by(f64::total_cmp);
+            Ok(samples[samples.len() / 2])
+        };
         // Passe de chauffe : la première mesure paie la montée en fréquence du GPU.
         pass(6, true)?;
         let one = pass(1, true)?;
@@ -105,6 +170,15 @@ fn tts_u6_rows_cost_bench() -> Result<()> {
                  T(R)/T(1) lignes={:.2} qmm={:.2}",
                 lines / one,
                 qmm / one
+            );
+            let parallel = wall(rows, 1)?;
+            let lines_wall = super::flags::with_qmm_u6_override(false, || wall(1, rows))?;
+            let serial = sequential(rows)?;
+            eprintln!(
+                "tts_rows {name} R={rows} mur: files_concurrentes={parallel:.3} \
+                 lignes={lines_wall:.3} ms concurrentes/lignes={:.2} ; \
+                 passes_sequentielles_gpu={serial:.3} ms",
+                parallel / lines_wall
             );
         }
     }
