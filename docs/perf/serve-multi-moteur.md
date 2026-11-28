@@ -106,9 +106,6 @@ exécutions.
   T(1), soit s ≈ 2,1 contre 6 × T(1) ; contre les 6 qmv mono mesurés
   (11,33 ms), le gain vaut ×1,52. Le `QmmBatchedU6` est 3 fois
   plus lent que lui à R = 6 et ne convient pas.
-- Borne Amdahl d'un TTS en lignes entre moteurs à N=6 : ×1,2 si seule la part
-  matmul (~1/3 d'une trame mesurée à N=1) accélère, ×1,8 si toute la trame
-  suit le facteur 2,1. Cette borne reste à confirmer par un prototype.
 
 #### Référence révisée : R passes complètes sur R files (28 nov. 2026)
 

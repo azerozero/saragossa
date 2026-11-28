@@ -128,6 +128,10 @@ fn tts_u6_rows_cost_bench() -> Result<()> {
                 let started = std::time::Instant::now();
                 buffers.iter().for_each(|buffer| buffer.commit());
                 buffers.iter().for_each(|buffer| buffer.wait_until_completed());
+                // Un buffer en erreur donnerait un temps sans calcul.
+                for buffer in &buffers {
+                    crate::metal_backend::byte_helpers::ensure_completed(buffer.status())?;
+                }
                 samples.push(started.elapsed().as_secs_f64() * 1e3);
             }
             samples.sort_by(f64::total_cmp);
