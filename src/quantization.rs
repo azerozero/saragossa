@@ -16,7 +16,7 @@ static NEXT_WEIGHT_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug)]
 enum PackedStorage {
     Owned(Vec<u32>),
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     MetalShared {
         buffer: metal::Buffer,
         offset_u32: usize,
@@ -28,7 +28,7 @@ impl PackedStorage {
     fn len(&self) -> usize {
         match self {
             Self::Owned(data) => data.len(),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::MetalShared { len_u32, .. } => *len_u32,
         }
     }
@@ -36,7 +36,7 @@ impl PackedStorage {
     fn data(&self) -> &[u32] {
         match self {
             Self::Owned(data) => data,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::MetalShared {
                 buffer,
                 offset_u32,
@@ -45,7 +45,7 @@ impl PackedStorage {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn metal_view(&self) -> Option<(&metal::Buffer, usize)> {
         match self {
             Self::Owned(_) => None,
@@ -58,7 +58,7 @@ impl PackedStorage {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn from_metal_shared(buffer: metal::Buffer, offset_u32: usize, len_u32: usize) -> Result<Self> {
         let end_u32 = offset_u32
             .checked_add(len_u32)
@@ -84,7 +84,7 @@ impl PackedStorage {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[expect(
     unsafe_code,
     reason = "vue CPU en lecture seule d'un MTLBuffer de poids partagé"
@@ -102,7 +102,7 @@ fn metal_shared_u32_slice(buffer: &metal::Buffer, offset_u32: usize, len_u32: us
 #[derive(Clone, Debug)]
 enum AffineStorage {
     F32(Tensor),
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     MetalSharedBf16 {
         buffer: metal::Buffer,
         offset_bf16: usize,
@@ -119,7 +119,7 @@ impl AffineStorage {
     fn shape(&self) -> &[usize] {
         match self {
             Self::F32(tensor) => tensor.shape(),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::MetalSharedBf16 { shape, .. } => shape,
         }
     }
@@ -127,7 +127,7 @@ impl AffineStorage {
     fn len(&self) -> usize {
         match self {
             Self::F32(tensor) => tensor.len(),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::MetalSharedBf16 { len_bf16, .. } => *len_bf16,
         }
     }
@@ -135,7 +135,7 @@ impl AffineStorage {
     fn value(&self, index: usize) -> f32 {
         match self {
             Self::F32(tensor) => tensor.data()[index],
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::MetalSharedBf16 {
                 buffer,
                 offset_bf16,
@@ -148,7 +148,7 @@ impl AffineStorage {
     fn f32_data(&self) -> Cow<'_, [f32]> {
         match self {
             Self::F32(tensor) => Cow::Borrowed(tensor.data()),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::MetalSharedBf16 {
                 buffer,
                 offset_bf16,
@@ -164,7 +164,7 @@ impl AffineStorage {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn metal_view(&self) -> Option<(&metal::Buffer, usize)> {
         match self {
             Self::F32(_) => None,
@@ -179,7 +179,7 @@ impl AffineStorage {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn from_metal_shared_bf16(
         shape: &[usize],
         buffer: metal::Buffer,
@@ -216,7 +216,7 @@ impl AffineStorage {
         })
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn move_to_metal_shared(&mut self, metal: &crate::MetalExecutor) -> Result<()> {
         let Self::F32(tensor) = self else {
             return Ok(());
@@ -228,7 +228,7 @@ impl AffineStorage {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn set_metal_view(&mut self, buffer: metal::Buffer, offset_bf16: usize) -> Result<()> {
         let shape = self.shape().to_vec();
         let len = checked_element_count(&shape, "vue affine Metal")?;
@@ -236,7 +236,7 @@ impl AffineStorage {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn release_cpu_data(&mut self) -> usize {
         match self {
             Self::F32(tensor) => tensor
@@ -246,7 +246,7 @@ impl AffineStorage {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn cpu_data_available(&self) -> bool {
         matches!(
             checked_element_count(self.shape(), "paramètres affines"),
@@ -254,7 +254,7 @@ impl AffineStorage {
         )
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn values_are_bf16_exact(&self) -> bool {
         match self {
             Self::F32(tensor) => tensor
@@ -272,7 +272,7 @@ impl PartialEq for AffineStorage {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[expect(
     unsafe_code,
     reason = "vue CPU en lecture seule d'un MTLBuffer bf16 partagé"
@@ -286,17 +286,17 @@ fn metal_shared_u16_slice(buffer: &metal::Buffer, offset_u16: usize, len_u16: us
     unsafe { std::slice::from_raw_parts(base.add(offset_u16), len_u16) }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn bf16_to_f32(value: u16) -> f32 {
     f32::from_bits(u32::from(value) << 16)
 }
 
 /// Matrice dense bf16 immuable, sans miroir f32, en mémoire Metal partagée.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct DenseBf16Tensor(AffineStorage);
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl DenseBf16Tensor {
     pub(crate) fn new(shape: &[usize], buffer: metal::Buffer) -> Result<Self> {
         if !matches!(shape, [rows, cols] if *rows > 0 && *cols > 0) {
@@ -456,7 +456,7 @@ impl AffineQuantizedTensor {
         )
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "constructeur interne: vue Metal et paramètres affine restent explicites"
@@ -491,7 +491,7 @@ impl AffineQuantizedTensor {
         })
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "constructeur interne: trois vues Metal et paramètres affine restent explicites"
@@ -547,7 +547,7 @@ impl AffineQuantizedTensor {
     }
 
     /// Renvoie l'identité stable du poids pour les caches Metal.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn weight_id(&self) -> u64 {
         self.weight_id
     }
@@ -558,22 +558,22 @@ impl AffineQuantizedTensor {
         &self.shape
     }
 
-    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+    #[cfg(any(test, gpu_metal))]
     pub(crate) fn packed_shape(&self) -> &[usize] {
         &self.packed_shape
     }
 
-    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+    #[cfg(any(test, gpu_metal))]
     pub(crate) fn packed_data(&self) -> &[u32] {
         self.packed.data()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn packed_metal_view(&self) -> Option<(&metal::Buffer, usize)> {
         self.packed.metal_view()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn move_packed_to_metal_shared(
         &mut self,
         metal: &crate::MetalExecutor,
@@ -587,7 +587,7 @@ impl AffineQuantizedTensor {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn set_packed_metal_view(
         &mut self,
         buffer: metal::Buffer,
@@ -601,17 +601,17 @@ impl AffineQuantizedTensor {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn scales_metal_view(&self) -> Option<(&metal::Buffer, usize)> {
         self.scales.metal_view()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn biases_metal_view(&self) -> Option<(&metal::Buffer, usize)> {
         self.biases.metal_view()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn set_affine_metal_views(
         &mut self,
         scales_buffer: metal::Buffer,
@@ -626,38 +626,38 @@ impl AffineQuantizedTensor {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn scales_shape(&self) -> &[usize] {
         self.scales.shape()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn biases_shape(&self) -> &[usize] {
         self.biases.shape()
     }
 
-    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+    #[cfg(any(test, gpu_metal))]
     pub(crate) fn scales_f32(&self) -> Cow<'_, [f32]> {
         self.scales.f32_data()
     }
 
-    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+    #[cfg(any(test, gpu_metal))]
     pub(crate) fn biases_f32(&self) -> Cow<'_, [f32]> {
         self.biases.f32_data()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn group_size(&self) -> usize {
         self.group_size
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn bits(&self) -> usize {
         self.bits
     }
 
     /// Libère les payloads CPU après leur copie dans les buffers Metal résidents.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn release_cpu_data(&mut self) -> usize {
         // MetalShared vit dans le buffer unifié : rien à libérer côté CPU.
         // Le chemin historique Owned conserve la sémantique de drop antérieure.
@@ -674,14 +674,14 @@ impl AffineQuantizedTensor {
         packed.saturating_add(scales).saturating_add(biases)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn cpu_data_available(&self) -> bool {
         self.packed.len() == self.packed_len()
             && self.scales.cpu_data_available()
             && self.biases.cpu_data_available()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn metal_embedding_byte_exact(&self) -> bool {
         self.bits > 0
             && 32 % self.bits == 0
@@ -689,17 +689,17 @@ impl AffineQuantizedTensor {
             && self.biases.values_are_bf16_exact()
     }
 
-    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+    #[cfg(any(test, gpu_metal))]
     pub(crate) fn packed_len(&self) -> usize {
         self.packed_shape.iter().product()
     }
 
-    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+    #[cfg(any(test, gpu_metal))]
     pub(crate) fn scales_len(&self) -> usize {
         self.scales.shape().iter().product()
     }
 
-    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+    #[cfg(any(test, gpu_metal))]
     pub(crate) fn biases_len(&self) -> usize {
         self.biases.shape().iter().product()
     }
@@ -791,14 +791,14 @@ impl AffineQuantizedTensor {
     }
 
     fn ensure_cpu_data(&self) -> Result<()> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if !self.cpu_data_available() {
             return Err(InferError::Config(format!(
                 "payload CPU du poids quantifié {} déjà libéré",
                 self.weight_id
             )));
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         if self.packed.len() != self.packed_shape.iter().product::<usize>()
             || self.scales.len() != self.scales.shape().iter().product::<usize>()
             || self.biases.len() != self.biases.shape().iter().product::<usize>()
@@ -1026,13 +1026,13 @@ pub(crate) fn quantize_affine_into(
 
 /// Bits bf16 de `value`, arrondi au plus proche pair comme les uploads Metal
 /// (`f32_slice_to_bf16`).
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
+#[cfg(any(gpu_metal, feature = "devtools"))]
 pub(crate) fn bf16_bits(value: f32) -> u16 {
     (bf16_round(value).to_bits() >> 16) as u16
 }
 
 /// Erreur cumulée d'une quantification : `Σ(w − dq)²` et `Σw²`, en f64.
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
+#[cfg(any(gpu_metal, feature = "devtools"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct QuantError {
     pub(crate) sum_sq_err: f64,
@@ -1073,7 +1073,7 @@ impl QuantError {
 /// `u32`, si les tranches ont une mauvaise taille ou si une valeur n'est pas
 /// finie.
 // NOTE: aussi hors `devtools` : la tête de draft MTP u4 la quantifie au chargement.
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
+#[cfg(any(gpu_metal, feature = "devtools"))]
 pub(crate) fn quantize_affine_bitstream_bf16(
     data: &[f32],
     cols: usize,
@@ -1160,7 +1160,7 @@ pub(crate) fn quantize_affine_bitstream_bf16(
 /// Le biais est arrondi **vers −∞** (`bias ≤ min`) et la scale **vers +∞**
 /// jusqu'à couvrir `max` (`bias + levels·scale ≥ max`) : aucun code n'est alors
 /// écrêté et l'erreur reste bornée par un demi-pas de la scale sérialisée.
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
+#[cfg(any(gpu_metal, feature = "devtools"))]
 pub(crate) fn affine_params_bf16(min: f32, max: f32, levels: f32) -> Result<(u16, u16)> {
     let mut bias_bits = bf16_bits(min);
     if bf16_value(bias_bits) > min {
@@ -1185,13 +1185,13 @@ pub(crate) fn affine_params_bf16(min: f32, max: f32, levels: f32) -> Result<(u16
     Ok((scale_bits, bias_bits))
 }
 
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
+#[cfg(any(gpu_metal, feature = "devtools"))]
 pub(crate) fn bf16_value(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
 /// bf16 immédiatement inférieur (vers −∞) à une valeur finie.
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
+#[cfg(any(gpu_metal, feature = "devtools"))]
 fn bf16_step_down(bits: u16) -> u16 {
     match bits {
         // +0 → plus petit sous-normal négatif.
@@ -1202,12 +1202,12 @@ fn bf16_step_down(bits: u16) -> u16 {
 }
 
 /// bf16 immédiatement supérieur d'une scale strictement positive et finie.
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
+#[cfg(any(gpu_metal, feature = "devtools"))]
 fn bf16_step_up_positive(bits: u16) -> u16 {
     bits + 1
 }
 
-#[cfg(any(all(target_os = "macos", feature = "metal"), feature = "devtools"))]
+#[cfg(any(gpu_metal, feature = "devtools"))]
 fn bf16_round(value: f32) -> f32 {
     let bits = value.to_bits();
     let rounding = 0x7fff_u32 + ((bits >> 16) & 1);
@@ -1357,7 +1357,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[test]
     fn stable_id_survives_clone_and_cpu_payload_release() {
         let scales = Tensor::from_vec(vec![1, 1], vec![0.5]).expect("invariant: scales valides");

@@ -1,5 +1,5 @@
 //! Oracle greedy et mesure à longueur exacte, à lancer sous verrou GPU.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 mod benchmark {
     use saragossa::decoder::{
         configure_prefix_disk_cache, flush_prefix_disk_cache, PrefixDiskSession,
@@ -45,7 +45,7 @@ mod benchmark {
             saragossa::load_causal_decoder(&assets)?.with_metal_runtime()?;
         if args[4] == "mtp" {
             decoder = decoder.with_mtp_weights(&assets.mtp)?;
-            #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+            #[cfg(all(gpu_metal, feature = "devtools"))]
             {
                 decoder = decoder.with_dflash_draft_from_env(&assets.config)?;
             }
@@ -105,11 +105,11 @@ mod benchmark {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     {
         benchmark::run()
     }
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     {
         Err("Cet oracle nécessite macOS et la feature metal".into())
     }

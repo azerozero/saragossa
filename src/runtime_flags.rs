@@ -1,14 +1,14 @@
 //! Flags runtime et instrumentation du décodeur.
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 pub(crate) mod pairwise;
 
 mod profile;
 pub use profile::{ModelEntry, Profile, ProfileError, Resolved, ServeSection, HOT_KEYS, PRESETS};
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use std::cell::Cell;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
@@ -17,15 +17,15 @@ use std::time::{Duration, Instant};
 // NOTE: posé par `serve` (multi-modèle) pour forcer le résident linear-attn
 // indépendamment de l'env gelé par OnceLock — porté depuis decoder/flags.rs
 // lors de l'extraction du module (rebase serve × tangle-quickwins).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 static FORCE_RESIDENT_FULL_LINEAR: AtomicBool = AtomicBool::new(false);
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn force_resident_full_linear_decode() {
     FORCE_RESIDENT_FULL_LINEAR.store(true, Ordering::Relaxed);
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 pub(crate) fn force_resident_full_linear_decode() {}
 
 /// Préfixe canonique des variables d'environnement du moteur.
@@ -82,14 +82,14 @@ pub(crate) fn decision_noncausal() -> bool {
     DECISION_NONCAUSAL.with(std::cell::Cell::get)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn decision_nax_enabled() -> bool {
     env_flag("SARAGOSSA_DECISION_NAX", true)
 }
 
 /// GEMM matmul2d bf16 (activation arrondie en bf16) pendant une décision ;
 /// `SARAGOSSA_DECISION_GEMM_BF16=0` rétablit le GEMM NAX hi + lo f32.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn decision_gemm_bf16_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     decision_noncausal() && *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DECISION_GEMM_BF16", true))
@@ -124,7 +124,7 @@ pub fn denoise_common() -> bool {
 /// (`SARAGOSSA_DENOISE_GPU`, défaut 0). Garde le fichier entier en mémoire ;
 /// sortie identique au bit au CPU en variante `exp`/`tanh` communes, à quelques
 /// ulp près du chemin CPU historique.
-#[cfg(all(feature = "denoise", feature = "metal", target_os = "macos"))]
+#[cfg(all(feature = "denoise", gpu_metal))]
 pub fn denoise_gpu() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_DENOISE_GPU", false))
@@ -281,7 +281,7 @@ pub fn env_flag(name: &str, default: bool) -> bool {
 
 /// Features STT relues par l'hôte au lieu de rester sur le GPU. Défaut OFF ;
 /// `SARAGOSSA_STT_FEATURES_HOST=1` rétablit le readback.
-#[cfg(all(feature = "stt", target_os = "macos", feature = "metal"))]
+#[cfg(all(feature = "stt", gpu_metal))]
 pub(crate) fn stt_features_host() -> bool {
     env_flag("SARAGOSSA_STT_FEATURES_HOST", false)
 }
@@ -317,7 +317,7 @@ pub(crate) fn env_flag_value(value: &str) -> Option<bool> {
 ///
 /// Défaut OFF : le chemin dense qualifié reste inchangé. L'activation demande
 /// `RETI_RUST_FREE_CPU_WEIGHTS_MOE=1` et reste soumise aux gates byte-id GPU.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn free_cpu_weights_moe_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("RETI_RUST_FREE_CPU_WEIGHTS_MOE", false))
@@ -328,7 +328,7 @@ pub(crate) fn free_cpu_weights_moe_enabled() -> bool {
 /// **Défaut ON** : les MTLBuffer partagés stockent les codes `u32` et les
 /// paramètres affines et matrices denses bf16 natifs. `RETI_RUST_SINGLE_COPY_WEIGHTS=0` restaure
 /// strictement le chemin historique f32 CPU puis copies Metal (kill-switch).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn single_copy_weights_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("RETI_RUST_SINGLE_COPY_WEIGHTS", true))
@@ -343,14 +343,14 @@ pub(crate) fn single_copy_weights_enabled() -> bool {
 /// non aligné : les réaligner d'abord (`tools/quant/safetensors_align.py`),
 /// sinon le chargement retombe sur la copie. Un shard tronqué ou réécrit en
 /// place pendant qu'il est mappé provoque un SIGBUS.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn mmap_weights_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MMAP_WEIGHTS", false))
 }
 
 /// Active la trace des résolutions de stacks MoE autour du drop CPU.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn moe_drop_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("RETI_RUST_MOE_DROP_TRACE", false))
@@ -361,7 +361,7 @@ pub(crate) fn moe_drop_trace_enabled() -> bool {
 /// Défaut OFF (`SARAGOSSA_RUST_TRACE_GPU_ALLOC=1` pour l'activer). Le flag est gelé
 /// au premier accès afin que le chemin désactivé ne fasse aucune lecture d'env,
 /// aucun appel Metal et aucune prise du mutex du cache scratch après démarrage.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn trace_gpu_alloc_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_GPU_ALLOC", false))
@@ -384,7 +384,7 @@ fn scratch_cap_bytes_from_env(value: Option<&str>) -> u64 {
 ///
 /// `SARAGOSSA_RUST_SCRATCH_CAP_GB` accepte un nombre entier de Gio. Une valeur
 /// absente, nulle ou invalide retombe sur 4 Gio.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn scratch_cap_bytes() -> u64 {
     static CAP: OnceLock<u64> = OnceLock::new();
     *CAP.get_or_init(|| {
@@ -396,7 +396,7 @@ pub(crate) fn scratch_cap_bytes() -> u64 {
 /// Plafond du poids bf16 matérialisé par le GEMM NA avec déquantification.
 /// `SARAGOSSA_RUST_QMM_NA_DEQUANT_MAX_BYTES` est exprimé en octets :
 /// défaut 512 Mio, zéro désactive ce chemin. Une valeur invalide garde le défaut.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn qmm_na_dequant_max_bytes() -> usize {
     static CAP: OnceLock<usize> = OnceLock::new();
     *CAP.get_or_init(|| {
@@ -404,14 +404,14 @@ pub(crate) fn qmm_na_dequant_max_bytes() -> usize {
     })
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn qmm_na_dequant_cap_from_env(value: Option<&str>) -> usize {
     value
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .unwrap_or(512 * 1024 * 1024)
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 #[test]
 fn qmm_na_dequant_budget_flag_parsing() {
     for raw in [None, Some(""), Some("-1"), Some("invalid")] {
@@ -477,7 +477,7 @@ pub(super) fn mtp_history_policy() -> MtpHistoryPolicy {
 /// et son coût par pas (~5 ms) est ~exactement compensé par le gain d'acceptance
 /// → spec/AR quasi identique (code 1,015× committed vs 1,019× fresh ; prose
 /// 0,920× vs 0,953×). draft#2 « se paie » : garder l'historique (défaut OFF).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn mtp_fresh_cache_enabled() -> bool {
     #[cfg(feature = "devtools")]
     if let Some(case) = pairwise::current() {
@@ -489,7 +489,7 @@ pub(super) fn mtp_fresh_cache_enabled() -> bool {
     mtp_fresh_cache_env()
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn mtp_fresh_cache_env() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_FRESH_CACHE", true))
@@ -505,7 +505,7 @@ fn mtp_fresh_cache_env() -> bool {
 /// elle-même ; sur un long prompt, l'historique lui rend du contexte et relève
 /// l'acceptance en position 2. `SARAGOSSA_RUST_MTP_FRESH_MAX_PROMPT=0` :
 /// committed partout ; `SARAGOSSA_RUST_MTP_FRESH_CACHE=0` reste prioritaire.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn mtp_fresh_max_prompt_tokens() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
@@ -515,14 +515,14 @@ pub(super) fn mtp_fresh_max_prompt_tokens() -> usize {
     })
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 thread_local! {
     static MTP_FRESH_FOR_PROMPT: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 /// Choix fresh/committed d'une génération : fresh seulement si activé par l'env
 /// et si le prompt ne dépasse pas [`mtp_fresh_max_prompt_tokens`].
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn fresh_for_prompt(env_fresh: bool, max_prompt_tokens: usize, prompt_tokens: usize) -> bool {
     env_fresh && prompt_tokens <= max_prompt_tokens
 }
@@ -530,13 +530,13 @@ fn fresh_for_prompt(env_fresh: bool, max_prompt_tokens: usize, prompt_tokens: us
 /// Fixe, pour la durée d'une génération MTP sur ce thread, le choix
 /// fresh/committed selon la longueur du prompt. Le Drop restaure l'état précédent ;
 /// un cas pairwise actif garde la priorité (le harnais mesure une configuration fixe).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) struct MtpHistoryForPrompt {
     previous: Option<bool>,
     _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl MtpHistoryForPrompt {
     pub(crate) fn enter(prompt_tokens: usize) -> Self {
         let fresh = fresh_for_prompt(
@@ -551,7 +551,7 @@ impl MtpHistoryForPrompt {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl Drop for MtpHistoryForPrompt {
     fn drop(&mut self) {
         MTP_FRESH_FOR_PROMPT.set(self.previous);
@@ -566,7 +566,7 @@ pub fn mtp_sidecar_override() -> Option<std::path::PathBuf> {
 }
 
 pub(crate) fn mtp_resident_hidden_enabled() -> bool {
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     if let Some(case) = pairwise::current() {
         return case.hidden;
     }
@@ -574,7 +574,7 @@ pub(crate) fn mtp_resident_hidden_enabled() -> bool {
 }
 
 pub(crate) fn mtp_gpu_embedding_enabled() -> bool {
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     if let Some(case) = pairwise::current() {
         return case.embedding;
     }
@@ -582,7 +582,7 @@ pub(crate) fn mtp_gpu_embedding_enabled() -> bool {
 }
 
 pub(crate) fn mtp_overlap_stream_enabled() -> bool {
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     if let Some(case) = pairwise::current() {
         return case.overlap;
     }
@@ -590,7 +590,7 @@ pub(crate) fn mtp_overlap_stream_enabled() -> bool {
 }
 
 pub(crate) fn mtp_gpu_block_enabled() -> bool {
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     if let Some(case) = pairwise::current() {
         return case.mode == pairwise::Mode::Block2;
     }
@@ -609,11 +609,11 @@ pub(crate) fn mtp_gpu_block_enabled() -> bool {
 /// que la tête MTP au dernier pas coûte une vérification. D'où la coupure sur la
 /// même longueur que le choix fresh/committed.
 pub(super) fn mtp_lookup_draft_tokens() -> usize {
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     if let Some(forced) = MTP_LOOKUP_DRAFT_TEST_OVERRIDE.with(std::cell::Cell::get) {
         return forced.min(15);
     }
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     if let Some(case) = pairwise::current() {
         return case.lookup.min(15);
     }
@@ -624,7 +624,7 @@ pub(super) fn mtp_lookup_draft_tokens() -> usize {
     }) {
         return forced.min(15);
     }
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if !mtp_fresh_cache_enabled() {
         return 8;
     }
@@ -648,7 +648,7 @@ pub(super) fn mtp_lookup_draft_tokens() -> usize {
 /// l'adaptatif plafonné à 2, qui reste presque toujours en D1 : +3,7/+4,8/+4,5 %
 /// en 4 bits, sorties identiques au bit.
 pub(super) fn mtp_adaptive_depth_override() -> Option<bool> {
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     if let Some(case) = pairwise::current() {
         return Some(matches!(
             case.mode,
@@ -673,7 +673,7 @@ thread_local! {
 
 /// Profondeur MTP fixe sur ce thread le temps de `run` : adaptatif et lookup
 /// coupés (oracles de profondeur).
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 pub(crate) fn with_mtp_fixed_depth_override<R>(run: impl FnOnce() -> R) -> R {
     /// Rétablit les réglages précédents, panique comprise.
     struct Restore(Option<bool>, Option<usize>);
@@ -746,7 +746,7 @@ pub(super) fn mtp_adaptive_probe_period() -> u32 {
     })
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 thread_local! {
     static GPU_ARGMAX_TEST_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     static MTP_LOOKUP_DRAFT_TEST_OVERRIDE: std::cell::Cell<Option<usize>> =
@@ -756,7 +756,7 @@ thread_local! {
 /// Force l'argmax GPU et les drafts lookup du MTP sur ce thread le temps de
 /// `run` (oracle O2 du repli `Skip` : vérification sans argmax GPU d'une
 /// proposition lookup multiligne).
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(test, gpu_metal, feature = "devtools"))]
 pub(crate) fn with_mtp_skip_override<R>(lookup_drafts: usize, run: impl FnOnce() -> R) -> R {
     /// Rétablit les réglages précédents, panique comprise.
     struct Restore(Option<bool>, Option<usize>);
@@ -773,7 +773,7 @@ pub(crate) fn with_mtp_skip_override<R>(lookup_drafts: usize, run: impl FnOnce()
     run()
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn gpu_argmax_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = GPU_ARGMAX_TEST_OVERRIDE.with(std::cell::Cell::get) {
@@ -783,7 +783,7 @@ pub(super) fn gpu_argmax_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GPU_ARGMAX", true))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn gpu_sampler_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GPU_SAMPLER", true))
@@ -791,12 +791,12 @@ pub(super) fn gpu_sampler_enabled() -> bool {
 
 // NOTE: Sans Metal, aucun chemin GPU n'existe : les flags retombent sur false
 // pour que le decode reste sur l'argmax/sampler CPU.
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 pub(super) fn gpu_argmax_enabled() -> bool {
     false
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 pub(super) fn gpu_sampler_enabled() -> bool {
     false
 }
@@ -1001,7 +1001,7 @@ fn decode_interval_nanos_for_rate(rate: f64) -> Option<u64> {
 /// le chemin résident s'active ensuite via la présence de `LayerKvCache::full`.
 /// Ce repli 1b reste vivant pour diagnostic et sera retiré avec le split de
 /// `decoder/resident.rs`, pas dans le tri des flags DG.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn decode_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_RESIDENT", false))
@@ -1018,7 +1018,7 @@ pub(super) fn decode_resident_enabled() -> bool {
 /// ([`crate::decoder::CausalDecoder::supports_resident_full_decode`]) :
 /// `temperature > 0`,
 /// lm_head biaisé ou modèle non supporté retombent automatiquement sur le per-op.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn decode_resident_full_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_RESIDENT_FULL", true))
@@ -1027,7 +1027,7 @@ pub(super) fn decode_resident_full_enabled() -> bool {
 /// Autorise les couches linear-attn dans le decode résident complet. **Défaut
 /// ON** après oracle greedy 35B-oQ8 byte-identique vs per-op ; kill-switch
 /// `SARAGOSSA_RUST_DECODE_RESIDENT_FULL_LINEAR=0` pour replier sur le per-op.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn decode_resident_full_linear_enabled() -> bool {
     if FORCE_RESIDENT_FULL_LINEAR.load(Ordering::Relaxed) {
         return true;
@@ -1039,7 +1039,7 @@ pub(super) fn decode_resident_full_linear_enabled() -> bool {
 /// Autorise la projection QKV concaténée dans les couches full-attn résidentes.
 /// Défaut ON ; kill-switch de diagnostic/tuning pour comparer avec les trois
 /// projections séparées sans recompiler.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn decode_resident_full_qkv_concat_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = QKV_CONCAT_TEST_OVERRIDE.with(Cell::get) {
@@ -1052,7 +1052,7 @@ pub(super) fn decode_resident_full_qkv_concat_enabled() -> bool {
 /// Fusionne rotation de K et append K/V du decode résident en un dispatch
 /// (au lieu de trois), aux mêmes bits. Défaut ON ; kill-switch
 /// `SARAGOSSA_RUST_DECODE_ROPE_APPEND_KV=0` pour l'A/B.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn decode_resident_rope_append_kv_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = ROPE_APPEND_KV_TEST_OVERRIDE.with(Cell::get) {
@@ -1062,7 +1062,7 @@ pub(super) fn decode_resident_rope_append_kv_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_ROPE_APPEND_KV", true))
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 thread_local! {
     // Par thread : les tests comparent les chemins fusionné et historique en
     // parallèle (`OnceLock` non réglable dans le processus de test).
@@ -1074,14 +1074,14 @@ thread_local! {
 
 /// Force la rotation de K fusionnée à l'append K/V sur ce thread le temps
 /// de `run`.
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 pub(crate) fn with_rope_append_kv_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
     with_test_override(&ROPE_APPEND_KV_TEST_OVERRIDE, enabled, run)
 }
 
 /// Exécute `run` avec `cell` forcé à `Some(enabled)` sur ce thread, puis
 /// rétablit le réglage précédent, panique comprise.
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 fn with_test_override<R>(
     cell: &'static std::thread::LocalKey<Cell<Option<bool>>>,
     enabled: bool,
@@ -1101,25 +1101,25 @@ fn with_test_override<R>(
 }
 
 /// Force le QKV concaténé résident sur ce thread le temps de `run`.
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 pub(crate) fn with_qkv_concat_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
     with_test_override(&QKV_CONCAT_TEST_OVERRIDE, enabled, run)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn decode_pipeline_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_PIPELINE", true))
 }
 
 /// Diagnostics MoE figés au premier accès, actifs par présence même pour "0".
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn moe_coop_skip_gemm() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_var(SNAPSHOT_ABLATION_FLAGS[0]).is_some())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn moe_coop_skip_shared() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_var(SNAPSHOT_ABLATION_FLAGS[1]).is_some())
@@ -1130,7 +1130,7 @@ pub(crate) fn moe_coop_skip_shared() -> bool {
 /// résident, pour classer les near-ties bf16 vs une vraie dégradation. Renvoie
 /// `None` si l'env est absent, non entier ou nul. Quand actif, le decode résident
 /// est forcé en non-pipeliné (une complétion GPU par token pour relire l'état).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn oracle_dump_logits_topk() -> Option<usize> {
     static TOPK: OnceLock<Option<usize>> = OnceLock::new();
     *TOPK.get_or_init(|| {
@@ -1145,7 +1145,7 @@ pub(super) fn oracle_dump_logits_topk() -> Option<usize> {
 /// supporte (gate [`crate::decoder::CausalDecoder::supports_resident_duo`]),
 /// kill-switch
 /// `SARAGOSSA_RUST_LIGHTBATCH_QMM2=0` → retombe sur le time-slicing E2.1.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn lightbatch_qmm2_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LIGHTBATCH_QMM2", true))
@@ -1157,7 +1157,7 @@ pub(super) fn lightbatch_qmm2_enabled() -> bool {
 /// **Défaut OFF** : les projections en lignes dérivent de ~1e-6 par rapport au
 /// qmv du solo (near-ties possibles) ; `SARAGOSSA_RUST_LIGHTBATCH_MULTI=1`
 /// l'active, sinon le time-slicing E2.1 reste servi.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn lightbatch_multi_dense_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LIGHTBATCH_MULTI", false))
@@ -1167,7 +1167,7 @@ pub(super) fn lightbatch_multi_dense_enabled() -> bool {
 /// batchés qmm2, topk/gathers routés par flux. **Défaut ON** quand les poids
 /// MoE sont qmm2-éligibles, kill-switch `SARAGOSSA_RUST_LIGHTBATCH_MOE2=0` →
 /// retombe sur le tail MoE par flux (composition solo).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn lightbatch_moe2_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LIGHTBATCH_MOE2", true))
@@ -1175,7 +1175,7 @@ pub(crate) fn lightbatch_moe2_enabled() -> bool {
 
 /// Trace le mode effectif du light-batch (duo qmm2 vs time-slicing, MoE duo)
 /// sur stderr — diagnostic du repli silencieux (`SARAGOSSA_RUST_TRACE_LIGHTBATCH=1`).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn trace_lightbatch_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_LIGHTBATCH", false))
@@ -1185,7 +1185,7 @@ pub(crate) fn trace_lightbatch_enabled() -> bool {
 /// n'est décodé qu'un pas sur N (`SARAGOSSA_RUST_LIGHTBATCH_BG_STRIDE`, défaut 1 =
 /// même cadence). N'altère pas la byte-identité par flux (la séquence d'un
 /// flux ne dépend que de son propre état, pas de QUAND ses pas s'exécutent).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn lightbatch_background_stride() -> u64 {
     static STRIDE: OnceLock<u64> = OnceLock::new();
     *STRIDE.get_or_init(|| {
@@ -1201,7 +1201,7 @@ pub(super) fn lightbatch_background_stride() -> u64 {
 /// indices top-k des 2 flux par couche MoE duo, synthèse n(2) en fin de run.
 /// Diagnostic pur (readback après wait) — ne change AUCUN résultat ; coût
 /// readback non nul → jamais actif en prod ni pendant un bench.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn lightbatch_expert_stats_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LIGHTBATCH_EXPERT_STATS", false))
@@ -1256,7 +1256,7 @@ pub(crate) fn moe_verify_rows_override() -> Option<bool> {
 /// actif par défaut sur les couches `LinearMoe` de toute vérification en lignes
 /// (chemin sous `SARAGOSSA_RUST_PREFILL_MOE_ROWS`, défaut ON), pas seulement
 /// sous `SARAGOSSA_RUST_MOE_VERIFY_ROWS=1` ; `=0` rend l'ancien chemin.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn moe_verify_tail_level() -> u8 {
     static LEVEL: OnceLock<u8> = OnceLock::new();
     *LEVEL.get_or_init(|| {
@@ -1269,7 +1269,7 @@ pub(crate) fn moe_verify_tail_level() -> u8 {
 /// Lignes maximales pour le gate+up+SwiGLU partagé fusionné de la vérification
 /// (`SARAGOSSA_RUST_MOE_VERIFY_SHARED_FUSED_MAX_ROWS`) : un threadgroup par ligne
 /// relit les poids partagés, au-delà le qmm2/skinny (lecture unique) reprend.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn moe_verify_shared_fused_max_rows() -> usize {
     static ROWS: OnceLock<usize> = OnceLock::new();
     *ROWS.get_or_init(|| {
@@ -1287,7 +1287,7 @@ pub(crate) fn moe_verify_shared_fused_max_rows() -> usize {
 /// `VerifySkipScope` (tests seulement) que seul le bench de vérification
 /// installe : le decode AR, `serve` et les oracles l'ignorent même si la
 /// variable est posée.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 pub(crate) fn verify_skip(part: &str) -> bool {
     static PARTS: OnceLock<Vec<String>> = OnceLock::new();
     VERIFY_SKIP_SCOPE.with(std::cell::Cell::get)
@@ -1311,7 +1311,7 @@ pub(crate) fn verify_skip(part: &str) -> bool {
             .any(|item| item == part)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 thread_local! {
     static VERIFY_SKIP_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1319,10 +1319,10 @@ thread_local! {
 /// Portée où [`verify_skip`] lit `SARAGOSSA_RUST_VERIFY_SKIP` (thread courant,
 /// restaurée au drop). Réservée au bench de vérification : compilée pour les
 /// tests seulement, aucun binaire ne peut l'installer.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools", test))]
+#[cfg(all(gpu_metal, feature = "devtools", test))]
 pub(crate) struct VerifySkipScope(bool);
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools", test))]
+#[cfg(all(gpu_metal, feature = "devtools", test))]
 impl VerifySkipScope {
     /// Active l'ablation sur ce thread jusqu'au drop.
     pub(crate) fn install() -> Self {
@@ -1330,7 +1330,7 @@ impl VerifySkipScope {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools", test))]
+#[cfg(all(gpu_metal, feature = "devtools", test))]
 impl Drop for VerifySkipScope {
     fn drop(&mut self) {
         VERIFY_SKIP_SCOPE.with(|scope| scope.set(self.0));
@@ -1338,7 +1338,7 @@ impl Drop for VerifySkipScope {
 }
 
 /// Sans devtools, aucune ablation : constante pour que l'appel disparaisse.
-#[cfg(all(target_os = "macos", feature = "metal", not(feature = "devtools")))]
+#[cfg(all(gpu_metal, not(feature = "devtools")))]
 #[inline(always)]
 pub(crate) const fn verify_skip(_part: &str) -> bool {
     false
@@ -1437,7 +1437,7 @@ pub(super) fn prefill_chunk_size() -> usize {
 /// (×5,6), 30B @9k réel 13→306 (×23) ; le régime 32k devient exploitable.
 /// Kill-switch : `SARAGOSSA_RUST_PREFILL_ATTN_BATCH_LONG=0` (fallback long
 /// byte-identique).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_attn_batch_long_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_BATCH_LONG", true))
@@ -1454,7 +1454,7 @@ pub(crate) fn prefill_attn_batch_long_enabled() -> bool {
 /// réduction n'est pas byte-identique au `mid`, donc le flag reste un
 /// kill-switch explicite.
 /// Kill-switch : `SARAGOSSA_RUST_PREFILL_ATTN_BATCH_MID_30B=0`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_attn_batch_mid_30b_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_BATCH_MID_30B", true))
@@ -1470,7 +1470,7 @@ pub(crate) fn prefill_attn_batch_mid_30b_enabled() -> bool {
 /// attention causale 491 → 20 ms à 732 tokens, 9,2 → 1,6 s à 8,3k (M5 Max),
 /// prefill −16 % et −25 %, suites greedy identiques (oracle CPU à 2e-3).
 /// Kill-switch dédié : `SARAGOSSA_RUST_PREFILL_ATTN_STEEL_D256=0`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_attn_steel_d256_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_STEEL_D256", true))
@@ -1487,7 +1487,7 @@ pub(crate) fn prefill_attn_steel_d256_enabled() -> bool {
 /// en d128). La variante d128 compile avec 302=false ; même tolérance oracle
 /// de 1e-3 à entrées bf16 que le d256. Identité greedy d128 non qualifiée
 /// faute de modèle local.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_attn_nax_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX", true))
@@ -1508,7 +1508,7 @@ pub(crate) fn prefill_attn_nax_enabled() -> bool {
 /// mlx bf16 à mlx f32 (17 et 2,6), argmax 18/18 et greedy identique. Si le
 /// pipeline ne compile pas (MPP absent avant macOS 26), repli sur le Steel
 /// d128 bf16. Kill-switch `SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS=0`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_attn_nax_sinks_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS", true))
@@ -1528,7 +1528,7 @@ pub(crate) fn prefill_attn_nax_sinks_enabled() -> bool {
 /// et pire moyenne 0,34 sur les logits, argmax 18/18, greedy identique.
 /// Kill-switch
 /// `SARAGOSSA_RUST_PREFILL_ATTN_NAX_WINDOW=0`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_attn_nax_window_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_ATTN_NAX_WINDOW", true))
@@ -1559,7 +1559,7 @@ pub(crate) fn prefill_attn_nax_window_enabled() -> bool {
 /// autres divergent après ~670 caractères sur un quasi-ex aequo.
 /// Sous [`verify_rows_nax_min_len`] (16k), le 2-passes reste en place : le MTP
 /// échantillonné à 4k y perdait jusqu'à 7 %. Lookup non mesuré à part.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn verify_rows_nax_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_ROWS_NAX", true))
@@ -1573,7 +1573,7 @@ pub(crate) fn verify_rows_nax_enabled() -> bool {
 /// requête (portée `install_verify_greedy_scope` à l'encodage), pas par
 /// variable d'environnement. Coût attendu d'après les mesures du 1er nov.
 /// ci-dessus : DFlash greedy −18 à −36 % à partir de 32k, MTP −1 à −7 %.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn verify_rows_nax_greedy_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_ROWS_NAX_GREEDY", true))
@@ -1586,7 +1586,7 @@ pub(crate) fn verify_rows_nax_greedy_enabled() -> bool {
 /// 5 lignes). Sans `SARAGOSSA_RUST_DFLASH_TREE`, l'arbre DFlash greedy passe à B = 3
 /// ([`DFLASH_TREE_STRICT_DEFAULT_BUDGET`]). Le défaut reste le chemin rapide, à
 /// identité greedy approchée.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn verify_strict_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_VERIFY_STRICT", false))
@@ -1597,7 +1597,7 @@ pub(crate) fn verify_strict_enabled() -> bool {
 /// bf16) : MTP échantillonné à 4k (KV bf16 dès le prompt court, même binaire,
 /// 2026-11-02) code 47,4/45,0 → 44,1/41,7 tok/s, prose inchangée ; le gain
 /// n'est mesuré qu'à partir de 32k. Le 2-passes reste en deçà.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn verify_rows_nax_min_len() -> usize {
     static TOKENS: OnceLock<usize> = OnceLock::new();
     *TOKENS.get_or_init(|| {
@@ -1614,7 +1614,7 @@ pub(crate) fn verify_rows_nax_min_len() -> usize {
 /// Mesuré le 2026-11-01 (M5 Max, 24/4 têtes d256, 16 couches, 8 lignes) :
 /// 32 → 8,45 ms, 64 → 7,62, 128 → 7,43, 256 → 8,59 à 32k ; 128 aussi le
 /// meilleur à 64k (12,8 ms).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn verify_rows_nax_blocks() -> usize {
     static BLOCKS: OnceLock<usize> = OnceLock::new();
     *BLOCKS.get_or_init(|| {
@@ -1631,7 +1631,7 @@ pub(crate) fn verify_rows_nax_blocks() -> usize {
 /// (`(NQ, H)`, ancien ordre). Calcul par threadgroup identique, sortie
 /// bit-identique (`nax_d256_head_major_grid_is_bit_identical`). Mesuré sur le
 /// 27B : TTFT 256k 756,4 → 750,0 s, neutre à 64k, textes identiques.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_attn_nax_head_major() -> bool {
     static HEAD: OnceLock<bool> = OnceLock::new();
     *HEAD.get_or_init(|| {
@@ -1645,7 +1645,7 @@ pub(crate) fn prefill_attn_nax_head_major() -> bool {
 /// autre valeur garde `bq64`. Écarts à l'oracle CPU et à `bq64` mesurés par
 /// `nax_d256_variants_match_cpu_oracle`. Écartés au bench 64k du 27B : `bk64`
 /// +27 % de TTFT et texte différent, `bq128` +1 %.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_attn_nax_variant() -> Option<&'static str> {
     static VARIANT: OnceLock<Option<String>> = OnceLock::new();
     VARIANT
@@ -1663,7 +1663,7 @@ pub(crate) fn prefill_attn_nax_variant() -> Option<&'static str> {
 /// bit-identiques (`prefill_resident_chunked_matches_single_chunk`). Coûte
 /// 1 Gio par couche full-attention à 256k sur le 27B (16 Gio) pour un gain
 /// mesuré de 3,4 s sur 750 s à 256k, neutre à 64k : reste opt-in.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_kv_bf16_mirror_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_BF16_MIRROR", false))
@@ -1684,7 +1684,7 @@ pub(crate) fn prefill_kv_bf16_mirror_enabled() -> bool {
 /// Les couches à sinks (flint) n'y entrent qu'avec
 /// [`flint_prefill_kv_bf16_store_enabled`].
 /// Kill-switch `SARAGOSSA_RUST_PREFILL_KV_BF16_STORE=0`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_kv_bf16_store_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_BF16_STORE", true))
@@ -1702,7 +1702,7 @@ pub(crate) fn prefill_kv_bf16_store_enabled() -> bool {
 /// 64k, 52 → 35 Go à 115k, TTFT −3 à −8 %, decode inchangé. Écarts de logits
 /// cités par `flint_int4_prefill_kv_bf16_store_drift`. Kill-switch
 /// `SARAGOSSA_RUST_FLINT_PREFILL_KV_BF16_STORE=0`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn flint_prefill_kv_bf16_store_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_PREFILL_KV_BF16_STORE", true))
@@ -1723,7 +1723,7 @@ pub(crate) fn flint_prefill_kv_bf16_store_enabled() -> bool {
 /// change au premier token, une quasi-égalité (marge 0,40) que le qmv seul
 /// tranche aussi autrement avec des morceaux de prefill de 2048 au lieu de
 /// 4096.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_SMALL_NAX_GEMM", true))
@@ -1740,7 +1740,7 @@ pub(crate) fn flint_small_nax_gemm_enabled() -> bool {
 /// prefill 4096 1082 → 907 ms et 16384 5020 → 4223 ms (ABBA ×3), KL corpus
 /// 0,01037 → 0,01003, Δ apparié −3,3 % d'IC95 [−0,0020 ; +0,0013], dans le
 /// bruit des perturbations neutres (−6 % à +13 %).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn qwen_small_nax_gemm(qwen_moe: bool) -> Option<SmallNaxGemm> {
     static VALUE: OnceLock<Option<String>> = OnceLock::new();
     let value = VALUE.get_or_init(|| env_var("SARAGOSSA_RUST_QWEN_SMALL_NAX_GEMM"));
@@ -1755,7 +1755,7 @@ pub(crate) fn qwen_small_nax_gemm(qwen_moe: bool) -> Option<SmallNaxGemm> {
 }
 
 /// Variante du GEMM tuilé u4 à lhs f32 scindé hi + lo.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SmallNaxGemm {
     /// hi·hi + hi·lo + lo·hi (lo·lo abandonné, ~2⁻¹⁶).
@@ -1779,7 +1779,7 @@ pub(crate) enum SmallNaxGemm {
 /// 32k, divergence au pas 17 sur une quasi-égalité (marge qmv 0,013, dérive
 /// du pas 0,09), dérive max 1,32 et argmax forcé 127/128. Le qmv seul est
 /// bit-identique entre morceaux de 4096 et 2048 : ce bruit ne situe rien ici.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn qwen_kv_nax_x3_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QWEN_KV_NAX_X3", true))
@@ -1794,7 +1794,7 @@ pub(crate) fn qwen_kv_nax_x3_enabled() -> bool {
 /// plein, en f32 comme en bf16. Sur flint-int4 (35 couches glissantes), le
 /// K/V bf16 retenu passe de ≈ 7,7 Gio à ≈ 0,3 Gio à 115k tokens.
 /// Kill-switch `SARAGOSSA_RUST_FLINT_WINDOW_KV=0`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn flint_window_kv_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_WINDOW_KV", true))
@@ -1806,7 +1806,7 @@ pub(crate) fn flint_window_kv_enabled() -> bool {
 /// (recopie du KV du préfixe vers le GPU), puis 342 contre 372 ms à 32, 450
 /// contre 591 ms à 128 et 5,7 contre 12,4 s à 3,5k.
 /// `SARAGOSSA_RUST_PREFIX_EXTEND_RESIDENT_MIN`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefix_extend_resident_min_tokens() -> usize {
     static MIN: OnceLock<usize> = OnceLock::new();
     *MIN.get_or_init(|| {
@@ -1916,7 +1916,7 @@ pub const PREFIX_ALIGN_ROWS: usize = 64;
 /// de 8k diverge au 1 775e caractère sur 1 783 (fin de phrase, near-tie
 /// présumé). Kill-switch `SARAGOSSA_RUST_PREFILL_LINEAR_NAX=0` (retour au
 /// séquentiel). Le cas 16/32 exige aussi `SARAGOSSA_RUST_GATED_DELTA_NAX_HV32=1`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_linear_nax_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_LINEAR_NAX", true))
@@ -1928,7 +1928,7 @@ pub(crate) fn prefill_linear_nax_enabled() -> bool {
 /// avec divergence greedy malgré les oracles synthétiques. Le remède
 /// d'identité reste à l'étude (docs/perf/moe-bm32-hv32.md).
 /// Le kill-switch global `SARAGOSSA_RUST_PREFILL_LINEAR_NAX=0` reste prioritaire.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn gated_delta_nax_hv32_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     prefill_linear_nax_enabled()
@@ -1947,7 +1947,7 @@ pub(crate) fn mtp_early_first_token_enabled() -> bool {
 /// Sème l'historique MTP committed sur GPU, dans le prefill par morceaux ou
 /// dans un command buffer par bloc sur le chemin de repli
 /// (`SARAGOSSA_RUST_MTP_SEED_GPU=0` pour le chemin CPU, qui reste l'oracle).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn mtp_seed_gpu_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_SEED_GPU", true))
@@ -1956,7 +1956,7 @@ pub(crate) fn mtp_seed_gpu_enabled() -> bool {
 /// Garde le K/V d'un prefill résident complet dans ses buffers GPU partagés,
 /// relus en place par le cache CPU et copiés sur GPU vers l'arène de decode
 /// (`SARAGOSSA_RUST_PREFILL_KV_SHARED=0` pour la relecture vers des `Vec`).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_kv_shared_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_KV_SHARED", true))
@@ -1964,7 +1964,7 @@ pub(crate) fn prefill_kv_shared_enabled() -> bool {
 
 /// QMV bf16 à lectures vectorisées et transposition threadgroup, identique au
 /// bit au qmv par ligne. Actif par défaut ; `SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE=0` rend l'ancien noyau.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn dense_bf16_qmv_stage_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_QMV_STAGE", true))
@@ -1975,13 +1975,13 @@ pub(crate) fn dense_bf16_qmv_stage_enabled() -> bool {
 /// par ligne. Même arithmétique par ligne que le qmv à blocs (égalité au bit,
 /// test `dense_bf16_qmv_stage_rows_matches_stage_bitwise`). Actif par défaut ;
 /// `SARAGOSSA_RUST_DENSE_BF16_QMV_ROWS=0` rend une relecture par ligne.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn dense_bf16_qmv_rows_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_QMV_ROWS", true))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 thread_local! {
     static DENSE_BF16_X1_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1996,7 +1996,7 @@ thread_local! {
 /// partout (tête MTP, drafter, Gemma, tenseurs bf16 des modèles quantifiés,
 /// decode et vérification si le plancher M descend sous 64) ; `=0` le coupe
 /// partout (GEMM hi + lo).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn dense_bf16_gemm_x1_enabled() -> bool {
     static FORCED: OnceLock<Option<bool>> = OnceLock::new();
     FORCED
@@ -2007,10 +2007,10 @@ pub(crate) fn dense_bf16_gemm_x1_enabled() -> bool {
 }
 
 /// Portée par défaut du GEMM bf16 à un produit, refermée au `drop`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) struct DenseBf16X1Scope(bool);
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl DenseBf16X1Scope {
     /// Ouvre (ou ferme, avec `false`) la portée sur ce thread.
     pub(crate) fn enter(enabled: bool) -> Self {
@@ -2018,7 +2018,7 @@ impl DenseBf16X1Scope {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl Drop for DenseBf16X1Scope {
     fn drop(&mut self) {
         DENSE_BF16_X1_SCOPE.with(|value| value.set(self.0));
@@ -2030,7 +2030,7 @@ impl Drop for DenseBf16X1Scope {
 /// f32 intermédiaires. Même arithmétique que le chemin X1 (égalité au bit,
 /// test `dense_bf16_fused_mlp_matches_x1`). Opt-in
 /// `SARAGOSSA_RUST_DENSE_BF16_FUSED_MLP=1` ; exige le GEMM X1.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn dense_bf16_fused_mlp_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_FUSED_MLP", false))
@@ -2040,7 +2040,7 @@ pub(crate) fn dense_bf16_fused_mlp_enabled() -> bool {
 /// GEMM hi + lo sur `[b; a]` au lieu de deux qmv par ligne (N = 48).
 /// Change l'ordre d'accumulation (KL dans docs/perf/prefill-bf16.md).
 /// Opt-in `SARAGOSSA_RUST_DENSE_BF16_LA_BA_GEMM=1`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn dense_bf16_la_ba_gemm_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_LA_BA_GEMM", false))
@@ -2048,7 +2048,7 @@ pub(crate) fn dense_bf16_la_ba_gemm_enabled() -> bool {
 
 /// GEMM NA tuilé des poids bf16 denses au prefill (batch ≥ 64). Défaut ON ;
 /// `SARAGOSSA_RUST_DENSE_BF16_GEMM=0` rétablit le qmv par ligne.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn dense_bf16_gemm_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DENSE_BF16_GEMM", true))
@@ -2063,7 +2063,7 @@ pub(crate) fn dense_bf16_gemm_enabled() -> bool {
 /// `SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0` désactive.
 /// Avec l'état SSM bf16 (opt-in), l'état est arrondi à chaque frontière de
 /// morceau au lieu d'une fois : dérive non mesurée.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_resident_chunk_tokens() -> usize {
     static CHUNK: OnceLock<usize> = OnceLock::new();
     *CHUNK.get_or_init(|| {
@@ -2090,7 +2090,7 @@ pub(crate) fn prefill_resident_chunk_tokens() -> usize {
 /// [`prefill_resident_chunk_tokens`] : ≈ 1 Go à 4096. Mesuré le 2026-10-30
 /// (M5 Max 128 Go) : working set 115,4 Go, poids 23,7 Go, soit ≈ 297k, borné
 /// à 262 144 ; un Mac de 64 Go (≈ 48 Go de working set) tomberait vers 73k.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn flint_prefill_max_tokens_override() -> Option<usize> {
     static MAX: OnceLock<Option<usize>> = OnceLock::new();
     *MAX.get_or_init(|| {
@@ -2110,13 +2110,13 @@ pub(crate) fn flint_prefill_max_tokens_override() -> Option<usize> {
 /// Le NAX ([`prefill_attn_nax_sinks_enabled`]) passe avant le Steel sur un
 /// K/V bf16 : pour le kernel naïf F3 avec K/V bf16, il faut aussi
 /// `SARAGOSSA_RUST_PREFILL_ATTN_NAX_SINKS=0`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn flint_prefill_steel_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_FLINT_PREFILL_STEEL", true))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn prefill_resident_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = PREFILL_RESIDENT_TEST_OVERRIDE.with(Cell::get) {
@@ -2126,25 +2126,25 @@ pub(super) fn prefill_resident_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_RESIDENT", true))
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(test, gpu_metal, feature = "devtools"))]
 pub(crate) fn with_prefill_resident_override<R>(enabled: bool, run: impl FnOnce() -> R) -> R {
     with_test_override(&PREFILL_RESIDENT_TEST_OVERRIDE, enabled, run)
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 thread_local! {
     static PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 /// Restaure la bascule Gemma 4 précédente à la fin d'un test.
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 pub(crate) struct PrefillResidentGemma4TestOverride {
     previous: Option<bool>,
     // Une garde locale ne doit pas être restaurée par un autre thread.
     _thread: std::marker::PhantomData<*const ()>,
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 impl Drop for PrefillResidentGemma4TestOverride {
     fn drop(&mut self) {
         PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.with(|cell| cell.set(self.previous));
@@ -2152,7 +2152,7 @@ impl Drop for PrefillResidentGemma4TestOverride {
 }
 
 /// Force temporairement la bascule Gemma 4 pour un oracle.
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 pub(crate) fn override_prefill_resident_gemma4_for_test(
     enabled: bool,
 ) -> PrefillResidentGemma4TestOverride {
@@ -2171,7 +2171,7 @@ pub(crate) fn override_prefill_resident_gemma4_for_test(
 /// ni régénérer les goldens (voir docs/perf/gemma4-prefill.md).
 /// Kill-switch : `SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4=0` rétablit le per-op.
 /// Une erreur d'exécution résidente est propagée, sans repli silencieux.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn prefill_resident_gemma4_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = PREFILL_RESIDENT_GEMMA4_TEST_OVERRIDE.with(Cell::get) {
@@ -2182,7 +2182,7 @@ pub(super) fn prefill_resident_gemma4_enabled() -> bool {
 }
 
 /// Admission Gemma 4 avant embedding/allocation, sans initialiser Metal.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_resident_gemma4_eligible(tokens: usize) -> bool {
     prefill_resident_gemma4_enabled() && tokens <= prefill_resident_gemma4_max_tokens()
 }
@@ -2197,7 +2197,7 @@ pub(crate) fn prefill_resident_gemma4_eligible(tokens: usize) -> bool {
 /// laisse l'appelant choisir le per-op. Les erreurs après admission remontent.
 /// Le découpage résident ne couvre pas d512 :
 /// `SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK` ne borne pas ces allocations.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_resident_gemma4_max_tokens() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
     *MAX.get_or_init(|| {
@@ -2207,7 +2207,7 @@ pub(crate) fn prefill_resident_gemma4_max_tokens() -> usize {
     })
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn parse_gemma4_prefill_max_tokens(value: Option<&str>) -> usize {
     value
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -2223,63 +2223,63 @@ fn parse_gemma4_prefill_max_tokens(value: Option<&str>) -> usize {
 /// kernel (sortie non écrite au-delà de seq 256), pas du tail dense. Gain
 /// mesuré 27B : prefill @1k 29,7 → 192,4 tok/s (×6,5), @8k timeout 900 s →
 /// 48,5 tok/s. Kill-switch : `SARAGOSSA_RUST_PREFILL_DENSE_RESIDENT=0`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn prefill_dense_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_DENSE_RESIDENT", true))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn gpu_counters_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GPU_COUNTERS", false))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn gpu_timestamps_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_GPU_TIMESTAMPS", false))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn moe_micro_split_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MOE_MICRO_SPLIT", false))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn linear_micro_split_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_LINEAR_MICRO_SPLIT", false))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn trace_linear_attn_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_LINEAR_ATTN", false))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn trace_prefill_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_PREFILL", false))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn prefill_profile_sections_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_PREFILL_PROFILE_SECTIONS", false))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn trace_dispatch_path_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_DISPATCH_PATH", false))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn decode_profile_enabled() -> bool {
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     if let Some(trace) = pairwise::traced() {
         return trace;
     }
@@ -2287,19 +2287,19 @@ pub(crate) fn decode_profile_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_DECODE_PROFILE", false))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn topk_bench_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TOPK_BENCH", false))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn trace_moe_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_MOE", false))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn trace_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_TRACE_RESIDENT", false))
@@ -2311,7 +2311,7 @@ pub(crate) fn trace_resident_enabled() -> bool {
 /// ré-uploadé à chaque génération (poste dominant du setup MTP, ~1,2 s → ~0). La
 /// sortie est byte-identique (mêmes octets). `SARAGOSSA_RUST_RESIDENT_CONCAT_CACHE=0`
 /// rétablit le rebuild par génération (coupe-circuit / preuve A/B).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn resident_concat_cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_RESIDENT_CONCAT_CACHE", true))
@@ -2322,7 +2322,7 @@ pub(crate) fn resident_concat_cache_enabled() -> bool {
 /// (≈ 2× plus lente). **Défaut ON**. À valider byte-identique : mêmes tokens ET
 /// acceptance inchangée (le hidden résident sert aussi à semer l'historique MTP).
 /// `SARAGOSSA_RUST_MTP_PREFILL_RESIDENT=0` rétablit le prefill per-op (coupe-circuit).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn mtp_prefill_resident_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_PREFILL_RESIDENT", true))
@@ -2334,7 +2334,7 @@ pub(crate) fn mtp_prefill_resident_enabled() -> bool {
 /// Diagnostic de la Phase 2 MTP (time-to-first-token) : distingue ce qui est
 /// invariant (poolable entre générations) de ce qui dépend du prompt. Hors
 /// chemin prod, aucun effet quand `SARAGOSSA_RUST_MTP_SETUP_TRACE=0` (défaut).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn mtp_setup_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_MTP_SETUP_TRACE", false))
@@ -2349,7 +2349,7 @@ pub(crate) fn attention_parallel_threshold() -> usize {
     })
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 /// Active les kernels QMV u5 gs64 alignés et tail. Défaut ON ;
 /// `SARAGOSSA_RUST_QMV_U5=0` rétablit le QMV générique, comme le kill-switch u6.
 /// Lu une fois au premier usage. Le prefill NA garde son flag `SARAGOSSA_RUST_QMM_NA`.
@@ -2358,14 +2358,14 @@ pub(crate) fn qmv_u5_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_RUST_QMV_U5", true))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn qmv_fast_mode() -> Option<&'static str> {
     static MODE: OnceLock<Option<String>> = OnceLock::new();
     MODE.get_or_init(|| crate::runtime_flags::env_var("SARAGOSSA_RUST_QMV_FAST"))
         .as_deref()
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn gather_fast_mode() -> Option<&'static str> {
     static MODE: OnceLock<Option<String>> = OnceLock::new();
     MODE.get_or_init(|| crate::runtime_flags::env_var("SARAGOSSA_RUST_GATHER_FAST"))
@@ -2437,7 +2437,7 @@ pub(crate) fn install_tts_qmm_na_dequant_scope(enabled: bool) -> QmmNaDequantSco
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn qmm_na_dequant_allowed() -> bool {
     QMM_NA_DEQUANT_ALLOWED.get()
 }
@@ -2575,9 +2575,9 @@ pub(crate) const DFLASH_TREE_BF16_DEFAULT_BUDGET: usize = 4;
 /// échantillonné.
 #[cfg(feature = "devtools")]
 pub(crate) fn dflash_tree_default_budget(greedy: bool, dense_bf16: bool) -> usize {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let strict = verify_strict_enabled();
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     let strict = false;
     select_dflash_tree_default_budget(greedy, strict, dense_bf16)
 }
@@ -2651,7 +2651,7 @@ pub(crate) fn kv_bf16_greedy_min_tokens() -> usize {
 /// est borné par la latence de sa boucle ligne à ligne, pas par les octets
 /// lus. Q8 change le texte à 32k (intégrité intacte) et ne réduit pas le pic
 /// RSS à 256k.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn kv_quant_format() -> crate::decode_resident::KvFormat {
     static FORMAT: OnceLock<crate::decode_resident::KvFormat> = OnceLock::new();
     *FORMAT.get_or_init(|| {
@@ -2668,7 +2668,7 @@ pub(crate) fn kv_quant_format() -> crate::decode_resident::KvFormat {
 }
 
 /// Parse `SARAGOSSA_RUST_KV_QUANT` (insensible à la casse, espaces ignorés).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn parse_kv_quant(value: &str) -> Option<crate::decode_resident::KvFormat> {
     use crate::decode_resident::KvFormat;
     match value.trim().to_ascii_lowercase().as_str() {
@@ -2996,7 +2996,7 @@ pub(super) fn print_layer_profile(
 /// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_KONLY=1`, défaut OFF. À utiliser avec
 /// `SARAGOSSA_RUST_KV_BF16=0` (buffers f32). N'arrondit que le seed, pas les lignes
 /// appendées en decode (négligeables devant le prompt).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn kv_bf16_sim_konly() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag(SNAPSHOT_ABLATION_FLAGS[3], false))
@@ -3005,7 +3005,7 @@ pub(crate) fn kv_bf16_sim_konly() -> bool {
 /// Diagnostic C1B (hors prod) : arrondit **seulement V** au seed prefill (K reste
 /// f32 exact), pour isoler l'effet de la précision des valeurs (→ sortie) sur la
 /// divergence. `SARAGOSSA_RUST_KV_BF16_SIM_VONLY=1`, défaut OFF.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn kv_bf16_sim_vonly() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| env_flag(SNAPSHOT_ABLATION_FLAGS[4], false))
@@ -3072,13 +3072,13 @@ pub(crate) fn state_snapshot_dir() -> Option<&'static std::path::Path> {
 
 /// Surcharges hors environnement, relues uniquement à la demande d'instantané.
 pub(crate) fn state_snapshot_overrides() -> String {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let force_resident_full_linear = FORCE_RESIDENT_FULL_LINEAR.load(Ordering::Relaxed);
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     let force_resident_full_linear = false;
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     let pairwise = pairwise::current();
-    #[cfg(not(all(target_os = "macos", feature = "metal", feature = "devtools")))]
+    #[cfg(not(all(gpu_metal, feature = "devtools")))]
     let pairwise: Option<()> = None;
     format!("force_resident_full_linear={force_resident_full_linear};pairwise={pairwise:?}")
 }
@@ -3280,7 +3280,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn gemma4_prefill_default_dispatch_and_kill_switch() {
         const CHILD: &str = "GEMMA4_PREFILL_DISPATCH_CHILD";
         if let Ok(expected) = std::env::var(CHILD) {
@@ -3329,7 +3329,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn gemma4_prefill_max_tokens_defaults_and_override() {
         for value in [None, Some(""), Some("0"), Some("-1"), Some("invalid")] {
             assert_eq!(super::parse_gemma4_prefill_max_tokens(value), 4100);
@@ -3463,7 +3463,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[test]
     fn moe_ablation_flags_cache_presence_and_legacy_aliases() {
         const CHILD: &str = "MOE_ABLATION_CACHE_CHILD";
@@ -3538,7 +3538,7 @@ mod tests {
         assert_eq!(legacy_alias("RETI_RUST_TRUC"), None);
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[test]
     fn gated_delta_nax_hv32_requires_opt_in() -> std::io::Result<()> {
         const CHILD: &str = "SARAGOSSA_TEST_NAX_FLAGS_CHILD";
@@ -3685,7 +3685,7 @@ mod tests {
         assert!(!env_flag("SARAGOSSA_TEST_DRAPEAU", false));
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[test]
     fn fresh_history_follows_prompt_length() {
         assert!(fresh_for_prompt(true, 128, 26));
@@ -3836,7 +3836,7 @@ pub(crate) fn tts_cp_fused_kernels_enabled() -> bool {
 /// `SARAGOSSA_TTS_TALKER_FUSED_KERNELS=0` rétablit les 16 dispatches par couche.
 #[cfg(feature = "tts")]
 pub(crate) fn tts_talker_fused_kernels_enabled() -> bool {
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     if let Some(forced) = TTS_TALKER_FUSED_KERNELS_TEST_OVERRIDE.with(Cell::get) {
         return forced;
     }
@@ -3844,7 +3844,7 @@ pub(crate) fn tts_talker_fused_kernels_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag("SARAGOSSA_TTS_TALKER_FUSED_KERNELS", true))
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "tts"))]
+#[cfg(all(test, gpu_metal, feature = "tts"))]
 thread_local! {
     /// Couches encodées par la voie TTS fusionnée sur ce thread, pour prouver
     /// qu'un test compare bien deux chemins distincts.
@@ -3852,7 +3852,7 @@ thread_local! {
 }
 
 /// Force les couches du talker sur ce thread, puis rétablit le réglage précédent.
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "tts"))]
+#[cfg(all(test, gpu_metal, feature = "tts"))]
 pub(crate) fn with_tts_talker_fused_kernels_override<R>(
     enabled: bool,
     run: impl FnOnce() -> R,

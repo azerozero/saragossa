@@ -63,17 +63,17 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> CliResult<()> {
     let bytes = read_audio(file)?;
     let samples = saragossa::wire_audio::wav_to_mono_16k(&bytes)?;
     let model = DiarizationModel::from_model_dir(&model_dir)?;
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let executor = if metal {
         Some(saragossa::MetalExecutor::new()?)
     } else {
         None
     };
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let runtime = executor
         .as_ref()
         .map_or_else(ForwardRuntime::cpu, ForwardRuntime::metal);
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     let runtime = if metal {
         return Err(cli_error("backend metal diarisation indisponible : utilisez --cpu ou recompilez avec --features metal"));
     } else {

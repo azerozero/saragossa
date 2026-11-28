@@ -46,7 +46,7 @@ pub(crate) fn tanh(x: f32) -> f32 {
 }
 
 /// Jumelle MSL des fonctions ci-dessus, à inclure dans une source Metal.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) const MSL: &str = r"
 static inline float dfx_exp(float x) {
     #pragma METAL fp contract(off)

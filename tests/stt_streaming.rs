@@ -8,7 +8,7 @@
 //! SARAGOSSA_WHISPER_DIR=… SARAGOSSA_FLEURS_DIR=… cargo test --release \
 //!   --test stt_streaming -- --ignored --nocapture --test-threads=1
 //! ```
-#![cfg(all(target_os = "macos", feature = "metal"))]
+#![cfg(gpu_metal)]
 
 use std::path::PathBuf;
 use std::time::Instant;

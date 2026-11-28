@@ -123,7 +123,7 @@ fn golden_encoder_matches_fixture() -> Result<()> {
     assert_eq!(got.shape(), &[ref_seq, ref_dim]);
     let (max_abs, mean_abs) = drift(got.data(), &ref_data);
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if let Ok(metal) = crate::MetalExecutor::new() {
         let got_metal = encoder.encode_mel(&mel_tensor, ForwardRuntime::metal(&metal))?;
         assert_eq!(got_metal.shape(), &[ref_seq, ref_dim]);
@@ -144,7 +144,7 @@ fn golden_encoder_matches_fixture() -> Result<()> {
 
 /// Features résidentes (sans readback intermédiaire) contre le chemin hôte
 /// `SARAGOSSA_STT_FEATURES_HOST=1` : identiques au bit sur whisper-tiny.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "inférence: whisper-tiny local et verrou GPU requis"]
 fn resident_features_match_host_path_bitwise() -> Result<()> {

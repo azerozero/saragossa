@@ -16,10 +16,10 @@ use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
 const MATMUL_KERNELS: &str = include_str!("../kernels.metal");
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 const STEEL_ATTENTION_KERNELS: &str =
     include_str!(concat!(env!("OUT_DIR"), "/steel_attention.metal"));
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 const STEEL_ATTN_F32_BQ32_BK32_BD64: &str =
     "steel_attention_float32_bq32_bk32_bd64_wm4_wn1_maskfloat32";
 const STEEL_CAUSAL_ATTN_D256_F32_BQ32_BK64_BD64X4: &str =
@@ -27,7 +27,7 @@ const STEEL_CAUSAL_ATTN_D256_F32_BQ32_BK64_BD64X4: &str =
 const STEEL_SINK_ATTN_D128_F32: &str = "steel_attention_float32_bq32_bk16_bd128_wm4_wn1_sinks";
 const STEEL_SINK_ATTN_D128_KV_BF16: &str =
     "steel_attention_float32_bq32_bk16_bd128_wm4_wn1_sinks_kvbf16";
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 const STEEL_ATTENTION_NAX_KERNELS: &str = include_str!("../../assets/steel_attention_nax.metal");
 const GATED_DELTA_NAX_KERNELS: &str = include_str!("../../assets/gated_delta_nax.metal");
 const GATED_DELTA_NAX_HK16_HV32: &str = "gated_delta_fused_nax_f32_dk128_dv128_hk16_hv32_c16";
@@ -167,7 +167,7 @@ pub(crate) use self::lightbatch_duo::{
 pub(crate) use self::linear_attention::linear_tree_journal_refusal;
 #[cfg(all(test, feature = "devtools"))]
 pub(crate) use self::linear_attention::{linear_tree_refusal, LinearTreeShape};
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) use self::matmul::take_concat_profile;
 #[cfg(any(feature = "stt", feature = "diar"))]
 pub(crate) use self::matmul::whisper_bf16_gemm_enabled;

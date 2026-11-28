@@ -9,9 +9,9 @@ use crate::{CausalDecoderCache, InferError, Result, Tensor};
 use std::time::Instant;
 
 /// Poids de la trame fusionnée du code predictor (jamais construits hors Metal).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 type CpFusedWeights = crate::decoder::TtsCodebookWeights;
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 type CpFusedWeights = std::convert::Infallible;
 
 impl TtsModel {
@@ -276,7 +276,7 @@ impl TtsModel {
         &self,
         cache: &mut crate::CausalDecoderCache,
     ) -> Result<bool> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if crate::runtime_flags::tts_talker_fused_kernels_enabled() {
             return self.talker.enable_tts_fused_layers(cache);
         }
@@ -288,7 +288,7 @@ impl TtsModel {
     /// permettent : température positive, `1 <= top_k < vocab`, `top_p` dans
     /// `(0, 1]`. Sinon `None` et le chemin pas à pas (tirage CPU) reste actif.
     fn cp_fused_weights(&self, sub: &TtsSampleParams) -> Result<Option<CpFusedWeights>> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             let supported = crate::runtime_flags::tts_cp_fused_enabled()
                 && self.code_predictor_embeddings_bf16_exact
@@ -311,7 +311,7 @@ impl TtsModel {
             };
             Ok((sub.top_k < weights.vocab()).then_some(weights))
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = sub;
             Ok(None)
@@ -403,7 +403,7 @@ impl TtsModel {
         let e0 = self.codec_embed(&[tok0])?;
         match cp_resident {
             Some(cp_cache) => {
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 if let (Some(weights), Some((params, sampler))) = (cp_fused, sampling.as_mut()) {
                     let sample = crate::decode_resident::TtsCodebookSample {
                         temperature: params.temperature,
@@ -432,7 +432,7 @@ impl TtsModel {
                     }
                     return Ok(codes_frame);
                 }
-                #[cfg(not(all(target_os = "macos", feature = "metal")))]
+                #[cfg(not(gpu_metal))]
                 let _ = cp_fused;
                 // position 0 : final_state (seed KV, pas de code). Puis un pas par
                 // codebook avec la tête dans le command buffer du pas. En greedy,

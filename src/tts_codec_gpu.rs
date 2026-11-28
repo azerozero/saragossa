@@ -16,7 +16,7 @@
 //! réduction scalaire CPU au niveau de l'arrondi f32 (FMA / ordre) ; le gate est
 //! une tolérance audio (cf. `tts_codec` tests), pas l'octet-à-octet.
 
-#![cfg(all(target_os = "macos", feature = "metal"))]
+#![cfg(gpu_metal)]
 
 use crate::metal_backend::{
     commit_and_wait, install_dispatch_barrier_scope, post_dispatch_barrier, read_f32_buffer,

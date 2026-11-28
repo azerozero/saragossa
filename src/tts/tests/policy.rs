@@ -42,7 +42,7 @@ fn customvoice_request_options_reset_and_change_generated_codes() -> Result<()> 
 /// ancienne projection CPU contre projection fusionnée. Seuil fixé à 1e-4
 /// avant mesure, sans tolérance sur les identifiants tirés à graine égale.
 #[test]
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[ignore = "inférence: snapshots TTS locaux et verrou GPU requis"]
 fn sampled_resident_heads_match_cpu_oracle() -> Result<()> {
     for (env, repo) in [
@@ -184,7 +184,7 @@ fn sampled_resident_heads_match_cpu_oracle() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn head_logits_close(cpu: &[f32], gpu: &[f32]) -> f32 {
     assert_eq!(cpu.len(), gpu.len());
     let mut max_abs = 0.0_f32;

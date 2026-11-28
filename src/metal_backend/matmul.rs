@@ -18,7 +18,7 @@ const CONCAT_CACHE_VRAM_FRACTION: f64 = 0.85;
 /// poids non mémoïsés. Un rebuild = un cache-miss ayant re-concaténé/ré-uploadé
 /// (les hits ne sont pas comptés) : la trace de setup MTP le lit pour chiffrer le
 /// coût récurrent restant.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn take_concat_profile() -> (u64, u64) {
     use std::sync::atomic::Ordering;
     (

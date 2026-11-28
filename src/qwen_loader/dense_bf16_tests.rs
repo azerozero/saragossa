@@ -41,7 +41,7 @@ fn dense_bf16_cpu_fallback_preserves_file_bits() {
     assert_eq!(actual, expected);
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "requiert un device Metal, RETI_RUST_SINGLE_COPY_WEIGHTS=1"]
 fn dense_bf16_file_storage_has_no_f32_copy() -> Result<()> {
@@ -78,7 +78,7 @@ fn dense_bf16_file_storage_has_no_f32_copy() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "requiert un device Metal, RETI_RUST_SINGLE_COPY_WEIGHTS=0"]
 fn dense_bf16_kill_switch_keeps_f32() -> Result<()> {

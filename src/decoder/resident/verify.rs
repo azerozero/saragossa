@@ -1,14 +1,14 @@
 use super::super::*;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use super::types::*;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::decoder::ResidentVerifyHead;
 
 /// Vérification enregistrée par l'oracle O2 (tests seulement) : position de la
 /// première ligne, tokens d'entrée, parents de l'arbre éventuel, états finaux
 /// normés `[lignes, hidden]` et chemin réellement exécuté (`batched` : kernels
 /// en lignes ; faux pour le repli séquentiel, un pas mono par token).
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(test, gpu_metal, feature = "devtools"))]
 #[derive(Clone, Debug)]
 pub(in crate::decoder) struct VerifyRecord {
     pub(in crate::decoder) base_position: usize,
@@ -20,19 +20,19 @@ pub(in crate::decoder) struct VerifyRecord {
     pub(in crate::decoder) skip_head: bool,
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(test, gpu_metal, feature = "devtools"))]
 thread_local! {
     /// Enregistreur des vérifications résidentes : `Some` pendant un oracle O2.
     pub(in crate::decoder) static VERIFY_RECORDER: std::cell::RefCell<Option<Vec<VerifyRecord>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(test, gpu_metal, feature = "devtools"))]
 pub(super) fn verify_recorder_active() -> bool {
     VERIFY_RECORDER.with(|slot| slot.borrow().is_some())
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(test, gpu_metal, feature = "devtools"))]
 pub(super) fn record_verify(
     base_position: usize,
     tokens: &[usize],
@@ -61,7 +61,7 @@ impl CausalDecoder {
     /// chargée. Ses cycles D1/D2 fusionnés n'existent qu'en lignes et portent tout
     /// le gain (×1,2 à ×1,6 contre l'AR, docs/perf/mtp-pairwise.md) ; sans tête,
     /// le défaut reste OFF (lookup seul : régression sur T0 et T7).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn moe_verify_rows(&self) -> bool {
         crate::runtime_flags::moe_verify_rows_override().unwrap_or_else(|| {
             matches!(
@@ -73,7 +73,7 @@ impl CausalDecoder {
 
     /// Vrai si toutes les couches ont leurs buffers résidents en lignes : la
     /// vérification batchée (captures, rollback par troncature) est possible.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn resident_layer_batch_supported(&self, arena: &ResidentArena) -> bool {
         self.layers.iter().enumerate().all(|(index, layer)| {
             match (self.plan.layers[index].resident_full, layer.mlp.as_ref()) {
@@ -115,7 +115,7 @@ impl CausalDecoder {
     /// linéaires par ancêtres) ; exige le chemin batché et des captures, laisse
     /// les états linéaires d'entrée intacts (rollback obligatoire, cf.
     /// `restore_tree_resident_progress`).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn next_final_states_resident_verify(
         &self,
         cache: &mut CausalDecoderCache,

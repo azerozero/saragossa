@@ -180,13 +180,13 @@ fn external_kld_ratio_gate() {
     assert!(kl.abs() < 1e-12 && delta < 1e-12);
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compare(name: &str, env: &str) -> TestResult {
     compare_with_prefill(name, env, |model, prompt| model.prefill_cache(prompt))
 }
 
 /// Même oracle, decode par le chemin résident complet sans repli per-op.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compare_resident(name: &str, env: &str) -> TestResult {
     compare_decode(name, env, true, |model, prompt| model.prefill_cache(prompt))
 }
@@ -194,7 +194,7 @@ fn compare_resident(name: &str, env: &str) -> TestResult {
 /// Même référence, provenance et seuils que l'oracle externe ; les deux chemins
 /// doivent réellement s'exécuter. Une absence de poids ou un refus résident
 /// fait échouer cette qualification même sans SARAGOSSA_REQUIRE_REAL_MODELS.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn compare_gemma4_prefill(resident: bool) -> TestResult {
     let env = "SARAGOSSA_GEMMA4_DIR";
     local(env)?.ok_or("SARAGOSSA_GEMMA4_DIR requis pour cet oracle")?;
@@ -217,7 +217,7 @@ pub(crate) fn compare_gemma4_prefill(resident: bool) -> TestResult {
 /// Référence indépendante mlx-lm f32 et bruit bf16 calibré sur le même prompt.
 /// Le prefill candidat est forcé sans repli ; le decode et les tokens de la
 /// référence sont communs aux deux chemins. Les seuils restent ceux du golden.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compare_gemma4_long_reference(name: &str, resident: bool) -> TestResult {
     let env = "SARAGOSSA_GEMMA4_DIR";
     local(env)?.ok_or("SARAGOSSA_GEMMA4_DIR requis pour cet oracle")?;
@@ -254,7 +254,7 @@ fn compare_gemma4_long_reference(name: &str, resident: bool) -> TestResult {
     })
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 macro_rules! long_oracle {
     ($test:ident, $name:literal, $resident:literal) => {
         #[test]
@@ -265,37 +265,37 @@ macro_rules! long_oracle {
     };
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 long_oracle!(
     external_kld_gemma4_long_1024_per_op,
     "gemma4_long_1024",
     false
 );
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 long_oracle!(
     external_kld_gemma4_long_1024_resident,
     "gemma4_long_1024",
     true
 );
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 long_oracle!(
     external_kld_gemma4_long_2048_per_op,
     "gemma4_long_2048",
     false
 );
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 long_oracle!(
     external_kld_gemma4_long_2048_resident,
     "gemma4_long_2048",
     true
 );
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 long_oracle!(
     external_kld_gemma4_long_4100_per_op,
     "gemma4_long_4100",
     false
 );
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 long_oracle!(
     external_kld_gemma4_long_4100_resident,
     "gemma4_long_4100",
@@ -306,7 +306,7 @@ long_oracle!(
 /// replay forcé des mêmes tokens après un prefill résident sans repli.
 /// La partition top-K + reste et le p99 des Δp maximaux par position sont
 /// exactement ceux du golden, contrairement aux métriques plein vocab CLI.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn compare_gemma4_long_prefill(
     model: &crate::CausalDecoder,
     prompt: &[usize],
@@ -316,7 +316,7 @@ pub(crate) fn compare_gemma4_long_prefill(
 }
 
 /// Même oracle et mêmes seuils, à une longueur totale contrôlée par le test.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn compare_gemma4_prefill_at_length(
     model: &crate::CausalDecoder,
     prompt: &[usize],
@@ -424,7 +424,7 @@ pub(crate) fn compare_gemma4_prefill_at_length(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compare_with_prefill(
     name: &str,
     env: &str,
@@ -436,7 +436,7 @@ fn compare_with_prefill(
     compare_decode(name, env, false, prefill)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compare_decode(
     name: &str,
     env: &str,
@@ -528,7 +528,7 @@ fn compare_decode(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 macro_rules! oracle {
     ($test:ident, $name:literal, $env:literal) => {
         #[test]
@@ -538,26 +538,26 @@ macro_rules! oracle {
         }
     };
 }
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 oracle!(external_kld_qwen38, "qwen38", "SARAGOSSA_QWEN38_DIR");
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 oracle!(
     external_kld_qwen36_moe,
     "qwen36_moe",
     "SARAGOSSA_QWEN36_MOE_DIR"
 );
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 oracle!(external_kld_gemma3, "gemma3", "SARAGOSSA_GEMMA3_DIR");
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 oracle!(external_kld_gemma4, "gemma4", "SARAGOSSA_GEMMA4_DIR");
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 oracle!(
     external_kld_mistral7b,
     "mistral7b",
     "SARAGOSSA_MISTRAL7B_DIR"
 );
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "oracle GPU externe: poids locaux requis, lancer sous verrou"]
 fn external_kld_mistral7b_resident() -> TestResult {

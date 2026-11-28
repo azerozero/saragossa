@@ -193,14 +193,14 @@ impl FullPlan {
         self.rope_frequency_dim.unwrap_or(head_dim)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn kv_dim(&self) -> Result<usize> {
         self.head_dim()?;
         self.kv_dim
             .ok_or_else(|| InferError::Dimension("kv_dim résident déborde".to_string()))
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn resident_full_attn_layer_dims(
         &self,
         hidden: usize,

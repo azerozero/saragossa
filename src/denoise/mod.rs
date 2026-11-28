@@ -13,9 +13,9 @@
 
 mod dsp;
 mod exact_math;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 mod gpu;
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 mod gpu_probe;
 mod layers;
 mod network;
@@ -133,7 +133,7 @@ impl DeepFilterNet3 {
     ///
     /// # Errors
     /// Erreurs Metal (pas de GPU, compilation, exécution).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub fn enhance_gpu(&self, audio: &[f32]) -> Result<Vec<f32>> {
         if !self.net.is_std() {
             return Err(InferError::Config(
@@ -214,7 +214,7 @@ impl DeepFilterNet3 {
 
 /// Origine des sorties du réseau d'un flux.
 #[cfg_attr(
-    not(all(target_os = "macos", feature = "metal")),
+    not(gpu_metal),
     allow(dead_code, reason = "seul le chemin Metal enregistre et rejoue")
 )]
 enum Steps {

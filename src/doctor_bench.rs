@@ -901,7 +901,7 @@ fn model_json(model: &ModelSummary) -> Value {
 }
 
 fn health_checks() -> Vec<(&'static str, &'static str, String)> {
-    let metal = cfg!(all(target_os = "macos", feature = "metal"));
+    let metal = cfg!(gpu_metal);
     let macos = macos_version().unwrap_or_else(|| "unknown".to_string());
     vec![
         (

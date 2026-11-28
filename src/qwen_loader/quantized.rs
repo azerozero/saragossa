@@ -305,7 +305,7 @@ pub(super) fn tensor_from_entry(
     }
     // Les normes et convolutions sont consommées comme Tensor f32 ; seules
     // les matrices de projection/embedding acceptent le stockage partagé.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if entry.dtype == Dtype::BF16
         && entry.shape.len() == 2
         && spec.target.ends_with(".weight")
@@ -345,7 +345,7 @@ fn lora_merged_tensor(
     let mut weight = crate::safetensor::bytes_to_dense_f32(&bytes, entry.dtype, &spec.source)?;
     drop(bytes);
     module.merge_into(&spec.source, &entry.shape, &mut weight)?;
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if entry.dtype == Dtype::BF16 && crate::runtime_flags::single_copy_weights_enabled() {
         if let Some(metal) = context.metal {
             let buffer = metal.weight_buffer_from_f32_as_bf16(&weight)?;
@@ -354,7 +354,7 @@ fn lora_merged_tensor(
             )));
         }
     }
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     let _ = context;
     Ok(DecoderTensor::Dense(Tensor::from_vec(
         entry.shape.clone(),
@@ -387,7 +387,7 @@ pub(super) fn quantized_tensor_from_entry(
             .ok_or_else(|| InferError::Shape("index shard invalide".into()))?;
         // Single-copy : codes et échelles sont lus directement dans les
         // MTLBuffer partagés que lisent les kernels, sans vecteur CPU.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if crate::runtime_flags::single_copy_weights_enabled() {
             if let Some(metal) = context.metal {
                 let file_offset = |header: &ShardHeader, entry: &ShardTensorEntry| {
@@ -431,7 +431,7 @@ pub(super) fn quantized_tensor_from_entry(
     let (group_size, bits) = resolve_quant_params(quant, &spec.source, entry, entries)?;
     let scales_key = replace_weight_suffix(&spec.source, ".scales")?;
     let biases_key = replace_weight_suffix(&spec.source, ".biases")?;
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if crate::runtime_flags::single_copy_weights_enabled() {
         if let Some(metal) = context.metal {
             let scales_entry = named_entry(headers, entries, &scales_key)?;
@@ -492,7 +492,7 @@ pub(super) fn quantized_tensor_from_entry(
     let biases = tensor_from_named_entry(headers, entries, &biases_key)?;
     let packed_len = element_count(&entry.shape, &spec.source)?;
     let packed_bytes = entry.payload_len(&spec.source)?;
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let shared = if crate::runtime_flags::single_copy_weights_enabled() {
         context
             .metal
@@ -509,9 +509,9 @@ pub(super) fn quantized_tensor_from_entry(
     } else {
         None
     };
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     let _ = (packed_len, packed_bytes);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if let Some(buffer) = shared {
         if is_moe_expert_weight(&spec.target) && entry.shape.len() == 3 {
             return quantized_expert_weights_from_parts(
@@ -563,7 +563,7 @@ pub(super) fn quantized_tensor_from_entry(
     )))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 struct MetalBf16Entry {
     buffer: metal::Buffer,
     /// Début de la vue dans `buffer`, en éléments bf16.
@@ -586,7 +586,7 @@ fn named_entry<'a>(
     Ok(entry_ref)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 /// Charge un payload bf16 ; `allow_view` autorise une vue mmap décalée, que
 /// seuls les consommateurs qui lient leur offset (paramètres affines) acceptent.
 fn bf16_entry_to_metal(
@@ -648,7 +648,7 @@ fn is_moe_expert_weight(target: &str) -> bool {
         && target.ends_with(".weight")
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[expect(
     clippy::too_many_arguments,
     reason = "vue packed (buffer, base, longueur) et paramètres affines restent explicites"
@@ -748,7 +748,7 @@ enum PackedWeight {
         file: std::fs::File,
         offset: u64,
     },
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     Metal(metal::Buffer),
 }
 
@@ -823,7 +823,7 @@ fn quantized_expert_weights_from_parts(
         let biases = Tensor::from_vec(vec![*rows, groups], biases_slice)
             .map_err(|err| InferError::Shape(format!("biases expert {expert} invalides: {err}")))?;
         let weight = match &packed {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             PackedWeight::Metal(buffer) => AffineQuantizedTensor::new_metal_shared(
                 &[*rows, *packed_cols],
                 buffer.clone(),

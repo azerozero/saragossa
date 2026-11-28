@@ -25,9 +25,9 @@ mod frontend;
 mod stream;
 
 pub use stream::{DiarizationStream, StreamUpdate};
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 type Resident = Option<crate::metal_backend::WhisperResidentEncoder>;
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 type Resident = ();
 
 use crate::{
@@ -482,14 +482,14 @@ impl DiarizationModel {
 
     /// Encodeur Metal résident, ou rien sur CPU.
     fn resident_for(&self, runtime: ForwardRuntime<'_>) -> Result<Resident> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             runtime
                 .metal_executor()
                 .map(|metal| self.build_resident(metal))
                 .transpose()
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = runtime;
             Ok(())
@@ -518,14 +518,14 @@ impl DiarizationModel {
         let key_rows = rows - masked_tail;
         let input = Tensor::from_vec(vec![rows, d], input)?;
         let normed = self.input_ln.forward(&input)?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let hidden = match (runtime.metal_executor(), resident.as_ref()) {
             (Some(metal), Some(enc)) => {
                 metal.encode_whisper_encoder_keys(&normed, enc, key_rows)?
             }
             _ => self.encode_cpu(normed, key_rows, runtime)?,
         };
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let hidden = {
             let _ = resident;
             self.encode_cpu(normed, key_rows, runtime)?
@@ -616,7 +616,7 @@ impl DiarizationModel {
             .collect())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn build_resident(
         &self,
         metal: &crate::MetalExecutor,

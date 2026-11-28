@@ -1,6 +1,6 @@
 //! MLP dense, MoE et routage des experts du modèle.
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::runtime_flags::trace_moe_enabled;
 use crate::{
     gelu_tanh, rms_norm, silu, softmax, ForwardRuntime, InferError, Linear, Result, Tensor,
@@ -78,7 +78,7 @@ impl FeedForward {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
         match self {
             Self::Dense(mlp) => mlp.release_affine_cpu_data(released),
@@ -86,7 +86,7 @@ impl FeedForward {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn move_packed_to_metal_shared(
         &mut self,
         metal: &crate::MetalExecutor,
@@ -127,7 +127,7 @@ impl GatedMlp {
 
     /// Renvoie l'activation de la porte de l'expert.
     #[cfg_attr(
-        not(all(target_os = "macos", feature = "metal")),
+        not(gpu_metal),
         expect(
             dead_code,
             reason = "consommé par les chemins MoE Metal batchés, absent du build CPU pur"
@@ -161,7 +161,7 @@ impl GatedMlp {
     }
 
     #[cfg_attr(
-        not(all(target_os = "macos", feature = "metal")),
+        not(gpu_metal),
         expect(
             dead_code,
             reason = "utilisé par les buffers MoE Metal, absent du build CPU pur"
@@ -171,14 +171,14 @@ impl GatedMlp {
         (&self.gate_proj, &self.up_proj, &self.down_proj)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
         self.gate_proj.release_affine_cpu_data(released);
         self.up_proj.release_affine_cpu_data(released);
         self.down_proj.release_affine_cpu_data(released);
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn move_packed_to_metal_shared(
         &mut self,
         metal: &crate::MetalExecutor,
@@ -188,7 +188,7 @@ impl GatedMlp {
         self.down_proj.move_packed_to_metal_shared(metal)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn projection(&self, index: usize) -> &Linear {
         match index {
             0 => &self.gate_proj,
@@ -197,7 +197,7 @@ impl GatedMlp {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn projection_mut(&mut self, index: usize) -> &mut Linear {
         match index {
             0 => &mut self.gate_proj,
@@ -233,7 +233,7 @@ pub(crate) struct MoePrecisionCapture {
 }
 
 /// Expose les poids du routeur Gemma 4 au chemin Metal résident.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) struct GemmaMoeMetalParts<'a> {
     pub(crate) router: &'a Linear,
     pub(crate) experts: &'a [GatedMlp],
@@ -420,7 +420,7 @@ impl MoeMlp {
         router_source: &Tensor,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if runtime.metal_executor().is_some() && !self.metal_compatible() {
             return Err(InferError::Config(
                 "MoE à routeur sigmoïde ou expert partagé sans gate refusé par le runtime Metal"
@@ -434,7 +434,7 @@ impl MoeMlp {
                 "MoE expert=[{batch},{hidden}] routeur=[{router_batch},{router_hidden}]"
             )));
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if self.router_norm.is_none() && std::ptr::eq(x, router_source) {
             if let Some(metal) = runtime.metal_executor() {
                 if batch == 1 {
@@ -539,7 +539,7 @@ impl MoeMlp {
                 self.experts.len()
             )));
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = runtime.metal_executor() {
             if batch > 1 && self.shared_expert.is_none() {
                 let mut weighted_rows = Vec::with_capacity(batch);
@@ -562,7 +562,7 @@ impl MoeMlp {
         for row in 0..batch {
             let input = Tensor::row(x.row_slice(row)?.to_vec())?;
             let top_weights = self.top_weights(router_logits.row_slice(row)?)?;
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             if let Some(metal) = runtime.metal_executor() {
                 if self.shared_expert.is_none() {
                     let expert_out = metal.moe_gated_topk(&input, &self.experts, &top_weights)?;
@@ -621,7 +621,7 @@ impl MoeMlp {
     }
 
     #[cfg_attr(
-        not(all(target_os = "macos", feature = "metal")),
+        not(gpu_metal),
         expect(
             dead_code,
             reason = "utilisé par les chemins MoE Metal, absent du build CPU pur"
@@ -639,7 +639,7 @@ impl MoeMlp {
     }
 
     /// Renvoie les poids routés et les modulations propres à Gemma 4.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn gemma4_metal_parts(&self) -> Option<GemmaMoeMetalParts<'_>> {
         if !self.metal_compatible()
             || self.shared_expert.is_some()
@@ -660,7 +660,7 @@ impl MoeMlp {
     }
 
     #[cfg_attr(
-        not(all(target_os = "macos", feature = "metal")),
+        not(gpu_metal),
         expect(
             dead_code,
             reason = "utilisé par les chemins MoE shared Metal, absent du build CPU pur"
@@ -693,7 +693,7 @@ impl MoeMlp {
     /// autre contrat (softmax, gate partagée, normes ou échelles Gemma), ou
     /// si un poids porte un biais : les buffers résidents n'en transmettent
     /// aucun, l'ignorer donnerait un résultat faux.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn sigmoid_metal_parts(&self) -> Option<(&Linear, &[GatedMlp], usize, &GatedMlp)> {
         let shared = self.ungated_shared_expert.as_ref()?;
         let plain_swiglu = |mlp: &GatedMlp| {
@@ -737,7 +737,7 @@ impl MoeMlp {
         Ok(out)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
         self.router.release_affine_cpu_data(released);
         // Le seul appelant est le drop du décodeur, qui garde les modèles MoE
@@ -758,7 +758,7 @@ impl MoeMlp {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn move_packed_to_metal_shared(&mut self, metal: &crate::MetalExecutor) -> Result<()> {
         self.router.move_packed_to_metal_shared(metal)?;
         for projection in 0..3 {
@@ -777,7 +777,7 @@ impl MoeMlp {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn move_expert_projection_to_metal_shared(
     experts: &mut [GatedMlp],
     projection: usize,
@@ -963,7 +963,7 @@ mod tests {
         assert!((out.data()[0] - 2.0 * silu_scalar(2.0)).abs() < 1.0e-5);
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     /// CONTRAT (depuis le drop MoE opt-in) : `release_affine_cpu_data` libère
     /// TOUT le MoE, experts routés compris — c'est ce qui rend le drop
     /// `RETI_RUST_FREE_CPU_WEIGHTS_MOE=1` effectif (avant : les experts
@@ -1074,12 +1074,12 @@ mod tests {
         GatedMlp::new(gate, up, down)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn quantized_expert() -> GatedMlp {
         GatedMlp::new(quantized_linear(), quantized_linear(), quantized_linear())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn quantized_linear() -> Linear {
         let scales = Tensor::from_vec(vec![1, 1], vec![0.5])
             .expect("invariant: échelles quantifiées valides");
@@ -1091,7 +1091,7 @@ mod tests {
         Linear::new_quantized(weight, None).expect("invariant: projection quantifiée valide")
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn quantized_cpu_data_available(linear: &Linear) -> bool {
         match linear.weight() {
             crate::LinearWeight::AffineQuantized(weight) => weight.cpu_data_available(),

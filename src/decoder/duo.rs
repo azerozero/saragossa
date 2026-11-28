@@ -6,10 +6,10 @@
 //! dispatches PAR FLUX sur l'état de chaque flux. La composition est BIT-exacte
 //! vs le pas solo (oracles E2.2a) → byte-identité par flux.
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use super::*;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl CausalDecoder {
     /// Renvoie `true` si le pas duo est applicable au cache résident : couches
     /// exclusivement FullMoe/LinearMoe (35B-A3B), `attn_output_gate`, et TOUTES

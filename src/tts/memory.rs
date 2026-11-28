@@ -20,7 +20,7 @@ pub(crate) fn checkpoint(phase: &'static str, fields: &[(&str, usize)]) {
     }
     drop(seen);
     let mut line = format!("tts_memory phase={phase} pid={}", std::process::id());
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if let Some(device) = metal::Device::system_default() {
         line.push_str(&format!(
             " metal_allocated={}",

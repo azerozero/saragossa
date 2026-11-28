@@ -1,6 +1,6 @@
 //! Génération, préfill et tête MTP du décodeur causal.
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::runtime_flags::mtp_sampled_enabled;
 use crate::sampling::{
     lossless_speculative_sample, lossless_speculative_sample_dense, sample_from_dense_distribution,
@@ -9,7 +9,7 @@ use crate::sampling::{
 #[cfg(feature = "devtools")]
 use crate::DFlashDraft;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use super::attention_ops::AttentionLayout;
 use super::attention_ops::{full_attention_append_kv_rows, full_attention_context_cached};
 use super::lookup::NgramLookup;
@@ -77,7 +77,7 @@ mod emission_tests {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Clone, Copy, Debug)]
 struct MtpProfilePoint {
     started: Instant,
@@ -87,7 +87,7 @@ struct MtpProfilePoint {
     dispatches: u64,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Clone, Copy, Debug, Default)]
 struct MtpProfileBucket {
     calls: u64,
@@ -98,7 +98,7 @@ struct MtpProfileBucket {
     wall_ns: u128,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Clone, Debug, Default)]
 struct MtpStepProfile {
     fused_one: MtpProfileBucket,
@@ -110,7 +110,7 @@ struct MtpStepProfile {
     bonus_next: MtpProfileBucket,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl MtpStepProfile {
     fn report(&self, generated: usize, verifications: usize) {
         let denom = generated.max(1) as f64;
@@ -147,7 +147,7 @@ impl MtpStepProfile {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn mtp_step_profile_enabled() -> bool {
     #[cfg(feature = "devtools")]
     {
@@ -162,7 +162,7 @@ fn mtp_step_profile_enabled() -> bool {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn mtp_profile_start(enabled: bool) -> Option<MtpProfilePoint> {
     enabled.then(|| {
         let (command_buffers, wait_ns, read_ns, dispatches) =
@@ -177,7 +177,7 @@ fn mtp_profile_start(enabled: bool) -> Option<MtpProfilePoint> {
     })
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn mtp_profile_record(bucket: &mut MtpProfileBucket, start: Option<MtpProfilePoint>) {
     let Some(start) = start else {
         return;
@@ -252,7 +252,7 @@ struct DFlashVerify<'a> {
     stats: &'a mut SpeculativeStats,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 struct ResidentLinearXrayProbe {
     layer_index: usize,
     normed_max_abs: f32,
@@ -304,13 +304,13 @@ fn longest_prefix_entry_index_where(
 
 struct SpeculativeCacheSnapshot {
     cpu: CausalDecoderCache,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     linear_metal: Vec<Option<crate::metal_backend::LinearAttentionMetalState>>,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     full_lens: Vec<Option<usize>>,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 struct DecodeProfiler {
     snapshot: Option<(u64, u64, u64, u64)>,
     site_snapshot:
@@ -319,7 +319,7 @@ struct DecodeProfiler {
         Option<std::collections::HashMap<crate::metal_backend::DispatchProfileShape, u64>>,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl DecodeProfiler {
     fn start() -> Self {
         // Profil decode (SARAGOSSA_RUST_DECODE_PROFILE) : borne le cumul Metal autour
@@ -425,7 +425,7 @@ impl DecodeProfiler {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compact_source_path(path: &'static str) -> &'static str {
     path.strip_prefix(concat!(env!("CARGO_MANIFEST_DIR"), "/"))
         .unwrap_or(path)
@@ -483,7 +483,7 @@ impl CausalDecoder {
                 self.layers.len()
             )));
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(output) = self.next_final_states_resident_verify(
             cache,
             token_ids,
@@ -520,7 +520,7 @@ impl CausalDecoder {
         emit_logits: bool,
         capture_linear: bool,
     ) -> Result<BatchedFinalStates> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             let head = if emit_logits {
                 ResidentVerifyHead::Logits
@@ -540,7 +540,7 @@ impl CausalDecoder {
                 return Ok((output.states, output.tokens, output.captures, output.logits));
             }
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = (emit_argmax, emit_logits, capture_linear);
         self.next_final_states_batched(cache, token_ids)
             .map(|states| (states, None, None, None))
@@ -588,7 +588,7 @@ impl CausalDecoder {
         suppress_start: usize,
         eos: usize,
     ) -> Result<Option<usize>> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = self.forward_runtime().metal_executor() {
             return metal
                 .talker_greedy_token_biasless(final_state, &self.lm_head, suppress_start, eos)
@@ -623,7 +623,7 @@ impl CausalDecoder {
         options: &GenerationOptions,
         sampler: &mut DeterministicSampler,
     ) -> Result<usize> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if options.token_constraint.is_none()
             && options.temperature <= f32::EPSILON
             && gpu_argmax_enabled()
@@ -634,7 +634,7 @@ impl CausalDecoder {
                 }
             }
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if options.token_constraint.is_none()
             && options.temperature > f32::EPSILON
             && options.top_k == 0
@@ -656,7 +656,7 @@ impl CausalDecoder {
                 }
             }
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if options.token_constraint.is_none()
             && options.temperature > f32::EPSILON
             && options.top_k > 0
@@ -780,9 +780,9 @@ impl CausalDecoder {
         max_new_tokens: usize,
         options: &GenerationOptions,
     ) -> Result<GenerationOutput> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _gpu_alloc_trace = self.trace_gpu_alloc_scope("generation");
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
@@ -970,25 +970,25 @@ impl CausalDecoder {
         // modèle supporté. L'arène doit être prête tout-ou-rien : si un état par
         // couche manque, on retombe sur le per-op (et le résident 1b si activé).
         let guided_sampling = options.token_constraint.is_some();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let resident_sampling = super::resident::resident_sampling_supported(options);
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let mut use_resident_full = decode_resident_full_enabled()
             && !guided_sampling
             && (options.temperature <= f32::EPSILON || resident_sampling)
             && self.supports_resident_full_decode();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let kv_bf16 = Self::resident_kv_bf16(options.temperature > f32::EPSILON, cache.position);
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if use_resident_full {
             use_resident_full =
                 self.setup_resident_full_decode(&mut cache, max_new_tokens, 0, kv_bf16)?;
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if decode_resident_enabled() && !use_resident_full && !guided_sampling {
             self.setup_resident_decode(&mut cache, max_new_tokens, kv_bf16)?;
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = guided_sampling;
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut sampler = DeterministicSampler::new(options.seed);
@@ -997,7 +997,7 @@ impl CausalDecoder {
         let mut token = self.sample_token_from_state(&final_state, options, &mut sampler)?;
         // Lookup n-grammes sans tête MTP (`SARAGOSSA_RUST_LOOKUP_GREEDY`, opt-in) :
         // il lui faut le prompt, absent des états pré-remplis.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(prompt) = prompt.filter(|_| {
             use_resident_full
                 && oracle_dump_logits_topk().is_none()
@@ -1026,11 +1026,11 @@ impl CausalDecoder {
                 tokens,
             });
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = prompt;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let decode_profiler = DecodeProfiler::start();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if allow_pipelined
             && use_resident_full
             && decode_pipeline_enabled()
@@ -1087,7 +1087,7 @@ impl CausalDecoder {
             }
             if step + 1 < max_new_tokens {
                 let decode_started = Instant::now();
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 if use_resident_full {
                     // 1c : forward complet + argmax/sampler en UN command buffer.
                     token = if options.temperature > f32::EPSILON {
@@ -1110,11 +1110,11 @@ impl CausalDecoder {
                 decode_tokens += 1;
             }
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         decode_profiler.report_decode_loop(decode, decode_tokens);
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         DecodeProfiler::report_gpu_sections(self, &cache);
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         DecodeProfiler::report_topk_microbench(self);
         Ok(GenerationOutput {
             tokens: generated,
@@ -1130,7 +1130,7 @@ impl CausalDecoder {
         &self,
         cache: &CausalDecoderCache,
     ) -> Result<SpeculativeCacheSnapshot> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             let Some(metal) = self.forward_runtime().metal_executor() else {
                 return Ok(SpeculativeCacheSnapshot {
@@ -1155,7 +1155,7 @@ impl CausalDecoder {
                 full_lens,
             })
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = self;
             Ok(SpeculativeCacheSnapshot { cpu: cache.clone() })
@@ -1183,7 +1183,7 @@ impl CausalDecoder {
             layer.kv_dim = snap_layer.kv_dim;
             layer.linear.restore_cpu_state_from(&snap_layer.linear);
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             let Some(metal) = self.forward_runtime().metal_executor() else {
                 return Ok(());
@@ -1232,7 +1232,7 @@ impl CausalDecoder {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn restore_mtp_resident_progress(
         &self,
         cache: &mut CausalDecoderCache,
@@ -1378,7 +1378,7 @@ impl CausalDecoder {
         // NOTE: sans ce scope, le scratch du prefill MTP (clé label × longueur)
         // n'était jamais élagué : chaque longueur de prompt distincte laissait
         // ~10 Go en 16k dans `serve` (ctxbench du 22 oct., 125 Go à 32k).
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
         // Drafter DFlash opt-in (`with_dflash_draft_from_env`) : le greedy non
         // contraint passe par la boucle résidente, stop sequences comprises ;
@@ -1388,7 +1388,7 @@ impl CausalDecoder {
         // +7 à +22 %, prose courte −13 à −27 % (docs/perf/mtp-pairwise.md).
         // Le routage par classe de prompt ne vaut que pour le greedy (seul mesuré) :
         // l'échantillonné garde DFlash quel que soit `allow_dflash`.
-        #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+        #[cfg(all(gpu_metal, feature = "devtools"))]
         if let Some(draft) = self
             .dflash
             .as_ref()
@@ -1407,7 +1407,7 @@ impl CausalDecoder {
                 );
             }
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal", feature = "devtools")))]
+        #[cfg(not(all(gpu_metal, feature = "devtools")))]
         let _ = allow_dflash;
         self.generate_greedy_mtp_core(prompt, max_new_tokens, options, max_draft_tokens, on_token)
     }
@@ -1415,7 +1415,7 @@ impl CausalDecoder {
     /// Boucle DFlash résidente, puis la tête MTP si la bascule par acceptance
     /// (`SARAGOSSA_RUST_DFLASH_SWITCH_MIN`, opt-in) a rendu la main : même
     /// enchaînement que le harnais d'acceptance, re-prefill compris.
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     fn generate_greedy_dflash_then_mtp(
         &self,
         prompt: &[usize],
@@ -1462,7 +1462,7 @@ impl CausalDecoder {
 
     /// Le repli possède les trois résultats du prefill : aucun état bf16 local
     /// ni entrée incompatible ne doit survivre à la reconstruction f32.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn prepare_mtp_decode(
         &self,
         prompt: &[usize],
@@ -1530,7 +1530,7 @@ impl CausalDecoder {
 
     /// Les entrées bf16 peuvent partager les allocations du prefill refusé,
     /// y compris entre préfixes étendus. Les retirer avant d'allouer le repli.
-    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+    #[cfg(any(test, gpu_metal))]
     pub(super) fn discard_bf16_mtp_prefixes(&self) -> Result<()> {
         self.prefix_cache
             .lock()
@@ -1576,7 +1576,7 @@ impl CausalDecoder {
         }
         // Historique MTP selon la longueur du prompt (fresh court, committed long),
         // lu par `mtp_fresh_cache_enabled` jusqu'à la fin de cette génération.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _mtp_history = crate::runtime_flags::MtpHistoryForPrompt::enter(prompt.len());
         // Un draft plus long que la génération restante est inutile et dépasserait
         // la capacité résidente (`draft_indices`, dimensionnée sur `max_new_tokens`).
@@ -1595,13 +1595,13 @@ impl CausalDecoder {
         let draft_headroom = max_draft_tokens.max(lookup_draft);
         let decode_reserve = max_new_tokens.saturating_add(draft_headroom);
 
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let trace_setup = mtp_setup_trace_enabled();
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let trace_setup = false;
         let t_prefill = trace_setup.then(Instant::now);
         let use_committed_mtp_history = mtp_history_policy() == MtpHistoryPolicy::Committed;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let history_capacity = (decode_resident_full_enabled()
             && (options.temperature <= f32::EPSILON || mtp_sampled_enabled())
             && self.supports_resident_full_decode()
@@ -1615,7 +1615,7 @@ impl CausalDecoder {
             )) == 2)
             .then(|| prompt.len().checked_add(decode_reserve))
             .flatten();
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let history_capacity = None;
         let mut sampler = DeterministicSampler::new(options.seed);
         // Premier token émis dès le retour du prefill, avant les arènes.
@@ -1661,7 +1661,7 @@ impl CausalDecoder {
                 use_committed_mtp_history
             );
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let (cache, final_state, mtp_history_cache) = self.prepare_mtp_decode(
             prompt,
             max_new_tokens,
@@ -1708,7 +1708,7 @@ impl CausalDecoder {
                 || !use_committed_mtp_history
                 || self.config.num_experts.is_some(),
         );
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         // Les baux D1 et les lignes D2 restent vivants jusqu'au cycle suivant.
         // Seul un repli CPU consomme et matérialise l'état.
         let retain_hidden = crate::runtime_flags::mtp_resident_hidden_enabled();
@@ -1719,13 +1719,13 @@ impl CausalDecoder {
             mtp_adaptive_threshold(),
             mtp_adaptive_probe_period(),
         );
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let decode_profiler = DecodeProfiler::start();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let profile_mtp_steps = mtp_step_profile_enabled();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let mut mtp_step_profile = MtpStepProfile::default();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let gpu_block_kernels = if crate::runtime_flags::mtp_gpu_block_enabled()
             && max_draft_tokens == 1
             && !adaptive_depth
@@ -1780,7 +1780,7 @@ impl CausalDecoder {
             if options.stop_token_ids.contains(&primary) {
                 break;
             }
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             if let Some(kernels) = gpu_block_kernels.as_ref() {
                 let MtpFinalState::Cpu(state) = &final_state else {
                     return Err(InferError::Config("bloc2 sans état CPU matérialisé".into()));
@@ -1844,7 +1844,7 @@ impl CausalDecoder {
                 lookup.sync(&generated);
                 lookup.propose(lookup_draft.min(max_new_tokens.saturating_sub(generated.len())))
             });
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             if options.temperature <= f32::EPSILON
                 && use_committed_mtp_history
                 && step_depth == 1
@@ -1958,7 +1958,7 @@ impl CausalDecoder {
                     mtp_profile_record(&mut mtp_step_profile.fused_one, profile_start);
                 }
             }
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             if options.temperature <= f32::EPSILON
                 && use_committed_mtp_history
                 && step_depth == 2
@@ -2044,7 +2044,7 @@ impl CausalDecoder {
             let mut draft_token = primary;
             let mut drafts = Vec::with_capacity(max_draft_tokens);
             let mut draft_distributions = Vec::with_capacity(max_draft_tokens);
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             let mtp_resident = if options.temperature <= f32::EPSILON || mtp_sampled_enabled() {
                 let profile_start = mtp_profile_start(profile_mtp_steps);
                 let resident = self.start_mtp_resident_draft(
@@ -2057,7 +2057,7 @@ impl CausalDecoder {
             } else {
                 false
             };
-            #[cfg(not(all(target_os = "macos", feature = "metal")))]
+            #[cfg(not(gpu_metal))]
             let mtp_resident = false;
             // Avec une proposition du lookup, la tête MTP ne sert qu'à écrire la
             // ligne KV du token primaire dans l'historique committed : la mise à
@@ -2069,7 +2069,7 @@ impl CausalDecoder {
             };
             // Les drafts chaînés sur le GPU imposent l'argmax : à T>0 chaque pas
             // relit ses logits pour échantillonner sur le CPU.
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             if mtp_resident && options.temperature <= f32::EPSILON {
                 let profile_start = mtp_profile_start(profile_mtp_steps);
                 if let Some(resident_drafts) = self.next_mtp_drafts_resident(
@@ -2089,7 +2089,7 @@ impl CausalDecoder {
                         .checked_add(position)
                         .ok_or_else(|| InferError::Dimension("position MTP déborde".to_string()))?;
                     let draft = if mtp_resident {
-                        #[cfg(all(target_os = "macos", feature = "metal"))]
+                        #[cfg(gpu_metal)]
                         {
                             if options.temperature > f32::EPSILON {
                                 let logits = self.next_mtp_draft_resident_logits(
@@ -2131,7 +2131,7 @@ impl CausalDecoder {
                                 )?
                             }
                         }
-                        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+                        #[cfg(not(gpu_metal))]
                         unreachable!("invariant: mtp_resident=false hors Metal")
                     } else {
                         let mtp_cache = if let Some(history_cache) = mtp_history_cache.as_mut() {
@@ -2178,7 +2178,7 @@ impl CausalDecoder {
                 draft_distributions.clear();
             }
             draft_distributions.resize_with(drafts.len(), || None);
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             let profile_start = mtp_profile_start(profile_mtp_steps);
             let verified = self.verify_mtp_drafts_batched(MtpVerify {
                 cache: &mut cache,
@@ -2193,7 +2193,7 @@ impl CausalDecoder {
                 sampler: &mut sampler,
                 stats: &mut stats,
             })?;
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             mtp_profile_record(&mut mtp_step_profile.verify, profile_start);
             let MtpVerifyResult {
                 accepted_all,
@@ -2203,13 +2203,13 @@ impl CausalDecoder {
             } = verified;
 
             if let Some(history_cache) = mtp_history_cache.as_mut() {
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 let profile_start = mtp_profile_start(profile_mtp_steps);
                 let committed_len = cycle_mtp_offset.checked_add(1).ok_or_else(|| {
                     InferError::Dimension("taille historique MTP déborde".to_string())
                 })?;
                 if mtp_resident {
-                    #[cfg(all(target_os = "macos", feature = "metal"))]
+                    #[cfg(gpu_metal)]
                     {
                         self.truncate_mtp_resident_history(&mut cache, committed_len)?;
                         self.append_mtp_resident_history_steps(
@@ -2223,7 +2223,7 @@ impl CausalDecoder {
                                 InferError::Dimension("taille historique MTP déborde".to_string())
                             })?;
                     }
-                    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+                    #[cfg(not(gpu_metal))]
                     {
                         let _ = history_cache;
                     }
@@ -2240,12 +2240,12 @@ impl CausalDecoder {
                     }
                     resident_mtp_history_len = history_cache.len();
                 }
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 mtp_profile_record(&mut mtp_step_profile.history, profile_start);
             }
 
             if accepted_all {
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 let profile_start = mtp_profile_start(profile_mtp_steps);
                 if let Some((bonus_token, bonus_state)) = bonus {
                     cpu_state = bonus_state;
@@ -2255,7 +2255,7 @@ impl CausalDecoder {
                     pending = self.sample_token_from_state(&cpu_state, options, &mut sampler)?;
                 }
                 stats.verifications += 1;
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 mtp_profile_record(&mut mtp_step_profile.bonus_next, profile_start);
             }
             // Retour d'expérience du chemin général (fallback per-op) : nb de
@@ -2270,7 +2270,7 @@ impl CausalDecoder {
         }
 
         let loop_duration = decode_started.elapsed();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         DecodeProfiler::report_gpu_sections(self, &cache);
         // Sorties de boucle sans repasser par le balayage de tête (limite de
         // sortie, primaire) : même troncature avant le flush.
@@ -2295,9 +2295,9 @@ impl CausalDecoder {
         if stop_streaming {
             generated.truncate(emitted);
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         decode_profiler.report_decode_loop(loop_duration, generated.len());
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if profile_mtp_steps {
             mtp_step_profile.report(generated.len(), stats.verifications);
         }
@@ -2506,7 +2506,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si le mode n'est pas greedy, si le résident full n'est
     /// pas disponible ou si une capture de couche échoue.
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     pub fn resident_linear_xray(
         &self,
         prompt: &[usize],
@@ -2526,18 +2526,18 @@ impl CausalDecoder {
         let mut sampler = DeterministicSampler::new(options.seed);
         let input_token = self.sample_token_from_state(&final_state, options, &mut sampler)?;
 
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let reference_metal = self.snapshot_prefix_cache_linear_metal(&base_cache)?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let resident_metal = self.snapshot_prefix_cache_linear_metal(&base_cache)?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let probe_metal = self.snapshot_prefix_cache_linear_metal(&base_cache)?;
 
         let probe =
             self.resident_linear_first_layer_probe(&base_cache, probe_metal, input_token)?;
 
         let mut reference_cache = base_cache.clone();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         self.restore_prefix_cache_linear_metal(&mut reference_cache, reference_metal)?;
         let (reference_states, reference_hidden) = self
             .next_final_states_batched_with_layer_capture(
@@ -2547,7 +2547,7 @@ impl CausalDecoder {
             )?;
 
         let mut resident_cache = base_cache.clone();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         self.restore_prefix_cache_linear_metal(&mut resident_cache, resident_metal)?;
         if !self.setup_resident_full_decode(&mut resident_cache, 2, 0, false)? {
             return Err(InferError::Config(
@@ -2662,7 +2662,7 @@ impl CausalDecoder {
         })
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     fn resident_linear_first_layer_probe(
         &self,
         base_cache: &CausalDecoderCache,
@@ -2908,20 +2908,20 @@ impl CausalDecoder {
         // chemin séquentiel du verify résident (arènes sans vérification batchée)
         // ne capture rien : le snapshot reste nécessaire dès qu'un rollback est
         // possible (plus d'un token à vérifier).
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let batched_rollback = gpu_argmax_enabled()
             && self.supports_resident_full_decode()
             && cache
                 .resident
                 .as_ref()
                 .is_some_and(|arena| self.resident_layer_batch_supported(arena));
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let capture_rollback = batched_rollback
             || (drafts.len() <= 1
                 && gpu_argmax_enabled()
                 && cache.resident.is_some()
                 && self.supports_resident_full_decode());
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let (batched_rollback, capture_rollback) = (false, false);
         let mut snapshot = if capture_rollback {
             None
@@ -2944,7 +2944,7 @@ impl CausalDecoder {
         // rejeux (rollback après rejet), quel que soit le type de tête (`Skip` sous
         // `SARAGOSSA_RUST_GPU_ARGMAX=0`) ; le prefill et l'extension de préfixe,
         // hors de cette fonction, gardent la sélection de l'AR.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _request_greedy =
             crate::metal_backend::install_request_greedy_scope(options.temperature <= f32::EPSILON);
         let (target_states, target_tokens, resident_captures, target_logits) =
@@ -2996,7 +2996,7 @@ impl CausalDecoder {
         let target_tokens = if target_tokens.is_some() {
             target_tokens
         } else if options.temperature <= f32::EPSILON && gpu_argmax_enabled() {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             {
                 if let (Some(metal), Some(arena)) = (
                     self.forward_runtime().metal_executor(),
@@ -3007,7 +3007,7 @@ impl CausalDecoder {
                     None
                 }
             }
-            #[cfg(not(all(target_os = "macos", feature = "metal")))]
+            #[cfg(not(gpu_metal))]
             {
                 None
             }
@@ -3078,7 +3078,7 @@ impl CausalDecoder {
                 if position + 1 < verify_tokens.len() {
                     stats.rollbacks += 1;
                     let replay_len = position + 1;
-                    #[cfg(all(target_os = "macos", feature = "metal"))]
+                    #[cfg(gpu_metal)]
                     if let Some(captures) = resident_captures.as_ref() {
                         self.restore_mtp_resident_progress(cache, captures, replay_len)?;
                     } else {
@@ -3090,7 +3090,7 @@ impl CausalDecoder {
                             final_state,
                         )?;
                     }
-                    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+                    #[cfg(not(gpu_metal))]
                     {
                         self.restore_mtp_snapshot_replay(
                             cache,
@@ -3115,7 +3115,7 @@ impl CausalDecoder {
                     if position + 1 < verify_tokens.len() {
                         stats.rollbacks += 1;
                         let replay_len = position + 1;
-                        #[cfg(all(target_os = "macos", feature = "metal"))]
+                        #[cfg(gpu_metal)]
                         if let Some(captures) = resident_captures.as_ref() {
                             self.restore_mtp_resident_progress(cache, captures, replay_len)?;
                         } else {
@@ -3127,7 +3127,7 @@ impl CausalDecoder {
                                 final_state,
                             )?;
                         }
-                        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+                        #[cfg(not(gpu_metal))]
                         {
                             self.restore_mtp_snapshot_replay(
                                 cache,
@@ -3148,7 +3148,7 @@ impl CausalDecoder {
                 if position + 1 < verify_tokens.len() {
                     stats.rollbacks += 1;
                     let replay_len = position + 1;
-                    #[cfg(all(target_os = "macos", feature = "metal"))]
+                    #[cfg(gpu_metal)]
                     if let Some(captures) = resident_captures.as_ref() {
                         self.restore_mtp_resident_progress(cache, captures, replay_len)?;
                     } else {
@@ -3160,7 +3160,7 @@ impl CausalDecoder {
                             final_state,
                         )?;
                     }
-                    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+                    #[cfg(not(gpu_metal))]
                     {
                         self.restore_mtp_snapshot_replay(
                             cache,
@@ -3233,7 +3233,7 @@ impl CausalDecoder {
         // rejeux (rollback après rejet), quel que soit le type de tête (`Skip` sous
         // `SARAGOSSA_RUST_GPU_ARGMAX=0`) ; le prefill et l'extension de préfixe,
         // hors de cette fonction, gardent la sélection de l'AR.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _request_greedy =
             crate::metal_backend::install_request_greedy_scope(options.temperature <= f32::EPSILON);
         let (target_states, target_hidden) = self.next_final_states_batched_with_layer_capture(
@@ -3438,7 +3438,7 @@ impl CausalDecoder {
         // Chemin rapide : le prefill résident fusionné copie les sorties des couches
         // cibles pendant l'encodage (3 s contre ~21 s per-op sur 732 tokens). Même
         // prefill que l'AR et le MTP du CLI, donc même trajectoire greedy.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some((cache, final_hidden, captures)) = self
             .prefill_resident_cache_hidden_and_captures(
                 prompt,
@@ -3457,7 +3457,7 @@ impl CausalDecoder {
             let final_states = rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
             return Ok((cache, final_states, target_hidden));
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = (keep_rows, all_rows);
         let runtime = self.forward_runtime();
         let mut cache = self.empty_cache();
@@ -3520,7 +3520,7 @@ impl CausalDecoder {
                 self.layers.len()
             )));
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(output) = self.next_final_states_resident_verify(
             cache,
             token_ids,
@@ -3777,20 +3777,20 @@ impl CausalDecoder {
                 "dump réservé à un prompt Gemma 4 MoE non vide".into(),
             ));
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if self.forward_runtime().metal_executor().is_some()
             && crate::runtime_flags::prefill_resident_gemma4_enabled()
         {
             return Err(InferError::Config("dump: désactiver SARAGOSSA_RUST_PREFILL_RESIDENT_GEMMA4 (chemin fusionné non instrumenté)".into()));
         }
         let backend = "cpu-f32";
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let backend = if self.forward_runtime().metal_executor().is_some() {
             "metal-per-op"
         } else {
             backend
         };
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
         let capture = crate::devtools::layer_dump::Capture::start(
             directory,
@@ -3844,7 +3844,7 @@ impl CausalDecoder {
             return Ok(());
         }
         self.ensure_prompt_within_prefill_cap(state.cache.position + suffix.len())?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
         let (final_states, _) =
             self.forward_suffix_batched(&mut state.cache, suffix, None, usize::MAX, false)?;
@@ -3854,7 +3854,7 @@ impl CausalDecoder {
 
     /// Couches du prefill résident pour prolonger un préfixe jusqu'à `seq`
     /// tokens, si le modèle et le backend le permettent.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[allow(clippy::type_complexity)]
     fn resident_extend_layers(
         &self,
@@ -3885,11 +3885,11 @@ impl CausalDecoder {
     /// résident, dont le coût par token est celui d'un prefill à froid : tout
     /// hit de cache est alors rentable.
     pub fn prefix_extend_as_cheap_as_cold(&self, seq: usize) -> bool {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             self.resident_extend_layers(seq).is_some()
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = seq;
             false
@@ -3908,7 +3908,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si le forward résident échoue ; l'état linéaire a pu
     /// avancer, il n'y a donc pas de repli.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn extend_cache_metal_resident(
         &self,
         cache: &mut CausalDecoderCache,
@@ -4041,13 +4041,13 @@ impl CausalDecoder {
         &self,
         state: &CausalDecoderPromptState,
     ) -> Result<CausalDecoderPromptMetalSnapshot> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             Ok(CausalDecoderPromptMetalSnapshot {
                 linear: self.snapshot_prefix_cache_linear_metal(&state.cache)?,
             })
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = (self, state);
             Ok(CausalDecoderPromptMetalSnapshot::default())
@@ -4063,13 +4063,13 @@ impl CausalDecoder {
         &self,
         snapshot: &CausalDecoderPromptMetalSnapshot,
     ) -> Result<CausalDecoderPromptMetalSnapshot> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             Ok(CausalDecoderPromptMetalSnapshot {
                 linear: self.copy_prefix_cache_linear_metal(&snapshot.linear)?,
             })
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = (self, snapshot);
             Ok(CausalDecoderPromptMetalSnapshot::default())
@@ -4086,11 +4086,11 @@ impl CausalDecoder {
         state: &mut CausalDecoderPromptState,
         snapshot: CausalDecoderPromptMetalSnapshot,
     ) -> Result<()> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             self.restore_prefix_cache_linear_metal(&mut state.cache, snapshot.linear)
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = (self, state, snapshot);
             Ok(())
@@ -4136,9 +4136,9 @@ impl CausalDecoder {
             }
             return Ok((pair.0, pair.1, prompt.len()));
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _gpu_alloc_trace = self.trace_gpu_alloc_scope("prefill");
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
         if prompt.is_empty() {
             return Err(InferError::Dimension("prompt token vide".to_string()));
@@ -4177,9 +4177,9 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
     ) -> Result<(CausalDecoderCache, Tensor)> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _gpu_alloc_trace = self.trace_gpu_alloc_scope("prefill");
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let _scratch_buffer_scope = self.scratch_buffer_scope();
         let snapshot = self.snapshot_request(prompt, SnapshotMode::Ar)?;
         if let Some(state) = self.snapshot_load(&snapshot) {
@@ -4303,7 +4303,7 @@ impl CausalDecoder {
             }
             return Ok((cache, final_state, history, reused));
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some((cache, final_state, _, history)) =
             self.prefill_resident_with_mtp_history(prompt, &[], usize::MAX)?
         {
@@ -4317,9 +4317,9 @@ impl CausalDecoder {
             self.snapshot_save(&snapshot, &state.0, &state.1, Some(&history), None);
             return Ok((state.0, state.1, history, 0));
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let trace_setup = mtp_setup_trace_enabled();
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let trace_setup = false;
         let t_main = trace_setup.then(Instant::now);
         // Chemin rapide : le prefill principal MTP passait par la boucle per-op
@@ -4329,25 +4329,25 @@ impl CausalDecoder {
         // l'historique MTP committed) depuis le hidden final résident. Repli per-op
         // si le chemin résident décline (préconditions) ou par coupe-circuit.
         let (cache, final_states) = {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             let resident = if mtp_prefill_resident_enabled() {
                 self.prefill_resident_cache_and_hidden(prompt)?
             } else {
                 None
             };
-            #[cfg(not(all(target_os = "macos", feature = "metal")))]
+            #[cfg(not(gpu_metal))]
             let resident: Option<(CausalDecoderCache, Tensor)> = None;
             match resident {
                 // Hidden lu en place : la norme finale de tout le prompt passe
                 // au semis GPU, seule la dernière ligne est normée ici.
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 Some((cache, crate::metal_backend::PrefillKvRows::Shared(raw)))
                     if crate::runtime_flags::mtp_seed_gpu_enabled() =>
                 {
                     (cache, PromptStates::Raw(raw))
                 }
                 Some((cache, final_hidden)) => {
-                    #[cfg(all(target_os = "macos", feature = "metal"))]
+                    #[cfg(gpu_metal)]
                     let final_hidden = final_hidden.into_tensor(self.final_norm.data().len())?;
                     let final_states =
                         rms_norm(&final_hidden, &self.final_norm, self.config.rms_eps)?;
@@ -4375,7 +4375,7 @@ impl CausalDecoder {
         let hidden = self.final_norm.data().len();
         let final_state = match &final_states {
             PromptStates::Normed(states) => Tensor::row(states.last_row()?.to_vec())?,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             PromptStates::Raw(raw) => {
                 let last = raw.as_slice().len().checked_sub(hidden).ok_or_else(|| {
                     InferError::Dimension("prefill MTP sans ligne finale".to_string())
@@ -4395,7 +4395,7 @@ impl CausalDecoder {
         let seeded = prompt.len().saturating_sub(1);
         let normed = match final_states {
             PromptStates::Normed(states) => Some(states),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             PromptStates::Raw(raw) => {
                 if self.seed_mtp_history_raw(&raw, &prompt[1..], &mut mtp_history)? {
                     None
@@ -4456,7 +4456,7 @@ impl CausalDecoder {
     /// Sème l'historique depuis le hidden final non normé `raw` (vue du buffer
     /// du prefill), norme finale comprise, sur le GPU. `false` : semis GPU
     /// indisponible pour cette tête, historique intact.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn seed_mtp_history_raw(
         &self,
         raw: &crate::metal_backend::SharedF32Rows,
@@ -4505,7 +4505,7 @@ impl CausalDecoder {
             )));
         }
         let runtime = self.forward_runtime();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if crate::runtime_flags::mtp_seed_gpu_enabled() {
             if let Some(metal) = runtime.metal_executor() {
                 let states = crate::metal_backend::MtpSeedStates::Normed(states);
@@ -4555,7 +4555,7 @@ impl CausalDecoder {
     /// bloc au lieu de normes CPU et de trois allers-retours GPU. Rend `false`,
     /// sans rien écrire, quand la tête sort du contrat des kernels (RoPE non
     /// rotate-half, échelle de position, fenêtre, K=V, biais) ; le CPU sème alors.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn seed_mtp_history_chunk_metal(
         &self,
         metal: &crate::MetalExecutor,
@@ -4593,7 +4593,7 @@ impl CausalDecoder {
         Ok(true)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn mtp_seed_parameters<'a>(
         &'a self,
         head: &'a MtpHead,
@@ -4670,7 +4670,7 @@ impl CausalDecoder {
     /// Avec `layer_ids` non vide (prefill DFlash), rend aussi les captures de
     /// ces couches bornées à `keep_rows`, sans relire ni normer les états de
     /// toutes les positions.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::type_complexity,
         reason = "cache, état final, captures facultatives et historique MTP"
@@ -4749,7 +4749,7 @@ impl CausalDecoder {
     }
 
     /// KV de l'historique MTP committed à partir des lignes du semis GPU.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn mtp_history_from_seed(
         &self,
         head: &MtpHead,
@@ -4785,7 +4785,7 @@ impl CausalDecoder {
         input: &Tensor,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = runtime.metal_executor().filter(|_| fc.bias().is_none()) {
             let [x] = metal.project_biasless(input, [fc])?;
             return Ok(x);
@@ -4798,13 +4798,13 @@ impl CausalDecoder {
     /// résident (cf. [`crate::runtime_flags::prefix_align`]). `None` :
     /// reprise à toute longueur, comme avant l'alignement.
     fn prefix_align_policy(&self, len: usize) -> Option<(usize, usize)> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             let (align, tail) = self.prefix_resume_align()?;
             self.prefix_extend_as_cheap_as_cold(len)
                 .then_some((align, tail))
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = len;
             None
@@ -4874,7 +4874,7 @@ impl CausalDecoder {
     /// (MTP, AR) étend une entrée qui en porte. Sans elles, l'entrée prolongée
     /// remplace celle du tour DFlash et le tour DFlash suivant repart d'un
     /// prefill complet (alternance du routage par classe de prompt).
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     fn dflash_capture_window(
         &self,
         captures: Option<&PrefixCaptures>,
@@ -4892,7 +4892,7 @@ impl CausalDecoder {
         ))
     }
 
-    #[cfg(not(all(target_os = "macos", feature = "metal", feature = "devtools")))]
+    #[cfg(not(all(gpu_metal, feature = "devtools")))]
     fn dflash_capture_window(
         &self,
         _captures: Option<&PrefixCaptures>,
@@ -5106,13 +5106,13 @@ impl CausalDecoder {
         // Semis sur GPU pendant le prefill (comme MTP committed) : le semis CPU
         // depuis les états normés de toutes les positions coûtait +5,7 % de
         // prefill à 32k (16 novembre).
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let fused = if needs_history {
             self.prefill_resident_with_mtp_history(head, layer_ids, keep_rows)?
         } else {
             None
         };
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let fused: Option<(
             CausalDecoderCache,
             Tensor,
@@ -5335,7 +5335,7 @@ impl CausalDecoder {
             Option<PrefixCaptures>,
         )>,
     > {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let cheap_extend = self.prefix_extend_as_cheap_as_cold(prompt.len());
         // Une extension ne repart que d'une entrée alignée, suivie d'au moins
         // `tail` tokens : sinon elle diffère du prefill à froid.
@@ -5368,7 +5368,7 @@ impl CausalDecoder {
         // une entrée clonée n'a ni arène ni KV monté, son état linéaire est
         // restauré), tout hit est rentable : un tour de conversation qui double
         // le prompt reprend quand même son préfixe.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             let suffix = prompt.len() - cache.entries[index].tokens.len();
             let resident_extend =
@@ -5396,12 +5396,12 @@ impl CausalDecoder {
         let cached_len = entry.tokens.len();
         let mut output = (entry.cache.clone(), entry.final_state.clone());
         let history = entry.mtp_history.clone();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let linear_metal_entry = entry.linear_metal.clone();
         cache.entries.insert(0, entry);
         drop(cache);
 
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             let linear_metal = self.copy_prefix_cache_linear_metal(&linear_metal_entry)?;
             self.restore_prefix_cache_linear_metal(&mut output.0, linear_metal)?;
@@ -5437,9 +5437,9 @@ impl CausalDecoder {
             ));
         }
         let capture_from = cache.position;
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = keep_rows;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             let started = Instant::now();
             if let Some((final_hidden, captures)) = self.extend_cache_metal_resident(
@@ -5462,17 +5462,17 @@ impl CausalDecoder {
                 return Ok((states, captures));
             }
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let trace = trace_prefill_enabled();
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let trace = false;
         let started = Instant::now();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let base_len = cache.position;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let resident = self.prefix_extend_resident_available()
             && self.setup_resident_decode_from_prefill(cache, suffix.len())?;
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let resident = false;
         #[cfg(test)]
         record_prefix_extend(suffix.len(), resident);
@@ -5512,7 +5512,7 @@ impl CausalDecoder {
             }
         }
         let forward_elapsed = started.elapsed() - setup_elapsed;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if resident {
             self.release_suffix_arena(cache, base_len)?;
         }
@@ -5547,7 +5547,7 @@ impl CausalDecoder {
     /// couches) et porte d'attention en sortie, exigée par la vérification
     /// batchée des couches full-attn denses. Reste la garde mémoire du setup,
     /// évaluée à l'allocation de l'arène.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn prefix_extend_resident_available(&self) -> bool {
         prefix_extend_resident_enabled()
             && self.config.attn_output_gate
@@ -5557,7 +5557,7 @@ impl CausalDecoder {
     /// Libère l'arène temporaire d'une extension : les lignes K/V ajoutées depuis
     /// `base_len` sont relues vers le cache CPU, l'état GPU est rendu. Le cache
     /// redevient un cache CPU ordinaire, à `position` lignes par couche full-attn.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn release_suffix_arena(&self, cache: &mut CausalDecoderCache, base_len: usize) -> Result<()> {
         for (index, layer_cache) in cache.layers.iter_mut().enumerate() {
             let Some(full) = layer_cache.full.take() else {
@@ -5588,7 +5588,7 @@ impl CausalDecoder {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn snapshot_prefix_cache_linear_metal(
         &self,
         cache: &CausalDecoderCache,
@@ -5609,7 +5609,7 @@ impl CausalDecoder {
         metal.snapshot_linear_attn_states(&states)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn copy_prefix_cache_linear_metal(
         &self,
         states: &[Option<crate::metal_backend::LinearAttentionMetalState>],
@@ -5626,7 +5626,7 @@ impl CausalDecoder {
         metal.snapshot_linear_attn_states(&state_refs)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn restore_prefix_cache_linear_metal(
         &self,
         cache: &mut CausalDecoderCache,
@@ -5679,7 +5679,7 @@ impl CausalDecoder {
         if capacity == 0 {
             return Ok(());
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let linear_metal = self.snapshot_prefix_cache_linear_metal(&state.0)?;
         let mut cache = self
             .prefix_cache
@@ -5709,7 +5709,7 @@ impl CausalDecoder {
                 final_state: state.1.clone(),
                 mtp_history,
                 captures,
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 linear_metal,
             },
         );
@@ -5736,7 +5736,7 @@ impl CausalDecoder {
         &self,
         prompt: &[usize],
     ) -> Result<(CausalDecoderCache, Tensor)> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(state) = self.prefill_cache_state_metal_resident(prompt)? {
             return Ok(state);
         }
@@ -5894,7 +5894,7 @@ impl CausalDecoder {
     /// # Errors
     ///
     /// Renvoie une erreur si le prefill échoue.
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn prefill_hidden_for_test(
         &self,
         prompt: &[usize],
@@ -5920,7 +5920,7 @@ impl CausalDecoder {
     /// # Errors
     ///
     /// Renvoie une erreur si le forward échoue.
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn per_op_layer_outputs_for_test(
         &self,
         prompt: &[usize],
@@ -5949,7 +5949,7 @@ impl CausalDecoder {
     /// # Errors
     ///
     /// Renvoie une erreur si le prefill échoue.
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn prefill_captures_for_test(
         &self,
         prompt: &[usize],
@@ -5993,7 +5993,7 @@ impl CausalDecoder {
             .collect()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn prefill_cache_state_metal_resident(
         &self,
         prompt: &[usize],
@@ -6031,7 +6031,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si l'embedding, le forward résident ou la construction
     /// du cache échoue.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn prefill_resident_cache_and_hidden(
         &self,
         prompt: &[usize],
@@ -6049,7 +6049,7 @@ impl CausalDecoder {
 
     /// Spec d'attention du prefill résident pour `seq` positions, `None` hors
     /// contrat du spine résident (RoPE, overrides par couche).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn resident_prefill_spec(
         &self,
         seq: usize,
@@ -6105,7 +6105,7 @@ impl CausalDecoder {
     /// (`warmup_and_release_cpu_weights`) : le prefill plonge alors chaque
     /// morceau sur le GPU, sans `[seq, hidden]` CPU ni sa copie (cf.
     /// [`Self::prefill_input`]).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn prefill_hidden(&self, tokens: &[usize]) -> Result<Option<Tensor>> {
         if self.runtime.embed_gather_byte_exact {
             Ok(None)
@@ -6116,7 +6116,7 @@ impl CausalDecoder {
 
     /// Entrée du prefill résident : le flux plongé sur CPU s'il existe, sinon
     /// les jetons, plongés par le gather Metal déjà vérifié.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn prefill_input<'a>(
         &'a self,
         tokens: &'a [usize],
@@ -6136,7 +6136,7 @@ impl CausalDecoder {
     /// Même prefill résident, avec capture du flux résiduel en sortie des
     /// couches `capture_layer_ids` (`[kept, n * hidden]`, cf. le drafter DFlash),
     /// bornées à `keep_rows` et accompagnées de leur position absolue de départ.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn prefill_resident_cache_hidden_and_captures(
         &self,
         prompt: &[usize],
@@ -6162,7 +6162,7 @@ impl CausalDecoder {
         )
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "prefill interne : captures, semis MTP et positions fournies indépendants"
@@ -6311,7 +6311,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur de configuration si le prompt dépasse le plafond.
     pub fn ensure_prompt_within_prefill_cap(&self, tokens: usize) -> Result<()> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             if let Some(max_tokens) = self.flint_prefill_max_tokens() {
                 if tokens > max_tokens {
@@ -6322,13 +6322,13 @@ impl CausalDecoder {
                 }
             }
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = tokens;
         Ok(())
     }
 
     /// Plafond de prompt flint, `None` hors flint ou sans prefill résident.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn flint_prefill_max_tokens(&self) -> Option<usize> {
         const MIN_TOKENS: usize = 4096;
         // Plafond historique du garde mémoire flint, indépendant de la réserve K/V.
@@ -6406,7 +6406,7 @@ impl CausalDecoder {
     /// sauf pour un modèle que seuls les chemins résidents couvrent (flint),
     /// dont le prefill CPU est ~500× plus lent : avertissement une fois par
     /// processus.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn resident_prefill_ineligible<T>(&self, reason: &str) -> Result<Option<T>> {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if self.config.metal_unsupported_reason().is_some()
@@ -6421,7 +6421,7 @@ impl CausalDecoder {
     }
 
     /// Exécute le gate résident sans masquer le chemin choisi par l'oracle.
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn prefill_cache_state_metal_resident_for_test(
         &self,
         prompt: &[usize],
@@ -6431,7 +6431,7 @@ impl CausalDecoder {
 
     /// Ablation de diagnostic : seules les couches globales d512 passent en
     /// per-op. Le contrôle garde toutes les couches résidentes, une par soumission.
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn prefill_gemma4_global_ablation_for_test(
         &self,
         prompt: &[usize],
@@ -6565,7 +6565,7 @@ pub(in crate::decoder) fn generated_matches_stop_sequence(
         .any(|sequence| !sequence.is_empty() && generated.ends_with(sequence))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn diff_stats_same_len(left: &[f32], right: &[f32]) -> Result<(f32, f32)> {
     if left.len() != right.len() {
         return Err(InferError::Dimension(format!(
@@ -6587,7 +6587,7 @@ fn diff_stats_same_len(left: &[f32], right: &[f32]) -> Result<(f32, f32)> {
     Ok((max_abs, sum_abs / left.len() as f32))
 }
 
-#[cfg(any(feature = "devtools", all(target_os = "macos", feature = "metal")))]
+#[cfg(any(feature = "devtools", gpu_metal))]
 fn validate_capture_layer_ids(layer_ids: &[usize], layer_count: usize) -> Result<()> {
     if layer_ids.is_empty() {
         return Err(InferError::Config(
@@ -6844,7 +6844,7 @@ enum PromptStates {
     /// Normés, en mémoire CPU.
     Normed(Tensor),
     /// Hidden final non normé lu en place dans le buffer du prefill résident.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     Raw(crate::metal_backend::SharedF32Rows),
 }
 

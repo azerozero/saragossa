@@ -85,7 +85,7 @@ impl Layer {
         }
         budget.blob(&self.conv, BlobDtype::F32, 0)?;
         budget.blob(&self.ssm, BlobDtype::F32, 0)?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if self.metal.is_some() {
             return Err(invalid("état linéaire sur full-attention"));
         }
@@ -109,7 +109,7 @@ impl Layer {
             config.conv_kernel_dim,
             ssm_shape,
         )?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let has_gpu = if let Some(gpu) = &self.metal {
             if !gpu.layout.matches_config(config)
                 || (gpu.layout.conv_len != short && gpu.layout.conv_len != _full)
@@ -132,7 +132,7 @@ impl Layer {
         } else {
             false
         };
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let has_gpu = false;
         budget.allow(short)?;
         budget.allow(ssm)?;

@@ -37,7 +37,7 @@ impl<'a> DenoiseStream<'a> {
     }
 
     #[cfg_attr(
-        not(all(target_os = "macos", feature = "metal")),
+        not(gpu_metal),
         allow(dead_code, reason = "seul le chemin Metal relit le flux")
     )]
     pub(crate) fn stream_mut(&mut self) -> &mut DfStream<'a> {

@@ -1,8 +1,8 @@
 //! Oracle LLM sur le vocabulaire entier ; seuils figés avant comparaison Rust.
 use super::external::TestResult;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::vision::prompt::SuppliedImage;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::{CausalDecoder, Tensor};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -207,7 +207,7 @@ fn calibration_is_frozen() -> TestResult {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids locaux, calibration préalable et verrou GPU requis"]
 fn vision_llm_logits_against_frozen_transformers() -> TestResult {

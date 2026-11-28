@@ -535,14 +535,14 @@ fn load_headless(
     };
     let decoder = crate::runtime_flags::with_decision_headless(|| -> Result<CausalDecoder> {
         Ok(if metal {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             {
                 let executor =
                     crate::runtime_flags::with_decision_noncausal(crate::MetalExecutor::new)?;
                 crate::qwen_loader::load_causal_decoder_for_metal(&assets, &executor)?
                     .with_metal_executor(executor)?
             }
-            #[cfg(not(all(target_os = "macos", feature = "metal")))]
+            #[cfg(not(gpu_metal))]
             {
                 return Err(invalid("Metal indisponible sur cette plateforme"));
             }

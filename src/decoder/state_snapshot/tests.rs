@@ -160,7 +160,7 @@ fn publication_incomplete_keeps_previous_manifest() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn identity_with_weights(mtp: bool) -> Result<()> {
     // Le flag est immuable : baseline, écriture et hit vivent dans trois
     // processus distincts, chacun recharge ses poids et ses OnceLock.
@@ -233,14 +233,14 @@ fn identity_with_weights(mtp: bool) -> Result<()> {
 
 #[test]
 #[ignore = "poids locaux et verrou GPU requis, AR"]
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn identity_weights_ar() -> Result<()> {
     identity_with_weights(false)
 }
 
 #[test]
 #[ignore = "poids locaux et verrou GPU requis, MTP"]
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn identity_weights_mtp() -> Result<()> {
     identity_with_weights(true)
 }
@@ -522,7 +522,7 @@ fn disabled_flag_skips_sources_and_stays_frozen() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn snapshot_key_uses_effective_chunk_after_environment_change() {
     isolated(
         "snapshot_key_uses_effective_chunk_after_environment_change",
@@ -578,7 +578,7 @@ fn snapshot_key_uses_effective_chunk_after_environment_change() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn snapshot_key_tracks_pairwise_overrides_without_environment_changes() {
     isolated(
         "snapshot_key_tracks_pairwise_overrides_without_environment_changes",
@@ -647,7 +647,7 @@ fn snapshot_key_tracks_pairwise_overrides_without_environment_changes() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn snapshot_key_tracks_forced_resident_linear() {
     isolated("snapshot_key_tracks_forced_resident_linear", true, |root| {
         std::env::set_var("SARAGOSSA_RUST_DECODE_RESIDENT_FULL_LINEAR", "0");

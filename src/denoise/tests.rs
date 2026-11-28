@@ -392,7 +392,7 @@ fn multicore_stream_is_bit_exact() {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn gpu_enhance_is_bit_exact_against_cpu_common_math() {
     if metal::Device::system_default().is_none() {
@@ -411,7 +411,7 @@ fn gpu_enhance_is_bit_exact_against_cpu_common_math() {
 }
 
 /// Sonde de l'étape 1 : boucle GRU persistante, µs par pas (hidden 256).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "mesure GPU ; lancer sous le verrou GPU"]
 fn dfn3_gpu_gru_step_probe() {
@@ -423,7 +423,7 @@ fn dfn3_gpu_gru_step_probe() {
 }
 
 /// Vitesse et identité sur un clip long réel : CPU historique, CPU commun, GPU.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "requiert SARAGOSSA_DFN3_DIR et SARAGOSSA_DFN3_LONG_WAV ; GPU sous verrou"]
 fn dfn3_gpu_long_file_bit_exact_and_speed() {

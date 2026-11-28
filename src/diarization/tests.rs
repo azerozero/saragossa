@@ -247,7 +247,7 @@ fn cache_compression_keeps_length_and_speaker_order() {
 }
 
 /// Deux couches aléatoires pour l'encodeur Metal (d = 128, 2 têtes de 64 : Steel d64).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn metal_test_model(qkv_bias: bool) -> Result<DiarizationModel> {
     let (d, heads, ffn) = (128, 2, 256);
     let mut seed = 11;
@@ -344,7 +344,7 @@ fn metal_test_model(qkv_bias: bool) -> Result<DiarizationModel> {
     DiarizationModel::from_tensors(config, t)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn metal_rope_encoder_matches_cpu_oracle() -> Result<()> {
     let Ok(metal) = crate::MetalExecutor::new() else {
@@ -374,7 +374,7 @@ fn metal_rope_encoder_matches_cpu_oracle() -> Result<()> {
 /// est une copie ; seul l'ordre d'accumulation du GEMM `[3d, d]` peut différer
 /// (autre tuile sur N = 3d). 1e-4 est une borne a priori, non mesurée : l'écart
 /// observé est journalisé pour la resserrer après le run de nuit.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "GPU Metal"]
 fn metal_fused_qkv_matches_separate_projections() -> Result<()> {
@@ -426,11 +426,11 @@ fn real_weights_match_torch_reference() -> Result<()> {
         serde_json::from_slice(&read(golden.join("tolerance.json"))?)
             .map_err(|e| InferError::Config(e.to_string()))?;
     let tol = |k: &str| tolerance["tolerance"][k].as_f64().unwrap_or(0.0) as f32;
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let metal = crate::MetalExecutor::new()?;
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let runtime = ForwardRuntime::metal(&metal);
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     let runtime = ForwardRuntime::cpu();
     for name in ["fleurs_en_us", "fleurs_fr_fr", "voices8"] {
         let samples =
@@ -503,11 +503,11 @@ fn real_weights_streaming_matches_batch_and_torch() -> Result<()> {
         serde_json::from_slice(&read(golden.join("tolerance.json"))?)
             .map_err(|e| InferError::Config(e.to_string()))?;
     let tol = |k: &str| tolerance["tolerance"][k].as_f64().unwrap_or(0.0) as f32;
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let metal = crate::MetalExecutor::new()?;
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let runtime = ForwardRuntime::metal(&metal);
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     let runtime = ForwardRuntime::cpu();
     for name in ["fleurs_en_us", "fleurs_fr_fr", "voices8"] {
         let samples =
@@ -559,7 +559,7 @@ fn real_weights_streaming_matches_batch_and_torch() -> Result<()> {
 }
 
 /// Débit sur une heure : `voices8.wav` du dossier golden répété jusqu'à 3600 s.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids réels, mesure de débit"]
 fn real_weights_hour_throughput() -> Result<()> {

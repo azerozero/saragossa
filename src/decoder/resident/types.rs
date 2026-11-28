@@ -1,7 +1,7 @@
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use super::super::*;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl FullPlan {
     pub(in crate::decoder) fn resident_windowed_full_attn_layer_dims(
         &self,
@@ -18,16 +18,16 @@ impl FullPlan {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) const RESIDENT_PIPELINE_WINDOW: usize = 4;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) enum ResidentDecodeInput<'a> {
     CpuToken(usize),
     GpuIndex(&'a metal::BufferRef),
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) struct ResidentDecodeInflight {
     pub(super) command_buffer: metal::CommandBuffer,
     pub(super) index: metal::Buffer,
@@ -35,20 +35,20 @@ pub(super) struct ResidentDecodeInflight {
     pub(super) _owned: Vec<metal::Buffer>,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) struct ResidentLogitsReadback {
     pub(super) lease: crate::decode_resident::ScratchLease,
     pub(super) len: usize,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn resident_capture_slot(layer_ids: &[usize], layer_index: usize) -> Option<usize> {
     layer_ids
         .iter()
         .position(|candidate| *candidate == layer_index)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Clone, Copy)]
 pub(in crate::decoder) struct ResidentSampleSpec {
     pub(in crate::decoder) temperature: f32,
@@ -58,14 +58,14 @@ pub(in crate::decoder) struct ResidentSampleSpec {
     pub(super) mode: ResidentSampleMode,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Clone, Copy)]
 pub(super) enum ResidentSampleMode {
     OnDevice,
     Readback,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(in crate::decoder) struct ResidentPipelineOutput {
     pub(in crate::decoder) tokens: Vec<usize>,
     pub(in crate::decoder) decode: Duration,
@@ -78,7 +78,7 @@ pub(in crate::decoder) struct ResidentPipelineOutput {
 
 /// Sortie d'un pas résident piloté par embedding : état, token glouton ou
 /// logits échantillonnables. Le talker a aussi besoin de l'état pour le cp.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(in crate::decoder) enum ResidentEmbeddingOut {
     State(Tensor),
     Token(usize),
@@ -87,14 +87,14 @@ pub(in crate::decoder) enum ResidentEmbeddingOut {
 }
 
 /// Projection terminale encodée avec le pas, avant toute synchronisation CPU.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(in crate::decoder) enum ResidentEmbeddingHead<'a> {
     Greedy(&'a crate::metal_backend::MetalLinearWeightBuffers),
     Logits(&'a crate::metal_backend::MetalLinearWeightBuffers),
     StateLogits(&'a crate::metal_backend::MetalLinearWeightBuffers),
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn resident_full_layer_unsupported_reason(layer: &DecoderLayer) -> Option<String> {
     if layer.pre_feedforward_norm.is_some() != layer.post_feedforward_norm.is_some() {
         return Some("normes feed-forward Gemma partielles".to_string());

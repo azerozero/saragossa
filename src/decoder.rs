@@ -1,6 +1,6 @@
 //! Décodeur causal, cache KV et orchestration CPU/GPU du modèle.
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::decode_resident::{
     install_pipeline_scratch_slot, DecodeResidentState, FullAttentionMetalState,
     FullAttnDenseLayerWeights, FullAttnLayerDims, FullAttnLayerWeights, FullAttnRoutedLayerWeights,
@@ -10,14 +10,14 @@ use crate::decode_resident::{
 use crate::linear_attention::{
     LinearAttention, LinearAttentionCache, LinearAttentionConfig, LinearAttentionWeights,
 };
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::metal_backend::{
     LinearAttentionMetalState, LinearAttentionStepSpec, LinearAttnResidentDims,
     MetalEmbeddingWeightBuffers, MetalLinearAttnResidentDenseWeights, MetalLinearWeightBuffers,
     MetalMoeRoutedWeights, MetalMoeSharedWeights,
 };
 use crate::runtime_flags::qwen_embed_bf16_enabled;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::runtime_flags::trace_gpu_alloc_enabled;
 use crate::{
     embed_weight_tokens, load_f32_tensors, process_purge_registry, rms_norm,
@@ -63,7 +63,7 @@ mod mtp_adaptive;
 mod mtp_history;
 mod multi;
 mod resident;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[cfg(feature = "tts")]
 pub(crate) use resident::tts_codebooks::TtsCodebookWeights;
 
@@ -79,17 +79,17 @@ pub fn force_resident_full_linear_decode() {
 mod flint_oracle_tests;
 
 /// Compte les pas encodés par le decode résident complet (tests flint).
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 pub(crate) fn resident_decode_steps_for_test() -> usize {
     resident::RESIDENT_DECODE_STEPS.with(std::cell::Cell::get)
 }
 #[cfg(test)]
 mod layer_plan_tests;
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(test, gpu_metal, feature = "devtools"))]
 mod mtp_moe_oracles;
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(test, gpu_metal, feature = "devtools"))]
 mod prefix_align_tests;
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(test, gpu_metal, feature = "devtools"))]
 mod qwen35_oracles;
 #[cfg(test)]
 mod tests;
@@ -114,7 +114,7 @@ pub enum RopeStyle {
 /// Forme `(in_dim, out_dim)` des k/v full-attention d'un Qwen dense à hidden
 /// 5120 et 4 têtes K/V de 256 (Qwen3.8 27B), seule forme Qwen validée sous
 /// le plancher du GEMM NA u4 par ses oracles (référence f64, greedy réel).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 const QWEN_27B_KV_SHAPE: (usize, usize) = (5120, 1024);
 
 /// Le modèle cible ouvre-t-il ses k/v full-attention au GEMM NA u4 bf16×3 ?
@@ -124,7 +124,7 @@ const QWEN_27B_KV_SHAPE: (usize, usize) = (5120, 1024);
 /// experts partagés sous le plancher, non validés, et restent exclus comme
 /// flint et Gemma. Seuls les poids k/v de ces couches sont ouverts, pas la
 /// forme : drafter DFlash et tête MTP gardent le qmv.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn qwen_kv_nax_x3_shape(
     config: &CausalDecoderConfig,
     kv_shapes: &[&[usize]],
@@ -372,7 +372,7 @@ impl CausalDecoderPromptState {
 
     /// `(base, lignes stockées)` du K/V de chaque couche full-attention :
     /// prouve en test qu'une couche glissante ne garde que sa fenêtre.
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn kv_rows_for_test(&self) -> Vec<(usize, usize)> {
         self.cache
             .layers
@@ -384,7 +384,7 @@ impl CausalDecoderPromptState {
 
     /// Vues K/V bf16 entières, adoptables par une arène, de chaque couche qui
     /// en a : les tests y reprennent le claim pour savoir qui tient la réserve.
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn kv_bf16_prefixes_for_test(
         &self,
     ) -> Vec<[crate::metal_backend::SharedBf16Rows; 2]> {
@@ -408,7 +408,7 @@ impl CausalDecoderPromptState {
 #[derive(Clone, Debug, Default)]
 /// Capture les états Metal associés à un état de prompt.
 pub struct CausalDecoderPromptMetalSnapshot {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     linear: Vec<Option<crate::metal_backend::LinearAttentionMetalState>>,
 }
 
@@ -416,7 +416,7 @@ impl CausalDecoderPromptMetalSnapshot {
     /// Estime l'empreinte GPU du snapshot.
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             self.linear
                 .iter()
@@ -424,14 +424,14 @@ impl CausalDecoderPromptMetalSnapshot {
                 .map(crate::metal_backend::LinearAttentionMetalState::estimated_bytes)
                 .sum()
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             0
         }
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[derive(Clone, Debug, PartialEq)]
 /// Décrit la divergence d'une couche du decode résident.
 pub struct ResidentLinearXrayLayerDiff {
@@ -445,7 +445,7 @@ pub struct ResidentLinearXrayLayerDiff {
     pub mean_abs: f32,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[derive(Clone, Debug, PartialEq)]
 /// Contient le diagnostic d'un pas résident-linear.
 pub struct ResidentLinearXrayReport {
@@ -501,7 +501,7 @@ pub struct ResidentLinearXrayReport {
     pub layer_diffs: Vec<ResidentLinearXrayLayerDiff>,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn new_resident_compute_encoder(
     command_buffer: &metal::CommandBufferRef,
 ) -> &metal::ComputeCommandEncoderRef {
@@ -583,7 +583,7 @@ pub struct CausalDecoderCache {
     vision_positions: Option<crate::vision::prompt::VisionPositions>,
     // Arène du decode résident COMPLET (1c) : ping-pong hidden + buffer u32 du
     // token + pool/queue/pipelines. Liée à la session → jamais clonée (cf. infra).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     resident: Option<ResidentArena>,
 }
 
@@ -597,7 +597,7 @@ impl Clone for CausalDecoderCache {
             position: self.position,
             rope_delta: self.rope_delta,
             vision_positions: self.vision_positions.clone(),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             resident: None,
         }
     }
@@ -607,7 +607,7 @@ impl Clone for CausalDecoderCache {
 /// vivre sur toute la session de génération : l'état `DecodeResidentState` (pool
 /// scratch à bail, queue, pipelines gate/RoPE), les deux buffers hidden ping-pong
 /// et le buffer `u32` recevant l'argmax du token. Non clonable (réserve Codex D).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 struct ResidentArena {
     state: DecodeResidentState,
@@ -628,7 +628,7 @@ struct ResidentArena {
     tts_fused_qkv: Option<Vec<Vec<MetalLinearWeightBuffers>>>,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 struct ResidentMtpArena {
     pre_fc_norm_embedding: metal::Buffer,
@@ -658,7 +658,7 @@ struct ResidentMtpArena {
 
 /// Couche unique de la tête MTP résidente : MLP dense (27B) ou MoE à expert
 /// partagé (35B-A3B), encodée par la queue mono-ligne du tronc correspondant.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
@@ -669,7 +669,7 @@ enum ResidentMtpLayer {
     Moe(ResidentFullMoeBuffers),
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 struct ResidentVerifyCaptures {
     base_position: usize,
@@ -677,12 +677,12 @@ struct ResidentVerifyCaptures {
     _linear_leases: Vec<ScratchLease>,
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 #[derive(Debug)]
 struct ResidentVerifyCaptures;
 
 /// Tête appliquée aux états finaux du verify résident.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(
     not(feature = "devtools"),
@@ -709,7 +709,7 @@ enum ResidentVerifyHead {
     },
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 struct ResidentVerifyOutput {
     states: Tensor,
@@ -723,7 +723,7 @@ struct ResidentVerifyOutput {
     target_hidden: Option<Tensor>,
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 thread_local! {
     // Lectures hidden et uploads hidden du seul chemin D1, pas du prefill.
     static MTP_D1_HIDDEN_TRANSFERS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
@@ -734,9 +734,9 @@ thread_local! {
 #[derive(Debug)]
 enum MtpFinalState {
     Cpu(Tensor),
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     Resident(ScratchLease),
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     ResidentRow {
         lease: ScratchLease,
         row: usize,
@@ -748,7 +748,7 @@ impl MtpFinalState {
     fn into_cpu(self) -> Result<Tensor> {
         match self {
             Self::Cpu(state) => Ok(state),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::Resident(lease) => {
                 #[cfg(test)]
                 MTP_D1_HIDDEN_TRANSFERS.with(|counts| {
@@ -760,7 +760,7 @@ impl MtpFinalState {
                     lease.tensor().len(),
                 )?)
             }
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::ResidentRow { lease, row, hidden } => {
                 let values = crate::metal_backend::read_f32_buffer(
                     lease.tensor().buffer(),
@@ -775,7 +775,7 @@ impl MtpFinalState {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn row_range(row: usize, hidden: usize) -> Result<std::ops::Range<usize>> {
         let start = row
             .checked_mul(hidden)
@@ -786,7 +786,7 @@ impl MtpFinalState {
         Ok(start..end)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn validate_resident(&self, hidden: usize) -> Result<()> {
         let (lease, end) = match self {
             Self::Cpu(_) => return Ok(()),
@@ -804,7 +804,7 @@ impl MtpFinalState {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn encode_resident_copy(
         &self,
         metal: &crate::metal_backend::MetalExecutor,
@@ -829,7 +829,7 @@ impl MtpFinalState {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn from_lease(lease: ScratchLease, retain_hidden: bool) -> Result<Self> {
         let state = Self::Resident(lease);
         if retain_hidden {
@@ -840,7 +840,7 @@ impl MtpFinalState {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 struct ResidentMtpSpecTwoOutput {
     drafts: [usize; 2],
@@ -854,7 +854,7 @@ struct ResidentMtpSpecTwoOutput {
     bonus_verified: bool,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
@@ -869,7 +869,7 @@ enum ResidentLayerBuffers {
     Other,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 struct ResidentFullMoeBuffers {
     rope_frequencies: metal::Buffer,
@@ -889,7 +889,7 @@ struct ResidentFullMoeBuffers {
     top_k: usize,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 struct ResidentFullRoutedBuffers {
     rope_frequencies: metal::Buffer,
@@ -906,7 +906,7 @@ struct ResidentFullRoutedBuffers {
     top_k: usize,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 struct ResidentLinearMoeBuffers {
     input_norm: metal::Buffer,
@@ -916,7 +916,7 @@ struct ResidentLinearMoeBuffers {
     top_k: usize,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 struct ResidentFullDenseBuffers {
     rope_frequencies: metal::Buffer,
@@ -943,7 +943,7 @@ struct ResidentFullDenseBuffers {
     sigmoid_moe: Option<(MetalMoeRoutedWeights, usize)>,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 struct ResidentGemmaParallelMoeBuffers {
     post_feedforward_norm_1: metal::Buffer,
@@ -956,7 +956,7 @@ struct ResidentGemmaParallelMoeBuffers {
     dense_inter_dim: usize,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl ResidentFullDenseBuffers {
     fn sigmoid_moe_weights(&self) -> Option<(&MetalMoeRoutedWeights, usize)> {
         self.sigmoid_moe.as_ref().map(|(moe, top_k)| (moe, *top_k))
@@ -989,7 +989,7 @@ impl ResidentFullDenseBuffers {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Debug)]
 struct ResidentLinearDenseBuffers {
     input_norm: metal::Buffer,
@@ -1010,7 +1010,7 @@ struct LayerKvCache {
     kv_dim: Option<usize>,
     linear: LinearAttentionCache,
     // KV full-attn résident GPU (decode résident, flag SARAGOSSA_RUST_DECODE_RESIDENT).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     full: Option<FullAttentionMetalState>,
 }
 
@@ -1025,7 +1025,7 @@ impl Clone for LayerKvCache {
             values: self.values.clone(),
             kv_dim: self.kv_dim,
             linear: self.linear.clone(),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             full: None,
         }
     }
@@ -1035,7 +1035,7 @@ impl CausalDecoderCache {
     /// Couches full-attention dont tout le K/V est stocké en bf16, et couches
     /// full-attention au K/V non vide : prouve en test que le stockage bf16 du
     /// prefill a bien été pris.
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn bf16_kv_layers_for_test(&self) -> (usize, usize) {
         use crate::decode_resident::KvSegment;
         let full = self
@@ -1111,7 +1111,7 @@ impl CausalDecoderCache {
     }
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 impl CausalDecoder {
     /// Prefill de `prompt` par morceaux de `chunk` tokens (réserve de
     /// `new_tokens` lignes, K/V bf16 dès la première ligne si le modèle le
@@ -1191,11 +1191,11 @@ impl CausalDecoder {
 /// suit (`max_tokens` + marge spéculative, queue de prompt servie) y écrit au
 /// lieu de recopier tout le K/V dans une arène neuve. Sans effet hors Metal.
 pub fn with_prefill_kv_reserve<R>(rows: usize, run: impl FnOnce() -> R) -> R {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     {
         crate::metal_backend::with_prefill_kv_reserve(rows, run)
     }
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     {
         let _ = rows;
         run()
@@ -1388,7 +1388,7 @@ pub struct CausalDecoder {
     mtp_draft_lm_head: Option<Linear>,
     /// Drafter DFlash 2 résident, opt-in : quand il est chargé, le greedy MTP
     /// passe par la boucle DFlash (`generate_greedy_mtp_inner`).
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     dflash: Option<crate::DFlashDraft>,
     snapshot_sources: SnapshotSources,
     /// Le loader du tronc a appliqué l'offset `1 + weight` des normes d'un
@@ -1399,7 +1399,7 @@ pub struct CausalDecoder {
     /// chargement (`runtime_flags::prefix_align_for_model`).
     prefix_align: Option<(usize, usize)>,
     memory_guard: Option<MemoryGuard>,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     runtime: DecoderRuntime,
 }
 
@@ -1442,7 +1442,7 @@ struct PrefixCacheEntry {
     /// Captures des couches cibles du drafter DFlash sur `tokens` ; absentes si
     /// l'entrée vient du chemin AR ou MTP. Le chemin DFlash les exige pour un hit.
     captures: Option<PrefixCaptures>,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     linear_metal: Vec<Option<crate::metal_backend::LinearAttentionMetalState>>,
 }
 
@@ -1528,7 +1528,7 @@ impl PrefixCacheEntry {
                     0
                 }
             }));
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             bytes = bytes.saturating_add(
                 self.linear_metal
@@ -1615,7 +1615,7 @@ impl PrefixCache {
 /// sous 64 lignes, elle passe par le qmv. La tête et l'embedding, appliqués
 /// ligne à ligne, n'entrent pas en compte.
 fn uses_dense_bf16_gemm(tensors: &HashMap<String, DecoderTensor>) -> bool {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     {
         crate::runtime_flags::dense_bf16_gemm_enabled()
             && tensors.iter().any(|(name, tensor)| {
@@ -1628,7 +1628,7 @@ fn uses_dense_bf16_gemm(tensors: &HashMap<String, DecoderTensor>) -> bool {
                     )
             })
     }
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     {
         let _ = tensors;
         false
@@ -1675,7 +1675,7 @@ impl CausalDecoder {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Clone, Debug, Default)]
 struct DecoderRuntime {
     metal: Option<Arc<crate::MetalExecutor>>,
@@ -1688,7 +1688,7 @@ struct DecoderRuntime {
     flint_prefill_cap: OnceLock<usize>,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Clone, Copy, Debug)]
 struct GpuAllocSnapshot {
     allocated_bytes: u64,
@@ -1696,7 +1696,7 @@ struct GpuAllocSnapshot {
     scratch_bytes: u64,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 struct GpuAllocTrace<'a> {
     executor: &'a crate::MetalExecutor,
     scope: &'static str,
@@ -1704,7 +1704,7 @@ struct GpuAllocTrace<'a> {
     before: GpuAllocSnapshot,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl GpuAllocTrace<'_> {
     fn capture(executor: &crate::MetalExecutor) -> Option<GpuAllocSnapshot> {
         let (scratch_entries, scratch_bytes) = match executor.scratch_buffer_stats() {
@@ -1739,7 +1739,7 @@ impl GpuAllocTrace<'_> {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl Drop for GpuAllocTrace<'_> {
     fn drop(&mut self) {
         if let Some(after) = Self::capture(self.executor) {
@@ -1827,7 +1827,7 @@ struct FullAttention {
     no_rope: bool,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl FullAttention {
     fn materialize_metal_weight_buffers(&self, metal: &crate::MetalExecutor) -> Result<()> {
         let v_proj = self.resident_v_proj();
@@ -1868,7 +1868,7 @@ impl FullAttention {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl DecoderLayer {
     fn materialize_metal_weight_buffers(
         &mut self,
@@ -1924,7 +1924,7 @@ impl DecoderLayer {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn materialize_feed_forward_weight_buffers(
     metal: &crate::MetalExecutor,
     feed_forward: &FeedForward,
@@ -1974,7 +1974,7 @@ fn materialize_feed_forward_weight_buffers(
 }
 
 impl CausalDecoder {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn has_resident_linear_attention_layer(&self) -> bool {
         self.layers
             .iter()
@@ -2060,14 +2060,14 @@ impl CausalDecoder {
             lm_head,
             mtp: None,
             mtp_draft_lm_head: None,
-            #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+            #[cfg(all(gpu_metal, feature = "devtools"))]
             dflash: None,
             snapshot_sources: SnapshotSources::default(),
             trunk_hf_raw_norms: false,
             prefix_cache: Arc::new(Mutex::new(PrefixCache::default())),
             prefix_align,
             memory_guard: None,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             runtime: DecoderRuntime::default(),
         })
     }
@@ -2079,7 +2079,7 @@ impl CausalDecoder {
     #[must_use]
     pub fn prefix_resume_align(&self) -> Option<(usize, usize)> {
         let (align, tail) = self.prefix_align?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let tail = tail.max(crate::runtime_flags::prefix_extend_resident_min_tokens());
         Some((align, tail))
     }
@@ -2098,7 +2098,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si la plongée échoue.
     pub(in crate::decoder) fn embed_scaled(&self, token_ids: &[usize]) -> Result<Tensor> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if !self.embed_tokens.cpu_data_available() {
             let metal = self.forward_runtime().metal_executor().ok_or_else(|| {
                 InferError::Config(
@@ -2194,7 +2194,7 @@ impl CausalDecoder {
             rms_norm(&picked, &self.final_norm, self.config.rms_eps)
         };
         crate::runtime_flags::with_decision_noncausal(|| {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             if self.resident_metal().is_some() {
                 let tokens: Vec<usize> = sequences
                     .iter()
@@ -2363,7 +2363,7 @@ impl CausalDecoder {
         cache: &mut CausalDecoderCache,
         max_steps: usize,
     ) -> Result<bool> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             // Le pas depuis embedding (`next_resident_embedding_step`) n'emploie
             // que le runtime per-op : hors périmètre pour flint, pas d'arène.
@@ -2376,7 +2376,7 @@ impl CausalDecoder {
             // KV f32 exact. Le DFlash résident suit `resident_kv_bf16`.
             self.setup_resident_full_decode(cache, max_steps, 0, false)
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = (cache, max_steps);
             Ok(false)
@@ -2400,7 +2400,7 @@ impl CausalDecoder {
         cache: &mut CausalDecoderCache,
         embedding: &Tensor,
     ) -> Result<Option<Tensor>> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             match self.next_resident_embedding_step(cache, embedding, None)? {
                 Some(crate::decoder::resident::ResidentEmbeddingOut::State(state)) => {
@@ -2412,7 +2412,7 @@ impl CausalDecoder {
                 None => Ok(None),
             }
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = (cache, embedding);
             Ok(None)
@@ -2438,7 +2438,7 @@ impl CausalDecoder {
         embedding: &Tensor,
         head: &crate::Linear,
     ) -> Result<Option<usize>> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             let Some(metal) = self.forward_runtime().metal_executor() else {
                 return Ok(None);
@@ -2458,7 +2458,7 @@ impl CausalDecoder {
                 None => Ok(None),
             }
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = (cache, embedding, head);
             Ok(None)
@@ -2477,7 +2477,7 @@ impl CausalDecoder {
         embedding: &Tensor,
         head: &crate::Linear,
     ) -> Result<Option<Tensor>> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             if head.bias().is_some() {
                 return Err(InferError::Config(
@@ -2500,7 +2500,7 @@ impl CausalDecoder {
                 None => Ok(None),
             }
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = (cache, embedding, head);
             Ok(None)
@@ -2517,7 +2517,7 @@ impl CausalDecoder {
         cache: &mut CausalDecoderCache,
         embedding: &Tensor,
     ) -> Result<Option<(Tensor, Tensor)>> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             if self.lm_head.bias().is_some() {
                 return Err(InferError::Config(
@@ -2543,7 +2543,7 @@ impl CausalDecoder {
                 None => Ok(None),
             }
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             let _ = (cache, embedding);
             Ok(None)
@@ -2582,7 +2582,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si la troncature d'un état KV résident échoue.
     pub fn reset_resident_decode_cache(&self, cache: &mut CausalDecoderCache) -> Result<()> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         for layer_cache in cache.layers.iter_mut() {
             if let Some(full) = layer_cache.full.as_mut() {
                 full.truncate(0)?;
@@ -2599,13 +2599,13 @@ impl CausalDecoder {
     /// # Errors
     ///
     /// Renvoie une erreur si Metal est indisponible ou si un kernel ne compile pas.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub fn with_metal_runtime(self) -> Result<Self> {
         self.with_metal_executor(crate::MetalExecutor::new()?)
     }
 
     /// Active le runtime Metal avec un executor déjà initialisé.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     ///
     /// # Errors
     ///
@@ -2643,7 +2643,7 @@ impl CausalDecoder {
     }
 
     /// Couches full-attention du modèle cible (tête MTP exclue).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn full_attentions(&self) -> impl Iterator<Item = &FullAttention> {
         self.layers
             .iter()
@@ -2654,7 +2654,7 @@ impl CausalDecoder {
     }
 
     /// Forme k/v à ouvrir au GEMM NA u4 bf16×3 ([`qwen_kv_nax_x3_shape`]).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn qwen_kv_nax_x3_shape(&self) -> Option<(usize, usize)> {
         let kv_shapes = self
             .full_attentions()
@@ -2675,7 +2675,7 @@ impl CausalDecoder {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn enable_single_copy_weights(&mut self, metal: &crate::MetalExecutor) -> Result<()> {
         if !crate::runtime_flags::single_copy_weights_enabled() {
             return Ok(());
@@ -2703,7 +2703,7 @@ impl CausalDecoder {
     /// # Errors
     ///
     /// Renvoie une erreur si Metal est absent ou si le warmup échoue.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub fn warmup_and_release_cpu_weights(&mut self, prompt: &[usize]) -> Result<usize> {
         let _warmup = crate::runtime_flags::StateSnapshotWarmup::enter();
         if self.runtime.cpu_weights_released {
@@ -2777,7 +2777,7 @@ impl CausalDecoder {
         Ok(bytes)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn materialize_and_release_cpu_weight_buffers(
         &mut self,
         metal: &crate::MetalExecutor,
@@ -2881,16 +2881,16 @@ impl CausalDecoder {
             && crate::runtime_flags::mtp_hf_norm_offset_enabled();
         self.ensure_metal_supported()?;
         let sources = SnapshotSources::capture([path.as_ref()]);
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let context = self
             .runtime
             .metal
             .as_deref()
             .map_or_else(mtp::MtpLoadContext::cpu, mtp::MtpLoadContext::metal);
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let context = mtp::MtpLoadContext::cpu();
         #[cfg_attr(
-            not(all(target_os = "macos", feature = "metal")),
+            not(gpu_metal),
             expect(unused_mut, reason = "single-copy Metal seulement")
         )]
         let mut head = MtpHead::from_sidecar(
@@ -2905,7 +2905,7 @@ impl CausalDecoder {
         // partagé, routeur) gardaient une copie CPU à scales f32 en plus de la
         // copie GPU. Les scales passent en bf16, ce que lisaient déjà les
         // kernels. Les experts sont, eux, quantifiés directement en Metal.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = self.runtime.metal.as_deref() {
             if crate::runtime_flags::single_copy_weights_enabled() {
                 head.move_packed_to_metal_shared(metal)?;
@@ -2913,7 +2913,7 @@ impl CausalDecoder {
         }
         self.snapshot_sources.append(sources);
         self.mtp = Some(head);
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         // NOTE: une tête de draft en sidecar remplace ensuite celle-ci ; ne pas
         // quantifier pour rien (0,64 Go et temps CPU au chargement).
         if self.mtp_draft_lm_head.is_none()
@@ -2941,7 +2941,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si le runtime Metal est absent, si le checkpoint est
     /// incompatible avec `target` ou si la quantification demandée est invalide.
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     pub fn with_dflash_draft_from_env(self, target: &crate::ModelConfig) -> Result<Self> {
         match crate::runtime_flags::env_var_os(crate::devtools::DFLASH_DRAFT_DIR_ENV) {
             Some(dir) if !dir.is_empty() && dir != "0" => {
@@ -2958,7 +2958,7 @@ impl CausalDecoder {
     /// # Errors
     ///
     /// Mêmes erreurs que [`Self::with_dflash_draft_from_env`].
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     pub fn with_dflash_draft_auto(mut self, assets: &crate::ModelAssets) -> Result<Self> {
         let env = crate::runtime_flags::env_var_os(crate::devtools::DFLASH_DRAFT_DIR_ENV);
         let hf_cache = crate::hf_resolve::hf_cache_dir_from_env();
@@ -3001,7 +3001,7 @@ impl CausalDecoder {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     fn with_dflash_draft_dir(
         mut self,
         target: &crate::ModelConfig,
@@ -3011,7 +3011,7 @@ impl CausalDecoder {
         Ok(self)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     fn load_dflash_draft_dir(
         &mut self,
         target: &crate::ModelConfig,
@@ -3048,7 +3048,7 @@ impl CausalDecoder {
     }
 
     /// Drafter DFlash chargé par `with_dflash_draft_from_env`, s'il y en a un.
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     pub fn dflash_draft(&self) -> Option<&crate::DFlashDraft> {
         self.dflash.as_ref()
     }
@@ -3061,13 +3061,13 @@ impl CausalDecoder {
     pub fn with_mtp_draft_lm_head_sidecar(mut self, path: impl AsRef<Path>) -> Result<Self> {
         self.ensure_metal_supported()?;
         let sources = SnapshotSources::capture([path.as_ref()]);
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let context = self
             .runtime
             .metal
             .as_deref()
             .map_or_else(mtp::MtpLoadContext::cpu, mtp::MtpLoadContext::metal);
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let context = mtp::MtpLoadContext::cpu();
         self.mtp_draft_lm_head = Some(mtp::load_mtp_draft_lm_head(
             &path,
@@ -3089,7 +3089,7 @@ impl CausalDecoder {
     /// kernels ne connaissent pas (flint), qui n'emploie Metal que via
     /// [`Self::resident_metal`].
     fn forward_runtime(&self) -> ForwardRuntime<'_> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = self
             .resident_metal()
             .filter(|_| self.config.metal_unsupported_reason().is_none())
@@ -3102,12 +3102,12 @@ impl CausalDecoder {
     /// Executor du prefill résident et du decode résident complet, seuls
     /// chemins Metal couvrant flint. Identique à
     /// `forward_runtime().metal_executor()` pour les autres modèles.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn resident_metal(&self) -> Option<&crate::MetalExecutor> {
         self.runtime.metal.as_deref()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn trace_gpu_alloc_scope(&self, scope: &'static str) -> Option<GpuAllocTrace<'_>> {
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3132,7 +3132,7 @@ impl CausalDecoder {
     /// `forward_runtime` : le prefill résident de flint alloue son scratch sur
     /// cet executor alors que son runtime per-op est le CPU ; sans scope, ce
     /// scratch n'était jamais rendu volatil ni plafonné.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn scratch_buffer_scope(&self) -> Option<impl Drop + '_> {
         self.resident_metal()
             .map(crate::MetalExecutor::scratch_buffer_scope)
@@ -3143,7 +3143,7 @@ impl CausalDecoder {
     /// # Errors
     ///
     /// Renvoie une erreur sans executor Metal ou si le cache est empoisonné.
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn scratch_stats_for_test(&self) -> Result<(usize, u64, usize)> {
         let metal = self
             .resident_metal()
@@ -3160,7 +3160,7 @@ impl CausalDecoder {
             position: 0,
             rope_delta: 0,
             vision_positions: None,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             resident: None,
         }
     }

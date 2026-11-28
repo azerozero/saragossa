@@ -132,11 +132,11 @@ impl EngineSeed {
     /// Construit le `ServeState` du moteur sur le thread appelant, qui devient
     /// son thread moteur.
     pub(super) fn build(self) -> ServeState {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         saragossa::set_scratch_engine(
             u32::try_from(self.engine).expect("invariant: --engines borné à 16"),
         );
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = self.engine;
         ServeState::for_engine(self.args, self.shared)
     }
@@ -810,7 +810,7 @@ fn load_shared_llm(id: &str, path: &Path, backend: RuntimeKind) -> ServeResult<S
         );
     }
     // Le drafter n'est joignable que par le chemin MTP : inutile sans lui.
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     if mtp_active {
         decoder = decoder.with_dflash_draft_auto(&assets)?;
         if let Some(draft) = decoder.dflash_draft() {
@@ -1876,7 +1876,7 @@ fn load_decoder_with_runtime(
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn load_decoder_metal(assets: &ModelAssets) -> ServeResult<CausalDecoder> {
     let executor = saragossa::MetalExecutor::new_with_kernel_profile(
         saragossa::KernelProfile::for_model_dir(&assets.model_dir),
@@ -1885,7 +1885,7 @@ fn load_decoder_metal(assets: &ModelAssets) -> ServeResult<CausalDecoder> {
         .with_metal_executor(executor)?)
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn load_decoder_metal(_assets: &ModelAssets) -> ServeResult<CausalDecoder> {
     Err(ServeError::args(
         "backend metal indisponible dans ce build — recompile avec --features metal",
@@ -2037,7 +2037,7 @@ mod gemma_json_tests;
 #[cfg(test)]
 mod batch_drive_tests;
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 mod batch_tests;
 
 /// Identités des allocations K/V (et autres segments comptés) d'un état de
@@ -2357,7 +2357,7 @@ mod tests {
     /// `serve --engines N` : des moteurs sur leurs threads, partageant le même
     /// décodeur Metal (poids, executor), rendent en parallèle les tokens greedy
     /// du moteur unique, requête par requête.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[test]
     #[ignore = "requiert un device Metal ; GPU synthétique exécuté par gpu-synthetic.yml"]
     fn engines_sharing_decoder_match_serial_greedy() {
@@ -2456,7 +2456,7 @@ mod tests {
     /// Tour d'agent : au tour N+1 seuls les nouveaux tokens sont préremplis,
     /// la sortie greedy ne dépend pas du cache, et une modification au milieu
     /// de l'historique invalide la réutilisation.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[test]
     #[ignore = "requiert un device Metal ; GPU synthétique exécuté par gpu-synthetic.yml"]
     fn agent_turn_prefills_only_new_tokens_and_matches_cold() {

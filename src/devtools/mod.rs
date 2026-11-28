@@ -6,7 +6,7 @@ pub mod kl_eval;
 pub mod kl_ref;
 pub(crate) mod layer_dump;
 pub mod paired;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 mod pairwise;
 
 use std::time::{Duration, Instant};
@@ -34,7 +34,7 @@ pub fn lightbatch_acceptance_enabled() -> bool {
     env_flag("SARAGOSSA_RUST_LIGHTBATCH_ACCEPTANCE", false)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub fn resident_linear_xray_enabled() -> bool {
     env_flag("SARAGOSSA_RUST_RESIDENT_LINEAR_XRAY", false)
 }
@@ -286,7 +286,7 @@ pub fn run_mtp_acceptance(
     load_elapsed: Duration,
     warmup_elapsed: Duration,
 ) -> Result<()> {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if env_flag("SARAGOSSA_RUST_PAIRWISE", false) {
         // Phase 7 : le drafter DFlash n'est chargé que si le répertoire est posé ; les
         // campagnes MTP seules restent inchangées.
@@ -486,10 +486,9 @@ pub fn run_dflash_acceptance(
         .generate_greedy_dflash_reference_with_options(prompt_ids, max_tokens, options, draft)?;
     let reference_elapsed = reference_started.elapsed();
     // Drafter résident : Metal seulement ; sans Metal le harnais garde la boucle CPU.
-    let resident = cfg!(all(target_os = "macos", feature = "metal"))
-        && env_flag("SARAGOSSA_RUST_DFLASH_RESIDENT", false);
+    let resident = cfg!(gpu_metal) && env_flag("SARAGOSSA_RUST_DFLASH_RESIDENT", false);
     let spec_started = Instant::now();
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let mut spec = if resident {
         decoder.generate_greedy_dflash_resident_with_options(
             prompt_ids, max_tokens, options, draft, max_draft,
@@ -499,7 +498,7 @@ pub fn run_dflash_acceptance(
             prompt_ids, max_tokens, options, draft, max_draft,
         )?
     };
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     let mut spec = decoder.generate_greedy_dflash_batched_with_options(
         prompt_ids, max_tokens, options, draft, max_draft,
     )?;
@@ -607,7 +606,7 @@ pub fn run_dflash_acceptance(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub fn run_resident_linear_xray(
     assets: &ModelAssets,
     decoder: &CausalDecoder,
@@ -736,7 +735,7 @@ pub fn print_dflash_draft(draft: &DFlashDraft) {
     );
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn decode_one_token(assets: &ModelAssets, token: usize) -> Result<String> {
     let token = u32::try_from(token)
         .map_err(|_| InferError::Dimension(format!("token diagnostic hors plage: {token}")))?;

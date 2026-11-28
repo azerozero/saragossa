@@ -108,7 +108,7 @@ const FLINT_ATTENTION_LAYER_WEIGHTS: &[&str] = &[
 use crate::safetensor::FP8_SCALE_BLOCK;
 
 struct DecoderLoadContext<'a> {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     metal: Option<&'a crate::MetalExecutor>,
     /// Adaptateur LoRA à fusionner dans les poids ciblés, cf. [`lora`].
     lora: Option<&'a LoraAdapter>,
@@ -118,14 +118,14 @@ struct DecoderLoadContext<'a> {
 impl DecoderLoadContext<'_> {
     fn cpu() -> Self {
         Self {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             metal: None,
             lora: None,
             marker: std::marker::PhantomData,
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn metal(executor: &crate::MetalExecutor) -> DecoderLoadContext<'_> {
         DecoderLoadContext {
             metal: Some(executor),
@@ -204,7 +204,7 @@ pub fn load_causal_decoder(assets: &ModelAssets) -> Result<CausalDecoder> {
 /// # Errors
 ///
 /// Renvoie une erreur si les poids sont invalides ou si l'allocation Metal échoue.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub fn load_causal_decoder_for_metal(
     assets: &ModelAssets,
     executor: &crate::MetalExecutor,
@@ -242,7 +242,7 @@ pub fn load_causal_decoder_with_lora(
 /// # Errors
 ///
 /// Mêmes erreurs que [`load_causal_decoder_with_lora`], plus l'allocation Metal.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub fn load_causal_decoder_for_metal_with_lora(
     assets: &ModelAssets,
     executor: &crate::MetalExecutor,
@@ -278,7 +278,7 @@ pub fn load_causal_decoder_with_memory_guard(
 /// # Errors
 ///
 /// Renvoie une erreur si les poids sont invalides ou si la garde refuse.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub fn load_causal_decoder_for_metal_with_memory_guard(
     assets: &ModelAssets,
     executor: &crate::MetalExecutor,
@@ -419,7 +419,7 @@ fn load_from_shards_with_context(
         .with_trunk_hf_raw_norms(hf_raw))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn load_causal_decoder_from_shards_for_metal(
     config: &ModelConfig,
     shards: &[PathBuf],
@@ -1462,18 +1462,18 @@ mod gemma4_tests;
 mod lora_tests;
 #[cfg(test)]
 mod qwen35_sanitize_tests;
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 mod qwen_kv_x3_tests;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 mod direct_file_tests;
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 mod prefill_variants_tests;
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 mod mmap_weights_tests;

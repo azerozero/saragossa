@@ -355,7 +355,7 @@ pub(super) fn full_attention_context_cached(
 /// couche a un KV résident (`LayerKvCache::full`), sinon `None` → chemin CPU
 /// `cached_attention_one`. Append du K/V (rope'd) du token courant par écriture
 /// résidente (réserve R3), puis attention single-query sur le KV résident.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn full_attention_resident_context(
     cache: &mut LayerKvCache,
     q: &Tensor,
@@ -370,7 +370,7 @@ pub(super) fn full_attention_resident_context(
     Ok(Some(Tensor::from_vec(vec![1, context.len()], context)?))
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 pub(super) fn full_attention_resident_context(
     _cache: &mut LayerKvCache,
     _q: &Tensor,
@@ -559,7 +559,7 @@ pub(super) fn project_qkv(
     attention: &FullAttention,
     runtime: ForwardRuntime<'_>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if let Some(metal) = runtime.metal_executor() {
         if attention.q_proj.bias().is_none()
             && attention.k_proj.bias().is_none()
@@ -607,7 +607,7 @@ fn project_kv(
     runtime: ForwardRuntime<'_>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let empty_q = empty_q(attention)?;
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if let Some(metal) = runtime.metal_executor() {
         if let Some(v_proj) = attention
             .v_proj

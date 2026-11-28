@@ -1,18 +1,18 @@
 use super::super::*;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::metal_backend::MetalExecutor;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 type ResidentMtpSpecOneOutput = (usize, usize, MtpFinalState, Option<(usize, MtpFinalState)>);
 
 /// Sortie d'un pas de draft MTP résident : l'argmax GPU ou la ligne de logits.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 enum MtpDraftResident {
     Token(usize),
     Logits(Vec<f32>),
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl ResidentMtpLayer {
     /// Encode la couche de la tête sur une ligne : seul point de dispatch
     /// dense/MoE de tous les cycles MTP (draft, historique, oracles).
@@ -88,15 +88,15 @@ impl ResidentMtpLayer {
 }
 
 impl CausalDecoder {
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     fn reset_mtp_append_oracle(mtp: &mut ResidentMtpArena) {
         mtp.append_oracle_len = 0;
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal", not(feature = "devtools")))]
+    #[cfg(all(gpu_metal, not(feature = "devtools")))]
     fn reset_mtp_append_oracle(_mtp: &mut ResidentMtpArena) {}
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn start_mtp_resident_draft(
         &self,
         cache: &mut CausalDecoderCache,
@@ -125,7 +125,7 @@ impl CausalDecoder {
         Ok(true)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn truncate_mtp_resident_history(
         &self,
         cache: &mut CausalDecoderCache,
@@ -142,7 +142,7 @@ impl CausalDecoder {
         mtp.kv.truncate(len)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn flush_mtp_resident_pending_append(
         &self,
         cache: &mut CausalDecoderCache,
@@ -230,7 +230,7 @@ impl CausalDecoder {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "encodage interne MTP: executor, arène, encoder, dims et liveness scratch"
@@ -336,7 +336,7 @@ impl CausalDecoder {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     fn encode_copy_mtp_kv_prefix(
         metal: &MetalExecutor,
         encoder: &metal::ComputeCommandEncoderRef,
@@ -404,7 +404,7 @@ impl CausalDecoder {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "oracle bit-identique de l'ancien append MTP série"
@@ -548,7 +548,7 @@ impl CausalDecoder {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     fn check_mtp_append_kv_oracle(
         &self,
         mtp: &mut ResidentMtpArena,
@@ -579,7 +579,7 @@ impl CausalDecoder {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     fn compare_mtp_kv_buffer_bits(
         label: &str,
         actual: &GpuTensor,
@@ -625,7 +625,7 @@ impl CausalDecoder {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn append_mtp_resident_history_steps(
         &self,
         cache: &mut CausalDecoderCache,
@@ -831,7 +831,7 @@ impl CausalDecoder {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn next_mtp_draft_resident(
         &self,
         cache: &mut CausalDecoderCache,
@@ -849,7 +849,7 @@ impl CausalDecoder {
     /// Draft MTP résident dont la tête rend la ligne de logits complète (lue
     /// sur le CPU) au lieu de l'argmax GPU : l'échantillonnage lossless à T>0
     /// a besoin de la distribution du draft.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn next_mtp_draft_resident_logits(
         &self,
         cache: &mut CausalDecoderCache,
@@ -864,7 +864,7 @@ impl CausalDecoder {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn next_mtp_draft_resident_with(
         &self,
         cache: &mut CausalDecoderCache,
@@ -1057,7 +1057,7 @@ impl CausalDecoder {
             .map_err(|_| InferError::Metal(format!("index MTP trop grand: {raw}")))
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn next_mtp_drafts_resident(
         &self,
         cache: &mut CausalDecoderCache,
@@ -1272,7 +1272,7 @@ impl CausalDecoder {
             .map(Some)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "cycle MTP : cache, état, historique, arrêt et callback après soumission explicites"
@@ -1957,7 +1957,7 @@ impl CausalDecoder {
         Ok(Some((draft, target, state, bonus)))
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "cycle MTP : cache, état, historique, arrêt et callback après soumission explicites"
@@ -2693,7 +2693,7 @@ impl CausalDecoder {
 /// Compteurs GPU (`SARAGOSSA_RUST_GPU_COUNTERS`) : clôt le command buffer courant du
 /// cycle fusionné, attend sa fin (chronométrée CPU) et repart sur un neuf. Mêmes
 /// kernels, même ordre, état GPU persistant : résultat numérique identique.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn cut_fused_segment<'q>(
     queue: &'q metal::CommandQueue,
     command_buffer: &mut &'q metal::CommandBufferRef,
@@ -2713,7 +2713,7 @@ fn cut_fused_segment<'q>(
 
 /// Réserve l'oracle une seule fois, après contrôle du budget courant. Le
 /// majorant f32 reste sûr même si le format runtime change depuis le setup.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn ensure_mtp_append_oracle(
     oracle: &mut Option<FullAttentionMetalState>,
     state: &DecodeResidentState,
@@ -2745,7 +2745,7 @@ fn ensure_mtp_append_oracle(
     Ok(())
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(test, gpu_metal, feature = "devtools"))]
 mod tests {
     use super::*;
 

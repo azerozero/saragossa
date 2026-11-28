@@ -1,6 +1,6 @@
 //! Oracles ignorés Qwen3.6-35B : précision couche 0 et CPU↔GPU réel.
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use super::ResidentVerifyHead;
 use super::*;
 use crate::MoeMlp;

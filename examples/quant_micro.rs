@@ -1,6 +1,6 @@
 //! Mesure locale sans golden : `quant_micro capture|score|bench MODEL ARTIFACT`.
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 mod macos {
     use saragossa::{GenerationOptions, ModelAssets};
     use serde::{Deserialize, Serialize};
@@ -241,12 +241,12 @@ mod macos {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     macos::main()
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn main() {
     eprintln!("quant_micro exige macOS avec la feature metal");
 }

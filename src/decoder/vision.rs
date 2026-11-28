@@ -22,7 +22,7 @@ impl CausalDecoderCache {
 
 #[cfg(feature = "vision")]
 impl CausalDecoder {
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn vision_forced_logits(
         &self,
         cache: &mut CausalDecoderCache,
@@ -93,7 +93,7 @@ impl CausalDecoder {
         let (input, positions) =
             insert_embeddings(tokens, image_pad, &self.embed_scaled(tokens)?, images)?;
         let delta = positions.delta_at(tokens.len())?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if resident {
             let (mut cache, hidden, _) = self
                 .prefill_resident_cache_hidden_captures_and_mtp(
@@ -112,7 +112,7 @@ impl CausalDecoder {
             let final_state = rms_norm(&hidden, &self.final_norm, self.config.rms_eps)?;
             return Ok((cache, final_state));
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         if resident {
             return Err(InferError::Config("Metal indisponible".into()));
         }

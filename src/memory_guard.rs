@@ -668,12 +668,12 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn recommended_metal_working_set_bytes() -> Option<u64> {
     metal::Device::system_default().map(|device| device.recommended_max_working_set_size())
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn recommended_metal_working_set_bytes() -> Option<u64> {
     None
 }

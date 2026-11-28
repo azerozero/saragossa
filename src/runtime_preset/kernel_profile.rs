@@ -47,7 +47,7 @@ impl KernelProfile {
         environment().for_model_dir(model_dir)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn for_legacy_executor() -> Self {
         environment().for_preset(super::LEGACY_PRESET.get().copied())
     }

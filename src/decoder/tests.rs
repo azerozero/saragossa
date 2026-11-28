@@ -4,13 +4,13 @@ use super::attention_ops::{
     rms_norm_heads, rms_norm_rope_heads_at, AttentionLayout, RopeParams,
 };
 use super::*;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[path = "gemma4_oracles.rs"]
 mod gemma4_oracles;
 use crate::oracle::assert_close_abs as assert_close;
 use safetensors::{serialize, Dtype, View};
 use std::borrow::Cow;
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -96,7 +96,7 @@ fn dflash_acceptance_matches_autoregressive_greedy() {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
 fn dflash_decoder_entry_point_preserves_shared_storage(
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -434,7 +434,7 @@ fn hybrid_snapshot_prompt_state_greedy_matches_cold_prefill() {
     assert_eq!(warm, cold);
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn hybrid_cloned_prompt_state_metal_matches_cold_prefill() {
     let config = CausalDecoderConfig {
@@ -577,7 +577,7 @@ fn prefix_cache_selects_longest_append_prefix() {
             final_state: final_state.clone(),
             mtp_history: None,
             captures: None,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             linear_metal: Vec::new(),
         },
         PrefixCacheEntry {
@@ -586,7 +586,7 @@ fn prefix_cache_selects_longest_append_prefix() {
             final_state: final_state.clone(),
             mtp_history: None,
             captures: None,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             linear_metal: Vec::new(),
         },
         PrefixCacheEntry {
@@ -595,7 +595,7 @@ fn prefix_cache_selects_longest_append_prefix() {
             final_state,
             mtp_history: None,
             captures: None,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             linear_metal: Vec::new(),
         },
     ];
@@ -631,7 +631,7 @@ fn prefix_cache_byte_cap_counts_shared_segments_once() {
         final_state: final_state.clone(),
         mtp_history: Some(mtp_history),
         captures: None,
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         linear_metal: Vec::new(),
     };
     let mut cache = PrefixCache {
@@ -778,7 +778,7 @@ fn prefix_cache_byte_cap_counts_shared_captures_once() -> Result<()> {
             final_state: Tensor::row(vec![0.0])?,
             mtp_history: None,
             captures,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             linear_metal: Vec::new(),
         })
     };
@@ -1325,7 +1325,7 @@ fn resident_full_attention_keeps_qwen_interval_and_uniform_dims() {
     assert_eq!(plan.rope_frequency_dim(head_dim), 32);
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn resident_linear_detection_uses_attention_block_variants() {
     let mut gemma_weights = HashMap::new();
@@ -2007,7 +2007,7 @@ fn full_attention_append_kv_rows_matches_prefill_cache_bytes() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn gemma4_global_attention_aliases_k_as_resident_v_projection() -> Result<()> {
     let mut tensors: HashMap<String, DecoderTensor> = HashMap::new();
@@ -2405,7 +2405,7 @@ pub(super) fn tensor_views(tensors: HashMap<String, Tensor>) -> Vec<(String, F32
 
 /// Modèle GQA synthétique (q=2, kv=1, hd=2) **métal-activé**, ou `None` si
 /// aucun device Metal (skip propre, comme les tests `metal_backend`).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn resident_test_model() -> Option<CausalDecoder> {
     let config = CausalDecoderConfig {
         num_attention_heads: 2,
@@ -2425,7 +2425,7 @@ fn resident_test_model() -> Option<CausalDecoder> {
 
 /// Le cap du modèle doit atteindre le sampler non résident partagé avec MTP.
 /// Le greedy conserve son argmax et n'avance pas le RNG.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn softcap_sampling_decoder_routes_and_greedy() -> Result<()> {
     let Some(mut model) = resident_test_model() else {
@@ -2488,7 +2488,7 @@ fn softcap_sampling_decoder_routes_and_greedy() -> Result<()> {
 }
 
 /// Décode `n` tokens en greedy T=0, chemin résident forcé (`resident`) ou CPU.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn greedy_resident_ab(
     model: &CausalDecoder,
     prompt: &[usize],
@@ -2523,7 +2523,7 @@ fn greedy_resident_ab(
 
 /// 1b.3 / R2 — le clone du cache (prefix-cache) DROP l'état Metal résident
 /// (`full` → None) sans toucher l'original (pas de double-ownership MTLBuffer).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn resident_cache_clone_drops_metal() {
     let Some(model) = resident_test_model() else {
@@ -2555,7 +2555,7 @@ fn resident_cache_clone_drops_metal() {
 /// plafond 256 du kernel de prefill), l'état final par token du chemin
 /// résident GPU est numériquement identique au chemin CPU (tolérance, réserve
 /// E : le kernel change l'ordre de réduction f32).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn resident_decode_state_matches_cpu_over_long_kv() {
     let Some(model) = resident_test_model() else {
@@ -2596,7 +2596,7 @@ fn resident_decode_state_matches_cpu_over_long_kv() {
 
 /// 1b.3 — oracle greedy : séquences T=0 token-identiques OFF vs ON, sur ≥256
 /// tokens, pour deux prompts (multi-tour à cache frais → reset propre).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn resident_decode_greedy_tokens_match_cpu() {
     let Some(model) = resident_test_model() else {
@@ -2615,7 +2615,7 @@ fn resident_decode_greedy_tokens_match_cpu() {
 /// 1c.0 / MAJEUR 6 — la validation des préconditions REFUSE un modèle non
 /// supporté en résident (ici le modèle GQA de test n'a pas de MoE/shared-expert)
 /// → tout-ou-rien : on ne démarre jamais le command buffer unique sans garantie.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn resident_full_precondition_rejects_model_without_moe() {
     let Some(model) = resident_test_model() else {
@@ -2627,7 +2627,7 @@ fn resident_full_precondition_rejects_model_without_moe() {
     );
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn mtp_final_state_row_range_is_checked() -> Result<()> {
     assert_eq!(MtpFinalState::row_range(2, 8)?, 16..24);
@@ -2645,7 +2645,7 @@ fn mtp_final_state_cpu_roundtrip() -> Result<()> {
 
 // --- MTP : oracle résident two-row committed-history (GPU + modèle réel) ---
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn mtp_verifier_env_ready() -> bool {
     let required = [
         ("SARAGOSSA_RUST_MTP_HISTORY", "committed"),
@@ -2678,7 +2678,7 @@ fn mtp_verifier_env_ready() -> bool {
     true
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn mtp_verifier_model_dir() -> Option<PathBuf> {
     let model_dir = if let Some(path) =
         crate::runtime_flags::env_var_os("SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL")
@@ -2705,7 +2705,7 @@ fn mtp_verifier_model_dir() -> Option<PathBuf> {
     )
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn mtp_verifier_prompt_file(path: &Path, fallback: &str) -> String {
     match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -2719,7 +2719,7 @@ fn mtp_verifier_prompt_file(path: &Path, fallback: &str) -> String {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn mtp_verifier_prompt_ids(assets: &crate::ModelAssets, prompt: &str) -> Result<Vec<usize>> {
     let templated = crate::render_qwen_chatml(
         &[crate::ChatTemplateMessage::new("user", prompt)],
@@ -2736,7 +2736,7 @@ fn mtp_verifier_prompt_ids(assets: &crate::ModelAssets, prompt: &str) -> Result<
         .collect()
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn mtp_verifier_options(stop_token_ids: Vec<usize>) -> GenerationOptions {
     GenerationOptions {
         stop_token_ids,
@@ -2754,7 +2754,7 @@ fn mtp_verifier_options(stop_token_ids: Vec<usize>) -> GenerationOptions {
 /// `end`. L'AR avec cette seule séquence rend donc exactement
 /// `generated[..=end]` ; balayer toutes les positions couvre les arrêts au
 /// milieu des drafts acceptés comme les séquences à cheval sur deux tours.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn stop_sequence_cases(generated: &[usize]) -> Vec<(Vec<usize>, usize)> {
     (0..generated.len())
         .map(|end| {
@@ -2773,7 +2773,7 @@ fn stop_sequence_cases(generated: &[usize]) -> Vec<(Vec<usize>, usize)> {
 /// et commençant avant `end`, où `end` ouvre une rafale et est suivi d'un token
 /// de la même rafale : le stop tombe au milieu des tokens d'un tour, la
 /// séquence commence dans le tour précédent.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn crossing_stop_case(tokens: &[usize], times: &[Instant]) -> Option<(Vec<usize>, usize)> {
     let gap = Duration::from_millis(2);
     let burst = Duration::from_micros(500);
@@ -2794,7 +2794,7 @@ fn crossing_stop_case(tokens: &[usize], times: &[Instant]) -> Option<(Vec<usize>
 
 /// Annulation par le callback avant ou sur le stop : aucun callback après
 /// `false`, tokens émis = préfixe de l'oracle = tokens rendus.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn assert_cancelled_stream(
     label: &str,
     oracle: &[usize],
@@ -2818,7 +2818,7 @@ fn assert_cancelled_stream(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn mtp_verifier_case(
     model: &CausalDecoder,
     name: &str,
@@ -2849,7 +2849,7 @@ fn mtp_verifier_case(
 /// Valide le chemin GPU-only `next_mtp_spec_one_resident` en historique MTP
 /// committed depth-1. Le test est ignoré par défaut car il charge le 27B réel ;
 /// il se lance explicitement avec les flags résident/MTP ci-dessous.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[test]
 #[ignore = "requires Metal + 27B MTP model; set SARAGOSSA_RUST_MTP_HISTORY=committed and resident decode flags"]
 fn mtp_committed_two_row_verifier_edges_match_ar() -> Result<()> {
@@ -2969,7 +2969,7 @@ fn mtp_committed_two_row_verifier_edges_match_ar() -> Result<()> {
 
 // --- MTP D1 : états hidden résidents (harnais pairwise `Case::hidden`) ---
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn mtp_hidden_and_embedding_off_outside_harness() {
     #[cfg(feature = "devtools")]
@@ -2981,7 +2981,7 @@ fn mtp_hidden_and_embedding_off_outside_harness() {
 }
 
 /// Garde pairwise D1/Fresh selon l'environnement courant, hidden forcé.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn d1_hidden_guard(resident: bool) -> Result<crate::runtime_flags::pairwise::Guard> {
     use crate::runtime_flags::pairwise::{Case, Guard, Mode};
     let mode = if super::flags::mtp_fresh_cache_enabled() {
@@ -2999,7 +2999,7 @@ fn d1_hidden_guard(resident: bool) -> Result<crate::runtime_flags::pairwise::Gua
     )
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[test]
 fn mtp_hidden_pairwise_guard_is_scoped() -> Result<()> {
     {
@@ -3015,17 +3015,17 @@ fn mtp_hidden_pairwise_guard_is_scoped() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn d1_transfers_reset() {
     MTP_D1_HIDDEN_TRANSFERS.with(|counts| counts.set((0, 0)));
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn d1_transfers() -> (usize, usize) {
     MTP_D1_HIDDEN_TRANSFERS.with(std::cell::Cell::get)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn d1_strict_arena() -> Result<DecodeResidentState> {
     let device = metal::Device::system_default()
         .ok_or_else(|| InferError::Metal("test D1 strict : aucun device Metal".to_string()))?;
@@ -3034,7 +3034,7 @@ fn d1_strict_arena() -> Result<DecodeResidentState> {
 
 /// Bail résident : survit à la réallocation du pool et au drop de l'arène, sans
 /// alias ; `into_cpu` relit exactement les valeurs (1 lecture, 0 upload).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "requires Metal device"]
 fn mtp_d1_resident_state_lease_survives_pool_reuse() -> Result<()> {
@@ -3089,7 +3089,7 @@ fn mtp_d1_resident_state_lease_survives_pool_reuse() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn d1_strict_model() -> Result<(crate::ModelAssets, CausalDecoder)> {
     if !mtp_verifier_env_ready() {
         return Err(InferError::Config(
@@ -3125,12 +3125,12 @@ fn d1_strict_model() -> Result<(crate::ModelAssets, CausalDecoder)> {
 }
 
 /// (sortie, (lectures, uploads) hidden D1, delta (CB, dispatchs) profilé).
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 type D1Run = (SpeculativeOutput, (usize, usize), Option<(u64, u64)>);
 
 /// Une génération MTP sous flag D1 forcé : sortie, compteurs D1 hors prefill, et
 /// delta (CB, dispatchs) si `SARAGOSSA_RUST_DECODE_PROFILE=1`.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn d1_run(
     model: &CausalDecoder,
     prompt: &[usize],
@@ -3151,7 +3151,7 @@ fn d1_run(
 }
 
 /// Vérifie OFF/ON == AR, stats identiques et compteurs D1 attendus.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn d1_check_off_on(
     model: &CausalDecoder,
     name: &str,
@@ -3185,12 +3185,12 @@ fn d1_check_off_on(
     Ok(off)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 const D1_MERGE_SORT_PROMPT: &str = "Écris une fonction Python de tri fusion avec une explication.";
 
 /// Oracle 64 tokens : OFF == ON == AR, acceptations et rejets présents,
 /// OFF=(2n,n) et ON=(0,1) transferts hidden D1, CB/dispatchs égaux si profilés.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[test]
 #[ignore = "requires Metal + 27B MTP model; committed history, resident flags; FRESH_CACHE=0 (D1) ou 1 (Fresh)"]
 fn mtp_d1_resident_hidden_oracle_matches_ar() -> Result<()> {
@@ -3209,7 +3209,7 @@ fn mtp_d1_resident_hidden_oracle_matches_ar() -> Result<()> {
 }
 
 /// Budgets : séparés des arrêts pour borner chaque exécution Metal.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[test]
 #[ignore = "requires Metal + 27B MTP model; committed history, resident flags; FRESH_CACHE=0 (D1) ou 1 (Fresh)"]
 fn mtp_d1_resident_hidden_edges_match_ar() -> Result<()> {
@@ -3228,7 +3228,7 @@ fn mtp_d1_resident_hidden_edges_match_ar() -> Result<()> {
 }
 
 /// EOS, arrêt streaming, D2 hors compteurs D1 et repli direct, sans refaire les budgets.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[test]
 #[ignore = "requires Metal + 27B MTP model; committed history, resident flags; FRESH_CACHE=0 (D1) ou 1 (Fresh)"]
 fn mtp_d1_resident_hidden_stop_and_fallback_match_ar() -> Result<()> {
@@ -3310,7 +3310,7 @@ fn mtp_d1_resident_hidden_stop_and_fallback_match_ar() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[test]
 #[ignore = "requires Metal + 27B MTP model; committed history and resident flags"]
 fn mtp_gpu_block_d2_and_capacity_fallback_without_mutation() -> Result<()> {
@@ -3386,7 +3386,7 @@ fn mtp_gpu_block_d2_and_capacity_fallback_without_mutation() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn resident_sampling_predicates_route_default_and_readback() {
     let default_sample = GenerationOptions {
@@ -3431,7 +3431,7 @@ fn resident_sampling_predicates_route_default_and_readback() {
 /// budget. Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` avec sidecar MTP.
 #[test]
 #[ignore = "modèle réel avec sidecar MTP requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn mtp_sampled_matches_ar_at_low_temperature_real_model() -> Result<()> {
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
@@ -3499,7 +3499,7 @@ fn mtp_sampled_matches_ar_at_low_temperature_real_model() -> Result<()> {
 /// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` avec sidecar MTP.
 #[test]
 #[ignore = "modèle réel avec sidecar MTP requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn mtp_stop_sequences_match_ar_real_model() -> Result<()> {
     use crate::runtime_flags::pairwise::{Case, Guard, Mode};
     let Some(model_dir) = mtp_verifier_model_dir() else {
@@ -3701,7 +3701,7 @@ fn mtp_stop_sequences_match_ar_real_model() -> Result<()> {
 /// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` avec sidecar MTP.
 #[test]
 #[ignore = "modèle réel avec sidecar MTP requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn mtp_early_first_token_streams_once_and_stops_real_model() -> Result<()> {
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
@@ -3763,7 +3763,7 @@ fn mtp_early_first_token_streams_once_and_stops_real_model() -> Result<()> {
 /// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`.
 #[test]
 #[ignore = "modèle réel + draft DFlash requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
     use crate::decoder::resident::dflash::{DFlashTreeMode, DFLASH_APPENDED_CONTEXT};
     let Some(model_dir) = mtp_verifier_model_dir() else {
@@ -3934,7 +3934,7 @@ fn dflash_tree_resident_matches_chain_and_ar_real_model() -> Result<()> {
 /// et `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`.
 #[test]
 #[ignore = "modèle réel BF16 + draft DFlash requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn dflash_default_tree_b4_bf16_matches_ar_real_model() -> Result<()> {
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
@@ -3994,7 +3994,7 @@ fn dflash_default_tree_b4_bf16_matches_ar_real_model() -> Result<()> {
 /// `SARAGOSSA_RUST_DFLASH_QUANT_BITS`, u4 si absente, appliquée aux deux boucles).
 #[test]
 #[ignore = "modèle réel + draft DFlash requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
     use crate::decoder::resident::dflash::DFlashTreeMode;
     // NOTE: les points d'entrée publics lisent `SARAGOSSA_RUST_DFLASH_TREE` ; sans
@@ -4381,7 +4381,7 @@ fn dflash_resident_matches_cpu_loop_real_model() -> Result<()> {
 /// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` avec sidecar MTP.
 #[test]
 #[ignore = "modèle réel avec sidecar MTP requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn mtp_seed_metal_matches_cpu_oracle_real_model() -> Result<()> {
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
@@ -4449,7 +4449,7 @@ fn mtp_seed_metal_matches_cpu_oracle_real_model() -> Result<()> {
 /// format `format` : vérification résidente alternant une ligne (boucle
 /// mono-ligne) et trois lignes (chemin en lignes fusionné), comme le decode
 /// AR et la vérification MTP.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn kv_quant_forced_logits(
     model: &CausalDecoder,
     prompt: &[usize],
@@ -4504,7 +4504,7 @@ fn kv_quant_forced_logits(
 }
 
 /// Rang 1 et 2 d'une ligne de logits : `(argmax, marge top1 − top2)`.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn top2(logits: &[f32]) -> (usize, f32) {
     let mut best = (0, f32::NEG_INFINITY);
     let mut second = f32::NEG_INFINITY;
@@ -4527,7 +4527,7 @@ fn top2(logits: &[f32]) -> (usize, f32) {
 /// top-1 Q8 ≥ 90 %. Requiert `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL`.
 #[test]
 #[ignore = "modèle réel requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn kv_quant_logit_drift_vs_bf16_real_model() -> Result<()> {
     use crate::decode_resident::KvFormat;
     const PROMPT_TOKENS: usize = 6000;
@@ -4594,7 +4594,7 @@ fn kv_quant_logit_drift_vs_bf16_real_model() -> Result<()> {
 /// Poids d'un Qwen dense synthétique à une couche full-attention d256
 /// (16 têtes Q, 2 K/V, QK-norm, MLP SwiGLU) : la forme qu'emprunte le
 /// prefill résident par morceaux avec K/V stocké en bf16 (NAX d256).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn resident_bf16_qwen_weights(
     vocab: usize,
     hidden: usize,
@@ -4676,7 +4676,7 @@ fn resident_bf16_qwen_weights(
 /// - autre branche depuis l'ancre du tour 1 sous une vue plus longue (tour 2) :
 ///   copie, lignes publiées intactes, entrées remplacées libérées ;
 /// - rollback (troncature du cache) puis prolongement : de nouveau en place.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
     if !prefix_cache_enabled()
@@ -4831,7 +4831,7 @@ fn prefix_cache_extends_bf16_kv_in_place_across_turns() -> Result<()> {
 /// qui prenaient avant l’extension en lignes. Seules les ancres alignées et les
 /// prompts complets entrent au cache.
 /// Projections f32 : alignement automatique de 16 (queue de 32).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn prefix_cache_aligned_hits_match_cold_prefill() -> Result<()> {
     check_prefix_cache_aligned_hits(false)
@@ -4840,13 +4840,13 @@ fn prefix_cache_aligned_hits_match_cold_prefill() -> Result<()> {
 /// Comme [`prefix_cache_aligned_hits_match_cold_prefill`] avec q/o en dense
 /// bf16 (GEMM NA dès 64 lignes, qmv en dessous) : alignement automatique de 64.
 /// Témoin : une queue de 40 lignes après un préfixe aligné sur 16 diffère.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn prefix_cache_aligned_hits_match_cold_prefill_dense_bf16() -> Result<()> {
     check_prefix_cache_aligned_hits(true)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn check_prefix_cache_aligned_hits(dense_bf16: bool) -> Result<()> {
     if !prefix_cache_enabled() || prefix_cache_capacity() < 2 {
         return Ok(());
@@ -4967,7 +4967,7 @@ fn check_prefix_cache_aligned_hits(dense_bf16: bool) -> Result<()> {
 /// Seul un Qwen dense à k/v 5120→1024 (Qwen3.8 27B) ouvre ses k/v au
 /// bf16×3 : Qwen 30B et Qwen3-Next (MoE), flint (sinks), un autre Qwen dense
 /// et un modèle hétérogène gardent le plancher.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn qwen_kv_nax_x3_shape_targets_dense_qwen_27b_only() {
     let qwen = CausalDecoderConfig {
@@ -5020,7 +5020,7 @@ fn qwen_kv_nax_x3_shape_targets_dense_qwen_27b_only() {
 /// (référence séquentielle voulue).
 #[test]
 #[ignore = "modèle réel requis, bench"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn verify_rows_cost_bench_real_model() -> Result<()> {
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
@@ -5177,7 +5177,7 @@ fn verify_rows_cost_bench_real_model() -> Result<()> {
 /// restaurés sont validés contre la référence.
 #[test]
 #[ignore = "modèle MoE réel requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn moe_verify_rows_match_single_rows_real_model() -> Result<()> {
     const PROMPT_TOKENS: usize = 512;
     const FORCED: usize = 16;
@@ -5339,7 +5339,7 @@ fn moe_verify_rows_match_single_rows_real_model() -> Result<()> {
 /// un modèle MoE.
 #[test]
 #[ignore = "modèle réel requis, bench"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn lookup_greedy_abba_vs_ar_real_model() -> Result<()> {
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
@@ -5418,7 +5418,7 @@ fn lookup_greedy_abba_vs_ar_real_model() -> Result<()> {
 /// qu'au moins un arrêt tombe parmi des drafts acceptés.
 #[test]
 #[ignore = "modèle réel requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn lookup_greedy_matches_ar_real_model() -> Result<()> {
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
@@ -5518,7 +5518,7 @@ fn lookup_greedy_matches_ar_real_model() -> Result<()> {
 /// Diagnostic d'un écart AR/DFlash au token `index` : probabilités, sous la
 /// cible filtrée de l'AR (logits du decode résident forcé sur le préfixe
 /// commun), des deux tokens et uniforme du tirage `index` de la graine.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn dflash_sampled_divergence(
     model: &CausalDecoder,
     prompt: &[usize],
@@ -5570,7 +5570,7 @@ fn dflash_sampled_divergence(
 /// et `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`.
 #[test]
 #[ignore = "modèle réel + draft DFlash requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn dflash_sampled_matches_ar_real_model() -> Result<()> {
     use crate::decoder::resident::dflash::DFlashTreeMode;
     let Some((model, assets, draft)) = dflash_sampled_model()? else {
@@ -5636,7 +5636,7 @@ fn dflash_sampled_matches_ar_real_model() -> Result<()> {
 }
 
 /// Modèle, assets et drafter des tests DFlash échantillonnés (`None` : skip).
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn dflash_sampled_model() -> Result<Option<(CausalDecoder, crate::ModelAssets, crate::DFlashDraft)>>
 {
     let Some(model_dir) = mtp_verifier_model_dir() else {
@@ -5659,7 +5659,7 @@ fn dflash_sampled_model() -> Result<Option<(CausalDecoder, crate::ModelAssets, c
     Ok(Some((model, assets, draft)))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn dflash_sampled_options() -> GenerationOptions {
     GenerationOptions {
         temperature: 0.7,
@@ -5680,7 +5680,7 @@ fn dflash_sampled_options() -> GenerationOptions {
 /// Requiert les mêmes variables que `dflash_sampled_matches_ar_real_model`.
 #[test]
 #[ignore = "modèle réel + draft DFlash requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn dflash_sampled_stops_match_ar_real_model() -> Result<()> {
     use crate::decoder::resident::dflash::DFlashTreeMode;
     let Some((model, assets, draft)) = dflash_sampled_model()? else {
@@ -5784,7 +5784,7 @@ fn dflash_sampled_stops_match_ar_real_model() -> Result<()> {
 /// Prompts du corpus figé (`tests/fixtures/rowsexact`) : liste de noms sans
 /// extension (`SARAGOSSA_RUST_IDENTITY_PROMPTS`, virgules), sinon les prompts
 /// courts (chat et code 4k ; le cas prose32k-1 se demande explicitement).
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn identity_corpus() -> Result<Vec<(String, String)>> {
     let names =
         crate::runtime_flags::env_var("SARAGOSSA_RUST_IDENTITY_PROMPTS").unwrap_or_else(|| {
@@ -5836,7 +5836,7 @@ fn identity_corpus() -> Result<Vec<(String, String)>> {
 }
 
 /// Bilan d'un mode spéculatif contre l'AR sur un prompt.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[derive(Default, Debug)]
 struct IdentityTally {
     /// Lignes vérifiées dont le chemin d'entrée est celui de l'AR.
@@ -5857,7 +5857,7 @@ struct IdentityTally {
 /// Compare les vérifications enregistrées (`VERIFY_RECORDER`) aux états AR :
 /// une ligne n'est comparée que si toute sa chaîne d'ancêtres (chaîne ou
 /// arbre) porte les tokens de l'AR aux mêmes positions.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn identity_compare_records(
     records: &[super::resident::VerifyRecord],
     sequence: &[usize],
@@ -5944,7 +5944,7 @@ fn identity_compare_records(
 /// dans docs/perf/greedy-identity.md.
 #[test]
 #[ignore = "modèle réel requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn greedy_identity_states_real_model() -> Result<()> {
     use crate::decoder::resident::dflash::DFlashTreeMode;
     use crate::decoder::resident::VERIFY_RECORDER;
@@ -6292,7 +6292,7 @@ fn greedy_identity_states_real_model() -> Result<()> {
 /// et le NAX des vérifications, voir docs/perf/greedy-identity.md).
 #[test]
 #[ignore = "modèle réel requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
     use crate::decoder::resident::VERIFY_RECORDER;
     let Some(model_dir) = mtp_verifier_model_dir() else {
@@ -6480,7 +6480,7 @@ fn greedy_identity_prefix_reuse_real_model() -> Result<()> {
 
 /// Le branchement du prefill MTP doit être exercé par la génération : le repli
 /// calcule aussi les bons K/V, mais les matérialise sur CPU avant leur publication.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_generation_publishes_shared_seed_history() -> Result<()> {
@@ -6559,7 +6559,7 @@ fn mtp_generation_publishes_shared_seed_history() -> Result<()> {
 
 /// Le préfixe retient les buffers MTP figés ; prolonger ou tronquer la copie
 /// de travail ne réécrit aucune ligne publiée et ne matérialise pas de Vec.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_seed_shared_prefix_keeps_allocations() -> Result<()> {
@@ -6621,7 +6621,7 @@ fn mtp_seed_shared_prefix_keeps_allocations() -> Result<()> {
 /// Profondeurs MTP fixes 1 à 4 (cycle fusionné en D2, chemin général sinon) :
 /// la sortie greedy reste celle de l'AR, avec acceptations à chaque position et
 /// rejets, donc retour arrière du KV MTP exercé à chaque profondeur.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_fixed_depths_match_ar_synthetic() -> Result<()> {
@@ -6655,7 +6655,7 @@ fn mtp_fixed_depths_match_ar_synthetic() -> Result<()> {
 
 /// Bridage `--gpu-share` : la sortie greedy (AR et MTP D2) est celle du chemin
 /// non bridé, seul le temps change.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn gpu_share_keeps_greedy_output_synthetic() -> Result<()> {
@@ -6720,7 +6720,7 @@ fn gpu_share_keeps_greedy_output_synthetic() -> Result<()> {
 /// Profondeur fixe 2 avec tête de draft u4 tirée du lm_head bf16 du tronc
 /// (`quantize_draft_lm_head_u4`, défaut des cibles bf16) : la vérification reste
 /// faite par le lm_head bf16, la sortie greedy est donc celle de l'AR.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_d2_u4_draft_head_matches_ar_synthetic() -> Result<()> {
@@ -6771,7 +6771,7 @@ fn mtp_d2_u4_draft_head_matches_ar_synthetic() -> Result<()> {
     })
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
     mtp_synthetic_model_with(|_| Ok(()))
 }
@@ -6783,7 +6783,7 @@ pub(super) fn mtp_seed_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> 
 /// irrégulière chez l'un ou l'autre. Avec ce poids `−1` (mesuré : `−0,5` et
 /// `−2` ne laissent que des acceptations ou que des rejets), chaque profondeur
 /// 1 à 4 voit des acceptations à toutes les positions et des rejets.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn mtp_sign_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
     mtp_synthetic_model_with(|weights| {
         let hidden = weights["norm.weight"].data().len();
@@ -6804,7 +6804,7 @@ fn mtp_sign_synthetic_model() -> Result<(CausalDecoder, Vec<usize>)> {
     })
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn mtp_synthetic_model_with(
     tweak: impl FnOnce(&mut HashMap<String, Tensor>) -> Result<()>,
 ) -> Result<(CausalDecoder, Vec<usize>)> {
@@ -6860,7 +6860,7 @@ fn mtp_synthetic_model_with(
 
 /// Couvre le branchement réel, l'adoption, la copie sous contention, les
 /// préfixes chauds/étendus et le retour au contrat f32 forcé.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_bf16_history_generation_adoption_and_f32_fallback() -> Result<()> {
@@ -6990,7 +6990,7 @@ fn mtp_bf16_history_generation_adoption_and_f32_fallback() -> Result<()> {
 
 /// La copie MTP refuse après l'installation du tronc : tous ses claims
 /// doivent être rendus, et le refus doit rester un repli, pas une erreur.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_bf16_busy_claim_memory_guard_cleans_setup() -> Result<()> {
@@ -7059,7 +7059,7 @@ fn mtp_bf16_busy_claim_memory_guard_cleans_setup() -> Result<()> {
 
 /// Refus réel de la garde APRÈS semis bf16, à froid et après extension.
 /// Compare le triplet reconstruit et la génération, émission précoce comprise.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn mtp_bf16_post_seed_refusal_rebuilds_f32_and_streams_once() -> Result<()> {
@@ -7358,7 +7358,7 @@ fn mtp_bf16_prefix_compatibility_and_shared_accounting_cpu() -> Result<()> {
 
 /// Validation explicite sur poids locaux : taille configurable pour 4k/32k/256k.
 /// Aucune recherche ni acquisition de modèle ; absence de paramètres = échec.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[test]
 #[ignore = "requiert Metal et un modèle MTP local explicitement fourni"]
 fn mtp_bf16_real_greedy_ids_and_memory() -> Result<()> {
@@ -7544,7 +7544,7 @@ fn prefix_cache_purge_recovers_poisoned_mutex() -> Result<()> {
         final_state: Tensor::row(vec![0.0]).expect("invariant: ligne non vide"),
         mtp_history: None,
         captures: None,
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         linear_metal: Vec::new(),
     };
     for poisoned in [false, true] {
@@ -7586,7 +7586,7 @@ fn prefix_cache_purge_recovers_poisoned_mutex() -> Result<()> {
 /// `SARAGOSSA_RUST_DFLASH_DRAFT_DIR`, routage et cache de préfixe actifs.
 #[test]
 #[ignore = "modèle réel + sidecar MTP + draft DFlash requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn spec_route_alternation_reuses_prefix_real_model() -> Result<()> {
     let Some(model_dir) = mtp_verifier_model_dir() else {
         return Ok(());
@@ -7869,7 +7869,7 @@ fn mini_llama_config(
 
 /// Le tail dense résident fige l'activation (SwiGLU, GeGLU sous normes FFN
 /// Gemma) : un GeGLU sans ces normes, avec ou sans QK-norm, reste au per-op.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn resident_full_refuses_dense_activation_without_its_tail() -> Result<()> {
     use crate::Activation::{GeluTanh, Silu};
@@ -7897,7 +7897,7 @@ fn resident_full_refuses_dense_activation_without_its_tail() -> Result<()> {
 
 /// La trame TTS fusionnée applique toujours la QK-norm : une couche sans
 /// QK-norm est écartée en amont, avant toute résolution de poids.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "tts"))]
+#[cfg(all(gpu_metal, feature = "tts"))]
 #[test]
 fn tts_cp_fused_layer_requires_qk_norm() -> Result<()> {
     use crate::decoder::resident::tts_codebooks::tts_cp_fused_layer_eligible;
@@ -7921,7 +7921,7 @@ fn tts_cp_fused_layer_requires_qk_norm() -> Result<()> {
 /// Sans porte de sortie (Llama, Mistral), la vérification en lignes n'existe
 /// pas : la boucle lookup est inéligible et la génération reste celle du
 /// decode ordinaire, au lieu d'échouer au premier draft.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn lookup_greedy_falls_back_without_output_gate() -> Result<()> {
@@ -7964,7 +7964,7 @@ fn lookup_greedy_falls_back_without_output_gate() -> Result<()> {
 /// Llama 3.2 1B, d128 ×8 comme Llama 3.1 8B, contexte d'origine 8192) contre
 /// le CPU, sur des positions qui franchissent 8192. Le témoin non scalé prouve
 /// que l'écart serait vu si le setup résident perdait la table scalée.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn resident_llama3_rope_matches_cpu_oracle() -> Result<()> {
@@ -8039,7 +8039,7 @@ fn resident_llama3_rope_matches_cpu_oracle() -> Result<()> {
 /// RoPE llama3 : les logits d'un mini-Llama à poids pseudo-aléatoires sont ceux
 /// du CPU, sur ~300 positions bien au-delà de `original_max_position_embeddings`
 /// (64) avec un facteur 32, là où la table scalée diffère de la table standard.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn llama3_rope_metal_matches_cpu_oracle() -> Result<()> {

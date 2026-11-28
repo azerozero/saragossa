@@ -1,5 +1,5 @@
 use super::*;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::InferError;
 use crate::{CausalDecoder, CausalDecoderConfig};
 
@@ -244,7 +244,7 @@ fn tts_prefill_memo_retains_compact_prefix_with_many_layers() -> Result<()> {
 }
 
 #[test]
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[ignore = "Metal : modèle VoiceDesign local, égalité exacte multi-voix des états, K/V et codes"]
 fn tts_prefill_memo_metal_codes_identical_multiple_voices() -> Result<()> {
     use crate::runtime_flags::with_tts_prefill_cache_for_test;

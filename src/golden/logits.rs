@@ -193,7 +193,7 @@ fn external_logits_comparison_keeps_strict_gates_and_bounds_bf16() {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compare(name: &str, env: &str, comparison: Comparison) -> TestResult {
     // POURQUOI : le GEMM groupé coop du prefill MoE est un chemin bf16 tensor-core
     // (classe near-tie, cf. `moe_routed_coop_prefill_enabled`) ; face à la référence
@@ -208,7 +208,7 @@ fn compare(name: &str, env: &str, comparison: Comparison) -> TestResult {
     compare_inner(name, env, comparison)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compare_inner(name: &str, env: &str, comparison: Comparison) -> TestResult {
     let Some(path) = local(env)? else {
         return Ok(());
@@ -260,7 +260,7 @@ fn compare_inner(name: &str, env: &str, comparison: Comparison) -> TestResult {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 macro_rules! oracle {
     ($test:ident, $name:literal, $env:literal, $comparison:expr) => {
         #[test]
@@ -270,42 +270,42 @@ macro_rules! oracle {
         }
     };
 }
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 oracle!(
     external_logits_qwen38,
     "qwen38",
     "SARAGOSSA_QWEN38_DIR",
     Comparison::Strict
 );
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 oracle!(
     external_logits_qwen36_moe,
     "qwen36_moe",
     "SARAGOSSA_QWEN36_MOE_DIR",
     Comparison::KnownBf16 { max_mismatches: 2 }
 );
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 oracle!(
     external_logits_gemma3,
     "gemma3",
     "SARAGOSSA_GEMMA3_DIR",
     Comparison::Strict
 );
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 oracle!(
     external_logits_gemma4,
     "gemma4",
     "SARAGOSSA_GEMMA4_DIR",
     Comparison::KnownBf16 { max_mismatches: 7 }
 );
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 oracle!(
     external_logits_gemma4_f32,
     "gemma4",
     "SARAGOSSA_GEMMA4_DIR",
     Comparison::Float32
 );
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 oracle!(
     external_logits_qwen36_moe_f32,
     "qwen36_moe",

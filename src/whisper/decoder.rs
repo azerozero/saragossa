@@ -77,7 +77,7 @@ fn silence_verdict(no_speech_prob: f32, avg_logprob: f64) -> bool {
 }
 
 /// État du decode RÉSIDENT (poids GPU + KV résident) lié à une génération.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 struct ResidentDecode<'a> {
     metal: &'a crate::MetalExecutor,
     dec: crate::metal_backend::WhisperResidentDecoder,
@@ -89,7 +89,7 @@ struct ResidentDecode<'a> {
 #[derive(Clone, Copy)]
 enum AudioFeatures<'a> {
     Host(&'a Tensor),
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     Resident(&'a crate::metal_backend::WhisperResidentMatrix),
 }
 
@@ -213,7 +213,7 @@ impl WhisperDecoder {
         }
         // Backend decode : RÉSIDENT (GPU, un command buffer/token, zéro readback)
         // par défaut sur Metal ; `SARAGOSSA_STT_DECODER_PEROP=1` rebascule per-op.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let mut resident: Option<ResidentDecode<'_>> = match runtime.metal_executor() {
             Some(metal)
                 if crate::runtime_flags::env_var_os("SARAGOSSA_STT_DECODER_PEROP").is_none() =>
@@ -236,14 +236,14 @@ impl WhisperDecoder {
             }
             _ => None,
         };
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let mut resident: Option<()> = None;
 
         let cross = match (resident.is_none(), features) {
             (true, AudioFeatures::Host(audio_features)) => {
                 self.precompute_cross_kv(audio_features, runtime)?
             }
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             (true, AudioFeatures::Resident(_)) => {
                 return Err(InferError::Config(
                     "features Whisper résidentes sans décodeur résident".to_string(),
@@ -262,7 +262,7 @@ impl WhisperDecoder {
                         want_logits: bool,
                         self_kv: &mut [LayerSelfKv]|
          -> Result<DecodeStep> {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             if let Some(rd) = resident.as_mut() {
                 use crate::metal_backend::{WhisperStepEmit, WhisperStepOutput};
                 let h = self.embed_tokens_at(&[token], position)?;
@@ -393,7 +393,7 @@ impl WhisperDecoder {
     }
 
     /// Prépare les poids GPU (mémoïsés) du décodeur résident.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn build_resident_decoder(
         &self,
         metal: &crate::MetalExecutor,
@@ -588,11 +588,11 @@ impl WhisperDecoder {
         // Head = embeddings liés (biasless). Sur Metal, le matmul vocab (51866×1280)
         // part sur GPU (buffer poids mémoïsé par ptr) au lieu du matmul CPU 66 M
         // MAC/token ; l'argmax reste CPU sur les logits relus (~207 ko).
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = runtime.metal_executor() {
             return metal.matmul_rhs_t_dense(&last, &self.token_embeddings);
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = runtime;
         last.matmul_rhs_t(&self.token_embeddings)
     }
@@ -749,7 +749,7 @@ impl WhisperModel {
         // Features gardées sur le GPU jusqu'au KV cross (identiques au bit :
         // seules des copies f32 disparaissent). `SARAGOSSA_STT_FEATURES_HOST=1`
         // rétablit le readback ; les replis per-op le rétablissent aussi.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = runtime.metal_executor() {
             if !crate::runtime_flags::stt_features_host()
                 && crate::runtime_flags::env_var_os("SARAGOSSA_STT_DECODER_PEROP").is_none()
@@ -1299,7 +1299,7 @@ mod tests {
         crate::test_support::require_real_model(snapshot, "snapshot openai/whisper-tiny")
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn live_runtime() -> ForwardRuntime<'static> {
         let metal = Box::leak(Box::new(
             crate::MetalExecutor::new().expect("invariant: Metal disponible pour le test live"),
@@ -1307,7 +1307,7 @@ mod tests {
         ForwardRuntime::metal(metal)
     }
 
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     fn live_runtime() -> ForwardRuntime<'static> {
         ForwardRuntime::cpu()
     }

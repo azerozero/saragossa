@@ -8,13 +8,13 @@
 //! lignes ne sont pas bit-identiques au qmv mono-ligne du solo : la dérive
 //! (~1e-6) est mesurée par l'oracle multi-flux, d'où l'activation explicite.
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use super::*;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::decode_resident::MultiFullAttnStream;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl CausalDecoder {
     /// Renvoie `true` si le pas multi-flux dense s'applique au cache résident :
     /// couches full-attn denses (porte de sortie, sans fenêtre glissante, sinks,
@@ -355,7 +355,7 @@ impl CausalDecoder {
 /// Oracles multi-flux sur le modèle dense hybride réel (Qwen3.8-27B) :
 /// `SARAGOSSA_RUST_MTP_VERIFIER_TEST_MODEL` pointe vers ses poids. Mode strict
 /// conseillé : `SARAGOSSA_RUST_QMM_SKINNY=0`.
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 mod tests {
     use super::*;
 

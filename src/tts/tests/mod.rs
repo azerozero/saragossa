@@ -9,7 +9,7 @@ use std::time::Instant;
 
 mod assets;
 mod codec;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 mod fused;
 mod golden;
 mod guards;

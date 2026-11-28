@@ -196,7 +196,7 @@ fn linear_attention_rejects_incompatible_heads() {
     assert!(matches!(err, InferError::Dimension(_)));
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn linear_attention_resident_metal_matches_cpu_cached_sequence() -> Result<()> {
     let executor = match crate::MetalExecutor::new() {
@@ -239,7 +239,7 @@ fn linear_attention_resident_metal_matches_cpu_cached_sequence() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn linear_attention_batch_resident_dk128_matches_cpu_cached_sequence() -> Result<()> {
     let executor = match crate::MetalExecutor::new() {

@@ -179,7 +179,7 @@ fn gemma4_unified_tied_embeddings_match_explicit_lm_head() {
     assert_eq!(tied_logits.data(), explicit_logits.data());
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn gemma4_moe_greedy_tokens_match_cpu_and_gpu() {
     let tmp = tempfile::NamedTempFile::new().expect("invariant: fichier temporaire");
@@ -254,7 +254,7 @@ fn gemma4_moe_greedy_tokens_match_cpu_and_gpu() {
     assert_eq!(resident_tokens, per_op_tokens, "{diagnostics}");
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compare_prefill_paths(
     decoder: &crate::CausalDecoder,
     per_op_cache: &crate::CausalDecoderCache,
@@ -318,7 +318,7 @@ fn compare_prefill_paths(
     )
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn max_abs_delta(left: &[f32], right: &[f32]) -> f32 {
     left.iter()
         .zip(right)
@@ -328,7 +328,7 @@ fn max_abs_delta(left: &[f32], right: &[f32]) -> f32 {
 
 #[test]
 #[ignore = "requiert le snapshot HF local gemma-4-26b-a4b-it-4bit"]
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn gemma4_resident_prefill_tokens_match_per_op() {
     let Some(model_dir) = real_gemma4_snapshot() else {
         eprintln!("snapshot Gemma 4 réel absent, test ignoré proprement");

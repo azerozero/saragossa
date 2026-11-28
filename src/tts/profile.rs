@@ -56,22 +56,22 @@ pub(super) struct FrameProfile {
     sites: Option<Vec<SiteCounts>>,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 type SiteCounts = std::collections::HashMap<crate::metal_backend::DispatchProfileSite, u64>;
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 type SiteCounts = ();
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn sites_snapshot(enabled: bool) -> Option<SiteCounts> {
     enabled.then(crate::metal_backend::decode_profile_dispatch_sites_snapshot)
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn sites_snapshot(_enabled: bool) -> Option<SiteCounts> {
     None
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn gpu_counters() -> [u64; 4] {
     let (command_buffers, wait_ns, _, dispatches) = crate::metal_backend::decode_profile_snapshot();
     [
@@ -82,7 +82,7 @@ fn gpu_counters() -> [u64; 4] {
     ]
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn gpu_counters() -> [u64; 4] {
     [0; 4]
 }
@@ -111,7 +111,7 @@ impl FrameProfile {
         let out = work();
         let wall = started.elapsed();
         let after = gpu_counters();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let (Some(before), Some(sites)) = (sites_before, self.sites.as_mut()) {
             let counts = &mut sites[phase as usize];
             for (site, count) in crate::metal_backend::decode_profile_dispatch_sites_snapshot() {
@@ -121,7 +121,7 @@ impl FrameProfile {
                 }
             }
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = sites_before;
         let delta = |index: usize| after[index].saturating_sub(before[index]);
         let totals = &mut self.totals[phase as usize];
@@ -155,7 +155,7 @@ impl FrameProfile {
             ));
         }
         eprintln!("{line}");
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(sites) = &self.sites {
             for ((name, _), counts) in PHASES.iter().zip(sites) {
                 let mut rows = counts.iter().collect::<Vec<_>>();

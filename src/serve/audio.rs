@@ -38,7 +38,7 @@ use serde_json::json;
 use saragossa::tts::TTS_GENERATION_HARD_CAP;
 #[cfg(any(feature = "stt", feature = "diar"))]
 use saragossa::ForwardRuntime;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[cfg(any(feature = "stt", feature = "diar"))]
 use saragossa::MetalExecutor;
 #[cfg(feature = "stt")]
@@ -104,18 +104,18 @@ pub(super) struct AudioState {
 #[cfg(any(feature = "stt", feature = "diar"))]
 struct AudioModel<M> {
     model: M,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     metal: Option<MetalExecutor>,
 }
 
 #[cfg(any(feature = "stt", feature = "diar"))]
 impl<M> AudioModel<M> {
     fn load(model: M, backend: RuntimeKind) -> ServeResult<Self> {
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = backend;
         Ok(Self {
             model,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             metal: if backend == RuntimeKind::Metal {
                 Some(MetalExecutor::new()?)
             } else {
@@ -125,7 +125,7 @@ impl<M> AudioModel<M> {
     }
 
     fn forward_runtime(&self) -> ForwardRuntime<'_> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = self.metal.as_ref() {
             return ForwardRuntime::metal(metal);
         }
@@ -331,7 +331,7 @@ impl AudioState {
                 path.display()
             )));
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         if self.backend == RuntimeKind::Metal {
             return Err(ServeError::args(
                 "backend metal STT indisponible dans ce build — recompile avec --features metal",
@@ -366,7 +366,7 @@ impl AudioState {
                         "endpoint diarisation non configuré: relancez saragossa serve avec --diar-model <dir>",
                     )
                 })?;
-                #[cfg(not(all(target_os = "macos", feature = "metal")))]
+                #[cfg(not(gpu_metal))]
                 if self.backend == RuntimeKind::Metal {
                     return Err(ServeError::args(
                         "backend metal diarisation indisponible — recompiler avec --features metal",
