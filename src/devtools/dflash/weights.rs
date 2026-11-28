@@ -135,7 +135,7 @@ impl<'a> DraftWeights<'a> {
         let key = format!("{prefix}.weight");
         let info = self.info(&key)?;
         expect_shape(&info.shape, &[rows, cols], &key)?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let (Some(quant), Some(metal)) = (quant, self.runtime.metal_executor()) {
             if crate::runtime_flags::single_copy_weights_enabled() {
                 let (packed_cols, groups) =
@@ -168,7 +168,7 @@ impl<'a> DraftWeights<'a> {
                 );
             }
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = self.runtime;
         let tensor = self.tensor(&key)?;
         match quant {
@@ -182,7 +182,7 @@ impl<'a> DraftWeights<'a> {
 
     /// Même cœur affine que le chargeur CPU, par blocs de lignes : les codes
     /// sont calculés AVANT l'arrondi bf16, comme dans l'ancien upload Metal.
-    #[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+    #[cfg(any(test, gpu_metal))]
     fn quantize_into(
         &self,
         key: &str,
@@ -457,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[ignore = "requiert un device Metal ; poids synthétiques uniquement"]
     fn streamed_metal_weights_match_legacy_upload() -> Result<()> {
         let metal = crate::MetalExecutor::new()?;

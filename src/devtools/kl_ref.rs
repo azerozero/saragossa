@@ -294,12 +294,12 @@ impl Metrics {
 
 /// NOTE: `SARAGOSSA_KL_KV_BF16=1` fait passer l'arène de référence en bf16, seul
 /// dtype où `SARAGOSSA_RUST_KV_QUANT` s'applique ; sans lui l'arène reste f32.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn kv_bf16() -> bool {
     std::env::var_os("SARAGOSSA_KL_KV_BF16").is_some_and(|value| value == "1")
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn record_rows(
     model: &CausalDecoder,
     prompt: &[usize],
@@ -327,7 +327,7 @@ fn record_rows(
     Ok((ids, rows))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compare_rows(model: &CausalDecoder, meta: &Metadata) -> Result<Vec<Vec<f32>>> {
     let (mut cache, state) = model.resident_reference_start(&meta.prompt_ids, meta.n, kv_bf16())?;
     let mut rows = vec![model.resident_reference_initial_logits(&cache, &state)?];
@@ -343,12 +343,12 @@ fn compare_rows(model: &CausalDecoder, meta: &Metadata) -> Result<Vec<Vec<f32>>>
     Ok(rows)
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn record_rows(_: &CausalDecoder, _: &[usize], _: usize) -> Result<(Vec<usize>, Vec<Vec<f32>>)> {
     Err(invalid("Metal résident requis"))
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn compare_rows(_: &CausalDecoder, _: &Metadata) -> Result<Vec<Vec<f32>>> {
     Err(invalid("Metal résident requis"))
 }

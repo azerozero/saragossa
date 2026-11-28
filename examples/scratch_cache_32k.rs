@@ -4,24 +4,24 @@
 //!   cargo run -p saragossa --release --features metal \
 //!     --example scratch_cache_32k -- <model_dir> [prompt_tokens] [max_tokens] [repeats]
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use std::path::Path;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use std::time::Instant;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use saragossa::{
     load_causal_decoder_for_metal, GenerationOptions, KernelProfile, MetalExecutor, ModelAssets,
 };
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn synth_ids(len: usize) -> Vec<usize> {
     (0..len)
         .map(|index| (index * 7 + 13) % 30_000 + 1)
         .collect()
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn parse_positive(value: Option<String>, default: usize, label: &str) -> Result<usize, String> {
     let Some(value) = value else {
         return Ok(default);
@@ -33,7 +33,7 @@ fn parse_positive(value: Option<String>, default: usize, label: &str) -> Result<
         .ok_or_else(|| format!("{label} doit être un entier > 0"))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn token_md5(tokens: &[usize]) -> String {
     let mut context = md5::Context::new();
     for token in tokens {
@@ -42,7 +42,7 @@ fn token_md5(tokens: &[usize]) -> String {
     format!("{:x}", context.finalize())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn token_ids(tokens: &[usize]) -> String {
     tokens
         .iter()
@@ -51,7 +51,7 @@ fn token_ids(tokens: &[usize]) -> String {
         .join(",")
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let model_dir = args
@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     Err("cet exemple nécessite macOS et la feature metal".into())
 }

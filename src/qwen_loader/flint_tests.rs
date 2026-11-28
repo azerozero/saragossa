@@ -385,7 +385,7 @@ fn flint_rejects_missing_sink_and_orphan_tensors() {
 
 /// Decode résident complet (sinks, NoPE, fenêtre dépassée, MoE sigmoïde et
 /// expert partagé sans gate) contre l'oracle CPU, sur prefill CPU commun.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_resident_decode_matches_cpu_oracle() {
     let cpu = load(flint_tensors(true)).expect("invariant: flint synthétique");
@@ -447,7 +447,7 @@ fn synthetic_flint_resident_decode_matches_cpu_oracle() {
 
 /// Déchargement d'inactivité : le décodeur est abandonné (poids, arènes, KV)
 /// puis rechargé ; la sortie greedy résidente reste identique au bit.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "GPU synthétique : exécuté par gpu-synthetic.yml"]
 fn synthetic_flint_greedy_identical_after_unload_and_reload() {
@@ -468,7 +468,7 @@ fn synthetic_flint_greedy_identical_after_unload_and_reload() {
 }
 
 /// Même oracle synthétique, toutes les compilations du runtime sans fast-math.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "GPU synthétique : exécuté par gpu-synthetic.yml"]
 fn synthetic_flint_resident_decode_without_fast_math_matches_cpu_oracle() {
@@ -482,7 +482,7 @@ fn synthetic_flint_resident_decode_without_fast_math_matches_cpu_oracle() {
 /// flux, chacun identique au flux seul, et chaque pas par le decode résident.
 /// Le flux de 600 tokens dépasse de loin la fenêtre synthétique de 2 ; il
 /// tient en un morceau de prefill résident (4096 par défaut).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_lightbatch_matches_solo_on_resident_decode() {
     let gpu = load(flint_tensors(true))
@@ -525,7 +525,7 @@ fn synthetic_flint_lightbatch_matches_solo_on_resident_decode() {
 /// Le pas multi-flux dense refuse flint (sinks, fenêtre, MoE sigmoïde) : le
 /// light-batch profilé retombe sur le time-slicing, un pas par flux et par
 /// token, chaque flux identique à son solo.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_lightbatch_multi_falls_back_to_time_slicing() {
     let gpu = load(flint_tensors(true))
@@ -563,7 +563,7 @@ fn synthetic_flint_lightbatch_multi_falls_back_to_time_slicing() {
 /// sigmoïde avec expert partagé sans gate) contre le prefill per-op CPU sur
 /// toutes les positions, puis greedy (prefill Metal + decode résident) contre
 /// le CPU.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_resident_prefill_matches_cpu_oracle() {
     let cpu = load(flint_tensors(true)).expect("invariant: flint synthétique");
@@ -608,7 +608,7 @@ fn synthetic_flint_resident_prefill_matches_cpu_oracle() {
 /// gate). Le coop arrondit en bf16 les activations d'entrée et l'intermédiaire
 /// SwiGLU ; le qmv garde du f32 : l'écart relatif attendu est de l'ordre de
 /// quelques 2^-9 par couche MoE.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_moe_coop_matches_qmv() {
     let executor = crate::MetalExecutor::new().expect("invariant: device Metal");
@@ -655,7 +655,7 @@ fn synthetic_flint_moe_coop_matches_qmv() {
 /// Kernels coop tuilés contre 16 × 32 sur le prefill résident flint
 /// synthétique (deux couches MoE) : hidden bit à bit identiques, puis greedy
 /// identique. Le compteur prouve que le tuilé sert les deux couches.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_moe_coop_tiled_matches_16x32() {
     let executor = crate::MetalExecutor::new().expect("invariant: device Metal");
@@ -702,7 +702,7 @@ fn synthetic_flint_moe_coop_tiled_matches_16x32() {
 /// Repli exécuté : sans le pipeline scatter u4 du coop groupé, le prefill
 /// résident flint doit passer par le qmv sur ses deux couches MoE et rendre
 /// exactement les hidden du qmv.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_moe_coop_falls_back_without_pipelines() {
     let mut executor = crate::MetalExecutor::new().expect("invariant: device Metal");
@@ -722,12 +722,12 @@ fn synthetic_flint_moe_coop_falls_back_without_pipelines() {
     assert_eq!(fallback.data(), qmv.data(), "repli != qmv");
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 const SYNTHETIC_COOP_PROMPT: [usize; 17] = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6, 1, 0, 4, 5, 7, 6];
 
 /// Prefill résident du prompt synthétique, bascule flint coop forcée, et
 /// couches MoE routées (coop exécuté, repli qmv faute de pipelines) comptées.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn traced_coop_prefill(gpu: &CausalDecoder, coop: bool) -> (Tensor, (usize, usize)) {
     crate::metal_backend::with_flint_moe_coop_override(coop, || {
         let (ran, fallback) = crate::metal_backend::routed_coop_trace_for_test();
@@ -743,7 +743,7 @@ fn traced_coop_prefill(gpu: &CausalDecoder, coop: bool) -> (Tensor, (usize, usiz
     })
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn max_gap(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter()
@@ -755,7 +755,7 @@ fn max_gap(a: &[f32], b: &[f32]) -> f32 {
 /// Prefill résident par morceaux (sinks à décalage : requêtes locales,
 /// K/V, causalité et fenêtre absolus) contre le même prefill en un morceau,
 /// sur des coupes qui tombent dans la fenêtre de 2 et autour.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_chunked_prefill_matches_single_chunk() {
     let gpu = load(flint_tensors(true))
@@ -781,7 +781,7 @@ fn synthetic_flint_chunked_prefill_matches_single_chunk() {
 /// Prolongement résident d'un préfixe (reliquat sous le seuil de 32 tokens
 /// des autres modèles) contre le prefill complet, puis greedy depuis l'état
 /// prolongé contre le CPU.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_prefix_extension_matches_full_prefill() {
     let cpu = load(flint_tensors(true)).expect("invariant: flint synthétique");
@@ -830,7 +830,7 @@ fn synthetic_flint_prefix_extension_matches_full_prefill() {
 /// fenêtrée), puis prolongement d'un préfixe et greedy. La dérive des hidden
 /// est chiffrée ; les tokens greedy doivent rester ceux du CPU. Sans le flag flint,
 /// le seuil seul ne change aucun octet.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_prefill_kv_bf16_store_drift() {
     let cpu = load(flint_tensors(true)).expect("invariant: flint synthétique");
@@ -908,7 +908,7 @@ fn synthetic_flint_prefill_kv_bf16_store_drift() {
 /// couche pendant le decode, et les tokens échantillonnés (arène bf16) sont
 /// ceux du semis par copie. Sans le flag flint, le K/V reste f32 : rien n'est
 /// adoptable.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
     let gpu = |sinks| {
@@ -977,7 +977,7 @@ fn synthetic_flint_arena_adopts_prefill_kv_bf16() {
 /// (dernier morceau plus court que la fenêtre), 3 et 5 lignes, puis sur un
 /// tour 2 dont le préfixe est plus court ou plus long que la fenêtre. Les
 /// couches glissantes ne gardent que leur fenêtre, la couche pleine tout.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_window_kv_matches_full_kv_bit_for_bit() {
     let gpu = |window, bf16| {
@@ -1073,7 +1073,7 @@ fn synthetic_flint_window_kv_matches_full_kv_bit_for_bit() {
 /// capacité de l'arène), puis tokens échantillonnés avec arène adoptée et
 /// semée par copie, en K/V plein puis borné (base non nulle des couches
 /// glissantes).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn flint_decode_fingerprint() -> Vec<Vec<u32>> {
     let prompt = [1, 2, 3, 4, 0, 5, 6, 7, 3, 2, 6];
     let forced = [4, 0, 5, 6, 3, 2];
@@ -1122,7 +1122,7 @@ fn flint_decode_fingerprint() -> Vec<Vec<u32>> {
 /// QKV concaténé de flint : un qmv au lieu de trois par couche, chaque ligne
 /// de sortie calculée à l'identique. Empreinte du decode bit-identique au
 /// chemin à trois projections, et chemin effectivement emprunté.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_qkv_concat_is_bit_identical() {
     let hits = || crate::decode_resident::QKV_CONCAT_NO_GATE_HITS.with(std::cell::Cell::get);
@@ -1139,7 +1139,7 @@ fn synthetic_flint_qkv_concat_is_bit_identical() {
 /// repli sur les trois projections, logits identiques. La garde tient aussi
 /// après préparation à la libération des poids CPU (caches préservés), où
 /// l'ancienne politique ignorait le budget.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_qkv_concat_falls_back_over_vram_budget() {
     let prompt = [1, 2, 3];
@@ -1240,7 +1240,7 @@ fn qwen_dense_gated_tensors() -> Vec<(String, Fixture)> {
 /// L'append fusionné est réservé à flint (sinks) : un Qwen dense à porte de
 /// sortie garde la rotation puis l'append historiques (aucun passage compté),
 /// avec des logits (K/V f32 et bf16) bit-identiques, flag actif ou non.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_qwen_dense_gated_keeps_historical_kv_append() {
     let raw = serde_json::json!({
@@ -1303,7 +1303,7 @@ fn synthetic_qwen_dense_gated_keeps_historical_kv_append() {
 /// Rotation de K et append K/V fusionnés dans le decode de flint : un
 /// dispatch au lieu de trois par couche. Empreinte du decode bit-identique
 /// au chemin historique, et chemin effectivement emprunté.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_rope_append_kv_is_bit_identical() {
     let hits = || crate::decode_resident::ROPE_APPEND_KV_HITS.with(std::cell::Cell::get);
@@ -1322,7 +1322,7 @@ fn synthetic_flint_rope_append_kv_is_bit_identical() {
 /// Le scratch du prefill résident flint passe par le scope de purge (marquage
 /// volatil, éviction LRU au-delà de `SARAGOSSA_RUST_SCRATCH_CAP_GB`) après
 /// chaque prefill, quelle que soit sa taille, et reste sous ce plafond.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_resident_prefill_scratch_is_released() {
     let gpu = load(flint_tensors(true))
@@ -1357,7 +1357,7 @@ fn synthetic_flint_resident_prefill_scratch_is_released() {
 /// Au-delà du plafond de prefill flint, refus explicite avant tout calcul
 /// plutôt qu'un échec mémoire suivi d'un repli CPU : même règle pour la
 /// vérification préalable de serve, le prefill à froid et le prolongement.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn synthetic_flint_refuses_prompt_beyond_prefill_cap() {
     let gpu = load(flint_tensors(true))
@@ -1601,7 +1601,7 @@ const MEAN_GAP_F32: f32 = 1.0;
 // Position du prompt de l'oracle où mlx bf16 s'écarte lui-même de mlx f32
 // (16,94 / 2,62 contre au plus 1,30 / 0,23 ailleurs) : quasi-égalité de
 // routage sensible à l'arrondi bf16, que le MoE coop groupé rencontre aussi.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 const NEAR_TIE_POSITION: usize = 3;
 
 /// Chemin Metal de flint-int4 (chargement Metal du CLI) contre l'oracle mlx-lm
@@ -1614,7 +1614,7 @@ const NEAR_TIE_POSITION: usize = 3;
 ///   prefill résident contre le prefill per-op CPU à cinq positions.
 ///
 /// Mêmes variables d'environnement que [`flint_int4_real_weights_match_mlx_oracle`].
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) et oracle mlx-lm requis"]
 fn flint_int4_metal_matches_mlx_oracle() {
@@ -1910,7 +1910,7 @@ fn flint_int4_metal_matches_mlx_oracle() {
 /// synthétique de 1000 tokens, puis les logits de sa dernière ligne. Deux
 /// exécutions sous des flags différents (`SARAGOSSA_RUST_FLINT_PREFILL_STEEL`,
 /// morceaux `SARAGOSSA_FLINT_DUMP_CHUNK`) se comparent ensuite hors processus.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) requis ; diagnostic, pas un gate"]
 fn flint_int4_prefill_capture_dump() {
@@ -1971,7 +1971,7 @@ fn flint_int4_prefill_capture_dump() {
 /// `SARAGOSSA_RUST_FLINT_PREFILL_STEEL=0 SARAGOSSA_RUST_PREFILL_RESIDENT_CHUNK=0`
 /// (kernel F3 seul, un seul morceau). `SARAGOSSA_FLINT_BENCH_LENS` remplace les
 /// longueurs (liste séparée par des virgules).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure, pas un gate"]
 fn flint_int4_prefill_ttft_bench() {
@@ -2025,7 +2025,7 @@ fn flint_int4_prefill_ttft_bench() {
 /// tout f32), logits comparés aux frontières réelles des morceaux (écarts
 /// centrés, argmax) et 16 tokens greedy de production identiques. Une seule
 /// copie des poids en mémoire à la fois.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure de dérive, pas un gate"]
 fn flint_int4_prefill_kv_bf16_store_drift() {
@@ -2141,7 +2141,7 @@ fn flint_int4_prefill_kv_bf16_store_drift() {
 /// morceaux, argmax et 16 tokens greedy. Le chemin pris est journalisé et
 /// vérifié (pipeline présent ou retiré) ; des logits bit à bit égaux
 /// signaleraient un NAX jamais exécuté.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure de dérive, pas un gate"]
 fn flint_int4_prefill_nax_window_drift() {
@@ -2226,15 +2226,15 @@ fn flint_int4_prefill_nax_window_drift() {
 // Écart propre de mlx bf16 contre mlx f32 sur l'oracle flint (cf. les seuils
 // f32 ci-dessus) : garde-fou large de la dérive d'un K/V de prefill stocké en
 // bf16, pas un budget transférable.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) const MAX_GAP_MLX_BF16: f32 = 17.0;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) const MEAN_GAP_MLX_BF16: f32 = 2.6;
 
 /// MoE routé groupé (coop) contre qmv sur flint-int4 réel : prompt
 /// synthétique de `SARAGOSSA_FLINT_COOP_LEN` tokens (16 384 par défaut),
 /// logits aux frontières et milieux des morceaux, argmax et 16 tokens greedy.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure de dérive, pas un gate"]
 fn flint_int4_moe_coop_matches_qmv() {
@@ -2321,7 +2321,7 @@ fn flint_int4_moe_coop_matches_qmv() {
 /// synthétique de `SARAGOSSA_FLINT_COOP_LEN` tokens (16 384 par défaut),
 /// hidden du prefill résident bit à bit identiques et 16 tokens greedy
 /// identiques. Le compteur prouve que le tuilé sert chaque couche MoE.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) requis"]
 fn flint_int4_moe_coop_tiled_matches_16x32() {
@@ -2394,7 +2394,7 @@ fn flint_int4_moe_coop_tiled_matches_16x32() {
 /// long de la continuation qmv. Une divergence des greedy est rapportée avec
 /// sa marge et le bruit du qmv contre lui-même ; seul le garde-fou de dérive
 /// (bornes mlx bf16 contre f32) fait échouer le test.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) requis ; mesure de dérive, pas un gate"]
 fn flint_int4_small_nax_gemm_greedy_matches_qmv() {
@@ -2551,7 +2551,7 @@ fn flint_int4_small_nax_gemm_greedy_matches_qmv() {
 }
 
 /// Écart max entre deux lignes de logits, après retrait du décalage moyen.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn centered_max_gap(a: &[f32], b: &[f32]) -> f32 {
     let shift = a.iter().zip(b).map(|(x, y)| x - y).sum::<f32>() / b.len() as f32;
     a.iter()
@@ -2562,7 +2562,7 @@ pub(super) fn centered_max_gap(a: &[f32], b: &[f32]) -> f32 {
 
 /// Hidden non normés du prefill per-op CPU puis du prefill résident Metal, et
 /// leurs durées.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn timed_prefills(
     model: &CausalDecoder,
     prompt: &[usize],
@@ -2590,7 +2590,7 @@ fn timed_prefills(
 }
 
 /// Texte synthétique déterministe tokenisé, tronqué à `len` tokens.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn synthetic_long_prompt(assets: &ModelAssets, len: usize) -> Vec<usize> {
     const SUBJECTS: [&str; 5] = [
         "The engineer",
@@ -2629,7 +2629,7 @@ pub(super) fn synthetic_long_prompt(assets: &ModelAssets, len: usize) -> Vec<usi
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn resident_decode_steps() -> usize {
     crate::decoder::resident_decode_steps_for_test()
 }
@@ -2639,7 +2639,7 @@ fn resident_decode_steps() -> usize {
 /// de `SARAGOSSA_FLINT_BF16_LEN` tokens (16 400 par défaut, cinq morceaux),
 /// hidden de toutes les positions et 16 tokens greedy bit-identiques, couches
 /// glissantes réduites à leur fenêtre. Une seule copie des poids à la fois.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) requis"]
 fn flint_int4_window_kv_matches_full_kv() {
@@ -2724,7 +2724,7 @@ fn flint_int4_window_kv_matches_full_kv() {
 /// `SARAGOSSA_FLINT_BF16_LEN` tokens (16 400 par défaut, au-delà des seuils
 /// de stockage et d'arène bf16), flag flint forcé, 16 tokens greedy identiques
 /// au semis par copie et réserve tenue par l'arène de toutes les couches.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids réels flint-int4 (22,6 Go) requis"]
 fn flint_int4_arena_adopts_prefill_kv_bf16() {
@@ -2768,7 +2768,7 @@ fn flint_int4_arena_adopts_prefill_kv_bf16() {
 }
 
 /// Référence plein vocabulaire sans poids externes, via le vrai decode résident.
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 #[test]
 #[ignore = "requiert un device Metal ; exécuté par gpu-synthetic.yml"]
 fn synthetic_flint_kl_reference_roundtrip() {

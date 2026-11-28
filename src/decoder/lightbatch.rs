@@ -18,7 +18,7 @@ use super::*;
 /// n(2) = nombre d'experts DISTINCTS dans l'union des top-k des 2 flux
 /// (top_k ≤ n(2) ≤ 2·top_k). C'est LA donnée du plafond du gain MoE batché :
 /// trafic routé dédupliqué idéal = n(2)/(2·top_k) du trafic par-flux actuel.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Default)]
 struct ExpertStats {
     steps: u64,
@@ -31,13 +31,13 @@ struct ExpertStats {
     per_layer: Vec<(u64, u64)>,
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn expert_stats() -> &'static Mutex<ExpertStats> {
     static STATS: OnceLock<Mutex<ExpertStats>> = OnceLock::new();
     STATS.get_or_init(|| Mutex::new(ExpertStats::default()))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn reset_expert_stats() {
     if let Ok(mut stats) = expert_stats().lock() {
         *stats = ExpertStats::default();
@@ -47,7 +47,7 @@ fn reset_expert_stats() {
 /// Enregistre les paires d'indices d'un pas duo (une entrée par couche MoE).
 /// Diagnostic pur : toute erreur de lecture est ignorée (jamais d'impact sur la
 /// génération).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn record_expert_stats(pairs: &[([metal::Buffer; 2], usize)]) {
     let Ok(mut stats) = expert_stats().lock() else {
         return;
@@ -85,7 +85,7 @@ pub(super) fn record_expert_stats(pairs: &[([metal::Buffer; 2], usize)]) {
 }
 
 /// Imprime la synthèse de la disjonction d'experts du run (puis remet à zéro).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn report_expert_stats() {
     let Ok(stats) = expert_stats().lock() else {
         return;
@@ -253,12 +253,12 @@ impl CausalDecoder {
         options: &GenerationOptions,
         on_token: impl FnMut(usize, usize) -> bool,
     ) -> Result<(Vec<GenerationOutput>, usize)> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let (stride, multi) = (
             lightbatch_background_stride(),
             lightbatch_multi_dense_enabled(),
         );
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let (stride, multi) = (1, false);
         let mut profile = LightBatchProfile::default();
         let outputs = self.lightbatch_generate(
@@ -279,14 +279,14 @@ impl CausalDecoder {
     /// vérifiée par lot : si elle échoue, le lot retombe sur le time-slicing,
     /// correct mais sans gain.
     pub fn lightbatch_multi_dense_ready(&self) -> bool {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             lightbatch_multi_dense_enabled()
                 && decode_resident_full_enabled()
                 && self.supports_resident_full_decode()
                 && self.multi_dense_layers_eligible()
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             false
         }
@@ -306,9 +306,9 @@ impl CausalDecoder {
         max_new_tokens: &[usize],
         options: &GenerationOptions,
     ) -> Result<(Vec<GenerationOutput>, LightBatchProfile)> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let stride = lightbatch_background_stride();
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let stride = 1;
         let mut profile = LightBatchProfile::default();
         let outputs = self.lightbatch_generate(
@@ -368,7 +368,7 @@ impl CausalDecoder {
         // buffer, projections denses batchées ; greedy (argmax) ou sampled
         // (E2.4, sampler GPU avec rng PAR FLUX — `use_resident_full` garantit
         // déjà greedy OU resident_sampling). Sinon time-slicing E2.1.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let duo_ok = streams.len() == 2
             && lightbatch_qmm2_enabled()
             && (options.temperature <= f32::EPSILON
@@ -378,7 +378,7 @@ impl CausalDecoder {
             });
         // Pas multi-flux dense : N ≥ 2 flux denses hybrides en greedy, chacun
         // sur son arène résidente complète. Sinon time-slicing E2.1.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let multi_ok = multi
             && !duo_ok
             && streams.len() >= 2
@@ -386,9 +386,9 @@ impl CausalDecoder {
             && streams.iter().all(|stream| {
                 stream.use_resident_full && self.supports_resident_multi_dense(&stream.cache)
             });
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = multi;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if trace_lightbatch_enabled() {
             eprintln!(
                 "lightbatch: mode={} (flux={})",
@@ -402,7 +402,7 @@ impl CausalDecoder {
                 streams.len()
             );
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if lightbatch_expert_stats_enabled() {
             reset_expert_stats();
         }
@@ -413,7 +413,7 @@ impl CausalDecoder {
             // Priorité du principal (E2.5) : les flux de fond (index > 0) ne
             // décodent qu'un tour sur `stride` — sauf si le principal est fini.
             let background_turn = stride <= 1 || round % stride == 0 || streams[0].done;
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             if multi_ok {
                 // Ligne compacte = rang parmi les flux vivants de ce pas ;
                 // l'identité du flux reste `stream.index` (callback, sorties).
@@ -436,7 +436,7 @@ impl CausalDecoder {
                 }
                 continue;
             }
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             if duo_ok {
                 if !background_turn {
                     let will_decode =
@@ -506,7 +506,7 @@ impl CausalDecoder {
                 break;
             }
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if lightbatch_expert_stats_enabled() {
             report_expert_stats();
         }
@@ -536,7 +536,7 @@ impl CausalDecoder {
             with_prefill_kv_reserve(max_new_tokens, || self.prefill_cache_state(prompt))?;
         // Mêmes prédicats que la boucle solo : résident complet (1c) si supporté
         // (greedy ou sampler GPU), sinon résident 1b puis per-op.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let use_resident_full = {
             let resident_sampling = super::resident::resident_sampling_supported(options);
             let kv_bf16 =
@@ -558,7 +558,7 @@ impl CausalDecoder {
             }
             use_resident_full
         };
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let use_resident_full = {
             let _ = slot;
             false
@@ -658,7 +658,7 @@ impl CausalDecoder {
 
     /// Décode un token pour chacun des flux `live` (indices dans `streams`, au
     /// moins 2) en UN pas multi-flux dense, chronométré une fois pour tous.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn decode_lightbatch_multi_step(
         &self,
         streams: &mut [LightBatchStream],
@@ -695,7 +695,7 @@ impl CausalDecoder {
         stream: &mut LightBatchStream,
         options: &GenerationOptions,
     ) -> Result<usize> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if stream.use_resident_full {
             return if options.temperature > f32::EPSILON {
                 self.decode_token_resident_sampled(

@@ -1,8 +1,8 @@
 use super::super::*;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use super::types::*;
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 thread_local! {
     // Par thread : les tests parallèles ne se comptent pas entre eux.
     static REFERENCE_PREFILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -30,7 +30,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si l'arène ou un état résident est absent, ou si un
     /// encodage Metal échoue.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn decode_token_resident(
         &self,
         cache: &mut CausalDecoderCache,
@@ -52,7 +52,7 @@ impl CausalDecoder {
             .map_err(|_| InferError::Metal(format!("token résident hors usize: {raw}")))
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn decode_token_resident_sampled(
         &self,
         cache: &mut CausalDecoderCache,
@@ -96,7 +96,7 @@ impl CausalDecoder {
     /// chaque token de `forced`. Conserve le prefill historique des oracles ;
     /// les modes KL utilisent exclusivement `resident_reference_start`.
     /// Aucun repli du decode résident n'est admis.
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn resident_forced_logits(
         &self,
         prompt: &[usize],
@@ -120,7 +120,7 @@ impl CausalDecoder {
             .collect()
     }
 
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn resident_forced_logits_for_test(
         &self,
         prompt: &[usize],
@@ -131,7 +131,7 @@ impl CausalDecoder {
     }
 
     /// Renvoie la dernière ligne du prefill AVANT la norme finale.
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     pub(crate) fn resident_reference_start(
         &self,
         prompt: &[usize],
@@ -167,7 +167,7 @@ impl CausalDecoder {
 
     /// Projette la dernière ligne non normée du prefill avec les kernels du
     /// decode résident, y compris pour Flint dont le runtime per-op est CPU.
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     pub(crate) fn resident_reference_initial_logits(
         &self,
         cache: &CausalDecoderCache,
@@ -219,7 +219,7 @@ impl CausalDecoder {
         Ok(self.finalize_logits(&Tensor::row(raw)?)?.data().to_vec())
     }
 
-    #[cfg(all(test, target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(test, gpu_metal, feature = "devtools"))]
     pub(crate) fn resident_reference_counts_for_test(&self) -> (usize, usize) {
         (
             REFERENCE_PREFILLS.with(std::cell::Cell::get),
@@ -227,11 +227,7 @@ impl CausalDecoder {
         )
     }
 
-    #[cfg(all(
-        target_os = "macos",
-        feature = "metal",
-        any(test, feature = "devtools")
-    ))]
+    #[cfg(all(gpu_metal, any(test, feature = "devtools")))]
     pub(crate) fn resident_reference_step(
         &self,
         cache: &mut CausalDecoderCache,
@@ -258,7 +254,7 @@ impl CausalDecoder {
         crate::metal_backend::read_f32_buffer(readback.lease.tensor().buffer(), readback.len)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn decode_tokens_resident_pipelined(
         &self,
         cache: &mut CausalDecoderCache,
@@ -282,7 +278,7 @@ impl CausalDecoder {
     /// aucun pas n'est enfilé, les pas en vol sont lus et gardés (ce sont des
     /// tokens AR valides), puis `drained` est vrai. Le dernier token rendu n'est
     /// alors pas encore injecté dans le modèle.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn decode_tokens_resident_pipelined_until(
         &self,
         cache: &mut CausalDecoderCache,
@@ -391,7 +387,7 @@ impl CausalDecoder {
         }))
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn enqueue_decode_token_resident(
         &self,
         cache: &mut CausalDecoderCache,
@@ -697,7 +693,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si l'embedding n'a pas la forme `[1, hidden]`, si un état
     /// résident est absent ou si un encodage Metal échoue.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn next_resident_embedding_step(
         &self,
         cache: &mut CausalDecoderCache,
@@ -934,7 +930,7 @@ impl CausalDecoder {
         cache: &mut CausalDecoderCache,
         token_id: usize,
     ) -> Result<Tensor> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(output) = self.next_final_states_resident_verify(
             cache,
             &[token_id],
@@ -949,7 +945,7 @@ impl CausalDecoder {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn pipeline_scratch_namespace(base: u64, slot: usize) -> Result<u64> {
     const TAG: u64 = 1_u64 << 63;
     const SLOT_BITS: u32 = 8;
@@ -963,7 +959,7 @@ fn pipeline_scratch_namespace(base: u64, slot: usize) -> Result<u64> {
     Ok(TAG | (base << SLOT_BITS) | slot)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(in crate::decoder) fn resident_sample_spec(
     options: &GenerationOptions,
     sampler: &DeterministicSampler,
@@ -989,7 +985,7 @@ pub(in crate::decoder) fn resident_sample_spec(
     })
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(in crate::decoder) fn resident_sampling_on_device(options: &GenerationOptions) -> bool {
     if !resident_sampling_params_valid(options) || !crate::decoder::flags::gpu_sampler_enabled() {
         return false;
@@ -998,12 +994,12 @@ pub(in crate::decoder) fn resident_sampling_on_device(options: &GenerationOption
         || (options.top_k > 0 && options.top_k <= crate::metal_backend::MAX_SAMPLER_TOP_K)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(in crate::decoder) fn resident_sampling_supported(options: &GenerationOptions) -> bool {
     resident_sampling_params_valid(options) && crate::decoder::flags::gpu_sampler_enabled()
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn resident_sampling_params_valid(options: &GenerationOptions) -> bool {
     options.temperature > f32::EPSILON
         && options.temperature.is_finite()
@@ -1012,7 +1008,7 @@ fn resident_sampling_params_valid(options: &GenerationOptions) -> bool {
         && options.top_p <= 1.0
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn resident_sample_spec_for_solo(
     options: &GenerationOptions,
     sampler: &DeterministicSampler,

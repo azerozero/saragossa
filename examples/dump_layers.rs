@@ -6,7 +6,7 @@ use std::path::Path;
 fn load(assets: &ModelAssets, backend: &str) -> Result<CausalDecoder, Box<dyn std::error::Error>> {
     match backend {
         "cpu" => Ok(saragossa::load_causal_decoder(assets)?),
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         "metal" => {
             let executor = saragossa::MetalExecutor::new()?;
             Ok(saragossa::load_causal_decoder_for_metal(assets, &executor)?

@@ -16,7 +16,7 @@ mod audio_resample;
 pub mod catalog;
 pub mod chat_template;
 pub mod config;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) mod decode_resident;
 pub mod decoder;
 #[cfg(feature = "denoise")]
@@ -30,16 +30,13 @@ pub mod error;
 #[cfg(test)]
 mod golden;
 pub mod guided;
-#[cfg(any(
-    test,
-    all(target_os = "macos", feature = "metal", feature = "devtools")
-))]
+#[cfg(any(test, all(gpu_metal, feature = "devtools")))]
 #[path = "hf_cache.rs"]
 pub(crate) mod hf_resolve;
 pub mod linear;
 pub mod linear_attention;
 pub mod memory_guard;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub mod metal_backend;
 pub mod mlp;
 pub mod norm;
@@ -65,7 +62,7 @@ pub mod tts;
 pub mod tts_clone;
 #[cfg(feature = "tts")]
 pub(crate) mod tts_codec;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[cfg(feature = "tts")]
 pub(crate) mod tts_codec_gpu;
 #[cfg(feature = "tts")]
@@ -90,9 +87,9 @@ pub mod wire_audio;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 pub(crate) use metal_backend::tests::oracle;
-#[cfg(all(test, not(all(target_os = "macos", feature = "metal"))))]
+#[cfg(all(test, not(gpu_metal)))]
 #[path = "metal_backend/tests/oracle.rs"]
 pub(crate) mod oracle;
 
@@ -110,7 +107,7 @@ pub use decoder::{
     CausalDecoderPromptMetalSnapshot, CausalDecoderPromptState, GenerationOptions,
     GenerationOutput, GenerationTimings, RopeStyle, SpeculativeOutput, SpeculativeStats,
 };
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 pub use decoder::{ResidentLinearXrayLayerDiff, ResidentLinearXrayReport};
 #[cfg(feature = "devtools")]
 pub use devtools::{
@@ -127,11 +124,11 @@ pub use memory_guard::{
     MemoryGuard, MemoryGuardError, MemoryLimits, MemoryPressureLevel, MemoryProjection,
     MemoryReservation, PurgeOutcome, PurgePressure, PurgeRegistry, PurgeReport,
 };
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub use metal_backend::{set_scratch_engine, MetalExecutor};
 pub use mlp::{Activation, FeedForward, GatedMlp, MoeMlp, RouterScore};
 pub use norm::{layer_norm, rms_norm};
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub use quantization::DenseBf16Tensor;
 pub use quantization::{dequantize_affine_u32, AffineQuantizedTensor};
 pub use quantization::{MicroMode, MicroQuantizedTensor};
@@ -142,7 +139,7 @@ pub use qwen_loader::{
     verify_decoder_contract_from_shards, verify_qwen_decoder_contract,
     verify_qwen_decoder_contract_from_shards, DecoderContract, QwenDecoderContract,
 };
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub use qwen_loader::{
     load_causal_decoder_for_metal, load_causal_decoder_for_metal_with_memory_guard,
 };

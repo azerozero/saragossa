@@ -1,13 +1,13 @@
 use super::super::*;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use super::types::*;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::MetalExecutor;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 type GemmaTailBuffers = (Option<metal::Buffer>, Option<metal::Buffer>, Option<f32>);
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn resolve_gemma_tail_buffers(
     metal: &MetalExecutor,
     layer: &DecoderLayer,
@@ -40,7 +40,7 @@ fn resolve_gemma_tail_buffers(
     ))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn resolve_gemma_parallel_moe_buffers(
     metal: &MetalExecutor,
     layer: &DecoderLayer,
@@ -120,7 +120,7 @@ fn resolve_gemma_parallel_moe_buffers(
 
 /// Vrai si toutes les projections des experts sont affines : le stack MoE
 /// résident (`build_stacked_affine`) n'accepte rien d'autre.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn experts_are_affine(experts: &[GatedMlp]) -> bool {
     experts.iter().all(|expert| {
         let (gate, up, down) = expert.projections();
@@ -134,7 +134,7 @@ impl CausalDecoder {
     /// Vrai si la tête MTP tient le contrat du decode résident. Sinon (MoE sans
     /// porte de sortie, routeur non softmax, experts non affines), la raison est
     /// tracée et l'arène MTP reste absente.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn resident_mtp_head_supported(&self, head: &MtpHead) -> bool {
         let FeedForward::Moe(mlp) = &head.layer.mlp else {
             return true;
@@ -166,7 +166,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur typée pour une tête MoE hors du contrat résident
     /// (routeur non softmax, expert partagé absent, experts non affines).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn resident_mtp_layer(
         &self,
         metal: &MetalExecutor,
@@ -286,7 +286,7 @@ impl CausalDecoder {
     /// Validation EN AMONT (réserve majeure 6) : le forward résident est
     /// tout-ou-rien — soit le command buffer unique est entièrement GPU, soit on
     /// retombe sur le per-op AVANT de commencer, jamais un readback CPU au milieu.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn supports_resident_full_decode(&self) -> bool {
         let unsupported = self.resident_full_decode_unsupported_reason();
         if let Some(reason) = unsupported.as_ref() {
@@ -298,7 +298,7 @@ impl CausalDecoder {
         true
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn resident_full_decode_unsupported_reason(&self) -> Option<String> {
         if self.resident_metal().is_none() {
             return Some("executor Metal absent".to_string());
@@ -389,7 +389,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si la compilation du kernel résident, une allocation ou
     /// le seed échoue.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn setup_resident_decode(
         &self,
         cache: &mut CausalDecoderCache,
@@ -459,7 +459,7 @@ impl CausalDecoder {
     ///
     /// Renvoie une erreur si la compilation des kernels, une allocation ou un seed
     /// échoue.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn setup_resident_full_decode(
         &self,
         cache: &mut CausalDecoderCache,
@@ -480,7 +480,7 @@ impl CausalDecoder {
     /// jusqu'à `max_draft`. Sans cette marge, une génération qui va au bout de son
     /// budget déborde (`append KV résident: capacité N atteinte`) — observé à D3,
     /// latent à D2 selon l'alignement du dernier pas.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn setup_resident_full_decode_with_slot(
         &self,
         cache: &mut CausalDecoderCache,
@@ -499,7 +499,7 @@ impl CausalDecoder {
         )
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn setup_resident_full_decode_with_mtp_history(
         &self,
         cache: &mut CausalDecoderCache,
@@ -518,7 +518,7 @@ impl CausalDecoder {
         )
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[allow(
         clippy::too_many_arguments,
         reason = "setup commun aux slots et au semis MTP"
@@ -1224,7 +1224,7 @@ impl CausalDecoder {
     /// TODO: adopter aussi les fenêtrées sans sinks (Gemma 4, prefill résident
     /// opt-in, NAX d256) une fois couvertes par un test d'adoption contre
     /// copie ; aucun modèle synthétique ne prend encore ce chemin.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn layer_kv_adoption_allowed(&self, index: usize) -> bool {
         self.plan.layers[index].resident.sliding_window.is_none()
             || matches!(
@@ -1236,7 +1236,7 @@ impl CausalDecoder {
     // Ne sert qu'au chemin résident Metal (`setup_resident_full_decode_with_slot`)
     // et référence `RESIDENT_PIPELINE_WINDOW`, lui-même gaté : sans ce `cfg`, la
     // compilation sans la feature `metal` échoue.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn check_resident_full_decode_allocation(
         &self,
         cache: &CausalDecoderCache,
@@ -1360,7 +1360,7 @@ fn checked_bytes(factors: &[usize], element_bytes: usize, label: &str) -> Result
 /// impose un KV f32 ou bf16 même si `SARAGOSSA_RUST_KV_QUANT` est posé ;
 /// `adoption_allowed` faux force la copie
 /// ([`CausalDecoder::layer_kv_adoption_allowed`]).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn resident_full_attention_state(
     arena: &DecodeResidentState,
     layer_cache: &LayerKvCache,
@@ -1437,7 +1437,7 @@ fn resident_full_attention_state(
 
 /// Lignes de l'arène d'une couche pour `capacity` positions absolues : sans
 /// les lignes sorties de la fenêtre (`LayerKvCache::base_rows`).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn arena_rows(layer_cache: &LayerKvCache, capacity: usize) -> Result<usize> {
     let base = layer_cache.base_rows();
     capacity.checked_sub(base).ok_or_else(|| {
@@ -1451,7 +1451,7 @@ fn arena_rows(layer_cache: &LayerKvCache, capacity: usize) -> Result<usize> {
 /// arène de `capacity` lignes : bf16 dense résolu, vues entières du prefill
 /// avec la place nécessaire.
 /// Le droit d'écriture, lui, n'est pris qu'à l'adoption.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn layer_adoptable(
     layer_cache: &LayerKvCache,
     capacity: usize,
@@ -1473,7 +1473,7 @@ fn layer_adoptable(
         })
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 mod tests {
     use super::*;
     use crate::decoder::attention_ops::AttentionLayout;

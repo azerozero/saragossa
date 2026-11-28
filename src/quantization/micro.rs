@@ -107,7 +107,7 @@ pub fn decode_e8m0(code: u8) -> f32 {
 /// Matrice MLX compacte `[N,K]`, codes U32 little-endian et échelles U8.
 #[derive(Clone, Debug)]
 pub struct MicroQuantizedTensor {
-    #[cfg_attr(not(all(target_os = "macos", feature = "metal")), allow(dead_code))]
+    #[cfg_attr(not(gpu_metal), allow(dead_code))]
     weight_id: u64,
     shape: [usize; 2],
     storage: MicroStorage,
@@ -122,7 +122,7 @@ enum MicroStorage {
         packed: Vec<u32>,
         scales: Vec<u8>,
     },
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     MetalShared {
         packed: metal::Buffer,
         scales: metal::Buffer,
@@ -144,7 +144,7 @@ fn micro_lengths(shape: [usize; 2], mode: MicroMode) -> Result<(usize, usize)> {
     Ok((count / (32 / mode.bits()), count / mode.group_size()))
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[expect(
     unsafe_code,
     reason = "vue CPU en lecture seule des échelles d'un MTLBuffer de poids partagé"
@@ -167,7 +167,7 @@ impl PartialEq for MicroQuantizedTensor {
 }
 
 impl MicroQuantizedTensor {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn weight_id(&self) -> u64 {
         self.weight_id
     }
@@ -200,7 +200,7 @@ impl MicroQuantizedTensor {
     }
 
     /// Adosse le poids aux MTLBuffer partagés lus par Metal, sans copie CPU.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn new_metal_shared(
         shape: [usize; 2],
         packed: metal::Buffer,
@@ -231,7 +231,7 @@ impl MicroQuantizedTensor {
 
     /// Déplace codes et échelles dans des MTLBuffer partagés, puis libère
     /// les vecteurs CPU : la vue CPU et les kernels lisent la même mémoire.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn move_to_metal_shared(&mut self, metal: &crate::MetalExecutor) -> Result<()> {
         if let MicroStorage::Owned { packed, scales } = &self.storage {
             let packed = metal.weight_buffer_from_u32(packed)?;
@@ -242,7 +242,7 @@ impl MicroQuantizedTensor {
     }
 
     /// Buffers partagés `(codes, échelles)` quand le poids y est adossé.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn metal_views(&self) -> Option<(&metal::Buffer, &metal::Buffer)> {
         match &self.storage {
             MicroStorage::Owned { .. } => None,
@@ -265,7 +265,7 @@ impl MicroQuantizedTensor {
     pub fn packed(&self) -> &[u32] {
         match &self.storage {
             MicroStorage::Owned { packed, .. } => packed,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             MicroStorage::MetalShared { packed, .. } => {
                 let words = self.shape[0] * self.shape[1] / (32 / self.mode.bits());
                 super::metal_shared_u32_slice(packed, 0, words)
@@ -277,7 +277,7 @@ impl MicroQuantizedTensor {
     pub fn scales(&self) -> &[u8] {
         match &self.storage {
             MicroStorage::Owned { scales, .. } => scales,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             MicroStorage::MetalShared { scales, .. } => metal_shared_u8_slice(
                 scales,
                 self.shape[0] * self.shape[1] / self.mode.group_size(),

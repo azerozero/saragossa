@@ -57,11 +57,11 @@
 //! Les oracles CPU GQA, aux frontières de 16 tokens et au-delà de 256 tokens,
 //! restent appliqués au scan séquentiel avec leurs tolérances inchangées.
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::runtime_flags::{env_flag, trace_linear_attn_enabled};
 use crate::{silu, ForwardRuntime, InferError, Linear, Result, Tensor};
 use rayon::prelude::*;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use std::sync::OnceLock;
 
 /// Dimensions d'une couche Gated DeltaNet (têtes GQA, conv causale, ε du RMSNorm).
@@ -207,7 +207,7 @@ pub(crate) struct LinearAttentionCache {
     pub(crate) conv_dim: Option<usize>,
     pub(crate) ssm: Vec<f32>,
     pub(crate) ssm_shape: Option<(usize, usize, usize)>,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     metal: Option<crate::metal_backend::LinearAttentionMetalState>,
 }
 
@@ -230,7 +230,7 @@ impl Clone for LinearAttentionCache {
             conv_dim: self.conv_dim,
             ssm: self.ssm.clone(),
             ssm_shape: self.ssm_shape,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             metal: None,
         }
     }
@@ -252,7 +252,7 @@ impl LinearAttention {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn materialize_metal_weight_buffers(
         &mut self,
         metal: &crate::MetalExecutor,
@@ -287,7 +287,7 @@ impl LinearAttention {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
         self.in_proj_qkv.release_affine_cpu_data(released);
         self.in_proj_z.release_affine_cpu_data(released);
@@ -296,7 +296,7 @@ impl LinearAttention {
         self.out_proj.release_affine_cpu_data(released);
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn move_packed_to_metal_shared(
         &mut self,
         metal: &crate::MetalExecutor,
@@ -464,7 +464,7 @@ impl LinearAttention {
                 "linear-attn cached batch vide".to_string(),
             ));
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if runtime.metal_executor().is_some() && seq > 1 {
             return self.forward_cached_rows_with_runtime(config, x, cache, runtime);
         }
@@ -472,7 +472,7 @@ impl LinearAttention {
     }
 
     /// Batch résident GPU si possible, sinon replay token-par-token du batch.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn forward_cached_rows_with_runtime(
         &self,
         config: LinearAttentionConfig,
@@ -562,7 +562,7 @@ impl LinearAttention {
             }
         };
 
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = runtime.metal_executor() {
             if seq == 1 && linear_attn_resident_step_enabled() {
                 let had_resident_state = cache.metal.is_some();
@@ -694,7 +694,7 @@ impl LinearAttention {
         x: &Tensor,
         runtime: ForwardRuntime<'_>,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = runtime.metal_executor() {
             match metal.project_biasless(
                 x,
@@ -722,7 +722,7 @@ impl LinearAttention {
     }
 
     /// Pas seq=1 sur le kernel Metal résident (états conv/ssm gardés sur GPU).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn forward_resident_metal_step(
         &self,
         config: LinearAttentionConfig,
@@ -766,7 +766,7 @@ impl LinearAttention {
 
     /// Renvoie les poids du pas linear-attn résident (références partagées avec le
     /// chemin per-op), pour le chaînage d'UNE couche du decode résident complet (1c).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn resident_weights(&self) -> crate::metal_backend::LinearAttnResidentWeights<'_> {
         crate::metal_backend::LinearAttnResidentWeights {
             in_proj_qkv: &self.in_proj_qkv,
@@ -782,7 +782,7 @@ impl LinearAttention {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl LinearAttentionCache {
     /// Renvoie l'état conv/ssm résident GPU s'il a été créé (par le chemin résident
     /// per-op pendant le prefill). Le decode résident complet (1c) le réutilise
@@ -1355,7 +1355,7 @@ fn softplus(value: f32) -> f32 {
 }
 
 /// Indique si le pas résident Metal (états conservés GPU) est activé (défaut oui).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn linear_attn_resident_step_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {

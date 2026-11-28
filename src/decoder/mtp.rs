@@ -12,12 +12,12 @@ use crate::qwen_loader::{read_shard_header, ShardHeader, ShardTensorEntry};
 use crate::safetensor::pread_exact;
 use crate::safetensor::{read_dense_f32_at, read_u32_at};
 use crate::AffineQuantizedTensor;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use safetensors::Dtype;
 use std::collections::HashMap;
 
 pub(super) struct MtpLoadContext<'a> {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     metal: Option<&'a crate::MetalExecutor>,
     marker: std::marker::PhantomData<&'a ()>,
 }
@@ -25,13 +25,13 @@ pub(super) struct MtpLoadContext<'a> {
 impl MtpLoadContext<'_> {
     pub(super) fn cpu() -> Self {
         Self {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             metal: None,
             marker: std::marker::PhantomData,
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn metal(executor: &crate::MetalExecutor) -> MtpLoadContext<'_> {
         MtpLoadContext {
             metal: Some(executor),
@@ -72,7 +72,7 @@ const MTP_QUANT_GROUP: usize = 64;
 impl MtpHead {
     /// Déplace les poids quantifiés dans des `MTLBuffer` partagés, experts en
     /// stacks contigus (`contiguous_metal_expert_stacks`) : une seule copie.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn move_packed_to_metal_shared(
         &mut self,
         metal: &crate::MetalExecutor,
@@ -532,7 +532,7 @@ fn load_mtp_moe_linear(
     if resolve.contains_key(&format!("{prefix}.scales")) {
         return load_mtp_linear(sidecar, resolve, prefix, context);
     }
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if let (MtpMoeQuant::Affine, Some(metal)) = (quant, context.metal) {
         if crate::runtime_flags::single_copy_weights_enabled() {
             let key = format!("{prefix}.weight");
@@ -584,7 +584,7 @@ fn load_mtp_fused_experts(
     expected_hidden: usize,
     quant: MtpMoeQuant,
     #[cfg_attr(
-        not(all(target_os = "macos", feature = "metal")),
+        not(gpu_metal),
         expect(unused_variables, reason = "quantification Metal seulement")
     )]
     context: &MtpLoadContext<'_>,
@@ -629,7 +629,7 @@ fn load_mtp_fused_experts(
     let down_stride = down.len_bytes() / experts;
     let gate_up_offset = sidecar.data_offset(resolve, MTP_MOE_MARKER)?;
     let down_offset = sidecar.data_offset(resolve, down_key)?;
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if let (MtpMoeQuant::Affine, Some(metal)) = (quant, context.metal) {
         if crate::runtime_flags::single_copy_weights_enabled() {
             // gate = première moitié de chaque expert `gate_up`, up = seconde.
@@ -727,7 +727,7 @@ fn load_mtp_fused_experts(
 
 /// Une projection des experts dans le fichier : expert `e` à
 /// `offset + e·stride`, matrice `[rows, cols]` de type `dtype`.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 struct ExpertSlices<'a> {
     offset: usize,
     stride: usize,
@@ -741,7 +741,7 @@ struct ExpertSlices<'a> {
 /// `MTLBuffer` partagés contigus, au format que `contiguous_metal_expert_stacks`
 /// sert sans copie. Passer par des poids CPU puis `move_packed_to_metal_shared`
 /// laissait ≈ 0,6 Go dans l'empreinte : malloc garde les blocs libérés.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn quantize_matrices_into_metal(
     metal: &crate::MetalExecutor,
     sidecar: &LazySidecar,
@@ -1071,7 +1071,7 @@ fn load_mtp_linear(
             None,
             &scales_key,
         )?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(quant) = mtp_affine_from_file(
             &weight,
             &scales_view,
@@ -1106,7 +1106,7 @@ fn load_mtp_dense_linear(
     _context: &MtpLoadContext<'_>,
     prefix: &str,
 ) -> Result<Linear> {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if crate::runtime_flags::single_copy_weights_enabled() {
         if let Some(metal) = _context.metal {
             if !matches!(weight.shape(), [rows, cols] if *rows > 0 && *cols > 0) {
@@ -1144,7 +1144,7 @@ fn load_mtp_dense_linear(
 /// seule l'acceptance des drafts peut bouger. `None` hors lm_head bf16 dense
 /// sans biais. Scales et minimums arrondis en bf16 avant le calcul des codes,
 /// comme les poids MLX que lisent les kernels u4.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn quantize_draft_lm_head_u4(lm_head: &Linear) -> Result<Option<Linear>> {
     const GROUP: usize = 64;
     const BITS: usize = 4;
@@ -1264,7 +1264,7 @@ fn load_mtp_draft_linear(
             Some(expected_in_dim),
             &scales_key,
         )?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(quant) = mtp_affine_from_file(
             &weight,
             &scales_view,
@@ -1293,7 +1293,7 @@ fn load_mtp_draft_linear(
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn mtp_affine_from_file(
     weight: &SidecarTensor<'_>,
     scales: &SidecarTensor<'_>,
@@ -1427,7 +1427,7 @@ fn infer_mtp_affine_layout(
 
 /// Fixtures de `quantize_draft_lm_head_u4` : lm_head bf16 partagé Metal (le seul
 /// usage du Metal est le stockage ; la quantification est calculée sur CPU).
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 mod draft_head_u4_tests {
     use super::quantize_draft_lm_head_u4;
     use crate::{DenseBf16Tensor, Linear, LinearWeight, Tensor};
@@ -1748,9 +1748,9 @@ mod tests {
         fn first(weight: &LinearWeight) -> Option<f32> {
             match weight {
                 LinearWeight::Dense(tensor) => tensor.data().first().copied(),
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 LinearWeight::DenseBf16(tensor) => tensor.row(0).ok()?.first().copied(),
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 LinearWeight::DenseShared(tensor) => tensor.data().first().copied(),
                 LinearWeight::AffineQuantized(_) | LinearWeight::MicroScaled(_) => None,
             }
@@ -1925,7 +1925,7 @@ mod tests {
         /// single-copy des linéaires par `with_mtp_sidecar` et forward CPU
         /// après conversion. Chaque test suit `RETI_RUST_SINGLE_COPY_WEIGHTS`
         /// (mémorisé par processus) : coupé, la tête doit rester sur le CPU.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         mod metal {
             use super::*;
             use crate::decoder::mtp::{MTP_MOE_DOWN, MTP_MOE_MARKER, MTP_QUANT_GROUP};

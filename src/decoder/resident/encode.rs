@@ -1,9 +1,9 @@
 use super::super::*;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use crate::metal_backend::MetalExecutor;
 
 impl CausalDecoder {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "routage résident: état couche + arena + ping-pong + encoder"
@@ -141,7 +141,7 @@ impl CausalDecoder {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "routage résident: état couche + arena + ping-pong + encoder"
@@ -230,7 +230,7 @@ impl CausalDecoder {
 
     /// Couche full-attn du tronc sur `rows` lignes, dense ou MoE shared selon
     /// les buffers résidents : boucle commune des cycles MTP fusionnés.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[allow(
         clippy::too_many_arguments,
         reason = "mêmes entrées que les encodeurs en lignes dense et MoE"
@@ -285,7 +285,7 @@ impl CausalDecoder {
     }
 
     /// Couche linear-attn du tronc sur `rows` lignes, queue dense ou MoE.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[allow(
         clippy::too_many_arguments,
         reason = "mêmes entrées que les encodeurs en lignes dense et MoE"
@@ -350,7 +350,7 @@ impl CausalDecoder {
     /// Couche full-attn MoE shared (`FullMoe`, Qwen3.5/3.6 MoE) sur `rows`
     /// positions contiguës de la vérification résidente : attention en lignes,
     /// puis queue MoE shared en lignes (routeur et top-k par ligne).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "routage full-attn MoE résident batché: état couche + arena + ping-pong + encoder"
@@ -402,7 +402,7 @@ impl CausalDecoder {
         )
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[allow(
         dead_code,
         reason = "prototype full-attn batché gardé hors hot path après mesure défavorable"
@@ -446,7 +446,7 @@ impl CausalDecoder {
     /// `dims.position` et `kv.len()` ignorés ; `kv.len()` inchangé (resync
     /// `truncate` par l'appelant après le bloc). Préconditions : cf.
     /// `DecodeResidentState::encode_full_attn_dense_layer_rows_gpu_position`.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "routage full-attn résident batché: état couche + arena + position GPU + encoder"
@@ -482,7 +482,7 @@ impl CausalDecoder {
         )
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "routage full-attn résident batché: état couche + arena + ping-pong + encoder"
@@ -567,7 +567,7 @@ impl CausalDecoder {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "routage résident batché: état couche + arena + ping-pong + encoder"
@@ -630,7 +630,7 @@ impl CausalDecoder {
         )
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[expect(
         clippy::too_many_arguments,
         reason = "routage résident batché: état couche + arena + ping-pong + encoder"
@@ -704,7 +704,7 @@ impl CausalDecoder {
     /// (1 CB chacun). `MoE pur ≈ moe − overhead` ; permet de retrancher le MoE des
     /// temps de couche pour isoler le mécanisme d'attention. Mesure pure (aucun
     /// effet sur la génération). `None` si le modèle/backend ne s'y prête pas.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(in crate::decoder) fn profile_moe_and_overhead(
         &self,
         queue: &metal::CommandQueueRef,

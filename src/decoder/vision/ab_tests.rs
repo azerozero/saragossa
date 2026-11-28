@@ -236,7 +236,7 @@ fn assert_ab(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "A/B réel : poids Qwen3.6, sidecars MTP/DFlash, fixtures et verrou GPU"]
 fn vision_decode_ab_real_sidecars() -> std::result::Result<(), Box<dyn std::error::Error>> {

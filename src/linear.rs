@@ -1,8 +1,8 @@
 //! Couches linéaires denses ou quantifiées et exécution runtime.
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 mod shared;
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub use shared::DenseSharedTensor;
 
 use crate::{AffineQuantizedTensor, ForwardRuntime, InferError, Result, Tensor};
@@ -22,10 +22,10 @@ pub enum LinearWeight {
     /// Stocke les codes flottants et micro-échelles MLX.
     MicroScaled(crate::MicroQuantizedTensor),
     /// Stocke les poids f32 en mémoire partagée, avec le dispatch dense historique.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     DenseShared(DenseSharedTensor),
     /// Stocke les poids bf16 natifs en mémoire unifiée.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     DenseBf16(crate::DenseBf16Tensor),
     /// Stocke les poids affine quantifiés.
     AffineQuantized(AffineQuantizedTensor),
@@ -36,9 +36,9 @@ impl LinearWeight {
         match self {
             Self::Dense(weight) => weight.shape(),
             Self::MicroScaled(weight) => weight.shape(),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::DenseBf16(weight) => weight.shape(),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::DenseShared(weight) => weight.shape(),
             Self::AffineQuantized(weight) => weight.shape(),
         }
@@ -58,7 +58,7 @@ impl LinearWeight {
         input: &Tensor,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = runtime.metal_executor() {
             return match self {
                 Self::Dense(weight) => metal.matmul_rhs_t_dense(input, weight),
@@ -68,13 +68,13 @@ impl LinearWeight {
                 Self::MicroScaled(weight) => metal.matmul_rhs_t_micro(input, weight),
             };
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = runtime;
         match self {
             Self::Dense(weight) => input.matmul_rhs_t(weight),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::DenseBf16(weight) => weight.matmul_rhs_t(input),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::DenseShared(weight) => {
                 input.matmul_rhs_t_data(weight.data(), weight.shape()[0], weight.shape()[1])
             }
@@ -91,7 +91,7 @@ impl LinearWeight {
         input: &Tensor,
         runtime: ForwardRuntime<'_>,
     ) -> Result<Tensor> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = runtime.metal_executor() {
             return match self {
                 Self::Dense(weight) => {
@@ -108,13 +108,13 @@ impl LinearWeight {
                 Self::MicroScaled(weight) => metal.matmul_rhs_t_micro(input, weight),
             };
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = runtime;
         match self {
             Self::Dense(weight) => input.matmul_rhs_t(weight),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::DenseBf16(weight) => weight.matmul_rhs_t(input),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::DenseShared(weight) => {
                 input.matmul_rhs_t_data(weight.data(), weight.shape()[0], weight.shape()[1])
             }
@@ -123,7 +123,7 @@ impl LinearWeight {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
         if let Self::AffineQuantized(weight) = self {
             let weight_id = weight.weight_id();
@@ -132,7 +132,7 @@ impl LinearWeight {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn move_packed_to_metal_shared(
         &mut self,
         metal: &crate::MetalExecutor,
@@ -145,7 +145,7 @@ impl LinearWeight {
         Ok(())
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn affine_quantized(&self) -> Option<&AffineQuantizedTensor> {
         match self {
             Self::Dense(_) | Self::MicroScaled(_) => None,
@@ -154,7 +154,7 @@ impl LinearWeight {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn affine_quantized_mut(&mut self) -> Option<&mut AffineQuantizedTensor> {
         match self {
             Self::Dense(_) | Self::MicroScaled(_) => None,
@@ -211,7 +211,7 @@ impl Linear {
         Ok(Self { weight, bias })
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn move_packed_to_metal_shared(
         &mut self,
         metal: &crate::MetalExecutor,
@@ -219,12 +219,12 @@ impl Linear {
         self.weight.move_packed_to_metal_shared(metal)
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn affine_quantized(&self) -> Option<&AffineQuantizedTensor> {
         self.weight.affine_quantized()
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn affine_quantized_mut(&mut self) -> Option<&mut AffineQuantizedTensor> {
         self.weight.affine_quantized_mut()
     }
@@ -278,14 +278,14 @@ impl Linear {
         &self.weight
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
         self.weight.release_affine_cpu_data(released);
     }
 
     #[must_use]
     #[cfg_attr(
-        not(all(target_os = "macos", feature = "metal")),
+        not(gpu_metal),
         expect(
             dead_code,
             reason = "utilisé par les chemins Metal, absent du build CPU pur"

@@ -19,7 +19,7 @@ fn codec_at_server_frame_cap() -> Result<()> {
 
 /// Le batch au préfixe GPU découpe en lots fixes (mémoire bornée) : PCM
 /// identique au bit à un lot unique, sur une séquence longue.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "parité: lots du préfixe codec GPU, snapshot local et Metal requis"]
 fn codec_gpu_prefix_lots_match_single_lot() -> Result<()> {
@@ -670,7 +670,7 @@ fn codec_gpu_prefix_matches_cpu_prefix() -> Result<()> {
 /// Profil par kernel du codec GPU streaming (lots de 4 trames, état chaud) :
 /// FLOP, octets et durée GPU par trame, débit atteint. `SARAGOSSA_TTS_PROFILE_FRAMES`
 /// et `SARAGOSSA_TTS_PROFILE_LOT` règlent la séquence (64 et 4 par défaut).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "perf: profil par kernel du codec GPU (snapshot local + Metal requis)"]
 fn codec_gpu_kernel_profile() -> Result<()> {
@@ -724,7 +724,7 @@ fn codec_gpu_kernel_profile() -> Result<()> {
 /// Convolutions en tuiles contre le kernel gather : PCM identique au bit en
 /// batch au préfixe CPU (chemin du glouton), en batch au préfixe GPU et en
 /// streaming par lots de 4, sur 150 trames.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "parité: codec GPU en tuiles vs gather (snapshot local + Metal requis)"]
 fn codec_gpu_tiled_conv_matches_gather() -> Result<()> {

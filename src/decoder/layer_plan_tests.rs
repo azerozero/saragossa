@@ -237,7 +237,7 @@ fn historical_attention_errors_and_inferred_dimension() {
     assert_eq!(attention.head_dim, Some(2));
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn resident_dims_debug(d: FullAttnLayerDims) -> String {
     format!(
         "{:?}",
@@ -258,7 +258,7 @@ fn resident_dims_debug(d: FullAttnLayerDims) -> String {
     )
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn historical_resident_dimensions() {
     let mut configs: Vec<_> = fixtures()

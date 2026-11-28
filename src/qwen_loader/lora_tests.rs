@@ -209,7 +209,7 @@ fn quantized_base_target_is_refused() {
 /// Adaptateur thinker de THX-02 (r = 32, alpha = 32) sur sa base bf16 : chaque
 /// module trouve sa cible, `W'·x` suit `W·x + s·B·(A·x)` calculé à part, et le
 /// modèle fusionné se charge sur Metal. `mtp.safetensors` n'est pas lu.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "poids THX-02 locaux (SARAGOSSA_DECISION_MODEL) et verrou GPU requis"]
 fn thx02_thinker_adapter_fuses_on_metal() {

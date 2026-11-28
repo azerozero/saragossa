@@ -289,7 +289,7 @@ impl WhisperEncoder {
         // Frontend conv : RÉSIDENT (GPU, im2col + GEMM tuilé, un command buffer) par
         // défaut sur Metal ; `SARAGOSSA_STT_CONV_PEROP=1` rebascule CPU rayon. Conv en
         // GEMM ⇒ drift ~1e-6 vs CPU (vérifié au golden).
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let h_resident: Option<Tensor> = match runtime.metal_executor() {
             Some(metal)
                 if crate::runtime_flags::env_var_os("SARAGOSSA_STT_CONV_PEROP").is_none() =>
@@ -300,7 +300,7 @@ impl WhisperEncoder {
             }
             _ => None,
         };
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let h_resident: Option<Tensor> = None;
 
         let mut h = match h_resident {
@@ -321,7 +321,7 @@ impl WhisperEncoder {
         // zéro readback (vs ~7 syncs/couche). Mêmes GEMM/attention f32 ⇒
         // byte-identique ; seuls LayerNorm/GELU/add migrent GPU (drift ~1e-7,
         // vérifié au golden). `SARAGOSSA_STT_ENCODER_PEROP=1` rebascule sur le per-op.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = runtime.metal_executor() {
             if crate::runtime_flags::env_var_os("SARAGOSSA_STT_ENCODER_PEROP").is_none() {
                 let enc = self.build_resident(metal)?;
@@ -365,7 +365,7 @@ impl WhisperEncoder {
     /// Prépare les poids GPU (mémoïsés) de l'encodeur résident depuis les `Linear`/
     /// `WhisperLayerNorm` chargés. Les buffers sont mémoïsés par adresse → un seul
     /// upload, réutilisés entre énoncés.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn build_resident(
         &self,
         metal: &crate::MetalExecutor,
@@ -451,7 +451,7 @@ impl WhisperEncoder {
 
     /// Prépare les poids GPU (mémoïsés) du frontend conv mel résident. conv1/conv2
     /// `[out,in,k]` sont relus tels quels comme `[out, in·k]` pour le GEMM.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn build_conv_weights(
         &self,
         metal: &crate::MetalExecutor,
@@ -560,7 +560,7 @@ impl WhisperEncoder {
     /// Comme [`Self::encode_samples`], features laissées sur le GPU pour le KV
     /// cross du décodeur résident. `None` si un repli per-op (conv ou encodeur)
     /// est demandé : l'appelant reprend alors le chemin hôte.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn encode_samples_resident(
         &self,
         samples: &[f32],
@@ -901,7 +901,7 @@ fn validate_vector(tensor: &Tensor, dim: usize, key: &str) -> Result<()> {
 
 /// Transpose le mel `[num_mel_bins, frames]` (channels-major) en `[frames,
 /// num_mel_bins]` (frames-major) pour le frontend conv résident.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn transpose_mel_to_nlc(mel: &Tensor) -> Result<Tensor> {
     let [channels, frames] = mel.shape() else {
         return Err(InferError::Dimension(format!(

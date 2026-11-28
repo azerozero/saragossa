@@ -9,7 +9,7 @@ impl CausalDecoderCache {
             return;
         }
         let fields = vec![("kv_cpu", self.estimated_cpu_bytes())];
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let fields = {
             let mut fields = fields;
             fields.push((
@@ -44,11 +44,11 @@ impl CausalDecoder {
         if !crate::tts::memory::enabled() {
             return;
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(metal) = self.runtime.metal.as_ref() {
             crate::tts::memory::checkpoint(phase, &metal.tts_memory_stats());
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         crate::tts::memory::checkpoint(phase, &[]);
     }
     pub(crate) fn extend_tts_prefill(

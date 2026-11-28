@@ -146,7 +146,7 @@ fn warn_na_once(message: &str) {
     });
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compile_steel_attention(device: &Device, source: &str) -> Option<ComputePipelineState> {
     if matches!(
         crate::runtime_flags::env_var("SARAGOSSA_STT_STEEL_ATTN").as_deref(),
@@ -174,7 +174,7 @@ fn compile_steel_attention(device: &Device, source: &str) -> Option<ComputePipel
 /// le d256 du prefill Qwen et le d128 avec sinks du prefill flint (K/V f32,
 /// puis K/V bf16). `None` pour un pipeline qui ne compile pas (trace sous
 /// `SARAGOSSA_RUST_TRACE_PREFILL`).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compile_steel_causal_attentions(device: &Device, source: &str) -> SteelCausalAttentions {
     let options = compile_options(true);
     let library = match device.new_library_with_source(source, &options) {
@@ -203,7 +203,7 @@ type SteelCausalAttentions = (
     Option<ComputePipelineState>,
 );
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn steel_causal_function(
     device: &Device,
     library: &metal::Library,
@@ -234,7 +234,7 @@ fn steel_causal_function(
 
 /// Compile l'attention causale NAX d128/d256 sans sinks (constante 302=false). `None`
 /// si MetalPerformancePrimitives manque (macOS < 26) ou sans accélérateur.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn compile_steel_causal_nax_attention(
     device: &Device,
     source: &str,
@@ -252,7 +252,7 @@ pub(super) fn compile_steel_causal_nax_attention(
 /// actif, la source est compilée deux fois au démarrage. Coût accepté plutôt
 /// qu'une `Library` partagée : `load_ms` de flint-int4 inchangé avec et sans
 /// ce pipeline (4,5 s, le cache du compilateur Metal absorbe la seconde).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(super) fn compile_nax_sink_d128_attention(
     device: &Device,
     source: &str,
@@ -262,7 +262,7 @@ pub(super) fn compile_nax_sink_d128_attention(
     compile_nax_causal_attention(device, source, shape, true, window)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compile_nax_causal_attention(
     device: &Device,
     source: &str,
@@ -331,24 +331,24 @@ pub(super) fn compile_nax_function(
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn trace_steel_compile_error(kernel: &str, stage: &str, message: &str) {
     if crate::runtime_flags::trace_prefill_enabled() {
         eprintln!("{kernel} {stage}: {message}");
     }
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn compile_steel_attention(_device: &Device, _source: &str) -> Option<ComputePipelineState> {
     None
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn compile_steel_causal_attentions(_device: &Device, _source: &str) -> SteelCausalAttentions {
     (None, None, None)
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn set_metal_bool_constant(
     constants: &metal::FunctionConstantValuesRef,
     index: NSUInteger,

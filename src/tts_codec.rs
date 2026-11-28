@@ -10,7 +10,7 @@ use weights::CodecWeights;
 
 /// Trames par lot du décodage batch au préfixe GPU : borne la mémoire des
 /// scores d'attention sans changer le PCM (invariant au découpage).
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 const CODEC_GPU_PREFIX_LOT_FRAMES: usize = 64;
 
 #[derive(Debug)]
@@ -21,7 +21,7 @@ pub(crate) struct TtsCodec {
     /// Forward GPU résident de la section chaude (`decoder.decoder.*`), construit
     /// au chargement quand Metal est dispo et `SARAGOSSA_TTS_CODEC_GPU` actif (défaut).
     /// Repli CPU (octet-identique) si absent.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     gpu: Option<crate::tts_codec_gpu::CodecGpu>,
 }
 
@@ -33,18 +33,18 @@ pub(crate) struct TtsCodecStreamState {
     hidden_time: usize,
     emitted_samples: usize,
     prefix: TtsCodecPrefixStreamState,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     gpu: Option<crate::tts_codec_gpu::CodecGpuStream>,
 }
 
 impl TtsCodecStreamState {
     /// Le repli CPU redécode tout le préfixe malgré le nom de cet état.
     pub(crate) fn is_incremental(&self) -> bool {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             self.gpu.is_some()
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             false
         }
@@ -152,7 +152,7 @@ impl TtsCodec {
             );
         }
         // Échec (pas de Metal, kernel KO, poids absent) ⇒ repli CPU silencieux.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let gpu = if crate::runtime_flags::env_flag("SARAGOSSA_TTS_CODEC_GPU", true) {
             match crate::tts_codec_gpu::CodecGpu::new(&weights, &cfg) {
                 Ok(gpu) => Some(gpu),
@@ -167,7 +167,7 @@ impl TtsCodec {
         crate::tts::memory::checkpoint("codec_gpu", &[]);
 
         let lazy_cpu = crate::runtime_flags::tts_codec_lazy_cpu_enabled();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let discard = |name: &str| {
             lazy_cpu
                 && gpu.as_ref().is_some_and(|gpu| {
@@ -177,7 +177,7 @@ impl TtsCodec {
                             && !name.starts_with("decoder.quantizer."))
                 })
         };
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let discard = |_name: &str| {
             let _ = lazy_cpu;
             false
@@ -194,7 +194,7 @@ impl TtsCodec {
             cfg,
             sample_rate,
             weights,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             gpu,
         })
     }
@@ -206,11 +206,11 @@ impl TtsCodec {
     /// Indique si le forward GPU résident du codec est actif (tests de parité).
     #[cfg(test)]
     pub(crate) fn gpu_active(&self) -> bool {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             self.gpu.is_some()
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             false
         }
@@ -233,16 +233,16 @@ impl TtsCodec {
         // Préfixe GPU : le batch passe par des lots streaming fixes, PCM
         // identique au bit quel que soit le découpage. Les lots bornent les
         // scores d'attention à `lot × têtes × clés` au lieu de `T² × têtes`.
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if gpu_prefix && self.gpu_prefix_active() {
             return self.decode_codes_in_lots(generated, CODEC_GPU_PREFIX_LOT_FRAMES);
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = gpu_prefix;
         let hidden = self.decode_prefix(generated)?;
         // Section chaude (`decoder.decoder.*`, ~94 % du coût) : forward GPU résident
         // si disponible, sinon repli CPU octet-identique (l'oracle de parité).
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(gpu) = self.gpu.as_ref() {
             let pcm = gpu.decode_tail(hidden.time, hidden.channels, &hidden.data)?;
             return Ok(pcm.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect());
@@ -252,7 +252,7 @@ impl TtsCodec {
 
     /// Décode `generated` en lots streaming de `lot` trames (préfixe GPU si
     /// actif) et concatène le PCM.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn decode_codes_in_lots(
         &self,
         generated: &[Vec<i32>],
@@ -272,7 +272,7 @@ impl TtsCodec {
     pub(crate) fn new_stream_state(&self) -> TtsCodecStreamState {
         TtsCodecStreamState {
             gpu_prefix: true,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             gpu: self.gpu.as_ref().map(|gpu| gpu.new_stream()),
             ..TtsCodecStreamState::default()
         }
@@ -305,12 +305,12 @@ impl TtsCodec {
     /// Préfixe GPU actif : forward GPU présent avec son préfixe, RVQ en deux
     /// groupes (sémantique puis acoustique).
     fn gpu_prefix_active(&self) -> bool {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             self.gpu.as_ref().is_some_and(|gpu| gpu.has_prefix())
                 && self.cfg.num_quantizers > self.cfg.num_semantic_quantizers
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             false
         }
@@ -333,7 +333,7 @@ impl TtsCodec {
             return Ok(Vec::new());
         }
 
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let (true, Some(gpu), Some(gpu_state)) =
             (gpu_prefix, self.gpu.as_ref(), state.gpu.as_mut())
         {
@@ -353,7 +353,7 @@ impl TtsCodec {
             state.emitted_samples = state.emitted_samples.saturating_add(pcm.len());
             return Ok(pcm.into_iter().map(|s| s.clamp(-1.0, 1.0)).collect());
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(gpu_state) = state.gpu.as_mut() {
             let hidden = self
                 .decode_prefix_streaming(&mut state.prefix, &generated[state.generated_frames..])?;
@@ -463,7 +463,7 @@ impl TtsCodec {
     }
 
     /// Bascule les convolutions GPU en tuiles (oracles).
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn set_gpu_conv_tiled(&mut self, enabled: bool) {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.set_conv_tiled(enabled);
@@ -473,7 +473,7 @@ impl TtsCodec {
     /// Profil par kernel de la section GPU streaming : préfixe CPU, lots de
     /// `lot` trames, le premier lot (contextes vides) écarté. Renvoie aussi la
     /// durée GPU d'un command buffer unique par lot, sur un second état.
-    #[cfg(all(test, target_os = "macos", feature = "metal"))]
+    #[cfg(all(test, gpu_metal))]
     pub(crate) fn profile_gpu_tail(
         &self,
         codes: &[Vec<i32>],

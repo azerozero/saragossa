@@ -1,15 +1,15 @@
 //! Sélection du runtime forward pour le décodeur expérimental.
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 use std::marker::PhantomData;
 
 /// Runtime utilisé par les opérations de couche.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ForwardRuntime<'a> {
     rope_positions: Option<&'a [[usize; 3]]>,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     metal: Option<&'a crate::MetalExecutor>,
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     _marker: PhantomData<&'a ()>,
 }
 
@@ -19,15 +19,15 @@ impl<'a> ForwardRuntime<'a> {
     pub fn cpu() -> Self {
         Self {
             rope_positions: None,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             metal: None,
-            #[cfg(not(all(target_os = "macos", feature = "metal")))]
+            #[cfg(not(gpu_metal))]
             _marker: PhantomData,
         }
     }
 
     /// Renvoie le runtime Metal.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[must_use]
     pub fn metal(executor: &'a crate::MetalExecutor) -> Self {
         Self {
@@ -46,7 +46,7 @@ impl<'a> ForwardRuntime<'a> {
         self.rope_positions
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn metal_executor(self) -> Option<&'a crate::MetalExecutor> {
         self.metal
     }

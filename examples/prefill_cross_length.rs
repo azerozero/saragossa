@@ -21,19 +21,19 @@
 //! Usage :
 //!   cargo run -p saragossa --release --features metal --example prefill_cross_length -- <model_dir> [A] [B]
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use std::time::Instant;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 use saragossa::{load_causal_decoder_for_metal, MetalExecutor, ModelAssets};
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn synth_ids(len: usize) -> Vec<usize> {
     // Ids valides et variés (routing MoE non dégénéré), déterministes.
     (0..len).map(|i| (i * 7 + 13) % 30_000 + 1).collect()
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let model_dir = args
@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     Err("cet exemple nécessite macOS et la feature metal".into())
 }

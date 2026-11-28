@@ -225,7 +225,7 @@ fn nope_layer_normalizes_qk_without_rotation() {
 /// l'oracle CPU à sinks : sorties bit-identiques à `base + 513`, `+ 1` et
 /// `+ 513` lignes, troncature jusqu'à la base seulement, lecture sous la base
 /// refusée, et un snapshot intact après le prolongement de son clone.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn bounded_window_kv_matches_full_kv_on_cpu_oracle() {
     use crate::metal_backend::PrefillKvRows;

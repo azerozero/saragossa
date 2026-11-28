@@ -135,13 +135,13 @@ pub(crate) fn ngram_ids(
 /// Contexte incrémental du hachage : les `ngram_size − 1` tokens précédents du
 /// segment courant, le plus récent d'abord, EOS au-delà du début de segment.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+#[cfg(any(test, gpu_metal))]
 pub(crate) struct NgramContext {
     recent: Vec<u64>,
     eos: u64,
 }
 
-#[cfg(any(test, all(target_os = "macos", feature = "metal")))]
+#[cfg(any(test, gpu_metal))]
 impl NgramContext {
     /// Contexte initial (début de séquence) : rempli d'EOS, comme `ngram_ids`.
     pub(crate) fn new(ngram_size: usize, eos: u64) -> Self {

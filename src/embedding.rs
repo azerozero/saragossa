@@ -11,7 +11,7 @@ pub enum EmbeddingWeight {
     /// Stocke une table MLX à micro-échelles.
     MicroScaled(crate::MicroQuantizedTensor),
     /// Stocke une table bf16 native en mémoire unifiée.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     DenseBf16(crate::DenseBf16Tensor),
     /// Stocke une table affine quantifiée.
     AffineQuantized(AffineQuantizedTensor),
@@ -24,13 +24,13 @@ impl EmbeddingWeight {
         match self {
             Self::Dense(tensor) => tensor.shape(),
             Self::MicroScaled(tensor) => tensor.shape(),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::DenseBf16(tensor) => tensor.shape(),
             Self::AffineQuantized(tensor) => tensor.shape(),
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn cpu_data_available(&self) -> bool {
         match self {
             Self::Dense(_) | Self::DenseBf16(_) | Self::MicroScaled(_) => true,
@@ -38,7 +38,7 @@ impl EmbeddingWeight {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn metal_release_byte_exact(&self) -> bool {
         match self {
             Self::Dense(_) | Self::DenseBf16(_) | Self::MicroScaled(_) => true,
@@ -46,7 +46,7 @@ impl EmbeddingWeight {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn release_affine_cpu_data(&mut self, released: &mut Vec<(u64, usize)>) {
         if let Self::AffineQuantized(weight) = self {
             let weight_id = weight.weight_id();
@@ -55,7 +55,7 @@ impl EmbeddingWeight {
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(crate) fn move_packed_to_metal_shared(
         &mut self,
         metal: &crate::MetalExecutor,
@@ -109,7 +109,7 @@ pub fn embed_weight_tokens(table: &EmbeddingWeight, token_ids: &[usize]) -> Resu
             }
             Tensor::from_vec(vec![token_ids.len(), table.shape()[1]], out)
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         EmbeddingWeight::DenseBf16(table) => {
             if token_ids.is_empty() {
                 return Err(InferError::Dimension("séquence de tokens vide".to_string()));

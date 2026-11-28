@@ -228,7 +228,7 @@ fn run() -> CliResult<()> {
     }
     // Les harnais d'acceptance et pairwise chargent le drafter eux-mêmes et
     // comparent la tête MTP nue : ne pas la détourner vers DFlash.
-    #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+    #[cfg(all(gpu_metal, feature = "devtools"))]
     if mtp_active
         && !saragossa::devtools::mtp_acceptance_enabled()
         && !saragossa::devtools::dflash_acceptance_enabled()
@@ -256,7 +256,7 @@ fn run() -> CliResult<()> {
     // le `MetalExecutor` persistant, si bien que le PREMIER vrai decode saute la
     // concaténation des poids (mesuré ~1,3 s → ~3,5 ms). Amorti une fois au
     // démarrage ; en prod résident (voice loop/serve) tous les tours en profitent.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let warmup_elapsed = if mtp_active && warmup_enabled() {
         let _warmup = saragossa::runtime_flags::StateSnapshotWarmup::enter();
         let started = Instant::now();
@@ -324,7 +324,7 @@ fn run() -> CliResult<()> {
             }
             return Ok(());
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let profile_snapshot = prefill_profile_enabled().then(|| {
             (
                 saragossa::metal_backend::decode_profile_snapshot(),
@@ -334,7 +334,7 @@ fn run() -> CliResult<()> {
         let prefill_started = Instant::now();
         let (_, logits) = decoder.prefill_cache(&prompt_ids)?;
         let prefill_elapsed = prefill_started.elapsed();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(((cb0, wait0, read0, dispatch0), site0)) = profile_snapshot {
             let (cb1, wait1, read1, dispatch1) =
                 saragossa::metal_backend::decode_profile_snapshot();
@@ -364,7 +364,7 @@ fn run() -> CliResult<()> {
                 );
             }
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         saragossa::metal_backend::dump_commit_components();
         let row = logits.as_row()?;
         println!(
@@ -416,7 +416,7 @@ fn run() -> CliResult<()> {
             warmup_elapsed,
         )?);
     }
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[cfg(feature = "devtools")]
     if saragossa::devtools::resident_linear_xray_enabled() {
         let options = generation_options(&args, &assets, args.top_p)?;
@@ -427,7 +427,7 @@ fn run() -> CliResult<()> {
             &options,
         )?);
     }
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let decode_profile_snapshot = prefill_profile_enabled().then(|| {
         (
             saragossa::metal_backend::decode_profile_snapshot(),
@@ -540,7 +540,7 @@ fn run() -> CliResult<()> {
             decode_tok_s
         );
     }
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if let Some(((cb0, wait0, read0, dispatch0), shape0)) = decode_profile_snapshot {
         let (cb1, wait1, read1, dispatch1) = saragossa::metal_backend::decode_profile_snapshot();
         eprintln!(
@@ -578,7 +578,7 @@ fn run() -> CliResult<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn compact_source_path(path: &'static str) -> &'static str {
     path.strip_prefix(concat!(env!("CARGO_MANIFEST_DIR"), "/"))
         .unwrap_or(path)
@@ -588,10 +588,10 @@ fn compact_source_path(path: &'static str) -> &'static str {
 ///
 /// Une courte génération spéculative peuple le cache de concaténation QKV du
 /// `MetalExecutor`, sortant le concat (~1,3 s) du prefill du premier prompt réel.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 const MTP_DECODE_WARMUP_TOKENS: usize = 6;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn prefill_profile_enabled() -> bool {
     saragossa::runtime_flags::env_flag("SARAGOSSA_RUST_DECODE_PROFILE", false)
 }
@@ -728,7 +728,7 @@ fn warmup_decoder(
     let warmup_prompt = &prompt_ids[..warmup_len];
     // Le drop doit précéder tout prefill : la première passe construirait sinon
     // les buffers Metal du modèle entier pendant que les payloads CPU résident.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let _ = decoder.warmup_and_release_cpu_weights(warmup_prompt)?;
     for _ in 0..passes {
         let _ = decoder.prefill_cache_uncached(warmup_prompt)?;
@@ -927,12 +927,12 @@ impl CliArgs {
 }
 
 impl RuntimeKind {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn default_backend() -> Self {
         Self::Metal
     }
 
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     fn default_backend() -> Self {
         Self::Cpu
     }
@@ -1005,7 +1005,7 @@ fn load_decoder_with_runtime(
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn load_decoder_metal(assets: &ModelAssets) -> CliResult<CausalDecoder> {
     let executor = saragossa::MetalExecutor::new_with_kernel_profile(
         saragossa::KernelProfile::for_model_dir(&assets.model_dir),
@@ -1014,7 +1014,7 @@ fn load_decoder_metal(assets: &ModelAssets) -> CliResult<CausalDecoder> {
         .with_metal_executor(executor)?)
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[cfg(not(gpu_metal))]
 fn load_decoder_metal(_assets: &ModelAssets) -> CliResult<CausalDecoder> {
     Err(cli_error(
         "backend metal indisponible dans ce build — recompile avec --features metal",
@@ -1141,10 +1141,10 @@ mod tests {
 
     #[test]
     fn cli_direct_backend_default_matches_platform_runtime() {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         assert_eq!(RuntimeKind::default_backend(), RuntimeKind::Metal);
 
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         assert_eq!(RuntimeKind::default_backend(), RuntimeKind::Cpu);
     }
 

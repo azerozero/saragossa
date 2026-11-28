@@ -10,13 +10,13 @@ pub(crate) fn multi_head_attention(
     causal: bool,
     runtime: ForwardRuntime<'_>,
 ) -> Result<Tensor> {
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     if let Some(metal) = runtime.metal_executor() {
         if !causal && q.shape() == k.shape() && k.shape() == v.shape() {
             return metal.noncausal_attention_prefill(q, k, v, heads, heads);
         }
     }
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     let _ = runtime;
     let (q_seq, dim) = q.as_matrix()?;
     let (kv_seq, k_dim) = k.as_matrix()?;

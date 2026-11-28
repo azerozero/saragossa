@@ -523,7 +523,7 @@ fn process_restart_mtp_extends_shorter_ssd_boundary() {
 
 /// Même tour d'agent sur Metal : ancre alignée relue du SSD après
 /// redémarrage, reprise MTP, sortie greedy identique au chemin à froid.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal requis, données synthétiques"]
 fn process_restart_mtp_aligned_resume_matches_cold_greedy_synthetic() {
@@ -925,7 +925,7 @@ fn priority_refusal_is_memoized_before_staging() {
 
 /// Sans poids externes : le KV est arrondi une seule fois puis placé en
 /// mémoire Metal partagée. Baseline et reprise voient les mêmes bits bf16.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "device Metal et verrou GPU requis, modèle hybride synthétique"]
 fn synthetic_metal_bf16_greedy_survives_restart() -> Result<()> {

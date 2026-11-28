@@ -383,10 +383,10 @@ impl LetterModel {
         if reads.len() < 2 || !self.decoder.prefix_extend_as_cheap_as_cold(longest) {
             return 0;
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let rows = crate::metal_backend::DENSE_BF16_GEMM_MIN_BATCH
             .max(crate::runtime_flags::prefix_extend_resident_min_tokens());
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let rows = usize::MAX;
         bounded_prefix(reads, rows)
     }

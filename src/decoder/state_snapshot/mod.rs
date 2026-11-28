@@ -287,10 +287,10 @@ struct Layer {
     conv_dim: Option<usize>,
     ssm: Blob,
     ssm_shape: Option<(usize, usize, usize)>,
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     metal: Option<MetalLinear>,
 }
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[derive(Serialize, Deserialize)]
 struct MetalLinear {
     layout: crate::metal_backend::LinearSnapshotLayout,
@@ -299,9 +299,9 @@ struct MetalLinear {
 }
 impl Layer {
     fn write(layer: &LayerKvCache, writer: &mut Writer, model: &CausalDecoder) -> Result<Self> {
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = model;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let metal = if let Some(state) = layer.linear.metal_state() {
             let executor = model
                 .forward_runtime()
@@ -329,7 +329,7 @@ impl Layer {
             conv_dim: layer.linear.conv_dim,
             ssm: writer.f32(&layer.linear.ssm)?,
             ssm_shape: layer.linear.ssm_shape,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             metal,
         })
     }
@@ -362,7 +362,7 @@ impl Layer {
         }
         Ok(layer)
     }
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     fn read_metal(
         &self,
         root: &Path,
@@ -419,9 +419,9 @@ fn staging_estimate(
     captures: Option<&PrefixCaptures>,
 ) -> (u64, u64) {
     let mut blobs = (final_state.data().len() as u64).saturating_mul(4);
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     let mut scratch = 0u64;
-    #[cfg(not(all(target_os = "macos", feature = "metal")))]
+    #[cfg(not(gpu_metal))]
     let scratch = 0u64;
     for layer in cache.layers.iter().chain(history) {
         for rows in [&layer.keys, &layer.values] {
@@ -432,7 +432,7 @@ fn staging_estimate(
                 .saturating_add(layer.linear.ssm.len() as u64)
                 .saturating_mul(4),
         );
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if let Some(state) = layer.linear.metal_state() {
             let bytes = state.estimated_bytes() as u64;
             blobs = blobs.saturating_add(bytes);
@@ -494,7 +494,7 @@ impl CausalDecoder {
         for &token in prompt {
             hash.update((token as u64).to_le_bytes());
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let kv_dtype = format!(
             "resident_bf16={} quant={:?} prefill_bf16={} mtp_history_bf16_v1={}",
             Self::resident_kv_bf16(false, prompt.len()),
@@ -502,16 +502,16 @@ impl CausalDecoder {
             crate::runtime_flags::prefill_kv_bf16_store_enabled(),
             super::mtp_history::bf16_capacity().is_some()
         );
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let kv_dtype = "f32".to_string();
         let environment = crate::runtime_flags::environment_sha256();
         let overrides = crate::runtime_flags::state_snapshot_overrides();
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let kernel_profile = self
             .forward_runtime()
             .metal_executor()
             .map(|metal| metal.snapshot_kernel_profile());
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let kernel_profile: Option<String> = None;
         let position_sha256 = position_digest(positions, prompt.len())?;
         if let Some(identity) = &position_sha256 {
@@ -534,7 +534,7 @@ impl CausalDecoder {
                 config: format!(
                     "{:?};metal={}",
                     self.config,
-                    cfg!(all(target_os = "macos", feature = "metal")) && self.snapshot_has_metal()
+                    cfg!(gpu_metal) && self.snapshot_has_metal()
                 ),
                 kv_dtype,
                 runtime_sha256: storage::digest(
@@ -554,11 +554,11 @@ impl CausalDecoder {
     }
 
     fn snapshot_has_metal(&self) -> bool {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             self.forward_runtime().metal_executor().is_some()
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         {
             false
         }
@@ -715,7 +715,7 @@ impl CausalDecoder {
                 Ok(PrefixCaptures::new(&c.layer_ids, c.from, hidden))
             })
             .transpose()?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             let linear = manifest
                 .layers

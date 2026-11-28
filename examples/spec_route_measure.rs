@@ -4,7 +4,7 @@
 //! Le drafter vient de `SARAGOSSA_RUST_DFLASH_DRAFT_DIR` ; les poids restent
 //! chargés et chaque requête repart d'un préfixe froid.
 
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use saragossa::{
         load_causal_decoder_for_metal, spec_route::prefers_dflash, GenerationOptions,
@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(all(target_os = "macos", feature = "metal", feature = "devtools")))]
+#[cfg(not(all(gpu_metal, feature = "devtools")))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     Err("cet exemple nécessite macOS et les features metal,devtools".into())
 }

@@ -3,10 +3,10 @@
 use super::attention_ops::*;
 use super::*;
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 const RESIDENT_SUPPORTED_BITS: &[usize] = &[2, 3, 4, 5, 6, 8];
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 fn resident_projection_unsupported_bits(projection: &Linear) -> Option<usize> {
     let LinearWeight::AffineQuantized(weight) = projection.weight() else {
         return None;
@@ -115,14 +115,14 @@ impl DecoderLayer {
     /// `CausalDecoder` refuse déjà d'attacher Metal à un tel modèle ; cette
     /// garde rend l'erreur explicite si un autre appelant passait outre.
     fn ensure_runtime_supported(&self, runtime: ForwardRuntime<'_>) -> Result<()> {
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if runtime.metal_executor().is_some() && self.metal_unsupported() {
             return Err(InferError::Config(
                 "couche flint (sinks, NoPE ou MoE sigmoïde) refusée par le runtime Metal"
                     .to_string(),
             ));
         }
-        #[cfg(not(all(target_os = "macos", feature = "metal")))]
+        #[cfg(not(gpu_metal))]
         let _ = runtime;
         Ok(())
     }
@@ -262,7 +262,7 @@ impl DecoderLayer {
     /// q_norm/k_norm présents ensemble, ou absents ensemble devant un MLP dense
     /// (Llama, Mistral : RoPE seule, norme `None`). Le
     /// shared-expert/router biasless est re-vérifié à l'encodage (`ensure_biasless`).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn supports_resident_full(&self) -> bool {
         // NOTE: Sinks, NoPE et MoE flint (sigmoïde + expert partagé sans gate)
         // ont leurs kernels résidents ; `metal_unsupported` ne garde ici que
@@ -316,7 +316,7 @@ impl DecoderLayer {
 
     /// Le tail dense résident fige l'activation : GeGLU avec les normes FFN
     /// Gemma, SwiGLU sinon. Toute autre paire reste au per-op.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn resident_dense_activation_ok(&self, mlp: &crate::GatedMlp) -> bool {
         let expected = if self.pre_feedforward_norm.is_some() {
             crate::Activation::GeluTanh
@@ -326,7 +326,7 @@ impl DecoderLayer {
         mlp.activation() == expected
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn resident_quantization_unsupported_bits(&self) -> Option<usize> {
         if let AttentionBlock::Full(attention) = &self.attention {
             for projection in [
@@ -351,7 +351,7 @@ impl DecoderLayer {
         None
     }
 
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn prefill_moe_layer(
         &self,
         config: &CausalDecoderConfig,
@@ -545,9 +545,9 @@ impl DecoderLayer {
         self.ensure_runtime_supported(runtime)?;
         let profile = profile_layer_enabled();
         let total_started = profile.then(Instant::now);
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         let (prefill_seq, _) = x.as_matrix()?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if runtime.rope_positions().is_none() && position_offset == 0 && !config.attn_output_gate {
             if let (
                 Some(metal),
@@ -656,7 +656,7 @@ impl DecoderLayer {
         // Variante GATED + SHARED-EXPERT (Qwen3.5/3.6 : `attn_output_gate`, MoE shared) :
         // GPU-ifie le prefill full-attn (attention causale batchée + MoE shared rows),
         // sinon l'attention retombe sur le CPU O(seq²) (goulot prefill à l'échelle).
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if runtime.rope_positions().is_none() && position_offset == 0 && config.attn_output_gate {
             if let (
                 Some(metal),
@@ -806,7 +806,7 @@ impl DecoderLayer {
                     config, &normed, cache, position, attention, runtime,
                 )?;
                 let _attention_elapsed = attention_started.map(|started| started.elapsed());
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 if let (Some(metal), Some(norm), Some(FeedForward::Moe(mlp))) = (
                     runtime.metal_executor(),
                     self.post_attention_norm.as_ref(),
@@ -880,7 +880,7 @@ impl DecoderLayer {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 impl FullAttention {
     /// Renvoie la projection V effective du layout résident.
     ///
@@ -892,7 +892,7 @@ impl FullAttention {
     }
 }
 
-#[cfg(all(test, target_os = "macos", feature = "metal"))]
+#[cfg(all(test, gpu_metal))]
 mod tests {
     use super::*;
 

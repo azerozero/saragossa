@@ -1,4 +1,4 @@
-#![cfg(all(target_os = "macos", feature = "metal"))]
+#![cfg(gpu_metal)]
 
 use saragossa::{InferError, KernelProfile, MetalExecutor};
 

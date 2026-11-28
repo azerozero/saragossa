@@ -12,6 +12,13 @@ use std::{env, fs, path::PathBuf};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_METAL");
     println!("cargo:rerun-if-changed=assets/steel_attention.metal");
+    // Alias du chemin Metal : `cfg(gpu_metal)` ⇔ `all(target_os = "macos", feature = "metal")`.
+    println!("cargo:rustc-check-cfg=cfg(gpu_metal)");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+        && env::var_os("CARGO_FEATURE_METAL").is_some()
+    {
+        println!("cargo:rustc-cfg=gpu_metal");
+    }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
     let output = out_dir.join("steel_attention.metal");

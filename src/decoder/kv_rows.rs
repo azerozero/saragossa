@@ -36,9 +36,9 @@ pub(super) struct KvRows {
 enum Segment {
     Owned(Vec<f32>),
     OwnedBf16(Vec<u16>),
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     Shared(crate::metal_backend::SharedF32Rows),
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     SharedBf16(crate::metal_backend::SharedBf16Rows),
 }
 
@@ -52,10 +52,10 @@ impl Segment {
     fn as_f32(&self) -> Cow<'_, [f32]> {
         let bf16 = match self {
             Self::Owned(data) => return Cow::Borrowed(data),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::Shared(rows) => return Cow::Borrowed(rows.as_slice()),
             Self::OwnedBf16(data) => data.as_slice(),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::SharedBf16(rows) => rows.as_slice(),
         };
         Cow::Owned(bf16.iter().copied().map(bf16_bits_to_f32).collect())
@@ -66,9 +66,9 @@ impl Segment {
         match self {
             Self::Owned(data) => data.len(),
             Self::OwnedBf16(data) => data.len(),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::Shared(rows) => rows.len(),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::SharedBf16(rows) => rows.len(),
         }
     }
@@ -85,9 +85,9 @@ impl Segment {
                 data.as_ptr().addr(),
                 data.capacity() * std::mem::size_of::<u16>(),
             ),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::Shared(rows) => (rows.allocation_id(), rows.allocation_bytes()),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::SharedBf16(rows) => (rows.allocation_id(), rows.allocation_bytes()),
         }
     }
@@ -96,9 +96,9 @@ impl Segment {
         match self {
             Self::Owned(data) => data.truncate(len),
             Self::OwnedBf16(data) => data.truncate(len),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::Shared(rows) => rows.truncate(len),
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Self::SharedBf16(rows) => rows.truncate(len),
         }
     }
@@ -135,9 +135,9 @@ impl KvRows {
                 Arc::new(match segment.as_ref() {
                     Segment::Owned(data) => Segment::Owned(data.to_vec()),
                     Segment::OwnedBf16(data) => Segment::OwnedBf16(data.to_vec()),
-                    #[cfg(all(target_os = "macos", feature = "metal"))]
+                    #[cfg(gpu_metal)]
                     Segment::Shared(rows) => Segment::Owned(rows.as_slice().to_vec()),
-                    #[cfg(all(target_os = "macos", feature = "metal"))]
+                    #[cfg(gpu_metal)]
                     Segment::SharedBf16(rows) => Segment::OwnedBf16(rows.as_slice().to_vec()),
                 })
             })
@@ -155,7 +155,7 @@ impl KvRows {
         self.segments.iter().fold(0u64, |total, segment| {
             let width = match segment.as_ref() {
                 Segment::OwnedBf16(_) => 2,
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 Segment::SharedBf16(_) => 2,
                 _ => 4,
             };
@@ -170,9 +170,9 @@ impl KvRows {
             .map(|segment| match segment.as_ref() {
                 Segment::Owned(data) => (BlobDtype::F32, bytemuck::cast_slice(data)),
                 Segment::OwnedBf16(data) => (BlobDtype::Bf16, bytemuck::cast_slice(data)),
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 Segment::Shared(rows) => (BlobDtype::F32, bytemuck::cast_slice(rows.as_slice())),
-                #[cfg(all(target_os = "macos", feature = "metal"))]
+                #[cfg(gpu_metal)]
                 Segment::SharedBf16(rows) => {
                     (BlobDtype::Bf16, bytemuck::cast_slice(rows.as_slice()))
                 }
@@ -184,7 +184,7 @@ impl KvRows {
     pub(super) fn has_bf16(&self) -> bool {
         self.segments.iter().any(|segment| match segment.as_ref() {
             Segment::OwnedBf16(_) => true,
-            #[cfg(all(target_os = "macos", feature = "metal"))]
+            #[cfg(gpu_metal)]
             Segment::SharedBf16(_) => true,
             _ => false,
         })
@@ -273,7 +273,7 @@ impl KvRows {
     /// Buffer GPU dont une seule vue porte toutes les lignes depuis son début
     /// (K ou V d'un prefill à froid) : un prolongement peut y écrire à la
     /// suite, cf. `PrefillResidentPrefixLayer::Full::in_place`.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn sole_shared_buffer(&self) -> Option<metal::Buffer> {
         match self.segments.as_slice() {
             [segment] => match segment.as_ref() {
@@ -291,7 +291,7 @@ impl KvRows {
     /// vivante ne dépasse) : une arène de decode peut adopter son buffer et
     /// écrire à la suite. Simple indice : l'adoption le revalide sous claim
     /// (`DecodeResidentState::full_attention_adopting`).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn adoptable_bf16_prefix(&self) -> Option<&crate::metal_backend::SharedBf16Rows> {
         match self.segments.first().map(AsRef::as_ref) {
             Some(Segment::SharedBf16(rows)) if rows.is_whole() => Some(rows),
@@ -300,7 +300,7 @@ impl KvRows {
     }
 
     /// Ajoute le K ou V d'un prefill résident, vue GPU comprise, sans copie.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn push_prefill(&mut self, rows: crate::metal_backend::PrefillKvRows) {
         use crate::metal_backend::PrefillKvRows;
         let segment = match rows {
@@ -318,7 +318,7 @@ impl KvRows {
 
     /// Segments dans l'ordre, typés avec leur provenance (semis de l'arène,
     /// préfixe d'un prolongement résident).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn segments(&self) -> Vec<crate::decode_resident::KvSegment<'_>> {
         use crate::decode_resident::KvSegment;
         self.segments
@@ -465,7 +465,7 @@ mod tests {
     /// Seule la vue entière d'un prefill bf16 est adoptable : un clone
     /// tronqué laisserait l'arène écrire dans des lignes encore vues par un
     /// autre état (snapshot plus long).
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     #[test]
     fn only_whole_bf16_prefill_view_is_adoptable() -> crate::Result<()> {
         let Some(device) = metal::Device::system_default() else {

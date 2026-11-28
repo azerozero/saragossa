@@ -210,11 +210,11 @@ impl ReplModel {
         if mtp_active && assets.mtp.path.is_some() {
             decoder = decoder.with_mtp_weights(&assets.mtp)?;
         }
-        #[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+        #[cfg(all(gpu_metal, feature = "devtools"))]
         if mtp_active {
             decoder = decoder.with_dflash_draft_auto(&assets)?;
         }
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         if args.backend == RuntimeKind::Metal {
             let prompt = assets.encode_prompt_with_special("warmup")?;
             let prompt = prompt

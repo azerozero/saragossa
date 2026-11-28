@@ -283,7 +283,7 @@ impl TtsModel {
         };
         let mut talker = CausalDecoder::from_decoder_tensors(tensors, decoder_config)?;
         super::memory::checkpoint("talker_cpu", &[]);
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             talker = talker.with_metal_runtime()?;
             super::memory::checkpoint("talker_gpu", &[]);
@@ -341,7 +341,7 @@ impl TtsModel {
                 ..CausalDecoderConfig::default()
             };
         let mut code_predictor = CausalDecoder::from_decoder_tensors(cp_tensors, cp_config)?;
-        #[cfg(all(target_os = "macos", feature = "metal"))]
+        #[cfg(gpu_metal)]
         {
             code_predictor = code_predictor.with_metal_runtime()?;
             super::memory::checkpoint("code_predictor_gpu", &[]);

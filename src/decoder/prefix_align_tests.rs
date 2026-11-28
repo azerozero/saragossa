@@ -42,7 +42,7 @@ fn first_divergence(left: &[usize], right: &[usize]) -> Option<usize> {
 /// alignée).
 #[test]
 #[ignore = "modèle réel requis"]
-#[cfg(all(target_os = "macos", feature = "metal", feature = "devtools"))]
+#[cfg(all(gpu_metal, feature = "devtools"))]
 fn prefix_extension_matches_cold_prefill_real_model() -> Result<()> {
     let Some(model_dir) = crate::runtime_flags::env_var_os("SARAGOSSA_RUST_PREFIX_ALIGN_MODEL")
         .map(std::path::PathBuf::from)

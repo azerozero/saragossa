@@ -105,7 +105,7 @@ fn vision_cpu_chunking_decode_and_text_identity() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 #[ignore = "oracle Metal sous verrou GPU"]
 fn vision_resident_prefill_and_decode_match_cpu() -> Result<()> {
@@ -180,7 +180,7 @@ fn vision_resident_prefill_and_decode_match_cpu() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 #[test]
 fn vision_mtp_resident_cycles_fall_back_before_mutating_cache() -> Result<()> {
     use crate::decoder::MtpFinalState;

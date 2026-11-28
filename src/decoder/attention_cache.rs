@@ -65,7 +65,7 @@ impl LayerKvCache {
     /// partagées comprises, sans recopie. `base` > 0 (couche glissante
     /// bornée à sa fenêtre) : `base` lignes absentes précèdent `key`/`value`,
     /// sur un cache vide seulement.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn append_prefill(
         &mut self,
         key: crate::metal_backend::PrefillKvRows,
@@ -108,7 +108,7 @@ impl LayerKvCache {
     /// lignes, préfixe compris, dont les `base` premières absentes),
     /// recopié dans un buffer neuf ou prolongé en place dans le sien, validé
     /// avant toute mutation.
-    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[cfg(gpu_metal)]
     pub(super) fn replace_prefill(
         &mut self,
         key: crate::metal_backend::PrefillKvRows,

@@ -1,6 +1,6 @@
 /// Les tests ordinaires sautent uniquement l'absence de device. La suite GPU
 /// explicite exige son exécution et conserve toutes les autres erreurs.
-#[cfg(all(target_os = "macos", feature = "metal"))]
+#[cfg(gpu_metal)]
 pub(crate) fn metal_executor() -> crate::Result<Option<crate::MetalExecutor>> {
     match crate::MetalExecutor::new() {
         Ok(executor) => Ok(Some(executor)),
