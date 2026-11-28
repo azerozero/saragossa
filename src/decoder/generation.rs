@@ -2932,7 +2932,8 @@ impl CausalDecoder {
         // si tout est accepté, le token bonus se tire de cette ligne au lieu d'un
         // pas de decode complet (32-34 ms sur le 27B). En greedy, c'est l'argmax
         // de la ligne, calculé par le même vérifieur en lignes que les autres
-        // cibles : même identité au bit avec l'AR que celles-ci.
+        // cibles. NOTE: la ligne en plus peut faire passer le lot au skinny
+        // (5 lignes et plus), exact sauf quasi-égalité (greedy-identity.md).
         let bonus_row = batched_rollback;
         let verified_drafts = if bonus_row {
             drafts.len()

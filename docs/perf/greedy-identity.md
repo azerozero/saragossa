@@ -21,7 +21,7 @@ Deux kernels actifs par défaut ne sont pas bit-identiques au pas mono-ligne.
 
 | Kernel | Quand | Pourquoi |
 |---|---|---|
-| matmul u4 skinny | lots de 5 lignes et plus : DFlash, lookup, MTP avec drafts lookup sur prompt long (8 lignes) | MMA bf16 hi+lo contre FMA scalaire du qmv |
+| matmul u4 skinny | lots de 5 lignes et plus : DFlash, lookup, MTP avec drafts lookup sur prompt long (8 lignes), MTP à 4 drafts avec ligne bonus (5 lignes) | MMA bf16 hi+lo contre FMA scalaire du qmv |
 | préfixe NAX de l'attention en lignes | contexte ≥ 16k, KV bf16, lots de 2 lignes et plus | Q en bf16 et MMA |
 
 Avec ces réglages par défaut, le texte reste celui de l'AR, sauf sur une
