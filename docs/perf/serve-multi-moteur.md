@@ -113,48 +113,25 @@ exécutions.
 #### Référence révisée : R passes complètes sur R files (28 nov. 2026)
 
 Le « R × qmv mono » ci-dessus relit chaque poids R fois de suite, donc chaud en
-cache, ce qui avantage le mono. Le serve fait R passes complètes, une par
-moteur, sur des files distinctes. Le même bench mesure maintenant ce cas, en
-temps mur, sur 3 exécutions (porte loadavg < 2, secteur) :
+cache. Le serve fait R passes complètes, une par moteur, sur des files
+distinctes et des sorties distinctes. Le bench mesure ce cas et le qmv en
+lignes avec la même horloge (temps mur, du commit à la fin du dernier command
+buffer), sur 3 exécutions (porte loadavg < 2, secteur) :
 
-| R | talker : R files concurrentes | R passes séquentielles | lignes | predictor : R files | lignes |
-|---|---|---|---|---|---|
-| 2 | 5,61 à 5,64 ms | 5,31 ms | 3,00 à 3,03 ms | 0,53 à 0,55 ms | 0,22 ms |
-| 6 | 16,26 à 16,30 ms | 15,94 à 15,99 ms | 7,42 ms | 1,34 à 1,37 ms | 0,555 ms |
+| R | talker : R files | talker : lignes | ratio | predictor : R files | predictor : lignes | ratio |
+|---|---|---|---|---|---|---|
+| 2 | 3,47 à 3,50 ms | 3,31 à 3,33 ms | 1,05 | 0,51 à 0,55 ms | 0,38 ms | 1,33 à 1,46 |
+| 4 | 6,58 à 6,66 ms | 5,70 à 5,71 ms | 1,15 à 1,17 | 0,81 à 0,82 ms | 0,58 à 0,62 ms | 1,32 à 1,42 |
+| 6 | 9,71 à 9,88 ms | 7,73 à 7,74 ms | 1,26 à 1,28 | 1,16 à 1,18 ms | 0,75 à 0,76 ms | 1,52 à 1,57 |
 
-- Les files concurrentes ne recouvrent rien : 6 passes coûtent 6 × T(1).
-  Contre le schéma actuel, les lignes gagnent ×2,2 sur le talker et ×2,45 sur
-  le predictor à R = 6, et non ×1,52.
-- Profil de trame à N=1 (`SARAGOSSA_TTS_INTERNAL_PROFILE=1`,
-  `SARAGOSSA_RUST_DECODE_PROFILE=1`, CustomVoice échantillonné, 118 trames,
-  2 passes) : 10,2 ms de mur par trame, dont talker 4,4 ms et trame fusionnée
-  du code predictor 5,6 à 5,8 ms (891 dispatches). Les matmuls pèsent
-  environ 2,65 + 16 × 0,2 ≈ 5,9 ms, soit ~58 % de la trame, et non 1/3. Le GPU
-  du codec (3,2 ms par trame, recouvert sur un autre thread) se mêle aux
-  compteurs GPU des phases.
-- Borne révisée, sous l'hypothèse de sérialisation à N=6 (trame GPU ≈ 8,7 ms) :
-  le TTS gagnerait environ ×1,6 si seules les matmuls passent en lignes, soit
-  ~×1,45 sur la chaîne vocale. Cette estimation n'est pas une mesure de bout en
-  bout.
-
-### Réglages faciles mesurés (ABBA `bench/ab.py`, 4 blocs, cooldown 120 s, N=6)
-
-| Essai | Cellule | Ratio B/A débit global [IC 95 %] | Verdict |
-|---|---|---|---|
-| Pool de buffers du codec gardé d'un morceau à l'autre | TTS seul | 1,006 [0,995 ; 1,016] | indistinct, écarté |
-| Cache des pipelines résidents entre arènes | LLM seul | 1,006 [0,998 ; 1,014] | indistinct, écarté |
-| MTP en D1 (`SARAGOSSA_RUST_MTP_MAX_DRAFT=1`) contre le défaut | LLM seul | ~0,98 (indicatif, 3 blocs valides sur 4) | perte probable |
-| AR (`SARAGOSSA_RUST_MTP_DECODE=0`) contre MTP par défaut | LLM seul | 1,075 [1,059 ; 1,092] | gain de débit, TTFT p50 ~150-200 → ~255-280 ms |
-
-- Le cache de pipelines ramène la création d'une arène de 8 à 11 ms à 0,65 ms
-  (`SARAGOSSA_RUST_MTP_SETUP_TRACE`). Cela ne fait que quelques ms par
-  génération, sous le bruit du cycle.
-- À N=6, l'AR bat le MTP de 7,5 % en débit LLM global : le GPU saturé paie
-  les lignes de vérification rejetées. Sur le cycle vocal (LLM = 15 %), cela
-  donne environ +1 % de débit global, contre un TTFT plus long de ~90 ms.
-  Aucun défaut n'est changé ; `SARAGOSSA_RUST_MTP_DECODE=0` reste le réglage
-  disponible pour un serve chargé. Il faut confirmer sur le cycle complet et à
-  N = 2 et 4 avant d'en faire une politique.
-- Caches de préfixe isolés par moteur : sans effet sur ce bench. Le mémo de
-  prefill TTS est opt-in et ne sert qu'à VoiceDesign. Chaque tour est une
-  conversation neuve. Non prototypés.
+- Les files concurrentes se recouvrent déjà : 6 passes talker prennent
+  9,7 à 9,9 ms de mur, contre 16,0 ms en séquence (durée GPU). Le gain des
+  lignes sur le schéma actuel se réduit à ×1,27 (talker) et ×1,55 (predictor)
+  à R = 6.
+- Profil de trame à N=1, codec non recouvert (`SARAGOSSA_TTS_CODEC_OVERLAP=0`,
+  `SARAGOSSA_TTS_INTERNAL_PROFILE=1`, `SARAGOSSA_RUST_DECODE_PROFILE=1`,
+  CustomVoice échantillonné, 118 trames, 2 passes), durée GPU par trame :
+  talker 3,37 à 3,40 ms, trame CP fusionnée 5,15 à 5,18 ms (891 dispatches),
+  codec 2,10 ms. Le recouvrement par défaut mêle le GPU du codec aux autres
+  phases. Il n'y a donc pas de mesure GPU propre à N=6, et aucune borne de bout
+  en bout n'est retenue ici.

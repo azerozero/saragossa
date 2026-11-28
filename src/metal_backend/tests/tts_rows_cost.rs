@@ -89,29 +89,38 @@ fn tts_u6_rows_cost_bench() -> Result<()> {
         };
         // NOTE: le « mono×R » ci-dessus relit chaque poids R fois de suite, donc
         // chaud en cache. Le serve multi-moteur fait plutôt R passes complètes,
-        // une par moteur, sur R files concurrentes : `streams` mesure ce cas
-        // en temps mur (commit des R command buffers → fin du dernier), et
-        // `sequential` les R passes complètes l'une après l'autre (durée GPU).
+        // une par moteur, sur R files concurrentes, chacune avec sa sortie
+        // (comme les scratchs des moteurs). `wall(files, batch)` chronomètre en
+        // temps mur, du commit des command buffers à la fin du dernier : R
+        // files à 1 ligne (serve actuel) ou 1 file à R lignes, même horloge.
+        // `sequential` enchaîne les R passes complètes (durée GPU).
         let queues: Vec<_> = (0..6).map(|_| executor.device.new_command_queue()).collect();
-        let full_pass = |encoder: &metal::ComputeCommandEncoderRef| -> Result<()> {
+        let outs = (0..6)
+            .map(|_| executor.uncached_f32_buffer(6 * 6144, "tts_rows_bench_out"))
+            .collect::<Result<Vec<_>>>()?;
+        let full_pass = |encoder: &metal::ComputeCommandEncoderRef,
+                         batch: usize,
+                         out: &metal::BufferRef|
+         -> Result<()> {
             for weight in &weights {
                 if let MetalLinearWeightBuffers::AffineQuantized { in_dim, .. } = weight {
                     executor.encode_matmul_weight_buffers(
-                        encoder, &lhs, 1, *in_dim, weight, &out, false,
+                        encoder, &lhs, batch, *in_dim, weight, out, false,
                     )?;
                 }
             }
             Ok(())
         };
-        let streams = |rows: usize| -> Result<f64> {
+        let wall = |files: usize, batch: usize| -> Result<f64> {
             let mut samples = Vec::new();
             for _ in 0..7 {
-                let buffers = queues[..rows]
+                let buffers = queues[..files]
                     .iter()
-                    .map(|queue| {
+                    .zip(&outs)
+                    .map(|(queue, out)| {
                         let command_buffer = queue.new_command_buffer().to_owned();
                         let encoder = command_buffer.new_compute_command_encoder();
-                        full_pass(encoder)?;
+                        full_pass(encoder, batch, out)?;
                         encoder.end_encoding();
                         Ok(command_buffer)
                     })
@@ -130,7 +139,7 @@ fn tts_u6_rows_cost_bench() -> Result<()> {
                 let command_buffer = executor.queue.new_command_buffer();
                 let encoder = command_buffer.new_compute_command_encoder();
                 for _ in 0..rows {
-                    full_pass(encoder)?;
+                    full_pass(encoder, 1, &out)?;
                 }
                 encoder.end_encoding();
                 commit_and_wait(command_buffer)?;
@@ -158,12 +167,14 @@ fn tts_u6_rows_cost_bench() -> Result<()> {
                 lines / one,
                 qmm / one
             );
-            let parallel = streams(rows)?;
+            let parallel = wall(rows, 1)?;
+            let lines_wall = super::flags::with_qmm_u6_override(false, || wall(1, rows))?;
             let serial = sequential(rows)?;
             eprintln!(
-                "tts_rows {name} R={rows} files_concurrentes_mur={parallel:.3} \
-                 passes_sequentielles={serial:.3} ms lignes/concurrentes={:.2}",
-                lines / parallel
+                "tts_rows {name} R={rows} mur: files_concurrentes={parallel:.3} \
+                 lignes={lines_wall:.3} ms concurrentes/lignes={:.2} ; \
+                 passes_sequentielles_gpu={serial:.3} ms",
+                parallel / lines_wall
             );
         }
     }
